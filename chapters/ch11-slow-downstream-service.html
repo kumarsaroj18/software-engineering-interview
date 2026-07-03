@@ -1,0 +1,2165 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 11 — Slow Downstream Service | Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="../assets/css/prism.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 11</span>
+      <span class="chapter-title">Slow Downstream Service</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#resilience-patterns">Resilience Patterns Overview</a></li>
+        <li><a href="#timeouts">Timeout Strategies</a></li>
+        <li><a href="#circuit-breaker">Circuit Breaker Deep Dive</a></li>
+        <li><a href="#bulkhead">Bulkhead Pattern</a></li>
+        <li><a href="#async-messaging">Async Messaging Fallback</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo; <a href="../index.html#part-iii">Part III — Production Engineering &amp; Debugging</a> &rsaquo; <span>Chapter 11</span>
+    </nav>
+
+    <h1>Chapter 11 — Slow Downstream Service</h1>
+    <div class="chapter-meta">
+      <span class="badge badge-medium">Medium</span>
+      <span class="badge badge-topic">Circuit Breaker</span>
+      <span class="badge badge-topic">Bulkhead</span>
+    </div>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+    <p class="chapter-question"><strong>"One downstream service is taking 8 seconds to respond. How do you stop it from affecting the rest of the system?"</strong></p>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 1: INTERVIEWER INTENT                                 -->
+    <!-- ============================================================ -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>What is the interviewer really assessing?</summary>
+
+        <div class="callout callout-info">
+          <p><strong>This question separates senior engineers from staff+ candidates.</strong> The interviewer wants to see:</p>
+        </div>
+
+        <ul>
+          <li><strong>Fault isolation thinking</strong> — Can you prevent a single slow dependency from cascading into a full platform outage?</li>
+          <li><strong>Pattern vocabulary</strong> — Do you know timeouts, circuit breakers, bulkheads, retries with backoff, and async decoupling?</li>
+          <li><strong>Production experience</strong> — Have you actually debugged thread pool exhaustion at 3 AM?</li>
+          <li><strong>Trade-off articulation</strong> — Can you explain why a 2-second timeout might be wrong for a batch job but right for a user-facing API?</li>
+          <li><strong>Layered defense</strong> — Do you know that no single pattern is sufficient and you need defense in depth?</li>
+          <li><strong>Observability awareness</strong> — Can you detect the problem before users report it?</li>
+          <li><strong>Framework fluency</strong> — Can you configure Resilience4j, Hystrix (legacy), or Spring Cloud Circuit Breaker?</li>
+        </ul>
+
+        <div class="callout callout-warning">
+          <p><strong>Red flags interviewers watch for:</strong></p>
+          <ul>
+            <li>Only mentioning "add a timeout" without discussing the full resilience stack</li>
+            <li>Not knowing the difference between connect timeout and read timeout</li>
+            <li>Suggesting infinite retries without backoff or jitter</li>
+            <li>No mention of monitoring or alerting on circuit breaker state changes</li>
+            <li>Confusing bulkhead with circuit breaker</li>
+          </ul>
+        </div>
+
+      </details>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 2: QUICK ANSWER                                       -->
+    <!-- ============================================================ -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <details>
+        <summary>30-second elevator pitch</summary>
+
+        <div class="callout callout-tip">
+          <blockquote>
+            <p>When a downstream service responds in 8 seconds instead of the expected 200ms, the immediate risk is <strong>thread pool exhaustion</strong> — every inbound request blocks a thread waiting for the slow dependency, and your service quickly runs out of capacity to serve <em>any</em> request, including those that don't touch the slow service.</p>
+            <p>The defense is <strong>layered resilience</strong>:</p>
+            <ol>
+              <li><strong>Aggressive timeouts</strong> — fail fast (e.g., 2s total budget) instead of waiting 8s</li>
+              <li><strong>Circuit breaker</strong> — stop calling the failing service entirely once error rate exceeds threshold</li>
+              <li><strong>Bulkhead</strong> — isolate the slow service's thread pool so it cannot starve other call paths</li>
+              <li><strong>Fallback strategy</strong> — return cached data, degraded response, or queue for async processing</li>
+              <li><strong>Retry with exponential backoff + jitter</strong> — only for transient failures, never for slowness</li>
+            </ol>
+            <p>In Spring Boot with Resilience4j, you compose these as decorators around your WebClient or RestTemplate calls, each pattern addressing a different failure mode.</p>
+          </blockquote>
+        </div>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 3: RESILIENCE PATTERNS OVERVIEW                       -->
+    <!-- ============================================================ -->
+    <section id="resilience-patterns">
+      <h2>Resilience Patterns Overview</h2>
+      <details>
+        <summary>The seven core patterns for handling slow/failing dependencies</summary>
+
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    RESILIENCE PATTERNS STACK                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   ┌──────────┐  ┌──────────────┐  ┌──────────┐  ┌──────────────────┐  │
+│   │ Timeout  │  │Circuit Breaker│  │ Bulkhead │  │  Rate Limiter    │  │
+│   │          │  │              │  │          │  │                  │  │
+│   │ Fail     │  │ Stop calling │  │ Isolate  │  │ Protect          │  │
+│   │ fast     │  │ broken svc   │  │ thread   │  │ downstream       │  │
+│   │          │  │              │  │ pools    │  │                  │  │
+│   └──────────┘  └──────────────┘  └──────────┘  └──────────────────┘  │
+│                                                                         │
+│   ┌──────────┐  ┌──────────────┐  ┌──────────────────────────────────┐ │
+│   │  Retry   │  │Queue Isolation│  │      Hedged Requests            │ │
+│   │          │  │              │  │                                  │ │
+│   │ Recover  │  │ Async        │  │ Send parallel requests,         │ │
+│   │ from     │  │ decouple     │  │ take first response             │ │
+│   │ transient│  │ via MQ       │  │                                  │ │
+│   └──────────┘  └──────────────┘  └──────────────────────────────────┘ │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>1. Timeouts</h3>
+        <p>The most fundamental pattern. Set an upper bound on how long you're willing to wait. If the downstream doesn't respond within the budget, fail immediately and free the thread.</p>
+
+        <h3>2. Retries with Backoff</h3>
+        <p>Automatically retry failed requests with exponential backoff and jitter. <strong>Critical:</strong> Only retry on transient errors (5xx, connection reset), never on slowness — retrying a slow service multiplies load.</p>
+
+        <h3>3. Circuit Breakers</h3>
+        <p>Monitor the failure rate. When it exceeds a threshold, "open" the circuit — immediately reject calls without attempting the downstream. Periodically allow a probe request to check if the service has recovered.</p>
+
+        <h3>4. Bulkheads</h3>
+        <p>Isolate resources (thread pools, connection pools, semaphores) per downstream service. A slow Service-A cannot consume threads allocated to Service-B.</p>
+
+        <h3>5. Rate Limiting</h3>
+        <p>Protect downstream services from being overwhelmed. Client-side rate limiting prevents your service from contributing to the downstream's overload.</p>
+
+        <h3>6. Queue Isolation (Async Decoupling)</h3>
+        <p>Instead of synchronous HTTP calls, publish to a message queue. The downstream processes at its own pace. Perfect for non-latency-sensitive operations.</p>
+
+        <h3>7. Hedged Requests</h3>
+        <p>Send the same request to multiple replicas. Take the first response and cancel the rest. Used at Google for tail latency reduction (see Jeff Dean's "Tail at Scale" paper).</p>
+
+        <div class="callout callout-info">
+          <p><strong>Pattern composition order matters.</strong> Resilience4j applies decorators in a specific order:</p>
+          <pre><code>Retry → CircuitBreaker → RateLimiter → TimeLimiter → Bulkhead → Function</code></pre>
+          <p>The outermost decorator (Retry) wraps everything. The innermost (Bulkhead) is closest to the actual call.</p>
+        </div>
+
+        <h3>When to use which pattern</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Pattern</th>
+              <th>Best For</th>
+              <th>Not Suitable For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Timeout</td>
+              <td>Every external call (always apply)</td>
+              <td>Never skip this</td>
+            </tr>
+            <tr>
+              <td>Retry</td>
+              <td>Transient failures, idempotent operations</td>
+              <td>Slow services (amplifies load), non-idempotent writes</td>
+            </tr>
+            <tr>
+              <td>Circuit Breaker</td>
+              <td>Repeated failures from same dependency</td>
+              <td>One-off errors, latency-insensitive batch jobs</td>
+            </tr>
+            <tr>
+              <td>Bulkhead</td>
+              <td>Multiple downstream services sharing thread pool</td>
+              <td>Single-dependency services</td>
+            </tr>
+            <tr>
+              <td>Rate Limiter</td>
+              <td>Protecting overwhelmed downstreams</td>
+              <td>When downstream has its own admission control</td>
+            </tr>
+            <tr>
+              <td>Queue Isolation</td>
+              <td>Non-real-time operations (email, notifications)</td>
+              <td>User-facing synchronous APIs</td>
+            </tr>
+            <tr>
+              <td>Hedged Requests</td>
+              <td>Read-heavy, idempotent, multi-replica services</td>
+              <td>Write operations, single-instance services</td>
+            </tr>
+          </tbody>
+        </table>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 4: TIMEOUT STRATEGIES                                 -->
+    <!-- ============================================================ -->
+    <section id="timeouts">
+      <h2>Timeout Strategies</h2>
+      <details>
+        <summary>Connect vs Read vs Total — and timeout budgets across the call chain</summary>
+
+        <h3>Three types of timeouts</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────┐
+│                     HTTP REQUEST TIMELINE                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ├── Connect Timeout ──┤                                             │
+│  │   TCP handshake     │                                             │
+│  │   TLS negotiation   │                                             │
+│  │                     │                                             │
+│  │                     ├── Read Timeout (per-read) ──────────────┤   │
+│  │                     │   Time between data packets              │   │
+│  │                     │                                          │   │
+│  ├── Total Timeout (Socket Timeout) ────────────────────────────────┤│
+│  │   End-to-end: connect + send + wait + receive                    ││
+│  │                                                                   ││
+│  └───────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Timeout Type</th>
+              <th>What It Guards</th>
+              <th>Typical Value</th>
+              <th>Failure Mode Without It</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Connect timeout</strong></td>
+              <td>TCP + TLS handshake</td>
+              <td>1–3 seconds</td>
+              <td>Threads blocked on unreachable host indefinitely</td>
+            </tr>
+            <tr>
+              <td><strong>Read timeout</strong></td>
+              <td>Time between response bytes</td>
+              <td>5–10 seconds</td>
+              <td>Slow trickle of data holds thread open</td>
+            </tr>
+            <tr>
+              <td><strong>Total/Request timeout</strong></td>
+              <td>Entire operation end-to-end</td>
+              <td>2–5 seconds (user-facing)</td>
+              <td>Large payloads or slow starts exceed SLA</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Spring WebClient timeout configuration</h3>
+        <pre><code class="language-java">import io.netty.channel.ChannelOption;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import io.netty.handler.timeout.WriteTimeoutHandler;
+import reactor.netty.http.client.HttpClient;
+
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
+
+@Configuration
+public class WebClientConfig {
+
+    @Bean
+    public WebClient paymentServiceClient() {
+        HttpClient httpClient = HttpClient.create()
+            // Connect timeout: 2 seconds
+            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 2000)
+            .doOnConnected(conn -> conn
+                // Read timeout: 3 seconds between packets
+                .addHandlerLast(new ReadTimeoutHandler(3, TimeUnit.SECONDS))
+                .addHandlerLast(new WriteTimeoutHandler(3, TimeUnit.SECONDS))
+            )
+            // Total response timeout: 5 seconds end-to-end
+            .responseTimeout(Duration.ofSeconds(5));
+
+        return WebClient.builder()
+            .clientConnector(new ReactorClientHttpConnector(httpClient))
+            .baseUrl("http://payment-service:8080")
+            .build();
+    }
+}</code></pre>
+
+        <h3>RestTemplate timeout configuration</h3>
+        <pre><code class="language-java">@Configuration
+public class RestTemplateConfig {
+
+    @Bean
+    public RestTemplate paymentRestTemplate() {
+        HttpComponentsClientHttpRequestFactory factory =
+            new HttpComponentsClientHttpRequestFactory();
+
+        // Connect timeout
+        factory.setConnectTimeout(2000);
+        // Read timeout (socket timeout)
+        factory.setReadTimeout(5000);
+
+        RestTemplate restTemplate = new RestTemplate(factory);
+        return restTemplate;
+    }
+}</code></pre>
+
+        <h3>Timeout budget across the call chain</h3>
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    TIMEOUT BUDGET PROPAGATION                             │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Client ──────► API Gateway ──────► Order Service ──────► Payment Svc    │
+│  (10s SLA)      (timeout: 8s)       (timeout: 5s)       (timeout: 3s)   │
+│                                                                          │
+│  RULE: Each hop's timeout MUST be less than the caller's timeout         │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐     │
+│  │ Gateway budget:  8s                                              │     │
+│  │   ├── Auth service:        0.5s                                  │     │
+│  │   ├── Order service:       5.0s                                  │     │
+│  │   │     ├── Inventory:     1.5s                                  │     │
+│  │   │     ├── Payment:       3.0s                                  │     │
+│  │   │     └── Notification:  0.5s (async, fire-and-forget)         │     │
+│  │   └── Response assembly:   0.5s                                  │     │
+│  │   Total:                   ~7.5s (leaves 0.5s buffer)            │     │
+│  └─────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <div class="callout callout-danger">
+          <p><strong>Anti-pattern: Uniform timeouts.</strong> Setting every service to the same 30-second timeout is a recipe for cascading failures. If Service-D is 4 hops deep, the caller at hop-1 will wait 30s × 4 = 2 minutes in the worst case. Always decrease timeouts as you go deeper in the call chain.</p>
+        </div>
+
+        <div class="callout callout-tip">
+          <p><strong>Deadline propagation (gRPC style):</strong> Pass a deadline header (e.g., <code>X-Request-Deadline: 1720045600000</code>) through the call chain. Each service checks remaining budget before making downstream calls. If budget is exhausted, fail immediately without calling downstream.</p>
+        </div>
+
+        <h3>Implementing deadline propagation</h3>
+        <pre><code class="language-java">@Component
+public class DeadlinePropagationFilter implements WebFilter {
+
+    @Override
+    public Mono&lt;Void&gt; filter(ServerWebExchange exchange, WebFilterChain chain) {
+        String deadline = exchange.getRequest().getHeaders()
+            .getFirst("X-Request-Deadline");
+
+        if (deadline != null) {
+            long deadlineMs = Long.parseLong(deadline);
+            long remainingMs = deadlineMs - System.currentTimeMillis();
+
+            if (remainingMs &lt;= 0) {
+                exchange.getResponse().setStatusCode(HttpStatus.GATEWAY_TIMEOUT);
+                return exchange.getResponse().setComplete();
+            }
+
+            // Store remaining budget in context for downstream calls
+            exchange.getAttributes().put("timeout-budget-ms", remainingMs);
+        }
+
+        return chain.filter(exchange);
+    }
+}</code></pre>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 5: CIRCUIT BREAKER DEEP DIVE                          -->
+    <!-- ============================================================ -->
+    <section id="circuit-breaker">
+      <h2>Circuit Breaker Deep Dive</h2>
+      <details>
+        <summary>Resilience4j states, transitions, metrics, and configuration</summary>
+
+        <h3>State machine diagram</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  CIRCUIT BREAKER STATE MACHINE                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│                    failure rate &lt; threshold                             │
+│              ┌──────────────────────────────────┐                       │
+│              │                                  │                       │
+│              ▼                                  │                       │
+│     ┌────────────────┐                 ┌────────────────┐              │
+│     │                │  failure rate    │                │              │
+│     │     CLOSED     │  &gt;= threshold   │   HALF_OPEN    │              │
+│     │                │────────────────►│                │              │
+│     │  (Normal flow) │                 │ (Probe state)  │              │
+│     │                │                 │                │              │
+│     └────────────────┘                 └────────────────┘              │
+│              │                                  │                       │
+│              │                                  │ failure rate           │
+│              │                                  │ &gt;= threshold          │
+│              │                                  ▼                       │
+│              │                          ┌────────────────┐              │
+│              │     wait duration        │                │              │
+│              │     expires              │      OPEN      │              │
+│              │◄─────────────────────────│                │              │
+│              │                          │ (Fast fail)    │              │
+│              │                          │                │              │
+│              │                          └────────────────┘              │
+│              │                                  ▲                       │
+│              │                                  │                       │
+│              └──────── failure rate ─────────────┘                       │
+│                        &gt;= threshold (from HALF_OPEN)                    │
+│                                                                         │
+│  SPECIAL STATES:                                                        │
+│  ┌──────────────────┐  ┌──────────────────┐                            │
+│  │    DISABLED       │  │   FORCED_OPEN    │                            │
+│  │ (Always allow)    │  │ (Always reject)  │                            │
+│  └──────────────────┘  └──────────────────┘                            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>State transitions explained</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>State</th>
+              <th>Behavior</th>
+              <th>Transitions To</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>CLOSED</strong></td>
+              <td>All requests pass through. Failures are recorded in a sliding window.</td>
+              <td>OPEN (when failure rate ≥ threshold)</td>
+            </tr>
+            <tr>
+              <td><strong>OPEN</strong></td>
+              <td>All requests are immediately rejected with <code>CallNotPermittedException</code>. No downstream calls.</td>
+              <td>HALF_OPEN (after waitDurationInOpenState)</td>
+            </tr>
+            <tr>
+              <td><strong>HALF_OPEN</strong></td>
+              <td>A limited number of probe requests are allowed through.</td>
+              <td>CLOSED (if probes succeed) or OPEN (if probes fail)</td>
+            </tr>
+            <tr>
+              <td><strong>DISABLED</strong></td>
+              <td>Circuit breaker is off. All calls pass through unconditionally.</td>
+              <td>Manual transition only</td>
+            </tr>
+            <tr>
+              <td><strong>FORCED_OPEN</strong></td>
+              <td>Circuit breaker is permanently open. All calls are rejected.</td>
+              <td>Manual transition only</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Sliding window types</h3>
+        <div class="callout callout-info">
+          <p><strong>Count-based vs Time-based sliding window:</strong></p>
+          <ul>
+            <li><strong>Count-based:</strong> Records the last N calls. Example: last 100 calls, if 50+ failed → open circuit.</li>
+            <li><strong>Time-based:</strong> Records calls in the last N seconds. Example: last 60 seconds, if failure rate &gt; 50% → open circuit.</li>
+          </ul>
+          <p>Count-based is simpler but may react slowly under low traffic. Time-based adapts to traffic patterns but needs a minimum call threshold to avoid false positives.</p>
+        </div>
+
+        <h3>Resilience4j configuration</h3>
+        <pre><code class="language-yaml"># application.yml
+resilience4j:
+  circuitbreaker:
+    instances:
+      paymentService:
+        # Sliding window configuration
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 100
+        minimumNumberOfCalls: 20
+
+        # Failure thresholds
+        failureRateThreshold: 50
+        slowCallRateThreshold: 80
+        slowCallDurationThreshold: 3s
+
+        # State transitions
+        waitDurationInOpenState: 30s
+        permittedNumberOfCallsInHalfOpenState: 10
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+
+        # What counts as a failure
+        recordExceptions:
+          - java.util.concurrent.TimeoutException
+          - java.io.IOException
+          - org.springframework.web.client.HttpServerErrorException
+        ignoreExceptions:
+          - com.example.BusinessException
+
+        # Metrics
+        registerHealthIndicator: true
+        eventConsumerBufferSize: 50</code></pre>
+
+        <h3>Programmatic configuration</h3>
+        <pre><code class="language-java">@Configuration
+public class CircuitBreakerConfig {
+
+    @Bean
+    public CircuitBreaker paymentCircuitBreaker(CircuitBreakerRegistry registry) {
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+            .slidingWindowType(SlidingWindowType.COUNT_BASED)
+            .slidingWindowSize(100)
+            .minimumNumberOfCalls(20)
+            .failureRateThreshold(50.0f)
+            .slowCallRateThreshold(80.0f)
+            .slowCallDurationThreshold(Duration.ofSeconds(3))
+            .waitDurationInOpenState(Duration.ofSeconds(30))
+            .permittedNumberOfCallsInHalfOpenState(10)
+            .automaticTransitionFromOpenToHalfOpenEnabled(true)
+            .recordExceptions(
+                TimeoutException.class,
+                IOException.class,
+                HttpServerErrorException.class
+            )
+            .ignoreExceptions(BusinessException.class)
+            .build();
+
+        return registry.circuitBreaker("paymentService", config);
+    }
+}</code></pre>
+
+        <h3>Slow call detection — critical for this scenario</h3>
+        <div class="callout callout-warning">
+          <p><strong>Key insight for the interview:</strong> Standard circuit breakers only trip on exceptions. But an 8-second response is a <em>successful</em> HTTP 200 — it just takes too long. You need <code>slowCallRateThreshold</code> and <code>slowCallDurationThreshold</code> to catch this.</p>
+        </div>
+
+        <pre><code class="language-java">// With slow call detection, any call taking > 3s is recorded as "slow"
+// If 80%+ of calls in the window are slow, the circuit opens
+CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+    .slowCallDurationThreshold(Duration.ofSeconds(3))
+    .slowCallRateThreshold(80.0f)
+    .build();</code></pre>
+
+        <h3>Monitoring circuit breaker state</h3>
+        <pre><code class="language-java">@Component
+@RequiredArgsConstructor
+public class CircuitBreakerMetrics {
+
+    private final CircuitBreaker paymentCircuitBreaker;
+    private final MeterRegistry meterRegistry;
+
+    @PostConstruct
+    public void registerMetrics() {
+        CircuitBreaker.Metrics metrics = paymentCircuitBreaker.getMetrics();
+
+        Gauge.builder("circuit_breaker.failure_rate",
+                metrics, CircuitBreaker.Metrics::getFailureRate)
+            .tag("service", "payment")
+            .register(meterRegistry);
+
+        Gauge.builder("circuit_breaker.slow_call_rate",
+                metrics, CircuitBreaker.Metrics::getSlowCallRate)
+            .tag("service", "payment")
+            .register(meterRegistry);
+
+        Gauge.builder("circuit_breaker.state",
+                paymentCircuitBreaker,
+                cb -> cb.getState().getOrder())
+            .tag("service", "payment")
+            .register(meterRegistry);
+
+        // Event listener for state transitions
+        paymentCircuitBreaker.getEventPublisher()
+            .onStateTransition(event ->
+                log.warn("Circuit breaker '{}' state transition: {} -> {}",
+                    event.getCircuitBreakerName(),
+                    event.getStateTransition().getFromState(),
+                    event.getStateTransition().getToState()));
+    }
+}</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Alert on OPEN state:</strong> Set up PagerDuty/OpsGenie alerts when the circuit transitions to OPEN. This is your early warning that a downstream is degraded — often before users notice.</p>
+        </div>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 6: BULKHEAD PATTERN                                   -->
+    <!-- ============================================================ -->
+    <section id="bulkhead">
+      <h2>Bulkhead Pattern</h2>
+      <details>
+        <summary>Thread pool isolation, semaphore isolation, and Resilience4j ThreadPoolBulkhead</summary>
+
+        <h3>The ship analogy</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    BULKHEAD CONCEPT (Ship Hull)                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  WITHOUT BULKHEAD:                                                      │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Shared Thread Pool (200 threads)                                │    │
+│  │  ┌─────────────────────────────────────────────────────────────┐│    │
+│  │  │ Payment (slow) ████████████████████████████████████████████ ││    │
+│  │  │ Inventory       ░░ (2 threads left)                         ││    │
+│  │  │ User Profile    ░  (1 thread left)                          ││    │
+│  │  │ Search          ░  (blocked - no threads available!)        ││    │
+│  │  └─────────────────────────────────────────────────────────────┘│    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  WITH BULKHEAD:                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────┐  ┌──────────────┐   │
+│  │ Payment Pool │  │Inventory Pool│  │User Pool │  │ Search Pool  │   │
+│  │  (50 threads)│  │ (50 threads) │  │(50 thrds)│  │ (50 threads) │   │
+│  │  ████████████│  │  ░░░░░░░░░░░ │  │ ░░░░░░░░ │  │ ░░░░░░░░░░░ │   │
+│  │  ALL USED UP │  │  UNAFFECTED  │  │UNAFFECTED│  │  UNAFFECTED  │   │
+│  └──────────────┘  └──────────────┘  └──────────┘  └──────────────┘   │
+│                                                                         │
+│  Payment is slow → only payment's 50 threads are exhausted             │
+│  Other services continue operating normally with their own pools        │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Two isolation strategies</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Mechanism</th>
+              <th>Pros</th>
+              <th>Cons</th>
+              <th>Use When</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Thread Pool</strong></td>
+              <td>Separate thread pool per dependency. Calls execute on isolated threads.</td>
+              <td>Complete isolation; queuing support; timeout per pool</td>
+              <td>Context switch overhead; ThreadLocal loss; higher memory</td>
+              <td>Blocking I/O, slow dependencies, need queue buffering</td>
+            </tr>
+            <tr>
+              <td><strong>Semaphore</strong></td>
+              <td>Limit concurrent calls using a semaphore. Calls run on caller's thread.</td>
+              <td>No context switch; preserves ThreadLocal; low overhead</td>
+              <td>No queuing; no timeout (relies on downstream timeout); less isolation</td>
+              <td>Reactive/async code, fast dependencies, memory-sensitive</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Resilience4j ThreadPoolBulkhead</h3>
+        <pre><code class="language-yaml"># application.yml
+resilience4j:
+  thread-pool-bulkhead:
+    instances:
+      paymentService:
+        maxThreadPoolSize: 20
+        coreThreadPoolSize: 10
+        queueCapacity: 50
+        keepAliveDuration: 100ms
+        writableStackTraceEnabled: true
+
+  bulkhead:
+    instances:
+      inventoryService:
+        maxConcurrentCalls: 30
+        maxWaitDuration: 500ms</code></pre>
+
+        <h3>Programmatic ThreadPoolBulkhead</h3>
+        <pre><code class="language-java">@Configuration
+public class BulkheadConfig {
+
+    @Bean
+    public ThreadPoolBulkhead paymentBulkhead() {
+        ThreadPoolBulkheadConfig config = ThreadPoolBulkheadConfig.custom()
+            .maxThreadPoolSize(20)
+            .coreThreadPoolSize(10)
+            .queueCapacity(50)
+            .keepAliveDuration(Duration.ofMillis(100))
+            .build();
+
+        return ThreadPoolBulkheadRegistry.of(config)
+            .bulkhead("paymentService");
+    }
+
+    @Bean
+    public Bulkhead inventoryBulkhead() {
+        BulkheadConfig config = BulkheadConfig.custom()
+            .maxConcurrentCalls(30)
+            .maxWaitDuration(Duration.ofMillis(500))
+            .build();
+
+        return BulkheadRegistry.of(config)
+            .bulkhead("inventoryService");
+    }
+}</code></pre>
+
+        <h3>Using bulkhead with annotations</h3>
+        <pre><code class="language-java">@Service
+public class PaymentService {
+
+    @Bulkhead(name = "paymentService", type = Bulkhead.Type.THREADPOOL,
+              fallbackMethod = "paymentFallback")
+    public CompletableFuture&lt;PaymentResult&gt; processPayment(PaymentRequest request) {
+        // This runs in the isolated thread pool
+        return CompletableFuture.supplyAsync(() ->
+            paymentClient.charge(request));
+    }
+
+    private CompletableFuture&lt;PaymentResult&gt; paymentFallback(
+            PaymentRequest request, BulkheadFullException ex) {
+        log.warn("Payment bulkhead full, queuing for retry: {}", request.getId());
+        // Queue for async retry
+        paymentRetryQueue.send(request);
+        return CompletableFuture.completedFuture(
+            PaymentResult.pending(request.getId()));
+    }
+}</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Sizing the bulkhead:</strong> Calculate based on expected throughput and latency:</p>
+          <pre><code>maxConcurrentCalls = (requests_per_second) × (avg_latency_seconds) × safety_factor
+
+Example: 100 RPS × 0.2s latency × 1.5 safety = 30 concurrent calls
+If latency spikes to 8s: 100 × 8 × 1.5 = 1200 (way over budget!)
+→ That's why you need the bulkhead: cap at 30, reject overflow</code></pre>
+        </div>
+
+        <div class="callout callout-warning">
+          <p><strong>ThreadLocal gotcha:</strong> Thread pool bulkhead executes on a different thread. If you rely on <code>SecurityContext</code>, <code>MDC</code>, or request-scoped beans, you must propagate them explicitly. Use <code>ContextPropagatingExecutorService</code> or Micrometer's context propagation.</p>
+        </div>
+
+        <pre><code class="language-java">// Propagating MDC context to bulkhead threads
+@Bean
+public ThreadPoolBulkhead paymentBulkhead() {
+    ThreadPoolBulkheadConfig config = ThreadPoolBulkheadConfig.custom()
+        .maxThreadPoolSize(20)
+        .coreThreadPoolSize(10)
+        .contextPropagator(new MdcContextPropagator())
+        .build();
+
+    return ThreadPoolBulkheadRegistry.of(config)
+        .bulkhead("paymentService");
+}
+
+public class MdcContextPropagator implements ContextPropagator {
+
+    @Override
+    public Supplier&lt;Optional&lt;Object&gt;&gt; retrieve() {
+        return () -> Optional.ofNullable(MDC.getCopyOfContextMap());
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public Consumer&lt;Optional&lt;Object&gt;&gt; copy() {
+        return context -> context
+            .map(c -> (Map&lt;String, String&gt;) c)
+            .ifPresent(MDC::setContextMap);
+    }
+
+    @Override
+    public Consumer&lt;Optional&lt;Object&gt;&gt; clear() {
+        return context -> MDC.clear();
+    }
+}</code></pre>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 7: ASYNC MESSAGING FALLBACK                           -->
+    <!-- ============================================================ -->
+    <section id="async-messaging">
+      <h2>Async Messaging Fallback</h2>
+      <details>
+        <summary>Queue the request instead of blocking — decouple via messaging</summary>
+
+        <h3>When synchronous becomes a liability</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│              SYNC vs ASYNC HANDLING OF SLOW SERVICE                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  SYNCHRONOUS (Problematic):                                             │
+│                                                                         │
+│  User ──► API ──► Order Service ──── 8s wait ────► Payment Service     │
+│                   (thread blocked)                  (slow)              │
+│                                                                         │
+│  ─────────────────────────────────────────────────────────────────────  │
+│                                                                         │
+│  ASYNC FALLBACK (Resilient):                                            │
+│                                                                         │
+│  User ──► API ──► Order Service ──► Message Queue ──► Payment Service  │
+│                   (returns immediately)   │          (processes later)  │
+│                   HTTP 202 Accepted       │                             │
+│                                           ▼                             │
+│                                    Retry + DLQ                          │
+│                                                                         │
+│  User polls GET /orders/{id}/status or gets webhook callback            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Implementation with Spring + SQS/Kafka</h3>
+        <pre><code class="language-java">@Service
+@RequiredArgsConstructor
+public class OrderService {
+
+    private final PaymentClient paymentClient;
+    private final SqsTemplate sqsTemplate;
+    private final CircuitBreaker paymentCircuitBreaker;
+
+    public OrderResponse createOrder(OrderRequest request) {
+        Order order = orderRepository.save(Order.pending(request));
+
+        // Try synchronous first, fall back to async
+        try {
+            PaymentResult result = CircuitBreaker
+                .decorateSupplier(paymentCircuitBreaker,
+                    () -> paymentClient.charge(request.getPaymentDetails()))
+                .get();
+
+            order.confirm(result);
+            return OrderResponse.confirmed(order);
+
+        } catch (CallNotPermittedException | TimeoutException e) {
+            // Circuit is open or call timed out — queue for async processing
+            log.warn("Payment unavailable, queuing order {} for async processing",
+                order.getId());
+
+            PaymentMessage message = PaymentMessage.builder()
+                .orderId(order.getId())
+                .amount(request.getAmount())
+                .paymentMethod(request.getPaymentDetails())
+                .retryCount(0)
+                .createdAt(Instant.now())
+                .build();
+
+            sqsTemplate.send("payment-processing-queue", message);
+
+            order.setPending("Payment queued for processing");
+            orderRepository.save(order);
+
+            return OrderResponse.pending(order,
+                "Payment is being processed. You'll receive confirmation shortly.");
+        }
+    }
+}
+
+@Component
+@RequiredArgsConstructor
+public class PaymentQueueConsumer {
+
+    private final PaymentClient paymentClient;
+    private final OrderRepository orderRepository;
+    private final SqsTemplate sqsTemplate;
+
+    private static final int MAX_RETRIES = 3;
+
+    @SqsListener("payment-processing-queue")
+    public void processPayment(PaymentMessage message) {
+        try {
+            PaymentResult result = paymentClient.charge(message.getPaymentMethod());
+
+            Order order = orderRepository.findById(message.getOrderId())
+                .orElseThrow();
+            order.confirm(result);
+            orderRepository.save(order);
+
+            // Notify user via webhook/email/push notification
+            notificationService.paymentConfirmed(order);
+
+        } catch (Exception e) {
+            if (message.getRetryCount() &lt; MAX_RETRIES) {
+                // Re-queue with incremented retry count and backoff
+                message.incrementRetry();
+                Duration backoff = Duration.ofSeconds(
+                    (long) Math.pow(2, message.getRetryCount()) * 10);
+
+                sqsTemplate.send("payment-processing-queue",
+                    message, backoff);
+            } else {
+                // Send to Dead Letter Queue for manual review
+                sqsTemplate.send("payment-dlq", message);
+                log.error("Payment failed after {} retries for order {}",
+                    MAX_RETRIES, message.getOrderId());
+            }
+        }
+    }
+}</code></pre>
+
+        <h3>API design for async operations</h3>
+        <pre><code class="language-java">// Return 202 Accepted with a location header for status polling
+@PostMapping("/orders")
+public ResponseEntity&lt;OrderResponse&gt; createOrder(@RequestBody OrderRequest request) {
+    OrderResponse response = orderService.createOrder(request);
+
+    if (response.isPending()) {
+        return ResponseEntity
+            .accepted()
+            .header("Location", "/orders/" + response.getOrderId() + "/status")
+            .header("Retry-After", "5")
+            .body(response);
+    }
+
+    return ResponseEntity.status(HttpStatus.CREATED).body(response);
+}
+
+// Status endpoint for polling
+@GetMapping("/orders/{orderId}/status")
+public ResponseEntity&lt;OrderStatus&gt; getOrderStatus(@PathVariable String orderId) {
+    OrderStatus status = orderService.getStatus(orderId);
+
+    if (status.isPending()) {
+        return ResponseEntity.ok()
+            .header("Retry-After", "5")
+            .body(status);
+    }
+
+    return ResponseEntity.ok(status);
+}</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Choose async when:</strong></p>
+          <ul>
+            <li>The operation doesn't need immediate confirmation (email, notifications, analytics)</li>
+            <li>The user can be shown a "processing" state (payment pending, order confirmed)</li>
+            <li>The downstream service has known availability issues</li>
+            <li>You can provide eventual consistency guarantees</li>
+          </ul>
+        </div>
+
+        <div class="callout callout-danger">
+          <p><strong>Don't forget the DLQ.</strong> Every async queue needs a Dead Letter Queue for messages that fail after max retries. Without it, failed messages disappear silently. Set up alerts on DLQ depth — messages piling up means your downstream is broken.</p>
+        </div>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 8: PRODUCTION INCIDENT                                -->
+    <!-- ============================================================ -->
+    <section id="production-incident">
+      <h2>Production Incident: Cascading Failure</h2>
+      <details>
+        <summary>Payment service latency spike → thread pool exhaustion → total platform outage</summary>
+
+        <div class="callout callout-danger">
+          <p><strong>Incident Severity: SEV-1 | Duration: 47 minutes | Impact: Complete platform outage affecting 2.3M users</strong></p>
+        </div>
+
+        <h3>Timeline</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     INCIDENT TIMELINE                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  14:23  Payment Service DB runs long-running migration                  │
+│         → Average latency increases from 200ms to 8-12 seconds          │
+│                                                                         │
+│  14:25  Order Service thread pool (200 threads) starts filling up       │
+│         → All threads waiting on Payment Service HTTP responses          │
+│         → No timeouts configured (default: infinite wait)               │
+│                                                                         │
+│  14:27  Order Service thread pool exhausted (200/200 threads busy)      │
+│         → Cannot process ANY request, including health checks           │
+│         → Load balancer marks Order Service instances as unhealthy      │
+│                                                                         │
+│  14:28  API Gateway starts returning 503 for all order-related APIs     │
+│         → Cart Service, which calls Order Service, also starts backing  │
+│           up (no timeout configured)                                    │
+│                                                                         │
+│  14:30  Cart Service thread pool exhausted (150/150 threads)            │
+│         → Product pages cannot load cart count                          │
+│         → Cascading to Product Service via shared connection pool        │
+│                                                                         │
+│  14:32  Search Service affected — shares database connection pool with  │
+│         Product Service (connection pool: 50 connections, all in use)   │
+│                                                                         │
+│  14:34  COMPLETE PLATFORM OUTAGE                                        │
+│         → 5 services down, all from one slow Payment Service DB query   │
+│         → PagerDuty SEV-1 escalation                                    │
+│                                                                         │
+│  14:45  On-call identifies root cause via thread dumps                  │
+│         → All threads in TIMED_WAITING state on Payment HTTP calls      │
+│                                                                         │
+│  14:52  Mitigation: Kill long-running DB migration on Payment Service   │
+│         → Payment Service latency returns to normal                     │
+│                                                                         │
+│  15:01  Full recovery                                                   │
+│         → Threads release, health checks pass, traffic resumes          │
+│                                                                         │
+│  15:10  All clear                                                       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Cascade visualization</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     FAILURE CASCADE                                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Payment DB                                                              │
+│  (slow query) ─────► Payment Service ─────► Order Service               │
+│                       (8s latency)          (thread exhaustion)          │
+│                                                    │                     │
+│                                                    ▼                     │
+│                                              Cart Service                │
+│                                              (thread exhaustion)         │
+│                                                    │                     │
+│                                              ┌─────┴─────┐              │
+│                                              ▼           ▼              │
+│                                        Product Svc   Search Svc         │
+│                                        (conn pool    (conn pool          │
+│                                         exhausted)    exhausted)         │
+│                                                                          │
+│  ROOT CAUSE: One slow DB query                                           │
+│  BLAST RADIUS: 5 services, entire platform                               │
+│  MISSING CONTROLS: Timeouts, circuit breakers, bulkheads                 │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Root cause analysis</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Factor</th>
+              <th>What Went Wrong</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>No timeouts</td>
+              <td>Default HTTP client config: infinite timeout. Threads waited forever.</td>
+              <td>Set connect=2s, read=3s, total=5s on all HTTP clients</td>
+            </tr>
+            <tr>
+              <td>No circuit breaker</td>
+              <td>Continued calling Payment Service even when 100% of calls timed out.</td>
+              <td>Add Resilience4j CB: open after 50% failure rate in 100-call window</td>
+            </tr>
+            <tr>
+              <td>No bulkhead</td>
+              <td>Payment calls consumed all 200 threads in the shared Tomcat pool.</td>
+              <td>Dedicated 50-thread pool for Payment calls; Tomcat pool for others</td>
+            </tr>
+            <tr>
+              <td>Shared resources</td>
+              <td>Product and Search services shared a DB connection pool.</td>
+              <td>Separate connection pools per service; dedicated pool per dependency</td>
+            </tr>
+            <tr>
+              <td>No load shedding</td>
+              <td>Services accepted requests they couldn't process, worsening backpressure.</td>
+              <td>Return 503 with Retry-After when thread pool &gt; 80% utilized</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Post-incident remediation</h3>
+        <pre><code class="language-java">// BEFORE (no resilience)
+@Service
+public class OrderService {
+    public OrderResult createOrder(OrderRequest req) {
+        // No timeout, no circuit breaker, no bulkhead
+        PaymentResult payment = restTemplate.postForObject(
+            "http://payment-service/charge", req, PaymentResult.class);
+        return new OrderResult(payment);
+    }
+}
+
+// AFTER (full resilience stack)
+@Service
+public class OrderService {
+
+    @CircuitBreaker(name = "paymentService", fallbackMethod = "paymentFallback")
+    @Bulkhead(name = "paymentService", type = Bulkhead.Type.THREADPOOL)
+    @TimeLimiter(name = "paymentService")
+    @Retry(name = "paymentService")
+    public CompletableFuture&lt;OrderResult&gt; createOrder(OrderRequest req) {
+        return CompletableFuture.supplyAsync(() ->
+            paymentWebClient.post()
+                .uri("/charge")
+                .bodyValue(req)
+                .retrieve()
+                .bodyToMono(PaymentResult.class)
+                .block()
+        );
+    }
+
+    private CompletableFuture&lt;OrderResult&gt; paymentFallback(
+            OrderRequest req, Exception ex) {
+        log.warn("Payment fallback triggered for order: {}", req.getId(), ex);
+        // Queue for async processing
+        paymentQueue.send(PaymentMessage.from(req));
+        return CompletableFuture.completedFuture(
+            OrderResult.pending("Payment queued"));
+    }
+}</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Lessons learned (shared across engineering org):</strong></p>
+          <ul>
+            <li>Every HTTP client MUST have explicit timeouts — enforce via lint rule</li>
+            <li>Every inter-service call MUST have a circuit breaker</li>
+            <li>Critical paths need bulkheaded thread pools</li>
+            <li>DB migrations must be tested for lock contention and rolled out during low-traffic windows</li>
+            <li>Runbook added: "How to identify thread pool exhaustion from thread dumps"</li>
+            <li>Added Grafana dashboard: thread pool utilization per service per dependency</li>
+          </ul>
+        </div>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 9: DEBUGGING WORKFLOW                                  -->
+    <!-- ============================================================ -->
+    <section id="debugging-workflow">
+      <h2>Debugging Workflow</h2>
+      <details>
+        <summary>Step-by-step guide to identify and resolve a slow downstream service in production</summary>
+
+        <h3>Detection → Diagnosis → Mitigation → Resolution</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     DEBUGGING WORKFLOW                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  1. DETECT                                                               │
+│     ├── Alert: p99 latency spike on API Gateway                          │
+│     ├── Alert: Thread pool utilization &gt; 80%                            │
+│     ├── Alert: Circuit breaker state → OPEN                              │
+│     └── Alert: Error rate &gt; 5%                                          │
+│                                                                          │
+│  2. IDENTIFY SLOW DEPENDENCY                                             │
+│     ├── Check distributed traces (Jaeger/Zipkin/X-Ray)                   │
+│     ├── Check HTTP client metrics (by target service)                    │
+│     ├── Check circuit breaker dashboard                                  │
+│     └── Thread dump analysis (jstack or async-profiler)                  │
+│                                                                          │
+│  3. ASSESS BLAST RADIUS                                                  │
+│     ├── Which services depend on the slow service?                       │
+│     ├── Are bulkheads containing the damage?                             │
+│     ├── Is the thread pool shared or isolated?                           │
+│     └── Are other non-related endpoints affected?                        │
+│                                                                          │
+│  4. MITIGATE (stop the bleeding)                                         │
+│     ├── If CB not configured: manually block traffic to slow service     │
+│     ├── Scale up caller service (more threads = buy time)                │
+│     ├── Enable feature flag to disable slow dependency call              │
+│     └── Activate async fallback / cached response                        │
+│                                                                          │
+│  5. RESOLVE (fix root cause)                                             │
+│     ├── Fix the downstream service (kill slow query, scale, rollback)    │
+│     ├── Add missing resilience patterns                                  │
+│     └── Validate recovery via canary traffic                             │
+│                                                                          │
+│  6. POST-MORTEM                                                          │
+│     ├── Timeline reconstruction                                          │
+│     ├── Action items with owners and deadlines                           │
+│     └── Chaos engineering test to validate fix                           │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Key commands for debugging</h3>
+        <pre><code class="language-bash"># 1. Get thread dump from running JVM
+jstack $(pgrep -f 'order-service') > thread_dump.txt
+
+# 2. Count threads in WAITING/TIMED_WAITING state
+grep -c "TIMED_WAITING" thread_dump.txt
+grep -c "WAITING" thread_dump.txt
+
+# 3. Find what threads are waiting on
+grep -A 5 "TIMED_WAITING" thread_dump.txt | grep "at " | sort | uniq -c | sort -rn
+
+# 4. Check Tomcat thread pool utilization
+curl -s http://localhost:8080/actuator/metrics/tomcat.threads.busy | jq '.measurements[0].value'
+curl -s http://localhost:8080/actuator/metrics/tomcat.threads.config.max | jq '.measurements[0].value'
+
+# 5. Check HTTP client connection pool
+curl -s http://localhost:8080/actuator/metrics/http.client.requests \
+  | jq '.availableTags[] | select(.tag == "uri")'
+
+# 6. Check circuit breaker state
+curl -s http://localhost:8080/actuator/circuitbreakers | jq '.'
+
+# 7. Check circuit breaker events
+curl -s http://localhost:8080/actuator/circuitbreakerevents/paymentService | jq '.'
+
+# 8. Async profiler for CPU/allocation/lock profiling
+./asprof -d 30 -f /tmp/flamegraph.html $(pgrep -f 'order-service')
+
+# 9. Check network connectivity to downstream
+curl -o /dev/null -s -w "Connect: %{time_connect}s\nTTFB: %{time_starttransfer}s\nTotal: %{time_total}s\n" \
+  http://payment-service:8080/health
+
+# 10. Check connection pool metrics
+curl -s http://localhost:8080/actuator/metrics/hikaricp.connections.active | jq '.'
+curl -s http://localhost:8080/actuator/metrics/hikaricp.connections.pending | jq '.'</code></pre>
+
+        <h3>Grafana queries for monitoring</h3>
+        <pre><code class="language-bash"># PromQL: HTTP client latency by target service (p99)
+histogram_quantile(0.99,
+  sum(rate(http_client_requests_seconds_bucket{service="order-service"}[5m]))
+  by (le, uri)
+)
+
+# Thread pool utilization
+tomcat_threads_busy_threads{application="order-service"}
+  / tomcat_threads_config_max_threads{application="order-service"}
+
+# Circuit breaker state (0=CLOSED, 1=OPEN, 2=HALF_OPEN)
+resilience4j_circuitbreaker_state{name="paymentService"}
+
+# Bulkhead available concurrent calls
+resilience4j_bulkhead_available_concurrent_calls{name="paymentService"}
+
+# Error rate by downstream service
+sum(rate(http_client_requests_seconds_count{status=~"5.."}[5m])) by (uri)
+/ sum(rate(http_client_requests_seconds_count[5m])) by (uri)</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Pro tip: Pre-build dashboards before incidents.</strong> Create a "Downstream Health" dashboard with:</p>
+          <ul>
+            <li>p50/p95/p99 latency per downstream service</li>
+            <li>Circuit breaker state (CLOSED/OPEN/HALF_OPEN) as a state timeline</li>
+            <li>Thread pool utilization (used/max) as a percentage gauge</li>
+            <li>Bulkhead rejection rate</li>
+            <li>Error rate by downstream and error type</li>
+          </ul>
+          <p>When the 3 AM page fires, you should be able to identify the slow service in under 60 seconds.</p>
+        </div>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 10: CODE EXAMPLES                                     -->
+    <!-- ============================================================ -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Complete Resilience4j configuration with all patterns composed</summary>
+
+        <h3>Full application.yml configuration</h3>
+        <pre><code class="language-yaml">spring:
+  application:
+    name: order-service
+
+# Resilience4j full configuration
+resilience4j:
+  # Circuit Breaker
+  circuitbreaker:
+    configs:
+      default:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 100
+        minimumNumberOfCalls: 20
+        failureRateThreshold: 50
+        slowCallRateThreshold: 80
+        slowCallDurationThreshold: 3s
+        waitDurationInOpenState: 30s
+        permittedNumberOfCallsInHalfOpenState: 10
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+        registerHealthIndicator: true
+        recordExceptions:
+          - java.util.concurrent.TimeoutException
+          - java.io.IOException
+          - org.springframework.web.reactive.function.client.WebClientResponseException.ServiceUnavailable
+          - org.springframework.web.reactive.function.client.WebClientResponseException.GatewayTimeout
+    instances:
+      paymentService:
+        baseConfig: default
+        failureRateThreshold: 40
+        slowCallDurationThreshold: 2s
+      inventoryService:
+        baseConfig: default
+        slowCallDurationThreshold: 1s
+
+  # Retry
+  retry:
+    configs:
+      default:
+        maxAttempts: 3
+        waitDuration: 1s
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2
+        enableRandomizedWait: true
+        randomizedWaitFactor: 0.5
+        retryExceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+        ignoreExceptions:
+          - com.example.BusinessValidationException
+    instances:
+      paymentService:
+        baseConfig: default
+        maxAttempts: 2
+        waitDuration: 500ms
+
+  # Time Limiter
+  timelimiter:
+    configs:
+      default:
+        timeoutDuration: 5s
+        cancelRunningFuture: true
+    instances:
+      paymentService:
+        timeoutDuration: 3s
+      inventoryService:
+        timeoutDuration: 2s
+
+  # Bulkhead (Semaphore)
+  bulkhead:
+    configs:
+      default:
+        maxConcurrentCalls: 50
+        maxWaitDuration: 500ms
+    instances:
+      inventoryService:
+        maxConcurrentCalls: 30
+        maxWaitDuration: 200ms
+
+  # Thread Pool Bulkhead
+  thread-pool-bulkhead:
+    configs:
+      default:
+        maxThreadPoolSize: 20
+        coreThreadPoolSize: 10
+        queueCapacity: 50
+        keepAliveDuration: 100ms
+    instances:
+      paymentService:
+        maxThreadPoolSize: 15
+        coreThreadPoolSize: 8
+        queueCapacity: 30
+
+  # Rate Limiter
+  ratelimiter:
+    configs:
+      default:
+        limitForPeriod: 100
+        limitRefreshPeriod: 1s
+        timeoutDuration: 0s
+    instances:
+      paymentService:
+        limitForPeriod: 50
+        limitRefreshPeriod: 1s
+
+# Actuator endpoints for monitoring
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,circuitbreakers,circuitbreakerevents,
+                 retries,retryevents,bulkheads,ratelimiters,timelimiters
+  health:
+    circuitbreakers:
+      enabled: true
+    ratelimiters:
+      enabled: true</code></pre>
+
+        <h3>Service layer with composed resilience patterns</h3>
+        <pre><code class="language-java">package com.example.orderservice.service;
+
+import io.github.resilience4j.bulkhead.annotation.Bulkhead;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
+import io.github.resilience4j.retry.annotation.Retry;
+import io.github.resilience4j.timelimiter.annotation.TimeLimiter;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.concurrent.CompletableFuture;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class PaymentIntegrationService {
+
+    private final PaymentWebClient paymentWebClient;
+    private final PaymentFallbackService fallbackService;
+
+    /**
+     * Resilience4j applies decorators in this order (outermost to innermost):
+     * Retry → CircuitBreaker → RateLimiter → TimeLimiter → Bulkhead → Function
+     *
+     * For @Bulkhead with THREADPOOL type, the method MUST return CompletableFuture.
+     */
+    @Retry(name = "paymentService", fallbackMethod = "retryFallback")
+    @CircuitBreaker(name = "paymentService", fallbackMethod = "circuitBreakerFallback")
+    @RateLimiter(name = "paymentService")
+    @TimeLimiter(name = "paymentService")
+    @Bulkhead(name = "paymentService", type = Bulkhead.Type.THREADPOOL)
+    public CompletableFuture&lt;PaymentResponse&gt; processPayment(PaymentRequest request) {
+        log.debug("Processing payment for order: {}", request.getOrderId());
+        return paymentWebClient.charge(request);
+    }
+
+    /**
+     * Fallback when circuit breaker is OPEN.
+     * Called immediately without attempting the downstream call.
+     */
+    private CompletableFuture&lt;PaymentResponse&gt; circuitBreakerFallback(
+            PaymentRequest request, io.github.resilience4j.circuitbreaker.CallNotPermittedException ex) {
+        log.warn("Circuit breaker OPEN for payment service. Order: {}", request.getOrderId());
+        return fallbackService.queueForAsyncProcessing(request);
+    }
+
+    /**
+     * Fallback after all retries are exhausted.
+     */
+    private CompletableFuture&lt;PaymentResponse&gt; retryFallback(
+            PaymentRequest request, Exception ex) {
+        log.error("All retries exhausted for payment. Order: {}, Error: {}",
+            request.getOrderId(), ex.getMessage());
+        return fallbackService.queueForAsyncProcessing(request);
+    }
+}</code></pre>
+
+        <h3>WebClient with proper timeout configuration</h3>
+        <pre><code class="language-java">package com.example.orderservice.client;
+
+import io.netty.channel.ChannelOption;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import io.netty.handler.timeout.WriteTimeoutHandler;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.resources.ConnectionProvider;
+
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
+
+@Slf4j
+@Configuration
+public class PaymentWebClientConfig {
+
+    @Value("${payment.service.url:http://payment-service:8080}")
+    private String paymentServiceUrl;
+
+    @Bean
+    public WebClient paymentWebClient() {
+        // Connection pool configuration
+        ConnectionProvider connectionProvider = ConnectionProvider.builder("payment-pool")
+            .maxConnections(50)
+            .maxIdleTime(Duration.ofSeconds(20))
+            .maxLifeTime(Duration.ofSeconds(60))
+            .pendingAcquireTimeout(Duration.ofMillis(500))
+            .evictInBackground(Duration.ofSeconds(30))
+            .metrics(true)
+            .build();
+
+        // HTTP client with timeouts
+        HttpClient httpClient = HttpClient.create(connectionProvider)
+            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 2000)
+            .doOnConnected(connection -> connection
+                .addHandlerLast(new ReadTimeoutHandler(3, TimeUnit.SECONDS))
+                .addHandlerLast(new WriteTimeoutHandler(3, TimeUnit.SECONDS)))
+            .responseTimeout(Duration.ofSeconds(5));
+
+        return WebClient.builder()
+            .clientConnector(new ReactorClientHttpConnector(httpClient))
+            .baseUrl(paymentServiceUrl)
+            .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+            .filter(logRequest())
+            .filter(logResponse())
+            .build();
+    }
+
+    private ExchangeFilterFunction logRequest() {
+        return ExchangeFilterFunction.ofRequestProcessor(request -> {
+            log.debug("Payment request: {} {}", request.method(), request.url());
+            return Mono.just(request);
+        });
+    }
+
+    private ExchangeFilterFunction logResponse() {
+        return ExchangeFilterFunction.ofResponseProcessor(response -> {
+            log.debug("Payment response: status={}", response.statusCode());
+            return Mono.just(response);
+        });
+    }
+}
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class PaymentWebClient {
+
+    private final WebClient paymentWebClient;
+
+    public CompletableFuture&lt;PaymentResponse&gt; charge(PaymentRequest request) {
+        return paymentWebClient.post()
+            .uri("/api/v1/payments/charge")
+            .bodyValue(request)
+            .retrieve()
+            .onStatus(HttpStatusCode::is5xxServerError, response ->
+                Mono.error(new PaymentServiceException(
+                    "Payment service error: " + response.statusCode())))
+            .bodyToMono(PaymentResponse.class)
+            .doOnError(ex -> log.error("Payment call failed: {}", ex.getMessage()))
+            .toFuture();
+    }
+}</code></pre>
+
+        <h3>Fallback strategies</h3>
+        <pre><code class="language-java">package com.example.orderservice.service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.concurrent.CompletableFuture;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class PaymentFallbackService {
+
+    private final PaymentMessageProducer messageProducer;
+    private final PaymentCacheService cacheService;
+
+    /**
+     * Strategy 1: Queue for async processing
+     * Best for: operations that can tolerate eventual consistency
+     */
+    public CompletableFuture&lt;PaymentResponse&gt; queueForAsyncProcessing(PaymentRequest request) {
+        String messageId = messageProducer.sendToPaymentQueue(request);
+        log.info("Payment queued for async processing. MessageId: {}, OrderId: {}",
+            messageId, request.getOrderId());
+
+        return CompletableFuture.completedFuture(
+            PaymentResponse.builder()
+                .status(PaymentStatus.PENDING)
+                .orderId(request.getOrderId())
+                .message("Payment is being processed asynchronously")
+                .trackingId(messageId)
+                .build());
+    }
+
+    /**
+     * Strategy 2: Return cached/stale data
+     * Best for: read operations where stale data is acceptable
+     */
+    public CompletableFuture&lt;PaymentResponse&gt; returnCachedResult(PaymentRequest request) {
+        return cacheService.getLastKnownStatus(request.getOrderId())
+            .map(cached -> CompletableFuture.completedFuture(
+                PaymentResponse.builder()
+                    .status(cached.getStatus())
+                    .orderId(request.getOrderId())
+                    .message("Cached result (may be stale)")
+                    .stale(true)
+                    .cachedAt(cached.getTimestamp())
+                    .build()))
+            .orElseGet(() -> queueForAsyncProcessing(request));
+    }
+
+    /**
+     * Strategy 3: Graceful degradation
+     * Best for: non-critical features that can be disabled
+     */
+    public CompletableFuture&lt;PaymentResponse&gt; degradedResponse(PaymentRequest request) {
+        log.warn("Payment service degraded. Returning partial response for order: {}",
+            request.getOrderId());
+
+        return CompletableFuture.completedFuture(
+            PaymentResponse.builder()
+                .status(PaymentStatus.UNAVAILABLE)
+                .orderId(request.getOrderId())
+                .message("Payment verification temporarily unavailable. " +
+                         "Your order will be processed shortly.")
+                .build());
+    }
+
+    /**
+     * Strategy 4: Alternative service (failover)
+     * Best for: when you have backup payment processors
+     */
+    public CompletableFuture&lt;PaymentResponse&gt; failoverToBackupProcessor(PaymentRequest request) {
+        log.info("Failing over to backup payment processor for order: {}",
+            request.getOrderId());
+        return backupPaymentClient.charge(request);
+    }
+}</code></pre>
+
+        <h3>Programmatic composition (without annotations)</h3>
+        <pre><code class="language-java">package com.example.orderservice.service;
+
+import io.github.resilience4j.bulkhead.ThreadPoolBulkhead;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.decorators.Decorators;
+import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.timelimiter.TimeLimiter;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.Supplier;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class ResilientPaymentService {
+
+    private final PaymentWebClient paymentWebClient;
+    private final CircuitBreaker circuitBreaker;
+    private final ThreadPoolBulkhead bulkhead;
+    private final RateLimiter rateLimiter;
+    private final Retry retry;
+    private final TimeLimiter timeLimiter;
+    private final ScheduledExecutorService scheduler;
+
+    public CompletionStage&lt;PaymentResponse&gt; processPayment(PaymentRequest request) {
+        // Compose all patterns programmatically
+        Supplier&lt;CompletionStage&lt;PaymentResponse&gt;&gt; decoratedSupplier =
+            Decorators.ofCompletionStage(
+                    () -> paymentWebClient.charge(request))
+                .withThreadPoolBulkhead(bulkhead)
+                .withTimeLimiter(timeLimiter, scheduler)
+                .withCircuitBreaker(circuitBreaker)
+                .withRateLimiter(rateLimiter)
+                .withRetry(retry, scheduler)
+                .withFallback(
+                    List.of(
+                        CallNotPermittedException.class,
+                        TimeoutException.class,
+                        BulkheadFullException.class
+                    ),
+                    ex -> handleFallback(request, ex))
+                .decorate();
+
+        return decoratedSupplier.get();
+    }
+
+    private CompletionStage&lt;PaymentResponse&gt; handleFallback(
+            PaymentRequest request, Throwable ex) {
+        log.warn("Payment fallback triggered. Reason: {}, Order: {}",
+            ex.getClass().getSimpleName(), request.getOrderId());
+
+        if (ex instanceof CallNotPermittedException) {
+            return fallbackService.queueForAsyncProcessing(request);
+        } else if (ex instanceof BulkheadFullException) {
+            return CompletableFuture.completedFuture(
+                PaymentResponse.serviceUnavailable(request.getOrderId()));
+        } else {
+            return fallbackService.degradedResponse(request);
+        }
+    }
+}</code></pre>
+
+        <h3>Integration test</h3>
+        <pre><code class="language-java">@SpringBootTest
+@AutoConfigureWireMock(port = 0)
+class PaymentIntegrationServiceTest {
+
+    @Autowired
+    private PaymentIntegrationService paymentService;
+
+    @Autowired
+    private CircuitBreakerRegistry circuitBreakerRegistry;
+
+    @Test
+    void shouldOpenCircuitBreakerAfterSlowCalls() throws Exception {
+        // Given: Payment service responds slowly (8 seconds)
+        stubFor(post(urlEqualTo("/api/v1/payments/charge"))
+            .willReturn(aResponse()
+                .withFixedDelay(8000)
+                .withStatus(200)
+                .withBody("{\"status\": \"SUCCESS\"}")));
+
+        // When: Make enough calls to trigger slow call threshold
+        CircuitBreaker cb = circuitBreakerRegistry.circuitBreaker("paymentService");
+
+        for (int i = 0; i &lt; 25; i++) {
+            try {
+                paymentService.processPayment(testRequest()).get();
+            } catch (Exception ignored) {
+                // TimeLimiter will timeout before 8s response
+            }
+        }
+
+        // Then: Circuit breaker should be OPEN
+        assertThat(cb.getState()).isEqualTo(CircuitBreaker.State.OPEN);
+    }
+
+    @Test
+    void shouldUseFallbackWhenCircuitIsOpen() throws Exception {
+        // Given: Circuit breaker is forced OPEN
+        CircuitBreaker cb = circuitBreakerRegistry.circuitBreaker("paymentService");
+        cb.transitionToOpenState();
+
+        // When: Attempt payment
+        PaymentResponse response = paymentService.processPayment(testRequest()).get();
+
+        // Then: Should return pending status (async fallback)
+        assertThat(response.getStatus()).isEqualTo(PaymentStatus.PENDING);
+        assertThat(response.getMessage()).contains("asynchronously");
+    }
+
+    @Test
+    void shouldRecoverWhenDownstreamRecovers() throws Exception {
+        // Given: Circuit is OPEN
+        CircuitBreaker cb = circuitBreakerRegistry.circuitBreaker("paymentService");
+        cb.transitionToOpenState();
+
+        // And: Downstream has recovered (fast response)
+        stubFor(post(urlEqualTo("/api/v1/payments/charge"))
+            .willReturn(aResponse()
+                .withStatus(200)
+                .withBody("{\"status\": \"SUCCESS\", \"transactionId\": \"tx-123\"}")));
+
+        // When: Wait for half-open transition and make a call
+        cb.transitionToHalfOpenState();
+        PaymentResponse response = paymentService.processPayment(testRequest()).get();
+
+        // Then: Should succeed and circuit should close
+        assertThat(response.getStatus()).isEqualTo(PaymentStatus.SUCCESS);
+    }
+}</code></pre>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 11: COMMON MISTAKES                                   -->
+    <!-- ============================================================ -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Pitfalls that senior engineers still fall into</summary>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Mistake</th>
+              <th>Why It's Wrong</th>
+              <th>Correct Approach</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>No timeouts configured (relying on defaults)</td>
+              <td>Most HTTP clients default to infinite or very high timeouts (60s+). A slow service blocks threads indefinitely.</td>
+              <td>Explicitly set connect (2s), read (3s), and total (5s) timeouts on every HTTP client bean.</td>
+            </tr>
+            <tr>
+              <td>Retrying a slow service</td>
+              <td>If the service is slow (not failing), retries multiply load. 3 retries × 8s = 24s of thread blocking, 3× the downstream load.</td>
+              <td>Only retry on transient failures (connection reset, 503). Use circuit breaker for slowness detection via <code>slowCallDurationThreshold</code>.</td>
+            </tr>
+            <tr>
+              <td>Same timeout at every hop</td>
+              <td>If Gateway=30s, ServiceA=30s, ServiceB=30s, the end-user could wait 90s. Each service waits the full timeout before timing out.</td>
+              <td>Decrease timeouts deeper in the chain. Use deadline propagation headers.</td>
+            </tr>
+            <tr>
+              <td>Circuit breaker without fallback</td>
+              <td>When the circuit opens, you get <code>CallNotPermittedException</code>. Without a fallback, you just return 500 to the user.</td>
+              <td>Always define a fallback: cached data, degraded response, async queue, or graceful error message.</td>
+            </tr>
+            <tr>
+              <td>Shared thread pool for all dependencies</td>
+              <td>One slow service consumes all threads, blocking calls to healthy services. Classic cascading failure.</td>
+              <td>Bulkhead per dependency. Allocate separate thread pools or semaphores per downstream service.</td>
+            </tr>
+            <tr>
+              <td>Circuit breaker thresholds too aggressive</td>
+              <td>Opening circuit after 2-3 failures causes unnecessary fallbacks during normal jitter. Users see degraded experience for no reason.</td>
+              <td>Use <code>minimumNumberOfCalls</code> (e.g., 20) before evaluating failure rate. Sliding window of 100 calls.</td>
+            </tr>
+            <tr>
+              <td>Circuit breaker thresholds too lenient</td>
+              <td>50% failure rate over 1000 calls means 500 users already got errors before the circuit opens.</td>
+              <td>Balance with <code>slidingWindowSize</code>. Smaller windows (50-100 calls) react faster but are noisier.</td>
+            </tr>
+            <tr>
+              <td>Not monitoring circuit breaker state</td>
+              <td>Circuit opens at 2 AM, nobody knows. It stays open and users get fallback responses for hours.</td>
+              <td>Alert on state transitions. Expose via Actuator + Prometheus + Grafana. PagerDuty on OPEN state.</td>
+            </tr>
+            <tr>
+              <td>Retrying non-idempotent operations</td>
+              <td>Payment charge retried → customer charged twice. Order creation retried → duplicate orders.</td>
+              <td>Only retry idempotent operations. Use idempotency keys for writes. Check downstream's idempotency support.</td>
+            </tr>
+            <tr>
+              <td>Ignoring backpressure signals</td>
+              <td>Downstream returns 429 (Too Many Requests) but caller keeps hammering it, making overload worse.</td>
+              <td>Respect Retry-After headers. Implement client-side rate limiting. Back off on 429/503 responses.</td>
+            </tr>
+            <tr>
+              <td>Testing only happy path</td>
+              <td>Resilience patterns are never exercised in tests. First real failure reveals misconfiguration.</td>
+              <td>Chaos engineering: inject latency, kill instances, simulate network partitions. Use WireMock delays in integration tests.</td>
+            </tr>
+            <tr>
+              <td>Forgetting ThreadLocal propagation with bulkheads</td>
+              <td>SecurityContext, MDC (logging correlation), request attributes lost when using thread pool bulkhead.</td>
+              <td>Use <code>ContextPropagator</code> in Resilience4j config. Propagate MDC and SecurityContext explicitly.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-warning">
+          <p><strong>The "retry storm" anti-pattern:</strong> Service A retries 3×, Service B retries 3×, Service C retries 3×. One failure at Service C generates 27 attempts (3³). Add jitter and limit total retries across the chain. Consider a retry budget (e.g., max 20% of requests can be retries).</p>
+        </div>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 12: TRADE-OFFS                                        -->
+    <!-- ============================================================ -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Timeout values, circuit breaker thresholds, consistency vs availability</summary>
+
+        <h3>Timeout value trade-offs</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Decision</th>
+              <th>Too Low</th>
+              <th>Too High</th>
+              <th>Guidance</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Connect timeout</td>
+              <td>Fails on minor network jitter; high false-positive rate in cloud environments with VPC routing</td>
+              <td>Threads blocked on unreachable hosts for too long; slow failure detection</td>
+              <td>1-3s for same-region; 3-5s for cross-region. Measure p99 connect time and add 50% buffer.</td>
+            </tr>
+            <tr>
+              <td>Read timeout</td>
+              <td>Cuts off legitimate slow queries (reports, batch); partial responses</td>
+              <td>Threads tied up waiting; contributes to pool exhaustion under load</td>
+              <td>Set per-endpoint: 2s for user-facing, 30s for batch. Use p99 latency × 2 as baseline.</td>
+            </tr>
+            <tr>
+              <td>Total timeout</td>
+              <td>Fails valid complex operations that involve multiple downstream hops</td>
+              <td>User experience degradation (staring at spinner); mobile clients may already have given up</td>
+              <td>Align with SLA: if user SLA is 3s, total timeout must be &lt; 3s including all processing.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Circuit breaker threshold trade-offs</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Parameter</th>
+              <th>Aggressive (Low threshold)</th>
+              <th>Conservative (High threshold)</th>
+              <th>Recommendation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>failureRateThreshold</td>
+              <td>Opens quickly, fewer users see errors. But false opens during normal jitter cause unnecessary fallbacks.</td>
+              <td>More users experience failures before circuit opens. But fewer false positives.</td>
+              <td>Start at 50%. Lower to 30% for critical paths. Combine with minimumNumberOfCalls (20+) to reduce noise.</td>
+            </tr>
+            <tr>
+              <td>slidingWindowSize</td>
+              <td>Small window (10-20): reacts fast but noisy. A burst of 5 failures in 10 calls = 50% failure rate.</td>
+              <td>Large window (500+): stable but slow to react. 250 failures needed to trip at 50%.</td>
+              <td>50-100 for most services. Scale with traffic: high-traffic services can use larger windows.</td>
+            </tr>
+            <tr>
+              <td>waitDurationInOpenState</td>
+              <td>Short (5s): recovers fast but may hammer a service that hasn't recovered yet.</td>
+              <td>Long (5min): safe for downstream but users see fallback for extended period unnecessarily.</td>
+              <td>30-60s typical. Shorter for services with fast recovery; longer for services with slow cold starts.</td>
+            </tr>
+            <tr>
+              <td>permittedCallsInHalfOpen</td>
+              <td>Few (1-3): quick decision but statistically unreliable. One lucky success closes circuit.</td>
+              <td>Many (50+): statistically reliable but slow to transition. Users see fallback longer.</td>
+              <td>5-10 probes. Enough for statistical confidence without excessive delay.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Consistency vs Availability</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                 CONSISTENCY vs AVAILABILITY SPECTRUM                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Strong Consistency                              High Availability       │
+│  ◄──────────────────────────────────────────────────────────────────►   │
+│                                                                          │
+│  │ Fail if payment   │ Queue &amp; retry   │ Accept &amp; reconcile  │ Best   │
+│  │ service is down   │ (eventual)      │ later (optimistic)  │ effort │
+│  │                   │                 │                     │        │
+│  │ Banking           │ E-commerce      │ Social media likes  │ Logs   │
+│  │ Stock trading     │ Order placement │ View counters       │ Metrics│
+│  │                   │                 │                     │        │
+│  │ "Rather fail than │ "Process async, │ "Accept now, fix    │ "Drop  │
+│  │  give wrong data" │  confirm later" │  inconsistencies    │  if    │
+│  │                   │                 │  in background"     │  busy" │
+│  └───────────────────┴─────────────────┴─────────────────────┴────────┘ │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <div class="callout callout-info">
+          <p><strong>Key insight for the interview:</strong> The "right" answer depends entirely on the business context. A FAANG interviewer wants you to ask: "What's the business impact of showing stale data vs failing the request?" before prescribing a solution. A payment service has different requirements than a recommendation engine.</p>
+        </div>
+
+        <h3>Bulkhead sizing trade-offs</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Pros</th>
+              <th>Cons</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Large bulkhead (100 threads)</td>
+              <td>Handles traffic spikes without rejecting; low rejection rate</td>
+              <td>If dependency is slow, 100 threads are blocked; higher memory usage</td>
+            </tr>
+            <tr>
+              <td>Small bulkhead (10 threads)</td>
+              <td>Minimal resource waste when dependency is slow; fast rejection</td>
+              <td>Rejects legitimate traffic during peaks; requires careful capacity planning</td>
+            </tr>
+            <tr>
+              <td>Semaphore (no thread pool)</td>
+              <td>Lower overhead; preserves caller thread context</td>
+              <td>No queuing; depends on downstream timeout for release; less isolation</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-tip">
+          <p><strong>Dynamic configuration:</strong> Use Spring Cloud Config or feature flags to adjust thresholds without redeployment. Start conservative and tighten based on production data. Monitor rejection rates — if &gt; 5% during normal operation, your bulkhead is too small.</p>
+        </div>
+
+      </details>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 13: FOLLOW-UP QUESTIONS                                -->
+    <!-- ============================================================ -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Questions the interviewer might ask next and how to approach them</summary>
+
+        <h3>Q1: "How would you handle this differently if the slow service is owned by a third party you can't fix?"</h3>
+        <div class="callout callout-info">
+          <p><strong>Key points:</strong></p>
+          <ul>
+            <li>You can't fix the root cause, so focus entirely on isolation and fallbacks</li>
+            <li>Cache aggressively (if data allows staleness)</li>
+            <li>Async queue with retry as primary interaction model</li>
+            <li>SLA monitoring with contractual escalation</li>
+            <li>Consider alternative providers (multi-vendor strategy)</li>
+            <li>Feature flags to disable the integration entirely during degradation</li>
+          </ul>
+        </div>
+
+        <h3>Q2: "What if the slow service is your database?"</h3>
+        <div class="callout callout-info">
+          <p><strong>Key points:</strong></p>
+          <ul>
+            <li>Connection pool acts as natural bulkhead (HikariCP maxPoolSize)</li>
+            <li>Statement timeout: <code>spring.datasource.hikari.connection-timeout=2000</code></li>
+            <li>Query timeout: <code>@QueryHints(@QueryHint(name = "jakarta.persistence.query.timeout", value = "3000"))</code></li>
+            <li>Read replicas for read-heavy workloads</li>
+            <li>CQRS: separate read/write models to isolate slow queries</li>
+            <li>Query optimization (explain plan, indexes, denormalization)</li>
+            <li>Connection pool monitoring: alert when pending acquisitions spike</li>
+          </ul>
+        </div>
+
+        <h3>Q3: "How do you test resilience patterns before production?"</h3>
+        <div class="callout callout-info">
+          <p><strong>Key points:</strong></p>
+          <ul>
+            <li><strong>Unit tests:</strong> Mock the downstream, verify fallback invocation</li>
+            <li><strong>Integration tests:</strong> WireMock with <code>.withFixedDelay(8000)</code> to simulate slow responses</li>
+            <li><strong>Contract tests:</strong> Pact/Spring Cloud Contract to verify timeout assumptions</li>
+            <li><strong>Chaos engineering:</strong> Toxiproxy, Chaos Monkey for Spring Boot, AWS FIS</li>
+            <li><strong>Load testing:</strong> Gatling/k6 with latency injection to verify bulkhead isolation</li>
+            <li><strong>Game days:</strong> Scheduled failure injection in staging environments</li>
+          </ul>
+        </div>
+
+        <h3>Q4: "The circuit breaker keeps flapping between OPEN and CLOSED. What do you do?"</h3>
+        <div class="callout callout-info">
+          <p><strong>Key points:</strong></p>
+          <ul>
+            <li>Increase <code>minimumNumberOfCalls</code> to reduce noise from small sample sizes</li>
+            <li>Increase <code>waitDurationInOpenState</code> to give downstream more recovery time</li>
+            <li>Increase <code>permittedNumberOfCallsInHalfOpenState</code> for more reliable probing</li>
+            <li>Check if the downstream issue is intermittent (partial deployment, one bad node)</li>
+            <li>Consider per-instance circuit breakers (break circuit to specific pod, not entire service)</li>
+            <li>Add hysteresis: different thresholds for opening vs closing</li>
+          </ul>
+        </div>
+
+        <h3>Q5: "How does this change with reactive/non-blocking architecture?"</h3>
+        <div class="callout callout-info">
+          <p><strong>Key points:</strong></p>
+          <ul>
+            <li>Thread pool exhaustion is less of a concern (event loop model)</li>
+            <li>But connection pool exhaustion still applies</li>
+            <li>Semaphore bulkhead is preferred over thread pool bulkhead</li>
+            <li>Timeout via <code>Mono.timeout()</code> or <code>TimeLimiter</code></li>
+            <li>Backpressure is the reactive equivalent of load shedding</li>
+            <li>Reactor's <code>retry()</code> and <code>retryWhen()</code> for reactive retry logic</li>
+            <li>Still need circuit breakers — a slow publisher still consumes memory (buffered signals)</li>
+          </ul>
+        </div>
+
+        <h3>Q6: "How do you decide between failing fast vs queuing?"</h3>
+        <div class="callout callout-info">
+          <p><strong>Decision framework:</strong></p>
+          <ul>
+            <li><strong>Fail fast</strong> when: user needs immediate confirmation, operation is time-sensitive, downstream failure is permanent (4xx)</li>
+            <li><strong>Queue</strong> when: eventual consistency is acceptable, operation is idempotent, user can be shown "processing" state</li>
+            <li><strong>Hybrid</strong>: try sync first with aggressive timeout, fall back to queue on failure (the pattern shown in this chapter)</li>
+          </ul>
+        </div>
+
+        <h3>Q7: "What metrics would you alert on to catch this before users notice?"</h3>
+        <div class="callout callout-info">
+          <p><strong>Early warning signals:</strong></p>
+          <ul>
+            <li>p99 latency increasing (even if p50 is fine — tail latency is the canary)</li>
+            <li>Thread pool utilization &gt; 70% (nearing exhaustion)</li>
+            <li>Circuit breaker slow call rate &gt; 30% (slowness building up)</li>
+            <li>Connection pool pending acquisitions &gt; 0 (pool is saturated)</li>
+            <li>Downstream error rate &gt; 1% (above baseline)</li>
+            <li>Queue depth growing (async fallback is activating more frequently)</li>
+          </ul>
+        </div>
+
+      </details>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 14: SUMMARY                                           -->
+    <!-- ============================================================ -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Key takeaways for the interview</summary>
+
+        <div class="callout callout-tip">
+          <ol>
+            <li><strong>Timeouts are non-negotiable.</strong> Every HTTP client must have explicit connect, read, and total timeouts. Never rely on defaults. Decrease timeouts deeper in the call chain.</li>
+            <li><strong>Circuit breakers prevent cascade.</strong> When a downstream is failing or slow, stop calling it. Resilience4j's <code>slowCallDurationThreshold</code> catches the 8-second scenario specifically.</li>
+            <li><strong>Bulkheads contain the blast radius.</strong> Isolate thread pools per downstream service. One slow dependency cannot starve threads for other call paths.</li>
+            <li><strong>Fallbacks preserve user experience.</strong> Return cached data, queue for async processing, or degrade gracefully — never just throw 500 to the user.</li>
+            <li><strong>Retries must be smart.</strong> Only for transient failures, only for idempotent operations, always with exponential backoff + jitter, always with a budget.</li>
+            <li><strong>Monitor everything.</strong> Alert on circuit breaker state transitions, thread pool utilization, and p99 latency spikes. Pre-build dashboards for 3 AM debugging.</li>
+            <li><strong>Test resilience proactively.</strong> Use chaos engineering, WireMock delays, and game days. The first real failure shouldn't be the first time your circuit breaker fires.</li>
+            <li><strong>Composition order matters.</strong> Retry → CircuitBreaker → RateLimiter → TimeLimiter → Bulkhead. Understand why each layer wraps the next.</li>
+            <li><strong>Context matters.</strong> Ask the interviewer about business requirements before prescribing a solution. A payment service has different needs than a recommendation engine.</li>
+            <li><strong>Defense in depth.</strong> No single pattern is sufficient. Layer timeouts + circuit breaker + bulkhead + fallback for production-grade resilience.</li>
+          </ol>
+        </div>
+
+      </details>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- CHAPTER NAVIGATION                                            -->
+    <!-- ============================================================ -->
+    <nav class="chapter-nav">
+      <a href="ch10-cache-hit-ratio-drop.html" class="prev">&larr; Chapter 10: Cache Hit Ratio Drop</a>
+      <a href="ch12-jvm-gc-latency.html" class="next">Chapter 12: JVM GC Latency &rarr;</a>
+    </nav>
+
+  </main>
+
+  <script src="../assets/js/prism.js"></script>
+  <script src="../assets/js/prism-java.min.js"></script>
+  <script src="../assets/js/prism-yaml.min.js"></script>
+  <script src="../assets/js/prism-bash.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,1861 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 6: Health Checks & 503 Errors | Senior Backend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 6</span>
+      <span class="chapter-title">Health Checks & 503 Errors</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#health-check-types">Health Probe Types</a></li>
+        <li><a href="#503-causes">503 Causes</a></li>
+        <li><a href="#kubernetes-deep">Kubernetes Networking</a></li>
+        <li><a href="#rolling-deployments">Rolling Deployments</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-ii">Part II — Distributed Systems &amp; Infrastructure</a> &rsaquo;
+      <span>Chapter 6</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">Kubernetes</span>
+        <span class="badge badge-topic">Load Balancers</span>
+      </div>
+      <h1>Your Application Passes All Health Checks, but Users Still Receive 503 Errors. What Could Be the Reason?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Health checks verify that your application <em>process</em> is alive — not that it can serve real traffic. A 503 occurs when the infrastructure layer (load balancer, ingress, service mesh, or Kubernetes itself) determines that no backend can handle the request, even though the application reports itself as healthy. The gap between "alive" and "able to serve" is where 503s hide.
+      </p>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter... (e.g., readiness probe, thread pool, envoy, rolling update)" aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <div class="callout callout-info">
+        <p><strong>What they're really testing:</strong></p>
+        <ul>
+          <li>Do you understand the difference between <strong>liveness</strong>, <strong>readiness</strong>, and <strong>startup</strong> probes — and how misconfiguring them causes production outages?</li>
+          <li>Can you explain the <strong>full request path</strong> from client → DNS → LB → ingress → service mesh → pod — and where 503s originate at each layer?</li>
+          <li>Do you know how Kubernetes networking works internally (kube-proxy, iptables/IPVS, endpoint propagation delays)?</li>
+          <li>Have you dealt with <strong>rolling deployment gaps</strong> where old pods are terminating but new pods aren't ready?</li>
+          <li>Can you design health checks that accurately reflect application capacity, not just process liveness?</li>
+          <li>Do you understand <strong>graceful shutdown</strong> — preStop hooks, connection draining, and terminationGracePeriodSeconds?</li>
+          <li>Can you debug this in production using kubectl, metrics, and distributed tracing?</li>
+        </ul>
+      </div>
+      <div class="callout callout-warning">
+        <p><strong>Senior-level differentiator:</strong> Junior engineers say "the server is overloaded." Mid-level engineers mention thread pool exhaustion. Senior engineers draw the full request path, identify the exact layer returning 503, explain the Kubernetes endpoint propagation delay, and describe how to implement health checks that reflect true serving capacity.</p>
+      </div>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+
+      <details>
+        <summary>Concise answer for time-pressured interviews</summary>
+        <div class="callout callout-tip">
+          <p><strong>Interview opener:</strong></p>
+          <blockquote>
+            "Health checks passing only means the application process is alive and the health endpoint responds. A 503 means 'service unavailable' — returned by an intermediary when it cannot route to a healthy backend. The most common reasons for this gap:
+            <br><br>
+            <strong>1. Shallow health checks:</strong> The /health endpoint returns 200 because the JVM is up, but all Tomcat threads are blocked on a slow downstream service. The app is alive but cannot serve new requests.
+            <br><br>
+            <strong>2. Readiness vs Liveness confusion:</strong> Liveness probe passes (don't kill me), but the readiness probe should be failing (don't send me traffic). If readiness checks are too shallow, Kubernetes keeps sending traffic to pods that can't handle it.
+            <br><br>
+            <strong>3. Infrastructure-layer limits:</strong> Ingress controller connection limits, service mesh circuit breakers (Envoy returning 503), rate limiting at the API gateway, or load balancer max-connections — all return 503 independent of app health.
+            <br><br>
+            <strong>4. Rolling deployment race:</strong> During deployment, old pods are terminating (removed from endpoints) but new pods haven't passed readiness yet. Briefly, zero backends are available.
+            <br><br>
+            <strong>5. Endpoint propagation delay:</strong> Kubernetes endpoint updates are eventually consistent. A pod marked unready may still receive traffic for seconds while iptables/IPVS rules propagate.
+            <br><br>
+            The fix is multi-layered: deep readiness checks that verify thread availability and downstream connectivity, proper graceful shutdown with preStop hooks, and capacity-aware health indicators."
+          </blockquote>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 3: Kubernetes Health Probes -->
+    <section id="health-check-types">
+      <h2>Kubernetes Health Probes</h2>
+
+      <details>
+        <summary>Liveness vs Readiness vs Startup — how each works and what happens when they fail</summary>
+
+        <h3>The Three Probe Types</h3>
+        <pre><code class="language-yaml"># Complete probe configuration for a Spring Boot application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+spec:
+  template:
+    spec:
+      containers:
+      - name: payment-service
+        image: payment-service:2.1.0
+        ports:
+        - containerPort: 8080
+
+        # STARTUP PROBE — Only runs during container startup
+        # Prevents liveness/readiness from killing slow-starting apps
+        startupProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 30      # 30 × 5s = 150s max startup time
+          # After startup succeeds, liveness + readiness take over
+
+        # LIVENESS PROBE — "Should I restart this container?"
+        # Only checks if the process is deadlocked/hung
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 0     # Starts after startup probe succeeds
+          periodSeconds: 10
+          failureThreshold: 3        # 3 failures = restart container
+          timeoutSeconds: 3
+          # DANGER: If this fails, Kubernetes KILLS the pod
+
+        # READINESS PROBE — "Should I send traffic to this pod?"
+        # Checks if the app can handle requests RIGHT NOW
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 0
+          periodSeconds: 5
+          failureThreshold: 3        # 3 failures = remove from Service endpoints
+          successThreshold: 1        # 1 success = add back to endpoints
+          timeoutSeconds: 3
+          # Safe: just stops traffic, doesn't kill the pod</code></pre>
+
+        <h3>How Each Probe Works — Decision Flowchart</h3>
+        <pre><code class="language-bash">
+┌─────────────────────────────────────────────────────────────────────┐
+│                    KUBERNETES PROBE LIFECYCLE                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Container Start                                                    │
+│       │                                                             │
+│       ▼                                                             │
+│  ┌─────────────┐    fails N times     ┌──────────────────┐        │
+│  │  STARTUP    │ ─────────────────────▶│  KILL + RESTART  │        │
+│  │  PROBE      │                       └──────────────────┘        │
+│  └──────┬──────┘                                                    │
+│         │ succeeds once                                             │
+│         ▼                                                           │
+│  ┌──────────────────────────────────────────┐                      │
+│  │  LIVENESS + READINESS probes activate    │                      │
+│  └──────────────────────────────────────────┘                      │
+│         │                           │                               │
+│         ▼                           ▼                               │
+│  ┌─────────────┐            ┌─────────────┐                       │
+│  │  LIVENESS   │            │  READINESS  │                        │
+│  │  PROBE      │            │  PROBE      │                        │
+│  └──────┬──────┘            └──────┬──────┘                        │
+│         │                          │                                │
+│    fails 3x                   fails 3x                             │
+│         │                          │                                │
+│         ▼                          ▼                                │
+│  ┌──────────────┐          ┌───────────────────┐                  │
+│  │ KILL + RESTART│          │ REMOVE FROM       │                  │
+│  │ (CrashLoop   │          │ SERVICE ENDPOINTS │                  │
+│  │  BackOff)    │          │ (no traffic)      │                   │
+│  └──────────────┘          └───────────────────┘                  │
+│                                    │                                │
+│                               succeeds 1x                          │
+│                                    │                                │
+│                                    ▼                                │
+│                            ┌───────────────────┐                  │
+│                            │ ADD BACK TO       │                   │
+│                            │ SERVICE ENDPOINTS │                   │
+│                            └───────────────────┘                  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>What Happens When Each Probe Fails</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Probe</th>
+              <th>On Failure</th>
+              <th>Impact</th>
+              <th>Recovery</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Startup</strong></td>
+              <td>Kill container, restart</td>
+              <td>CrashLoopBackOff if app never starts</td>
+              <td>Container restart with backoff</td>
+            </tr>
+            <tr>
+              <td><strong>Liveness</strong></td>
+              <td>Kill container, restart</td>
+              <td>In-flight requests dropped, connections reset</td>
+              <td>Container restart (all state lost)</td>
+            </tr>
+            <tr>
+              <td><strong>Readiness</strong></td>
+              <td>Remove from Service endpoints</td>
+              <td>No new traffic routed, existing connections may continue</td>
+              <td>Automatic: added back when probe succeeds again</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-danger">
+          <p><strong>Critical mistake:</strong> Using the same endpoint for both liveness and readiness. If your readiness check includes a database connectivity check and the DB goes down, the liveness probe ALSO fails → Kubernetes kills all your pods → cascading failure. The DB being down doesn't mean your process is broken — it means you can't serve requests <em>right now</em>.</p>
+        </div>
+
+        <h3>Spring Boot Actuator Probe Groups</h3>
+        <pre><code class="language-yaml"># application.yml — Separate liveness from readiness
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true       # Enables /actuator/health/liveness and /readiness
+      show-details: always
+      group:
+        liveness:
+          include: livenessState, ping
+          # Only checks: Is the JVM alive? No external deps!
+        readiness:
+          include: readinessState, db, redis, customThreadPool
+          # Checks: Can this pod serve traffic right now?
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true</code></pre>
+
+      </details>
+    </section>
+
+    <!-- Section 4: 503 Causes Despite Passing Health Checks -->
+    <section id="503-causes">
+      <h2>All Reasons for 503 Despite Passing Health Checks</h2>
+
+      <details>
+        <summary>Eight distinct failure modes where health ≠ serving capacity</summary>
+
+        <pre><code class="language-bash">
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              REQUEST PATH — WHERE 503s ORIGINATE                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Client                                                                     │
+│    │                                                                        │
+│    ▼                                                                        │
+│  ┌──────────┐  503: rate limit    ┌───────────────┐  503: conn limit       │
+│  │   DNS    │ ──────────────────▶ │  API Gateway  │ ──────────────────┐    │
+│  └──────────┘                     │  (Kong/Zuul)  │                   │    │
+│                                   └───────┬───────┘                   │    │
+│                                           │                           │    │
+│                                           ▼                           │    │
+│                                   ┌───────────────┐  503: no backends │    │
+│                                   │   Ingress     │ ──────────────────┤    │
+│                                   │  Controller   │                   │    │
+│                                   │  (NGINX/ALB)  │                   │    │
+│                                   └───────┬───────┘                   │    │
+│                                           │                           │    │
+│                                           ▼                           │    │
+│                                   ┌───────────────┐  503: circuit open│    │
+│                                   │  Service Mesh │ ──────────────────┤    │
+│                                   │  Sidecar      │                   │    │
+│                                   │  (Envoy)      │                   │    │
+│                                   └───────┬───────┘                   │    │
+│                                           │                           │    │
+│                                           ▼                           │    │
+│                                   ┌───────────────┐  503: threads full│    │
+│                                   │  Application  │ ──────────────────┘    │
+│                                   │  (Tomcat/     │                        │
+│                                   │   Netty)      │                        │
+│                                   └───────────────┘                        │
+│                                                                             │
+│  Health check hits app directly ─── bypasses all middle layers!            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>Cause 1: Thread Pool Exhausted (App is "Alive" but Can't Accept More)</h3>
+        <div class="callout callout-danger">
+          <p><strong>Most common cause in production.</strong></p>
+        </div>
+        <pre><code class="language-java">// Scenario: All 200 Tomcat threads are stuck waiting on a slow downstream service
+// Health check: GET /actuator/health → 200 OK (runs on its own thread)
+// Real request: GET /api/payments → waits in accept queue → timeout → 503
+
+// Why health check passes:
+// - Spring Boot health endpoint is lightweight (no I/O to downstream)
+// - Tomcat has a separate acceptor thread that accepts the health check connection
+// - The health response is tiny, doesn't need a worker thread for long
+
+// But real requests:
+// - Need a Tomcat worker thread (all 200 are blocked on downstream HTTP calls)
+// - New requests queue in the OS TCP accept queue (backlog = 100 by default)
+// - After accept queue is full → connection refused → LB returns 503</code></pre>
+        <pre><code class="language-yaml"># Tomcat defaults that hide this problem:
+server:
+  tomcat:
+    threads:
+      max: 200              # Only 200 worker threads
+      min-spare: 10
+    accept-count: 100       # TCP backlog queue size
+    connection-timeout: 20000  # 20s — way too long for a stuck downstream
+    max-connections: 8192   # Max simultaneous connections</code></pre>
+
+        <h3>Cause 2: Ingress Controller / Load Balancer Connection Limits</h3>
+        <pre><code class="language-yaml"># NGINX Ingress Controller has its own limits:
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    # These cause 503 INDEPENDENT of application health:
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/upstream-max-fails: "3"        # ← Mark upstream as down after 3 fails
+    nginx.ingress.kubernetes.io/upstream-fail-timeout: "30"    # ← Keep it down for 30s
+    nginx.ingress.kubernetes.io/limit-connections: "100"       # ← Max 100 concurrent connections per pod
+    nginx.ingress.kubernetes.io/limit-rps: "50"                # ← Rate limit: 50 req/s per IP</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>The trap:</strong> NGINX's <code>upstream-max-fails</code> uses its OWN health checking. If 3 requests to a pod timeout (even though the Kubernetes readiness probe is passing), NGINX marks that upstream as unavailable for 30 seconds. Result: 503 even though <code>kubectl get pods</code> shows all pods Ready.</p>
+        </div>
+
+        <h3>Cause 3: Service Mesh Sidecar (Envoy) Rejecting Requests</h3>
+        <pre><code class="language-yaml"># Istio DestinationRule with circuit breaking:
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: payment-service
+spec:
+  host: payment-service
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100          # Max 100 TCP connections
+      http:
+        h2UpgradePolicy: DEFAULT
+        http1MaxPendingRequests: 50   # Max 50 queued requests
+        http2MaxRequests: 200         # Max 200 concurrent HTTP/2 requests
+    outlierDetection:
+      consecutive5xxErrors: 5        # After 5 errors...
+      interval: 10s                  # ...within 10s...
+      baseEjectionTime: 30s          # ...eject pod for 30s
+      maxEjectionPercent: 50         # Max 50% pods ejected
+
+# When Envoy's circuit breaker trips:
+# → Returns 503 with "upstream connect error or disconnect/reset before headers"
+# → Kubernetes health checks still pass (they bypass Envoy sidecar)
+# → App logs show NOTHING because request never reached the app</code></pre>
+
+        <h3>Cause 4: Rolling Deployment Gap</h3>
+        <pre><code class="language-bash">
+┌─────────────────────────────────────────────────────────────────────┐
+│           ROLLING DEPLOYMENT — THE 503 WINDOW                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Time ────────────────────────────────────────────────────▶        │
+│                                                                     │
+│  Pod v1-A:  [═══════ SERVING ═══════][TERMINATING][GONE]           │
+│  Pod v1-B:  [═══════ SERVING ═══════════════════][TERM][GONE]      │
+│  Pod v2-A:  ............[STARTING][READY ══════════════════]       │
+│  Pod v2-B:  ................[STARTING][READY ══════════════]       │
+│                                                                     │
+│                         ▲                                           │
+│                         │                                           │
+│                    ┌────┴────┐                                      │
+│                    │ 503     │  ← Zero ready pods!                  │
+│                    │ WINDOW  │  maxUnavailable=1 + slow startup     │
+│                    └─────────┘  = brief period with no backends     │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘</code></pre>
+        <pre><code class="language-yaml"># Deployment strategy that CAUSES 503s:
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1     # Can take down 1 pod (50% of capacity!)
+      maxSurge: 1           # Only 1 extra pod at a time
+
+# With slow startup (30s readiness check):
+# T=0: Kill pod v1-A (maxUnavailable=1)
+# T=0: Start pod v2-A (maxSurge=1)
+# T=0 to T=30: Only pod v1-B is serving (50% capacity)
+# If v1-B also gets terminated before v2-A is ready → 0 backends → 503</code></pre>
+
+        <h3>Cause 5: Rate Limiting at Gateway Level</h3>
+        <pre><code class="language-yaml"># Kong / AWS API Gateway rate limiting:
+# Returns 429 or 503 based on configuration
+plugins:
+  - name: rate-limiting
+    config:
+      second: 100
+      policy: redis
+      fault_tolerant: false    # ← If Redis is down, DENY all requests (503!)
+      hide_client_headers: false
+
+# AWS ALB: Connection limits
+# - Default: 100 targets per target group
+# - If ALL targets are draining/unhealthy → 503
+# - ALB has its own idle timeout (60s default)</code></pre>
+
+        <h3>Cause 6: DNS Resolution Failures to Downstream</h3>
+        <pre><code class="language-java">// Application health check: ✅ (doesn't call downstream)
+// Real request flow: App → DNS lookup for payment-gateway.prod → TIMEOUT → 503
+
+// CoreDNS in Kubernetes has its own failure modes:
+// - CoreDNS pods overwhelmed (ndots:5 causes 10x DNS queries)
+// - DNS cache expired + upstream DNS unreachable
+// - /etc/resolv.conf search domains causing cascading lookups
+
+// The health check doesn't test DNS because it doesn't make outbound calls!</code></pre>
+        <pre><code class="language-yaml"># Kubernetes default ndots:5 multiplies DNS queries:
+# Request for "payment-gateway.prod" generates:
+#   1. payment-gateway.prod.my-namespace.svc.cluster.local  ← NXDOMAIN
+#   2. payment-gateway.prod.svc.cluster.local               ← NXDOMAIN
+#   3. payment-gateway.prod.cluster.local                   ← NXDOMAIN
+#   4. payment-gateway.prod.my-domain.com                   ← NXDOMAIN
+#   5. payment-gateway.prod                                 ← Finally resolves!
+
+# Fix: Use FQDN with trailing dot, or reduce ndots
+dnsConfig:
+  options:
+    - name: ndots
+      value: "2"</code></pre>
+
+        <h3>Cause 7: Health Check is Lightweight but Real Endpoints Hit DB (Which is Down)</h3>
+        <pre><code class="language-java">// Classic shallow health check that hides database failures:
+
+@RestController
+public class HealthController {
+    
+    @GetMapping("/health")
+    public ResponseEntity&lt;String&gt; health() {
+        return ResponseEntity.ok("UP");  // Just returns 200, checks NOTHING
+    }
+}
+
+// Meanwhile, the real endpoint:
+@GetMapping("/api/orders/{id}")
+public Order getOrder(@PathVariable Long id) {
+    // This calls the database which is DOWN
+    return orderRepository.findById(id)  // → ConnectionTimeout after 30s
+        .orElseThrow();                  // → Eventually: 503 or 500
+}
+
+// Health probe: ✅ 200 OK (every 10 seconds)
+// Real traffic: ❌ All requests hanging on DB connection → thread exhaustion → 503</code></pre>
+
+        <h3>Cause 8: Pod Resource Limits (CPU Throttling)</h3>
+        <pre><code class="language-yaml"># Pod with aggressive CPU limits:
+resources:
+  requests:
+    cpu: 250m        # Request 0.25 cores
+    memory: 512Mi
+  limits:
+    cpu: 500m        # HARD LIMIT: 0.5 cores
+    memory: 1Gi      # OOMKilled if exceeded
+
+# What happens:
+# - Health check: tiny CPU cost, responds in 1ms → ✅
+# - Real request: needs CPU for JSON serialization, encryption, business logic
+# - CFS scheduler throttles the pod at 500m
+# - Request processing takes 10x longer (50ms → 500ms)
+# - Requests pile up → thread pool exhausted → 503
+#
+# Evidence: `kubectl top pods` shows CPU at limit
+# container_cpu_cfs_throttled_seconds_total keeps increasing</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Summary table — 503 causes vs health check status:</strong></p>
+          <table>
+            <thead>
+              <tr>
+                <th>Cause</th>
+                <th>Liveness</th>
+                <th>Readiness</th>
+                <th>Who Returns 503</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>Thread pool exhausted</td><td>✅ Pass</td><td>✅ Pass*</td><td>Ingress/LB (conn refused)</td></tr>
+              <tr><td>Ingress connection limit</td><td>✅ Pass</td><td>✅ Pass</td><td>Ingress controller</td></tr>
+              <tr><td>Envoy circuit breaker</td><td>✅ Pass</td><td>✅ Pass</td><td>Envoy sidecar</td></tr>
+              <tr><td>Rolling deployment gap</td><td>N/A</td><td>N/A (no pods)</td><td>Ingress (no backends)</td></tr>
+              <tr><td>Gateway rate limiting</td><td>✅ Pass</td><td>✅ Pass</td><td>API Gateway</td></tr>
+              <tr><td>DNS failures</td><td>✅ Pass</td><td>✅ Pass</td><td>App (timeout → 503)</td></tr>
+              <tr><td>DB down, shallow health</td><td>✅ Pass</td><td>✅ Pass*</td><td>App (timeout → 503)</td></tr>
+              <tr><td>CPU throttling</td><td>✅ Pass</td><td>✅ Pass*</td><td>LB (timeout → 503)</td></tr>
+            </tbody>
+          </table>
+          <p><em>* Would fail if readiness probe properly checked these conditions</em></p>
+        </div>
+
+      </details>
+    </section>
+
+    <!-- Section 5: Kubernetes Networking Internals -->
+    <section id="kubernetes-deep">
+      <h2>Kubernetes Networking Internals</h2>
+
+      <details>
+        <summary>kube-proxy, iptables/IPVS, and endpoint propagation delays that cause 503s</summary>
+
+        <h3>How Traffic Reaches a Pod</h3>
+        <pre><code class="language-bash">
+┌─────────────────────────────────────────────────────────────────────────────┐
+│             KUBERNETES SERVICE NETWORKING                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Client Request: payment-service.prod.svc.cluster.local:8080                │
+│       │                                                                     │
+│       ▼                                                                     │
+│  ┌──────────┐                                                              │
+│  │ CoreDNS  │ → Resolves to ClusterIP (e.g., 10.96.45.12)                 │
+│  └────┬─────┘                                                              │
+│       │                                                                     │
+│       ▼                                                                     │
+│  ┌──────────────────────────────────────────────────────────┐              │
+│  │  kube-proxy (on each node)                               │              │
+│  │                                                          │              │
+│  │  Mode: iptables (default)                                │              │
+│  │  ┌─────────────────────────────────────────────────┐    │              │
+│  │  │ -A KUBE-SERVICES -d 10.96.45.12/32 -p tcp       │    │              │
+│  │  │   --dport 8080 -j KUBE-SVC-XXXXX                │    │              │
+│  │  │                                                  │    │              │
+│  │  │ -A KUBE-SVC-XXXXX -m statistic --mode random    │    │              │
+│  │  │   --probability 0.333 -j KUBE-SEP-POD1          │    │              │
+│  │  │ -A KUBE-SVC-XXXXX -m statistic --mode random    │    │              │
+│  │  │   --probability 0.500 -j KUBE-SEP-POD2          │    │              │
+│  │  │ -A KUBE-SVC-XXXXX -j KUBE-SEP-POD3             │    │              │
+│  │  │                                                  │    │              │
+│  │  │ -A KUBE-SEP-POD1 -j DNAT --to 10.244.1.5:8080  │    │              │
+│  │  │ -A KUBE-SEP-POD2 -j DNAT --to 10.244.2.8:8080  │    │              │
+│  │  │ -A KUBE-SEP-POD3 -j DNAT --to 10.244.3.2:8080  │    │              │
+│  │  └─────────────────────────────────────────────────┘    │              │
+│  │                                                          │              │
+│  │  Mode: IPVS (better for large clusters)                  │              │
+│  │  - Virtual server on ClusterIP, real servers = pod IPs   │              │
+│  │  - Supports: rr, lc, dh, sh, sed, nq algorithms         │              │
+│  │  - O(1) rule lookup vs O(n) for iptables                 │              │
+│  └──────────────────────────────────────────────────────────┘              │
+│       │                                                                     │
+│       ▼                                                                     │
+│  ┌──────────┐                                                              │
+│  │   Pod    │ (actual application container)                               │
+│  └──────────┘                                                              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>Endpoint Propagation Delay — The Hidden 503 Cause</h3>
+        <pre><code class="language-bash">
+┌─────────────────────────────────────────────────────────────────────────────┐
+│       ENDPOINT UPDATE PROPAGATION TIMELINE                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  T=0s:   Pod readiness probe fails                                         │
+│  T=0s:   kubelet updates Pod status → API server                           │
+│  T=~1s:  Endpoint controller notices Pod not Ready                         │
+│  T=~1s:  Endpoint controller removes Pod IP from Endpoints object          │
+│  T=~2s:  kube-proxy watches Endpoints, sees change                         │
+│  T=~2-5s: kube-proxy regenerates iptables rules                            │
+│  T=~3-7s: New iptables rules active on ALL nodes                           │
+│                                                                             │
+│  ╔═══════════════════════════════════════════════════════╗                  │
+│  ║  DURING THIS 3-7 SECOND WINDOW:                      ║                  │
+│  ║  Traffic is STILL being sent to the failing pod!      ║                  │
+│  ║  Result: 503 errors (connection refused / timeout)    ║                  │
+│  ╚═══════════════════════════════════════════════════════╝                  │
+│                                                                             │
+│  Same delay in REVERSE during pod startup:                                 │
+│  Pod passes readiness → 3-7s before traffic arrives                        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Why this matters for 503s:</strong> When a pod starts terminating, it's removed from Endpoints. But iptables rules on other nodes still have the old pod's IP. Requests sent to the terminating pod get <code>connection refused</code> → the upstream (ingress/LB) returns 503. This is why you need a <code>preStop</code> hook with a sleep — to keep the pod alive long enough for iptables to propagate.</p>
+        </div>
+
+        <h3>IPVS vs iptables — Performance at Scale</h3>
+        <pre><code class="language-bash"># iptables problems at scale:
+# - Rules are evaluated linearly: O(n) where n = number of services × endpoints
+# - 10,000 services = 40,000+ iptables rules
+# - Rule regeneration takes seconds (locks iptables during update)
+# - During regeneration: packets can be dropped → 503
+
+# IPVS advantages:
+# - Hash-based lookup: O(1) regardless of service count
+# - Kernel-space load balancing (faster than userspace)
+# - Supports weighted routing, least-connections, etc.
+# - Rule updates are incremental (no full regeneration)
+
+# Check which mode your cluster uses:
+kubectl get configmap kube-proxy -n kube-system -o yaml | grep mode
+# mode: "ipvs"  ← good for large clusters
+# mode: ""      ← defaults to iptables</code></pre>
+
+        <h3>EndpointSlices — Reducing Propagation Delay</h3>
+        <pre><code class="language-bash"># Kubernetes 1.21+ uses EndpointSlices instead of Endpoints
+# Benefits:
+# - Endpoints object = ALL pod IPs in one object (doesn't scale)
+# - EndpointSlice = max 100 endpoints per slice (scalable)
+# - Smaller watch payloads → faster propagation
+# - Topology-aware routing → prefer same-zone pods
+
+# Check EndpointSlices:
+kubectl get endpointslices -l kubernetes.io/service-name=payment-service
+
+# Output:
+# NAME                        ADDRESSTYPE   PORTS   ENDPOINTS                     AGE
+# payment-service-abc12       IPv4          8080    10.244.1.5,10.244.2.8,...     5m</code></pre>
+
+      </details>
+    </section>
+
+    <!-- Section 6: Rolling Deployment Pitfalls -->
+    <section id="rolling-deployments">
+      <h2>Rolling Deployment Pitfalls</h2>
+
+      <details>
+        <summary>Graceful shutdown, preStop hooks, terminationGracePeriodSeconds</summary>
+
+        <h3>What Happens When Kubernetes Terminates a Pod</h3>
+        <pre><code class="language-bash">
+┌─────────────────────────────────────────────────────────────────────────────┐
+│            POD TERMINATION SEQUENCE                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. API Server sets pod.deletionTimestamp                                   │
+│     │                                                                       │
+│     ├──▶ Endpoint controller: START removing pod from Endpoints             │
+│     │    (takes 1-7 seconds to propagate to all nodes)                      │
+│     │                                                                       │
+│     └──▶ kubelet: START termination sequence (IN PARALLEL!)                 │
+│          │                                                                  │
+│          ▼                                                                  │
+│  2. Execute preStop hook (if defined)                                       │
+│     │   e.g., sleep 5 → gives time for endpoint removal to propagate       │
+│     │                                                                       │
+│     ▼                                                                       │
+│  3. Send SIGTERM to PID 1 in container                                      │
+│     │   App should: stop accepting NEW connections,                         │
+│     │               finish in-flight requests,                              │
+│     │               close DB connections, flush buffers                     │
+│     │                                                                       │
+│     ▼                                                                       │
+│  4. Wait up to terminationGracePeriodSeconds (default: 30s)                 │
+│     │                                                                       │
+│     ▼                                                                       │
+│  5. If still running → SIGKILL (force kill, no cleanup)                     │
+│                                                                             │
+│  ╔═══════════════════════════════════════════════════════════╗              │
+│  ║  THE RACE CONDITION:                                      ║              │
+│  ║  Steps 1a (endpoint removal) and 1b (termination) happen  ║              │
+│  ║  IN PARALLEL. Without preStop sleep, the app may get       ║              │
+│  ║  SIGTERM and close its server socket BEFORE iptables       ║              │
+│  ║  rules are updated → requests routed to dead pod → 503    ║              │
+│  ╚═══════════════════════════════════════════════════════════╝              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>Correct Configuration for Zero-Downtime Deployments</h3>
+        <pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0        # ← NEVER reduce below desired count
+      maxSurge: 1              # ← Always have extra capacity during rollout
+  template:
+    spec:
+      terminationGracePeriodSeconds: 60   # ← Must be > preStop + drain time
+      containers:
+      - name: payment-service
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - "sleep 10"     # ← Wait for endpoint removal to propagate
+                               #   (covers the 3-7s iptables propagation delay)
+        # Readiness probe: once this fails, no NEW traffic is sent
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          periodSeconds: 5
+          failureThreshold: 1  # ← Fail fast: 1 failure = remove from endpoints</code></pre>
+
+        <h3>Spring Boot Graceful Shutdown</h3>
+        <pre><code class="language-yaml"># application.yml
+server:
+  shutdown: graceful              # ← Enable graceful shutdown (Spring Boot 2.3+)
+
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s  # ← Max time to finish in-flight requests
+
+# What happens on SIGTERM:
+# 1. Spring sets readiness to OUT_OF_SERVICE (readiness probe will fail)
+# 2. Server stops accepting NEW connections
+# 3. Waits for in-flight requests to complete (up to 30s)
+# 4. Closes connection pools, flushes buffers
+# 5. JVM exits</code></pre>
+
+        <h3>Common Deployment Mistakes That Cause 503s</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Mistake</th>
+              <th>Effect</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>No <code>preStop</code> hook</td>
+              <td>Pod closes socket before iptables update → 503 for 3-7s</td>
+              <td><code>preStop: sleep 10</code></td>
+            </tr>
+            <tr>
+              <td><code>maxUnavailable: 1</code> with 2 replicas</td>
+              <td>50% capacity loss during deploy, single failure → 0 pods</td>
+              <td><code>maxUnavailable: 0, maxSurge: 1</code></td>
+            </tr>
+            <tr>
+              <td><code>terminationGracePeriod</code> too short</td>
+              <td>SIGKILL before in-flight requests complete → 503</td>
+              <td>Set to <code>preStop + drain time + buffer</code></td>
+            </tr>
+            <tr>
+              <td>No graceful shutdown in app</td>
+              <td>SIGTERM kills mid-request → client gets connection reset</td>
+              <td><code>server.shutdown=graceful</code></td>
+            </tr>
+            <tr>
+              <td>readinessProbe <code>failureThreshold: 3</code></td>
+              <td>Takes 15s (3×5s) to remove pod from traffic → stale routing</td>
+              <td><code>failureThreshold: 1</code> for faster removal</td>
+            </tr>
+            <tr>
+              <td>PodDisruptionBudget missing</td>
+              <td>Node drain removes all pods simultaneously</td>
+              <td><code>PDB minAvailable: 2</code> or <code>maxUnavailable: 1</code></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>PodDisruptionBudget — Preventing Accidental 503s</h3>
+        <pre><code class="language-yaml">apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-service-pdb
+spec:
+  minAvailable: 2              # ← Always keep at least 2 pods running
+  # OR: maxUnavailable: 1     # ← At most 1 pod can be disrupted
+  selector:
+    matchLabels:
+      app: payment-service
+
+# This prevents:
+# - kubectl drain from killing all pods at once
+# - Cluster autoscaler from scaling down too aggressively
+# - Node upgrades from disrupting more pods than allowed</code></pre>
+
+      </details>
+    </section>
+
+    <!-- Section 7: Production Incident -->
+    <section id="production-incident">
+      <h2>Production Incident: Tomcat Threads Stuck on Downstream</h2>
+
+      <details>
+        <summary>Real incident — health checks passing but all threads blocked on a non-responsive downstream service</summary>
+
+        <h3>Incident Timeline</h3>
+        <div class="callout callout-danger">
+          <p><strong>Severity: P1 — 100% of user-facing requests returning 503 for 12 minutes</strong></p>
+        </div>
+
+        <pre><code class="language-bash">
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    INCIDENT TIMELINE                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  14:23:00  Fraud-detection service deploys new version (unrelated team)     │
+│            New version has a bug: responds to /health but hangs on          │
+│            /api/check-fraud (infinite loop in new regex validation)          │
+│                                                                             │
+│  14:23:01  fraud-detection pods pass liveness + readiness probes ✅         │
+│            (probes hit /health which still responds in 2ms)                 │
+│                                                                             │
+│  14:23:30  Payment-service starts timing out on calls to fraud-detection    │
+│            HttpClient timeout: 30s (too long!)                              │
+│            Tomcat threads start blocking, waiting for response              │
+│                                                                             │
+│  14:24:00  50/200 Tomcat threads blocked on fraud-detection call            │
+│            Payment-service health check: ✅ (still passes)                  │
+│            Users experiencing slowness (fewer threads available)            │
+│                                                                             │
+│  14:25:00  150/200 Tomcat threads blocked                                  │
+│            Response times spike from 200ms → 8s                            │
+│            Kubernetes readiness probe: ✅ (GET /actuator/health → 200)      │
+│                                                                             │
+│  14:26:00  200/200 Tomcat threads blocked                                  │
+│            No threads available for ANY request                             │
+│            Health check: ✅ (still passes — dedicated management port!)     │
+│            NGINX ingress: 502 Bad Gateway (connection accepted but no       │
+│            response within proxy_read_timeout)                              │
+│                                                                             │
+│  14:27:00  PagerDuty alert fires on 5xx rate > 10%                         │
+│            SRE team investigates                                            │
+│                                                                             │
+│  14:28:00  kubectl get pods → all pods Running, Ready 1/1                  │
+│            kubectl top pods → CPU low, memory normal                        │
+│            "Everything looks fine?!"                                        │
+│                                                                             │
+│  14:30:00  Check ingress logs → 502/503 for all payment endpoints          │
+│            Thread dump reveals all threads TIMED_WAITING on:                │
+│            java.net.SocketInputStream.socketRead0()                         │
+│            → waiting for fraud-detection response                           │
+│                                                                             │
+│  14:32:00  Circuit breaker identified as OPEN in Resilience4j dashboard     │
+│            But circuit breaker was misconfigured: only trips on exceptions  │
+│            Timeout doesn't throw exception until 30s → too slow             │
+│                                                                             │
+│  14:35:00  MITIGATION: kubectl rollout undo deployment/fraud-detection      │
+│            fraud-detection rolled back to previous version                  │
+│            Within 30s, Tomcat threads drain, payment-service recovers       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>Root Cause Analysis</h3>
+        <pre><code class="language-java">// The fraud-detection service health check:
+@GetMapping("/health")
+public String health() {
+    return "OK";  // Always returns OK — doesn't test the regex engine
+}
+
+// The broken endpoint (new version):
+@PostMapping("/api/check-fraud")
+public FraudResult checkFraud(@RequestBody Transaction tx) {
+    // New regex for card validation — catastrophic backtracking!
+    // Pattern: ^(([a-z])+.)+[A-Z]([a-z])+$
+    // On certain inputs: takes 30+ seconds (regex DoS)
+    if (tx.getCardHolder().matches(CARD_HOLDER_REGEX)) {
+        // ... never reaches here for some inputs
+    }
+}</code></pre>
+
+        <h3>Why Health Checks Didn't Catch It</h3>
+        <pre><code class="language-bash">
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  FRAUD-DETECTION POD                                                        │
+│  ┌──────────────────────────────────┐                                      │
+│  │  /health endpoint               │ ← Returns 200 in 2ms (no real work)  │
+│  │  Thread: health-check-1         │                                       │
+│  ├──────────────────────────────────┤                                      │
+│  │  /api/check-fraud endpoint      │ ← Stuck in regex for 30+ seconds     │
+│  │  Thread: tomcat-worker-1..200   │    All 200 threads consumed           │
+│  └──────────────────────────────────┘                                      │
+│                                                                             │
+│  Kubernetes probe: GET /health → 200 ✅                                    │
+│  Real traffic: POST /api/check-fraud → hangs → timeout                     │
+│                                                                             │
+│  PAYMENT-SERVICE POD                                                        │
+│  ┌──────────────────────────────────┐                                      │
+│  │  /actuator/health               │ ← Returns 200 (doesn't call fraud)   │
+│  │  Thread: management-1           │                                       │
+│  ├──────────────────────────────────┤                                      │
+│  │  /api/payments                  │ ← All threads waiting on fraud-svc    │
+│  │  Thread: tomcat-worker-1..200   │    HttpClient.execute() blocking      │
+│  └──────────────────────────────────┘                                      │
+│                                                                             │
+│  Kubernetes probe: GET /actuator/health → 200 ✅                           │
+│  Real traffic: POST /api/payments → no thread available → 503              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>Post-Incident Fixes</h3>
+        <pre><code class="language-java">// Fix 1: Add thread pool health indicator to readiness check
+@Component
+public class ThreadPoolHealthIndicator implements HealthIndicator {
+    
+    @Override
+    public Health health() {
+        ThreadPoolExecutor executor = getServletThreadPool();
+        int activeCount = executor.getActiveCount();
+        int maxPoolSize = executor.getMaximumPoolSize();
+        double utilization = (double) activeCount / maxPoolSize;
+        
+        if (utilization > 0.9) {  // >90% threads busy = not ready
+            return Health.down()
+                .withDetail("activeThreads", activeCount)
+                .withDetail("maxThreads", maxPoolSize)
+                .withDetail("utilization", String.format("%.1f%%", utilization * 100))
+                .build();
+        }
+        return Health.up()
+            .withDetail("activeThreads", activeCount)
+            .withDetail("maxThreads", maxPoolSize)
+            .build();
+    }
+}
+
+// Fix 2: Reduce HTTP client timeout drastically
+// Old: 30s timeout (way too long, allows thread pile-up)
+// New: 3s connect timeout, 5s read timeout + circuit breaker
+@Bean
+public RestTemplate restTemplate() {
+    var factory = new SimpleClientHttpRequestFactory();
+    factory.setConnectTimeout(3000);   // 3 seconds
+    factory.setReadTimeout(5000);      // 5 seconds
+    return new RestTemplate(factory);
+}
+
+// Fix 3: Bulkhead pattern — limit threads for downstream calls
+@Bulkhead(name = "fraudService", fallbackMethod = "fraudFallback",
+           type = Bulkhead.Type.THREADPOOL)
+@CircuitBreaker(name = "fraudService", fallbackMethod = "fraudFallback")
+public FraudResult checkFraud(Transaction tx) {
+    return fraudClient.check(tx);
+}
+
+// Only 20 threads allocated to fraud calls — remaining 180 available for other work
+// resilience4j.bulkhead.instances.fraudService.maxConcurrentCalls=20</code></pre>
+
+      </details>
+    </section>
+
+    <!-- Section 8: Debugging Workflow -->
+    <section id="debugging-workflow">
+      <h2>Debugging Workflow</h2>
+
+      <details>
+        <summary>kubectl commands, metrics, and logs to diagnose 503s in production</summary>
+
+        <h3>Step 1: Identify WHERE the 503 Originates</h3>
+        <pre><code class="language-bash"># Check if 503 comes from ingress, service mesh, or app
+
+# 1. Check ingress controller logs:
+kubectl logs -n ingress-nginx deploy/ingress-nginx-controller --tail=100 | grep 503
+# Look for: "upstream" errors = problem is behind ingress
+# Look for: "no upstream" = no backends available (endpoint issue)
+
+# 2. Check Envoy sidecar logs (if Istio):
+kubectl logs payment-service-pod-xyz -c istio-proxy --tail=100 | grep 503
+# "UO" = upstream overflow (circuit breaker tripped)
+# "UF" = upstream connection failure
+# "RL" = rate limited
+# "NR" = no route configured
+
+# 3. Check application logs:
+kubectl logs payment-service-pod-xyz -c payment-service --tail=100 | grep -i error
+# If app logs show nothing → 503 is from an intermediary, never reached the app</code></pre>
+
+        <h3>Step 2: Check Pod Status and Endpoints</h3>
+        <pre><code class="language-bash"># Are pods actually ready?
+kubectl get pods -l app=payment-service -o wide
+# NAME                    READY   STATUS    RESTARTS   AGE   IP            NODE
+# payment-svc-abc12-xyz   1/1     Running   0          5h    10.244.1.5    node-1
+# payment-svc-abc12-uvw   1/1     Running   0          5h    10.244.2.8    node-2
+
+# Check endpoints (are pod IPs registered?):
+kubectl get endpoints payment-service
+# NAME              ENDPOINTS                         AGE
+# payment-service   10.244.1.5:8080,10.244.2.8:8080   5h
+
+# If ENDPOINTS is empty → readiness probe failing or selector mismatch
+# If ENDPOINTS has IPs but 503 persists → problem is at a different layer
+
+# Check EndpointSlices for more detail:
+kubectl get endpointslices -l kubernetes.io/service-name=payment-service -o yaml
+
+# Check recent events:
+kubectl get events --sort-by=.lastTimestamp --field-selector reason=Unhealthy
+# Shows recent probe failures</code></pre>
+
+        <h3>Step 3: Check Resource Pressure</h3>
+        <pre><code class="language-bash"># CPU/Memory usage:
+kubectl top pods -l app=payment-service
+# NAME                    CPU(cores)   MEMORY(bytes)
+# payment-svc-abc12-xyz   498m         756Mi        ← CPU at limit (500m)!
+# payment-svc-abc12-uvw   245m         512Mi
+
+# Check for CPU throttling:
+kubectl exec payment-svc-abc12-xyz -- cat /sys/fs/cgroup/cpu/cpu.stat
+# nr_throttled 15234     ← Being throttled frequently!
+# throttled_time 45000000000  ← 45 seconds total throttled time
+
+# Or via Prometheus:
+# rate(container_cpu_cfs_throttled_seconds_total{pod=~"payment.*"}[5m]) > 0
+
+# Check for OOM kills:
+kubectl get events --field-selector reason=OOMKilling
+kubectl describe pod payment-svc-abc12-xyz | grep -A5 "Last State"</code></pre>
+
+        <h3>Step 4: Thread Dump (The Silver Bullet for Thread Exhaustion)</h3>
+        <pre><code class="language-bash"># Get thread dump from running pod:
+kubectl exec payment-svc-abc12-xyz -- jcmd 1 Thread.print > thread_dump.txt
+
+# Or via actuator (if exposed):
+kubectl exec payment-svc-abc12-xyz -- \
+  curl -s localhost:8080/actuator/threaddump | python3 -m json.tool
+
+# Count threads by state:
+grep "java.lang.Thread.State" thread_dump.txt | sort | uniq -c
+#   180 java.lang.Thread.State: TIMED_WAITING  ← All waiting on I/O!
+#    15 java.lang.Thread.State: RUNNABLE
+#     5 java.lang.Thread.State: WAITING
+
+# Find what threads are blocked on:
+grep -A 5 "TIMED_WAITING" thread_dump.txt | grep "at " | sort | uniq -c | head
+#   175 at java.net.SocketInputStream.socketRead0()  ← Stuck on downstream!
+#     5 at java.util.concurrent.locks.LockSupport.parkNanos()</code></pre>
+
+        <h3>Step 5: Check Ingress and Service Mesh Config</h3>
+        <pre><code class="language-bash"># NGINX Ingress — check upstream status:
+kubectl exec -n ingress-nginx deploy/ingress-nginx-controller -- \
+  cat /etc/nginx/nginx.conf | grep -A 20 "upstream.*payment"
+
+# Check if NGINX has marked upstreams as down:
+kubectl exec -n ingress-nginx deploy/ingress-nginx-controller -- \
+  curl -s localhost:18080/nginx_status
+
+# Istio — check Envoy circuit breaker status:
+kubectl exec payment-svc-abc12-xyz -c istio-proxy -- \
+  pilot-agent request GET /clusters | grep payment
+# Look for: "circuit_breakers::default::remaining_cx" = 0 means limit hit
+
+# Check Envoy stats:
+kubectl exec payment-svc-abc12-xyz -c istio-proxy -- \
+  pilot-agent request GET /stats | grep -E "(503|overflow|circuit)"
+# cluster.outbound|8080||fraud-service.upstream_rq_503: 1523
+# cluster.outbound|8080||fraud-service.circuit_breakers.default.cx_open: 1</code></pre>
+
+        <h3>Step 6: Verify Deployment State</h3>
+        <pre><code class="language-bash"># Check if deployment is mid-rollout:
+kubectl rollout status deployment/payment-service
+# "Waiting for deployment to finish: 1 old replicas are pending termination..."
+
+# Check ReplicaSets:
+kubectl get rs -l app=payment-service
+# NAME                      DESIRED   CURRENT   READY   AGE
+# payment-svc-7b4f9c8d5     3         3         3       2m   ← new (all ready)
+# payment-svc-6a3e8b7c4     1         1         1       5h   ← old (terminating)
+
+# Check rollout history:
+kubectl rollout history deployment/payment-service
+
+# Check for recent disruptions:
+kubectl get events --sort-by=.lastTimestamp | grep -E "(Killing|Evict|Drain)"</code></pre>
+
+        <h3>Key Metrics to Monitor (Prometheus/Grafana)</h3>
+        <pre><code class="language-bash"># Prometheus queries for 503 root cause analysis:
+
+# 1. Request success rate at ingress level:
+sum(rate(nginx_ingress_controller_requests{status="503"}[5m]))
+
+# 2. Pod readiness flapping:
+kube_pod_status_ready{condition="true", pod=~"payment.*"} == 0
+
+# 3. Thread pool utilization (custom metric):
+tomcat_threads_busy_threads / tomcat_threads_config_max_threads > 0.9
+
+# 4. CPU throttling:
+rate(container_cpu_cfs_throttled_periods_total{pod=~"payment.*"}[5m])
+/ rate(container_cpu_cfs_periods_total{pod=~"payment.*"}[5m]) > 0.5
+
+# 5. Downstream latency (the real cause often):
+histogram_quantile(0.99, rate(http_client_requests_seconds_bucket{
+  client="fraud-service"}[5m])) > 5
+
+# 6. Connection pool saturation:
+hikaricp_connections_active / hikaricp_connections_max > 0.9
+
+# 7. Envoy circuit breaker trips:
+envoy_cluster_upstream_cx_overflow{cluster=~".*payment.*"}</code></pre>
+
+      </details>
+    </section>
+
+    <!-- Section 9: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples — Proper Health Check Implementations</h2>
+
+      <details>
+        <summary>Custom health indicators, separate liveness from readiness, graceful shutdown</summary>
+
+        <h3>Complete Health Check Architecture</h3>
+        <pre><code class="language-java">// =============================================================
+// LIVENESS: Only check if the JVM/process is fundamentally broken
+// =============================================================
+@Component
+public class LivenessHealthIndicator implements HealthIndicator {
+    
+    private final AtomicBoolean deadlockDetected = new AtomicBoolean(false);
+    
+    @Scheduled(fixedRate = 10000)  // Check every 10s
+    public void detectDeadlocks() {
+        ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
+        long[] deadlockedThreads = threadBean.findDeadlockedThreads();
+        deadlockDetected.set(deadlockedThreads != null && deadlockedThreads.length > 0);
+    }
+    
+    @Override
+    public Health health() {
+        if (deadlockDetected.get()) {
+            return Health.down()
+                .withDetail("reason", "Deadlock detected")
+                .build();
+        }
+        
+        // Check if event loop / main thread is responsive
+        // (this method being called already proves basic JVM health)
+        return Health.up().build();
+    }
+}
+
+// =============================================================
+// READINESS: Check if the pod can serve REAL traffic RIGHT NOW
+// =============================================================
+@Component
+public class ReadinessHealthIndicator implements HealthIndicator {
+    
+    private final TomcatWebServer tomcatWebServer;
+    private final DataSource dataSource;
+    private final RedisConnectionFactory redisFactory;
+    
+    // Thresholds
+    private static final double THREAD_UTILIZATION_THRESHOLD = 0.85;
+    private static final double CONNECTION_POOL_THRESHOLD = 0.90;
+    
+    public ReadinessHealthIndicator(
+            ApplicationContext ctx,
+            DataSource dataSource,
+            RedisConnectionFactory redisFactory) {
+        // Get Tomcat instance from Spring context
+        ServletWebServerApplicationContext webCtx = (ServletWebServerApplicationContext) ctx;
+        this.tomcatWebServer = (TomcatWebServer) webCtx.getWebServer();
+        this.dataSource = dataSource;
+        this.redisFactory = redisFactory;
+    }
+    
+    @Override
+    public Health health() {
+        Health.Builder builder = Health.up();
+        boolean ready = true;
+        
+        // Check 1: Tomcat thread pool utilization
+        Executor executor = tomcatWebServer.getTomcat()
+            .getConnector().getProtocolHandler().getExecutor();
+        if (executor instanceof ThreadPoolExecutor tpe) {
+            int active = tpe.getActiveCount();
+            int max = tpe.getMaximumPoolSize();
+            double utilization = (double) active / max;
+            
+            builder.withDetail("tomcat.activeThreads", active);
+            builder.withDetail("tomcat.maxThreads", max);
+            builder.withDetail("tomcat.utilization", 
+                String.format("%.1f%%", utilization * 100));
+            
+            if (utilization > THREAD_UTILIZATION_THRESHOLD) {
+                builder.down().withDetail("reason", 
+                    "Thread pool utilization above " + 
+                    (THREAD_UTILIZATION_THRESHOLD * 100) + "%");
+                ready = false;
+            }
+        }
+        
+        // Check 2: Database connection pool
+        if (dataSource instanceof HikariDataSource hikari) {
+            HikariPoolMXBean pool = hikari.getHikariPoolMXBean();
+            int active = pool.getActiveConnections();
+            int max = hikari.getMaximumPoolSize();
+            double connUtilization = (double) active / max;
+            
+            builder.withDetail("db.activeConnections", active);
+            builder.withDetail("db.maxConnections", max);
+            
+            if (connUtilization > CONNECTION_POOL_THRESHOLD) {
+                builder.down().withDetail("reason", 
+                    "DB connection pool above " + 
+                    (CONNECTION_POOL_THRESHOLD * 100) + "%");
+                ready = false;
+            }
+        }
+        
+        // Check 3: Can we reach the database? (quick check)
+        try (Connection conn = dataSource.getConnection()) {
+            if (!conn.isValid(2)) {  // 2 second timeout
+                builder.down().withDetail("reason", "DB connection not valid");
+                ready = false;
+            }
+        } catch (SQLException e) {
+            builder.down().withDetail("reason", "DB unreachable: " + e.getMessage());
+            ready = false;
+        }
+        
+        // Check 4: Redis connectivity
+        try {
+            redisFactory.getConnection().ping();
+            builder.withDetail("redis", "UP");
+        } catch (Exception e) {
+            builder.down().withDetail("reason", "Redis unreachable: " + e.getMessage());
+            ready = false;
+        }
+        
+        return ready ? builder.build() : builder.status(Status.DOWN).build();
+    }
+}</code></pre>
+
+        <h3>Graceful Shutdown Implementation</h3>
+        <pre><code class="language-java">@Component
+@Slf4j
+public class GracefulShutdownHandler {
+    
+    private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
+    private final AtomicInteger activeRequests = new AtomicInteger(0);
+    private final CountDownLatch shutdownLatch = new CountDownLatch(1);
+    
+    /**
+     * Servlet filter that tracks in-flight requests
+     * and rejects new ones during shutdown
+     */
+    @Bean
+    public FilterRegistrationBean&lt;Filter&gt; shutdownFilter() {
+        FilterRegistrationBean&lt;Filter&gt; registration = new FilterRegistrationBean<>();
+        registration.setFilter((request, response, chain) -> {
+            if (shuttingDown.get()) {
+                HttpServletResponse httpResponse = (HttpServletResponse) response;
+                httpResponse.setStatus(503);
+                httpResponse.setHeader("Connection", "close");
+                httpResponse.setHeader("Retry-After", "5");
+                httpResponse.getWriter().write(
+                    "{\"error\":\"Service shutting down, retry on another instance\"}");
+                return;
+            }
+            
+            activeRequests.incrementAndGet();
+            try {
+                chain.doFilter(request, response);
+            } finally {
+                if (activeRequests.decrementAndGet() == 0 && shuttingDown.get()) {
+                    shutdownLatch.countDown();
+                }
+            }
+        });
+        registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
+        return registration;
+    }
+    
+    /**
+     * Called when SIGTERM is received (via Spring lifecycle)
+     */
+    @PreDestroy
+    public void onShutdown() {
+        log.info("Shutdown signal received. Active requests: {}", activeRequests.get());
+        shuttingDown.set(true);
+        
+        // Wait for in-flight requests to complete (max 25s)
+        try {
+            if (activeRequests.get() > 0) {
+                log.info("Waiting for {} in-flight requests to complete...", 
+                    activeRequests.get());
+                boolean drained = shutdownLatch.await(25, TimeUnit.SECONDS);
+                if (!drained) {
+                    log.warn("Timed out waiting for requests. {} still active.", 
+                        activeRequests.get());
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Interrupted during shutdown drain");
+        }
+        
+        log.info("Graceful shutdown complete.");
+    }
+    
+    public boolean isShuttingDown() {
+        return shuttingDown.get();
+    }
+}</code></pre>
+
+        <h3>Readiness Probe That Accounts for Startup Dependencies</h3>
+        <pre><code class="language-java">@Component
+public class StartupReadinessIndicator implements HealthIndicator, 
+                                                   ApplicationListener&lt;ApplicationReadyEvent&gt; {
+    
+    private final AtomicBoolean applicationReady = new AtomicBoolean(false);
+    private final List&lt;StartupCheck&gt; startupChecks;
+    
+    public StartupReadinessIndicator(List&lt;StartupCheck&gt; startupChecks) {
+        this.startupChecks = startupChecks;
+    }
+    
+    @Override
+    public void onApplicationEvent(ApplicationReadyEvent event) {
+        // Run all startup checks before marking as ready
+        boolean allPassed = startupChecks.stream()
+            .allMatch(check -> {
+                try {
+                    check.verify();
+                    return true;
+                } catch (Exception e) {
+                    log.error("Startup check failed: {}", check.name(), e);
+                    return false;
+                }
+            });
+        applicationReady.set(allPassed);
+    }
+    
+    @Override
+    public Health health() {
+        if (!applicationReady.get()) {
+            return Health.down()
+                .withDetail("reason", "Application startup checks not complete")
+                .build();
+        }
+        return Health.up().build();
+    }
+}
+
+// Startup checks — verify critical dependencies are reachable
+public interface StartupCheck {
+    String name();
+    void verify() throws Exception;
+}
+
+@Component
+public class DatabaseStartupCheck implements StartupCheck {
+    private final DataSource dataSource;
+    
+    @Override
+    public String name() { return "database"; }
+    
+    @Override
+    public void verify() throws Exception {
+        try (Connection conn = dataSource.getConnection()) {
+            conn.createStatement().execute("SELECT 1");
+        }
+    }
+}
+
+@Component  
+public class KafkaStartupCheck implements StartupCheck {
+    private final KafkaTemplate&lt;String, String&gt; kafkaTemplate;
+    
+    @Override
+    public String name() { return "kafka"; }
+    
+    @Override
+    public void verify() throws Exception {
+        // Verify broker connectivity
+        kafkaTemplate.send("health-check-topic", "startup-ping").get(5, TimeUnit.SECONDS);
+    }
+}</code></pre>
+
+        <h3>Complete application.yml — Production Health Configuration</h3>
+        <pre><code class="language-yaml"># application.yml — Production-grade health check setup
+server:
+  port: 8080
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 20
+    accept-count: 100
+    connection-timeout: 10000
+    # Separate management port so health checks bypass Tomcat worker pool:
+    # management requests go through a different connector
+
+management:
+  server:
+    port: 8081              # ← Health checks on SEPARATE port!
+                            # This ensures health probes NEVER compete
+                            # with real traffic for Tomcat threads
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, threaddump, prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+      group:
+        liveness:
+          include: livenessState, deadlockDetector
+          # NEVER include external dependencies here!
+        readiness:
+          include: readinessState, db, redis, threadPoolCheck, startupCheck
+      status:
+        http-mapping:
+          DOWN: 503
+          OUT_OF_SERVICE: 503
+
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+# Resilience4j — prevent thread exhaustion from downstream failures
+resilience4j:
+  circuitbreaker:
+    instances:
+      fraudService:
+        slidingWindowSize: 10
+        failureRateThreshold: 50
+        waitDurationInOpenState: 10s
+        permittedNumberOfCallsInHalfOpenState: 3
+  bulkhead:
+    instances:
+      fraudService:
+        maxConcurrentCalls: 20        # Only 20 threads for fraud calls
+        maxWaitDuration: 500ms        # Don't queue more than 500ms
+  timelimiter:
+    instances:
+      fraudService:
+        timeoutDuration: 3s           # Hard timeout: 3 seconds</code></pre>
+
+        <h3>Kubernetes Deployment with All Fixes</h3>
+        <pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  labels:
+    app: payment-service
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0           # Never go below desired count
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: payment-service
+  template:
+    metadata:
+      labels:
+        app: payment-service
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: payment-service
+        image: payment-service:2.1.0
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: management
+          containerPort: 8081      # Separate management port
+        
+        resources:
+          requests:
+            cpu: 500m
+            memory: 768Mi
+          limits:
+            cpu: "2"              # Don't set CPU limits too tight!
+            memory: 1536Mi        # 2x request for burst headroom
+        
+        startupProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8081            # ← Management port
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 30
+        
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8081            # ← Management port
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8081            # ← Management port
+          periodSeconds: 5
+          failureThreshold: 1     # Fail fast: remove from endpoints quickly
+          successThreshold: 1
+          timeoutSeconds: 3
+        
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 10"]
+        
+        env:
+        - name: JAVA_OPTS
+          value: "-XX:+UseG1GC -XX:MaxRAMPercentage=75.0"
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-service-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: payment-service</code></pre>
+
+      </details>
+    </section>
+
+    <!-- Section 10: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Anti-patterns that lead to 503s despite green health checks</summary>
+
+        <div class="callout callout-danger">
+          <p><strong>Mistake #1: Same endpoint for liveness and readiness</strong></p>
+          <pre><code class="language-yaml"># BAD: Both probes hit the same endpoint
+livenessProbe:
+  httpGet:
+    path: /actuator/health     # ← Includes DB check!
+readinessProbe:
+  httpGet:
+    path: /actuator/health     # ← Same endpoint
+
+# What happens when DB goes down:
+# 1. /actuator/health returns 503 (DB is down)
+# 2. Readiness fails → pod removed from endpoints (correct!)
+# 3. Liveness ALSO fails → Kubernetes KILLS the pod (wrong!)
+# 4. Pod restarts → DB still down → fails again → CrashLoopBackOff
+# 5. ALL pods enter CrashLoopBackOff → total outage
+# 
+# The DB being down doesn't mean the JVM is broken!
+# Liveness should NEVER check external dependencies.</code></pre>
+        </div>
+
+        <div class="callout callout-danger">
+          <p><strong>Mistake #2: Health check on same port/thread pool as application</strong></p>
+          <pre><code class="language-yaml"># BAD: Health probe competes with real traffic for threads
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080        # ← Same port as application!
+
+# When all 200 Tomcat threads are busy:
+# - Health probe request queues behind real requests
+# - Probe times out → Kubernetes thinks pod is dead → kills it
+# - This makes the situation WORSE (restarts reduce capacity)
+# 
+# FIX: Use a separate management port (8081)
+management:
+  server:
+    port: 8081        # ← Dedicated port with its own thread pool</code></pre>
+        </div>
+
+        <div class="callout callout-danger">
+          <p><strong>Mistake #3: No timeout on downstream calls</strong></p>
+          <pre><code class="language-java">// BAD: Default RestTemplate has NO timeout
+RestTemplate restTemplate = new RestTemplate();
+// Connect timeout: infinite
+// Read timeout: infinite
+// One slow downstream service → ALL threads stuck → 503
+
+// GOOD: Always set timeouts + circuit breaker
+@Bean
+public RestTemplate restTemplate() {
+    var factory = new SimpleClientHttpRequestFactory();
+    factory.setConnectTimeout(3000);    // 3s connect
+    factory.setReadTimeout(5000);       // 5s read
+    return new RestTemplate(factory);
+}</code></pre>
+        </div>
+
+        <div class="callout callout-danger">
+          <p><strong>Mistake #4: Aggressive liveness probe timing</strong></p>
+          <pre><code class="language-yaml"># BAD: Liveness probe too sensitive
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  periodSeconds: 2         # Check every 2s
+  failureThreshold: 1      # Kill after 1 failure!
+  timeoutSeconds: 1        # 1s timeout
+
+# During a GC pause (G1 can pause for 200-500ms normally):
+# - One probe takes > 1s due to GC → failure
+# - failureThreshold=1 → immediate kill
+# - Result: healthy pods killed during normal GC
+#
+# FIX: Generous liveness, strict readiness
+livenessProbe:
+  periodSeconds: 10
+  failureThreshold: 3      # 3 × 10s = 30s before kill
+  timeoutSeconds: 5
+readinessProbe:
+  periodSeconds: 5
+  failureThreshold: 1      # Quick traffic removal (safe)</code></pre>
+        </div>
+
+        <div class="callout callout-danger">
+          <p><strong>Mistake #5: No preStop hook + no graceful shutdown</strong></p>
+          <pre><code class="language-bash"># What happens without preStop:
+# T=0.000s: Pod gets SIGTERM
+# T=0.000s: kube-proxy starts removing iptables rules (takes 3-7s)
+# T=0.001s: Spring Boot receives SIGTERM, starts shutdown
+# T=0.500s: Server socket closed, no new connections accepted
+# T=0.500s - T=7.000s: iptables still routing traffic to this pod!
+#            → Connection refused → 503 for 6+ seconds
+#
+# With preStop: sleep 10:
+# T=0.000s: preStop starts (sleep 10)
+# T=0.000s: kube-proxy starts removing iptables rules
+# T=7.000s: iptables rules fully propagated (pod removed from routing)
+# T=10.00s: preStop completes, SIGTERM sent to app
+# T=10.50s: App stops accepting connections (but no traffic coming anyway)
+# Result: ZERO dropped requests during shutdown</code></pre>
+        </div>
+
+        <div class="callout callout-danger">
+          <p><strong>Mistake #6: Health check doesn't verify thread availability</strong></p>
+          <pre><code class="language-java">// BAD: Health check says "UP" even when no threads are available
+@GetMapping("/health")
+public String health() {
+    return "UP";  // Meaningless! Doesn't reflect serving capacity.
+}
+
+// GOOD: Health check reflects actual capacity
+@Override
+public Health health() {
+    ThreadPoolExecutor executor = getTomcatExecutor();
+    double utilization = (double) executor.getActiveCount() 
+                        / executor.getMaximumPoolSize();
+    
+    if (utilization > 0.85) {
+        return Health.outOfService()
+            .withDetail("threads.utilization", utilization)
+            .withDetail("threads.active", executor.getActiveCount())
+            .withDetail("threads.max", executor.getMaximumPoolSize())
+            .build();
+    }
+    return Health.up().build();
+}</code></pre>
+        </div>
+
+        <div class="callout callout-danger">
+          <p><strong>Mistake #7: CPU limits too tight (throttling)</strong></p>
+          <pre><code class="language-yaml"># BAD: CPU limit = CPU request (no burst capacity)
+resources:
+  requests:
+    cpu: 250m
+  limits:
+    cpu: 250m       # ← Pod WILL be throttled under any load spike
+
+# The health probe uses almost no CPU → always passes
+# Real requests need CPU for JSON parsing, encryption, logging
+# CFS scheduler throttles → requests take 10x longer → timeout → 503
+
+# GOOD: Remove CPU limits entirely (Google's recommendation)
+# Or set limit = 4-8x request for burst capacity
+resources:
+  requests:
+    cpu: 500m       # Scheduler uses this for placement
+  limits:
+    # cpu: not set  # ← No CPU limit! Let it burst.
+    memory: 1536Mi  # Memory limit is fine (OOM is catastrophic)</code></pre>
+        </div>
+
+      </details>
+    </section>
+
+    <!-- Section 11: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+
+      <details>
+        <summary>Design decisions and their consequences</summary>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Decision</th>
+              <th>Benefit</th>
+              <th>Cost</th>
+              <th>When to Choose</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Deep readiness checks (DB, Redis, threads)</td>
+              <td>Accurate serving capacity signal</td>
+              <td>Higher probe latency; cascade risk if dependency flaps</td>
+              <td>Always for critical services; use timeouts on dependency checks</td>
+            </tr>
+            <tr>
+              <td>Separate management port</td>
+              <td>Probes never compete with traffic</td>
+              <td>Extra port to expose and configure in K8s</td>
+              <td>Always in production; skip for local dev</td>
+            </tr>
+            <tr>
+              <td>preStop: sleep 10</td>
+              <td>Zero dropped requests during rollout</td>
+              <td>Slower deployments (10s added per pod termination)</td>
+              <td>Always for user-facing services; skip for batch jobs</td>
+            </tr>
+            <tr>
+              <td>maxUnavailable: 0</td>
+              <td>Never reduce capacity during deploy</td>
+              <td>Requires extra resources (maxSurge pods need nodes)</td>
+              <td>Critical services with strict SLA; use maxUnavailable=1 for dev</td>
+            </tr>
+            <tr>
+              <td>No CPU limits</td>
+              <td>No throttling; better tail latency</td>
+              <td>Noisy neighbor risk; harder capacity planning</td>
+              <td>Latency-sensitive services; use limits for batch/background</td>
+            </tr>
+            <tr>
+              <td>Thread pool health indicator</td>
+              <td>Prevents 503s from overloaded pods</td>
+              <td>Pods marked unready under load → reduced capacity</td>
+              <td>When you have enough replicas to absorb the re-routing</td>
+            </tr>
+            <tr>
+              <td>Bulkhead per downstream</td>
+              <td>One slow dep can't exhaust all threads</td>
+              <td>Complexity; need to size each bulkhead correctly</td>
+              <td>When you call 3+ downstream services with varying latency</td>
+            </tr>
+            <tr>
+              <td>Circuit breaker (fail fast)</td>
+              <td>Frees threads immediately on downstream failure</td>
+              <td>Requests fail fast (might be worse than slow for some UX)</td>
+              <td>Non-critical paths with fallback; critical paths need retry</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-info">
+          <p><strong>The fundamental trade-off:</strong> Deep health checks give Kubernetes better signal about pod readiness, but they also make your pods more likely to be marked unready. If ALL pods fail readiness simultaneously (e.g., shared DB goes down), you get 503 because zero endpoints are available. The solution: don't include shared dependencies in ALL pods' readiness unless you have a fallback.</p>
+        </div>
+
+      </details>
+    </section>
+
+    <!-- Section 12: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+
+      <details>
+        <summary>Questions interviewers ask to go deeper</summary>
+
+        <dl>
+          <dt><strong>Q: "How would you handle a scenario where all pods fail readiness simultaneously because a shared database is down?"</strong></dt>
+          <dd>This is the <strong>cascading readiness failure</strong> problem. Options: (1) Use a <strong>degraded</strong> state — if DB is down, serve cached responses and mark readiness as UP with a warning. (2) Only check DB in readiness for <strong>write endpoints</strong>; read endpoints can serve from cache. (3) Use a <strong>circuit breaker</strong> on the DB check itself — if DB has been down for > 60s, stop checking and return UP (accept degraded service is better than no service). (4) Split into separate deployments: one for reads (always ready) and one for writes (needs DB). The key insight: <strong>some service is better than no service</strong>.</dd>
+
+          <dt><strong>Q: "What's the difference between a 502 and a 503 in this context?"</strong></dt>
+          <dd><strong>502 Bad Gateway:</strong> The proxy/ingress established a connection to the upstream pod but received an invalid response (e.g., connection reset mid-response, pod died mid-request). <strong>503 Service Unavailable:</strong> The proxy/ingress couldn't find ANY available upstream to route to (all endpoints removed, or connection refused by all backends). In practice during deployments: 503 = no backends available (endpoint propagation); 502 = pod was killed mid-response (no graceful shutdown).</dd>
+
+          <dt><strong>Q: "How would you implement canary deployments to avoid the rolling update 503 gap?"</strong></dt>
+          <dd>Canary avoids the gap because you <strong>don't terminate old pods until new ones are proven</strong>: (1) Deploy new version as a separate Deployment with 1 replica. (2) Route 5% traffic via weighted routing (Istio VirtualService or ingress canary annotation). (3) Monitor error rates and latency for 10 minutes. (4) If clean, gradually shift traffic 5% → 25% → 50% → 100%. (5) Only then scale down old Deployment. Zero gap because old pods stay up until new pods are fully handling traffic. Tools: Argo Rollouts, Flagger, Istio traffic shifting.</dd>
+
+          <dt><strong>Q: "How do you handle long-running requests during pod termination?"</strong></dt>
+          <dd>Set <code>terminationGracePeriodSeconds</code> longer than your longest expected request. For example, if you have endpoints that take up to 60s: set <code>terminationGracePeriodSeconds: 90</code>, <code>preStop: sleep 10</code>, leaving 80s for graceful drain. In the app, on SIGTERM: (1) Return 503 for new health checks (readiness), (2) Stop accepting new requests, (3) Wait for in-flight requests to complete (with timeout), (4) Exit. For WebSocket connections: send a "reconnect" frame before closing. For streaming responses: complete the current chunk then close.</dd>
+
+          <dt><strong>Q: "What if the health check endpoint itself is slow?"</strong></dt>
+          <dd>If your readiness check takes > 3s (the timeout), Kubernetes treats it as a failure. Solutions: (1) <strong>Cache health status</strong> — run checks in a background thread every 5s, health endpoint returns cached result in < 1ms. (2) <strong>Async health checks</strong> — Spring Boot supports this with <code>ReactiveHealthIndicator</code>. (3) <strong>Reduce check scope</strong> — don't ping every dependency; use a pre-computed "canServe" boolean. (4) <strong>Increase timeoutSeconds</strong> — but this delays failure detection. Best practice: health endpoint should respond in < 100ms always.</dd>
+
+          <dt><strong>Q: "How do you prevent Kubernetes from sending traffic during JVM warmup?"</strong></dt>
+          <dd>JVM warmup (JIT compilation, class loading, cache priming) means the first N requests are slow. Solutions: (1) <strong>Startup probe</strong> with warm-up logic — don't pass until you've served N warm-up requests. (2) <strong>Readiness probe delay</strong> — delay readiness by 30s after startup for JIT to kick in. (3) <strong>Custom warmup bean</strong> — on startup, make synthetic requests to hot paths before marking ready. (4) <strong>CDS/AOT</strong> (Spring Boot 3.x) — reduce warmup with Ahead-of-Time compilation. (5) <strong>GraalVM native image</strong> — no warmup needed (instant peak performance).</dd>
+
+          <dt><strong>Q: "How does this differ in a serverless/Lambda context?"</strong></dt>
+          <dd>In Lambda, there's no long-running health check — but the equivalent problem is <strong>cold starts</strong>. The "health check passes but 503" equivalent is: (1) Lambda provisioned concurrency is exhausted → 429 throttling. (2) Lambda is alive but VPC ENI attachment takes 10s → timeout. (3) Lambda invoked successfully but downstream (inside VPC) is unreachable. Solutions: Provisioned concurrency, SnapStart (Java), reduce package size, keep-alive pings.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- Section 13: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Key Takeaways:</strong></p>
+        <ol>
+          <li><strong>Health checks passing ≠ serving capacity.</strong> A pod can be "alive" (liveness ✅) and even "ready" (readiness ✅) but unable to serve due to thread exhaustion, CPU throttling, or downstream failures that the health check doesn't test.</li>
+          <li><strong>503s originate at many layers</strong> — app (thread pool full), ingress (no backends / connection limit), service mesh (circuit breaker), gateway (rate limit), or Kubernetes itself (endpoint propagation delay).</li>
+          <li><strong>Separate liveness from readiness.</strong> Liveness = "is the process broken?" (restart if yes). Readiness = "can this pod serve traffic right now?" (stop routing if no). Never check external dependencies in liveness.</li>
+          <li><strong>Use a separate management port</strong> (8081) for health probes so they never compete with real traffic for Tomcat worker threads.</li>
+          <li><strong>Deep readiness checks</strong> should verify: thread pool utilization < 85%, DB connection pool available, critical downstream reachable. Fail readiness = stop traffic before users see 503s.</li>
+          <li><strong>Rolling deployments need:</strong> <code>maxUnavailable: 0</code>, <code>preStop: sleep 10</code> (for iptables propagation), <code>server.shutdown=graceful</code>, and <code>terminationGracePeriodSeconds</code> > preStop + drain time.</li>
+          <li><strong>Bulkhead pattern</strong> prevents one slow downstream from consuming all threads. Allocate thread pools per downstream service so failures are isolated.</li>
+          <li><strong>Set aggressive timeouts</strong> on all downstream calls (3-5s, not 30s). Combined with circuit breakers, this prevents thread pile-up — the #1 cause of "healthy but 503."</li>
+          <li><strong>CPU throttling is invisible.</strong> Pods pass health checks but real requests timeout because CFS scheduler limits CPU. Monitor <code>container_cpu_cfs_throttled_seconds_total</code>. Consider removing CPU limits for latency-sensitive services.</li>
+          <li><strong>Debug with layers:</strong> Check ingress logs → Envoy stats → endpoint list → thread dump → resource metrics. Identify WHERE the 503 originates before fixing.</li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch05-kafka-exactly-once.html" class="chapter-nav-prev">← Chapter 5: Kafka Exactly-Once Delivery</a>
+      <a href="ch07-duplicate-scheduled-jobs.html" class="chapter-nav-next">Chapter 7: Duplicate Scheduled Jobs →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

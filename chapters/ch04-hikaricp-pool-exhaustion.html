@@ -1,0 +1,1860 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 4: HikariCP Pool Exhaustion | Senior Backend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 4</span>
+      <span class="chapter-title">HikariCP Pool Exhaustion</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#connection-lifecycle">Connection Lifecycle</a></li>
+        <li><a href="#pool-sizing">Pool Sizing Theory</a></li>
+        <li><a href="#exhaustion-causes">Exhaustion Causes</a></li>
+        <li><a href="#leak-detection">Leak Detection</a></li>
+        <li><a href="#monitoring">Monitoring HikariCP</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-i">Part I — Spring Boot Core Internals</a> &rsaquo;
+      <span>Chapter 4</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">HikariCP</span>
+        <span class="badge badge-topic">Connection Pools</span>
+      </div>
+      <h1>Why Can a HikariCP Connection Pool Become Exhausted Even When the Database CPU Is Below 20%?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Pool exhaustion is almost never about database capacity — it's about how long your application <em>holds</em> connections. A pool of 10 connections handling 5ms queries can serve 2,000 req/s, but a single @Transactional method calling a slow REST API holds a connection for seconds, starving the entire pool. The database sits idle while your application queues.
+      </p>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter... (e.g., leak detection, connectionTimeout, REQUIRES_NEW)" aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <div class="callout callout-info">
+        <p><strong>What they're really testing:</strong></p>
+        <ul>
+          <li>Do you understand that connection pool exhaustion ≠ database overload?</li>
+          <li>Can you distinguish between <strong>hold time</strong> (how long a connection is borrowed) vs <strong>query time</strong> (actual DB work)?</li>
+          <li>Do you know how <code>@Transactional</code> interacts with connection pools in Spring?</li>
+          <li>Can you diagnose a "SQLTransientConnectionException: Connection is not available" in production?</li>
+          <li>Do you understand the <strong>pool sizing formula</strong> and why bigger pools are often worse?</li>
+          <li>Have you dealt with connection leaks, and do you know how to detect them?</li>
+          <li>Can you reason about <strong>thread-to-connection ratios</strong> and deadlock scenarios?</li>
+        </ul>
+      </div>
+      <div class="callout callout-warning">
+        <p><strong>Common trap:</strong> Junior candidates immediately say "increase the pool size" — this is almost always the wrong first answer. The interviewer wants you to explain <em>why</em> connections aren't being returned, not how to add more.</p>
+      </div>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Interview Answer</h2>
+      <div class="callout callout-tip">
+        <p><strong>Use this in the interview:</strong></p>
+        <blockquote>
+          "A HikariCP pool exhausts when connections are <strong>held longer than necessary</strong>, not when the database is overloaded. The DB CPU being low actually <em>confirms</em> this — the database is idle because connections are borrowed but not actively executing queries.
+          <br><br>
+          <strong>The top causes are:</strong><br>
+          <strong>1. @Transactional wrapping HTTP calls</strong> — a method annotated @Transactional grabs a connection at entry, then calls a slow REST API for 2 seconds. The connection is held idle the entire time.<br>
+          <strong>2. Connection leaks</strong> — connections borrowed but never returned due to exception paths that bypass close().<br>
+          <strong>3. Long-running transactions</strong> — batch operations or report queries holding connections for minutes.<br>
+          <strong>4. Propagation.REQUIRES_NEW</strong> — nested transactions that hold 2+ connections per request thread, effectively halving pool capacity.<br>
+          <strong>5. Thread deadlocks on pool</strong> — all threads hold one connection and need a second, but the pool is empty.
+          <br><br>
+          <strong>Key insight:</strong> Pool throughput = poolSize / avgHoldTime. A pool of 10 with 5ms hold time → 2,000 req/s. The same pool with 2s hold time → 5 req/s. The database CPU doesn't change — it's the <em>application's hold pattern</em> that determines exhaustion."
+        </blockquote>
+      </div>
+    </section>
+
+    <!-- Section 3: Connection Lifecycle -->
+    <section id="connection-lifecycle">
+      <h2>Connection Lifecycle in HikariCP</h2>
+
+      <details>
+        <summary>How connections are created, borrowed, returned, and evicted</summary>
+
+        <pre class="diagram">
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                    HikariCP Connection Lifecycle                     │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │                                                                     │
+  │   ┌──────────┐    getConnection()    ┌──────────────┐              │
+  │   │  Thread  │ ───────────────────► │  ConcurrentBag │              │
+  │   └──────────┘                       │  (Pool Store)  │              │
+  │        │                             └───────┬────────┘              │
+  │        │                                     │                       │
+  │        │         ┌───────────────────────────┼────────────┐         │
+  │        │         │ Try borrow in this order: │            │         │
+  │        │         │ 1. Thread-local (last used by this thread)       │
+  │        │         │ 2. Shared list (CAS operation)         │         │
+  │        │         │ 3. handoffQueue (wait for return)      │         │
+  │        │         │ 4. Timeout → SQLException              │         │
+  │        │         └────────────────────────────────────────┘         │
+  │        │                                                             │
+  │        ▼              connection.close()                             │
+  │   ┌──────────┐    (proxied — returns to pool)    ┌──────────┐      │
+  │   │ Use Conn │ ──────────────────────────────► │ Returned  │      │
+  │   └──────────┘                                   └──────────┘      │
+  │                                                                     │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  Connection States (PoolEntry):
+  ═══════════════════════════════
+  NOT_IN_USE  → Available for borrowing
+  IN_USE      → Currently held by a thread
+  REMOVED     → Marked for eviction (maxLifetime reached)
+  RESERVED    → Being validated before handoff
+        </pre>
+
+        <h3>Key Internals</h3>
+        <p><strong>ConcurrentBag</strong> — HikariCP's secret weapon. Unlike traditional pools that use a blocking queue (causing lock contention), HikariCP uses a lock-free ConcurrentBag with thread-local affinity:</p>
+
+        <pre><code class="language-java">// Simplified HikariCP ConcurrentBag.borrow() logic
+public T borrow(long timeout, TimeUnit timeUnit) throws InterruptedException {
+    // 1. Try thread-local list first (no synchronization needed)
+    final List&lt;Object&gt; list = threadList.get();
+    for (int i = list.size() - 1; i >= 0; i--) {
+        final Object entry = list.remove(i);
+        final T bagEntry = weakThreadLocals ? ((WeakReference&lt;T&gt;) entry).get() : (T) entry;
+        if (bagEntry != null && bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
+            return bagEntry;  // Fast path — no contention
+        }
+    }
+
+    // 2. Scan shared list with CAS
+    final int waiting = waiters.incrementAndGet();
+    try {
+        for (T bagEntry : sharedList) {
+            if (bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
+                if (waiting > 1) listener.addBagItem(waiting - 1);
+                return bagEntry;
+            }
+        }
+        // 3. Wait on handoff queue (this is where threads block during exhaustion)
+        listener.addBagItem(waiting);
+        T bagEntry = handoffQueue.poll(timeout, timeUnit);
+        return bagEntry;  // null = timeout = SQLTransientConnectionException
+    } finally {
+        waiters.decrementAndGet();
+    }
+}</code></pre>
+
+        <h3>Connection Creation</h3>
+        <pre><code class="language-java">// HikariCP creates connections asynchronously via HouseKeeper
+// minimumIdle connections are maintained at all times
+// New connections created when:
+//   1. Pool initializes (minimumIdle connections)
+//   2. Connection evicted (maxLifetime exceeded)
+//   3. Demand exceeds available (up to maximumPoolSize)
+
+// Key: connection creation is ASYNC — if all connections are in-use
+// and pool is at max, new requests BLOCK on handoffQueue</code></pre>
+
+        <h3>Connection Eviction</h3>
+        <div class="callout callout-info">
+          <p><strong>maxLifetime</strong> (default: 30 min) — Connections are retired after this duration to prevent stale connections, DNS changes, and firewall timeouts. HikariCP adds a random jitter (±2.5%) to prevent mass eviction storms.</p>
+          <p><strong>idleTimeout</strong> (default: 10 min) — Idle connections beyond minimumIdle are removed after this duration.</p>
+          <p><strong>keepaliveTime</strong> (default: 0/disabled) — Periodic validation of idle connections.</p>
+        </div>
+
+        <h3>Why This Matters for Exhaustion</h3>
+        <p>The critical insight: <strong>a connection in IN_USE state cannot be evicted, cannot be borrowed by another thread, and counts against maximumPoolSize</strong>. If your code holds a connection for 5 seconds (e.g., waiting on an HTTP call inside @Transactional), that's one less connection for 5 seconds × your request rate = massive queuing.</p>
+      </details>
+    </section>
+
+    <!-- Section 4: Pool Sizing Theory -->
+    <section id="pool-sizing">
+      <h2>Pool Sizing Theory</h2>
+
+      <details>
+        <summary>The HikariCP wiki formula and why small pools win</summary>
+
+        <h3>The Formula</h3>
+        <div class="callout callout-info">
+          <p><strong>HikariCP's recommended formula:</strong></p>
+          <p><code>connections = ((core_count * 2) + effective_spindle_count)</code></p>
+          <p>For a 4-core server with SSD (1 spindle): <code>(4 * 2) + 1 = 9 connections</code></p>
+          <p>For a 4-core server with 4 HDDs: <code>(4 * 2) + 4 = 12 connections</code></p>
+        </div>
+
+        <pre class="diagram">
+  Why Small Pools Are Better — The Counter-Intuitive Truth
+  ═════════════════════════════════════════════════════════
+
+  Scenario: PostgreSQL on 4-core machine, SSD storage
+
+  Pool Size = 50 connections:
+  ┌─────────────────────────────────────────┐
+  │ • 50 threads competing for 4 CPU cores  │
+  │ • Massive context switching overhead    │
+  │ • Lock contention on shared buffers     │
+  │ • WAL write contention                  │
+  │ • Effective throughput: ~1,800 TPS      │
+  └─────────────────────────────────────────┘
+
+  Pool Size = 10 connections:
+  ┌─────────────────────────────────────────┐
+  │ • 10 threads, low context switching     │
+  │ • Minimal lock contention               │
+  │ • Each query gets more CPU time         │
+  │ • Lower latency per query               │
+  │ • Effective throughput: ~2,200 TPS      │
+  └─────────────────────────────────────────┘
+
+  Result: FEWER connections = MORE throughput
+  (up to the point where DB cores are idle)
+        </pre>
+
+        <h3>Throughput Formula</h3>
+        <pre><code class="language-java">// Pool throughput (requests/second the pool can handle):
+// throughput = poolSize / avgConnectionHoldTime
+
+// Example 1: Fast queries
+// poolSize = 10, avgHoldTime = 5ms
+// throughput = 10 / 0.005 = 2,000 req/s ✓
+
+// Example 2: @Transactional wrapping HTTP call
+// poolSize = 10, avgHoldTime = 2000ms (waiting for REST API)
+// throughput = 10 / 2.0 = 5 req/s ✗ (POOL EXHAUSTED)
+
+// Example 3: After increasing pool to 100 (wrong fix)
+// poolSize = 100, avgHoldTime = 2000ms
+// throughput = 100 / 2.0 = 50 req/s
+// But now DB has 100 connections competing → query latency increases
+// → hold time increases → still exhausts, just slower</code></pre>
+
+        <h3>Why Increasing Pool Size Is Usually Wrong</h3>
+        <div class="callout callout-warning">
+          <p><strong>The "bigger pool" trap:</strong></p>
+          <ul>
+            <li>More connections = more memory on DB server (~10MB per connection in PostgreSQL)</li>
+            <li>More concurrent queries = more lock contention = slower queries = longer hold times</li>
+            <li>Creates a <strong>negative feedback loop</strong>: more connections → slower DB → longer hold → need more connections</li>
+            <li>Multiple application instances: 5 pods × 50 connections = 250 DB connections (PostgreSQL default max is 100!)</li>
+            <li>Masks the real problem — you're treating the symptom, not the cause</li>
+          </ul>
+        </div>
+
+        <h3>Multi-Instance Pool Planning</h3>
+        <pre><code class="language-bash"># Production calculation:
+# PostgreSQL max_connections = 100 (default)
+# Reserve 5 for superuser/monitoring
+# Available for app: 95
+#
+# 5 Kubernetes pods running the service
+# Max pool per pod: 95 / 5 = 19 connections
+#
+# With HikariCP config:
+#   maximumPoolSize = 15 (leave headroom for scaling)
+#   minimumIdle = 5 (handle idle periods efficiently)
+#
+# During deployment (rolling update with 1 extra pod):
+#   6 pods × 15 connections = 90 (within 95 limit) ✓
+
+# WRONG approach:
+#   maximumPoolSize = 50
+#   5 pods × 50 = 250 connections
+#   PostgreSQL rejects connections → cascade failure</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Exhaustion Causes -->
+    <section id="exhaustion-causes">
+      <h2>All Causes of Pool Exhaustion with Low DB CPU</h2>
+
+      <details>
+        <summary>Cause 1: Long-running transactions holding connections</summary>
+        <div class="callout callout-danger">
+          <p><strong>Impact: HIGH</strong> — Each long transaction removes one connection from the pool for its entire duration.</p>
+        </div>
+
+        <pre><code class="language-java">// PROBLEM: Batch processing in a single transaction
+@Transactional
+public void generateMonthlyReport() {
+    List&lt;Order&gt; orders = orderRepository.findByMonth(YearMonth.now()); // 500K rows
+    
+    for (Order order : orders) {
+        ReportLine line = calculateMetrics(order); // CPU work, 10ms each
+        reportRepository.save(line);               // DB write
+    }
+    // Connection held for: 500,000 × 10ms = 83 MINUTES
+    // DB CPU: low (queries are fast, just too many)
+    // Pool impact: 1 connection locked for 83 minutes
+}
+
+// FIX: Chunk processing with separate transactions
+@Service
+public class ReportService {
+    @Autowired private PlatformTransactionManager txManager;
+    
+    public void generateMonthlyReport() {
+        List&lt;Long&gt; orderIds = getOrderIds(YearMonth.now()); // Quick query
+        
+        Lists.partition(orderIds, 500).forEach(chunk -> {
+            TransactionTemplate tx = new TransactionTemplate(txManager);
+            tx.execute(status -> {
+                List&lt;Order&gt; orders = orderRepository.findAllById(chunk);
+                orders.forEach(order -> {
+                    reportRepository.save(calculateMetrics(order));
+                });
+                return null;
+            });
+            // Connection returned after each chunk of 500
+        });
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Cause 2: Connection leaks (borrowed but never returned)</summary>
+        <div class="callout callout-danger">
+          <p><strong>Impact: CRITICAL</strong> — Leaked connections are never returned. Pool slowly drains to zero over hours/days.</p>
+        </div>
+
+        <pre><code class="language-java">// LEAK PATTERN 1: Manual DataSource usage without try-with-resources
+public User findUser(Long id) {
+    Connection conn = dataSource.getConnection();
+    PreparedStatement ps = conn.prepareStatement("SELECT * FROM users WHERE id = ?");
+    ps.setLong(1, id);
+    ResultSet rs = ps.executeQuery();
+    if (rs.next()) {
+        return mapUser(rs);
+    }
+    conn.close(); // NEVER REACHED if rs.next() throws or returns false early!
+    return null;
+}
+
+// LEAK PATTERN 2: Exception in @Transactional with manual connection
+@Transactional
+public void processPayment(PaymentRequest req) {
+    Connection reportConn = reportDataSource.getConnection(); // Second datasource
+    try {
+        paymentRepository.save(new Payment(req));
+        generateReceipt(reportConn, req); // If this throws...
+    } finally {
+        // Developer forgot this finally block
+        // reportConn is LEAKED — never returned to report pool
+    }
+}
+
+// LEAK PATTERN 3: Reactive/async code with connections
+public CompletableFuture&lt;User&gt; findUserAsync(Long id) {
+    Connection conn = dataSource.getConnection(); // Borrowed on thread-1
+    return CompletableFuture.supplyAsync(() -> {
+        // Runs on ForkJoinPool thread — different thread!
+        // If exception here, conn never closed
+        return queryUser(conn, id);
+    }); // conn.close() never called if future is cancelled/timed out
+}
+
+// FIX: Always use try-with-resources or let Spring manage connections
+public User findUserFixed(Long id) {
+    try (Connection conn = dataSource.getConnection();
+         PreparedStatement ps = conn.prepareStatement("SELECT * FROM users WHERE id = ?")) {
+        ps.setLong(1, id);
+        try (ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? mapUser(rs) : null;
+        }
+    }  // Connection ALWAYS returned, even on exception
+}</code></pre>
+
+        <pre class="diagram">
+  Connection Leak Timeline
+  ═══════════════════════════════════════════════════════════
+
+  Time     Active Connections    Available    Behavior
+  ──────   ──────────────────    ─────────    ─────────────────
+  00:00    0 / 10                10           Normal
+  00:30    2 / 10 (2 leaked)     8            Still fine
+  01:00    4 / 10 (4 leaked)     6            Slight latency spike
+  01:30    7 / 10 (7 leaked)     3            connectionTimeout errors start
+  01:45    9 / 10 (9 leaked)     1            Most requests timing out
+  02:00    10 / 10 (10 leaked)   0            FULL EXHAUSTION — all requests fail
+
+  Pattern: Linear degradation over hours = connection leak
+  (vs. sudden spike = traffic surge or long transaction)
+        </pre>
+      </details>
+
+      <details>
+        <summary>Cause 3: Deadlocks between threads waiting for connections</summary>
+        <div class="callout callout-danger">
+          <p><strong>Impact: CRITICAL</strong> — All pool connections held, all threads blocked waiting for more. Complete deadlock.</p>
+        </div>
+
+        <pre><code class="language-java">// DEADLOCK SCENARIO: Nested @Transactional with REQUIRES_NEW
+// Pool size: 10, Tomcat threads: 200
+
+@Service
+public class OrderService {
+    
+    @Transactional  // Borrows Connection #1
+    public void placeOrder(OrderRequest req) {
+        Order order = orderRepository.save(new Order(req));  // Uses Connection #1
+        
+        // This needs a NEW connection (REQUIRES_NEW suspends outer tx)
+        auditService.logOrderCreated(order);  // Needs Connection #2
+        
+        inventoryService.reserve(order);  // Also REQUIRES_NEW → Connection #3
+    }
+}
+
+@Service
+public class AuditService {
+    @Transactional(propagation = Propagation.REQUIRES_NEW)  // Borrows Connection #2
+    public void logOrderCreated(Order order) {
+        auditRepository.save(new AuditLog("ORDER_CREATED", order.getId()));
+    }
+}
+
+// DEADLOCK SCENARIO:
+// With pool size = 10 and 10 concurrent requests:
+// - All 10 threads borrow Connection #1 (pool empty)
+// - All 10 threads need Connection #2 for REQUIRES_NEW
+// - Pool is empty → all 10 threads WAIT
+// - No thread can finish → no connection will be returned
+// - DEADLOCK: connectionTimeout fires after 30s → all fail
+
+// FIX: Use REQUIRED (same connection) or async pattern
+@Transactional(propagation = Propagation.REQUIRED)  // Reuses parent connection
+public void logOrderCreated(Order order) {
+    auditRepository.save(new AuditLog("ORDER_CREATED", order.getId()));
+}</code></pre>
+
+        <pre class="diagram">
+  Pool Deadlock Visualization (poolSize=10, 10 concurrent requests)
+  ═══════════════════════════════════════════════════════════════════
+
+  Thread-1:  [Holds Conn-1]  ──► WAITING for any connection (REQUIRES_NEW)
+  Thread-2:  [Holds Conn-2]  ──► WAITING for any connection (REQUIRES_NEW)
+  Thread-3:  [Holds Conn-3]  ──► WAITING for any connection (REQUIRES_NEW)
+  ...
+  Thread-10: [Holds Conn-10] ──► WAITING for any connection (REQUIRES_NEW)
+
+  Pool Status: 10/10 IN_USE, 0 available, 10 threads in handoffQueue
+  Result: DEADLOCK — no thread can proceed, no connection will be freed
+
+  Prevention Rule:
+  Max concurrent requests ≤ poolSize / max_connections_per_request
+  If each request needs 2 connections: max_concurrent = poolSize / 2 = 5
+        </pre>
+      </details>
+
+      <details>
+        <summary>Cause 4: @Transactional on methods calling external services</summary>
+        <div class="callout callout-danger">
+          <p><strong>Impact: HIGH</strong> — The #1 cause of pool exhaustion in Spring Boot microservices.</p>
+        </div>
+
+        <pre><code class="language-java">// THE CLASSIC ANTI-PATTERN
+@Service
+public class PaymentService {
+    
+    @Transactional  // ← Connection borrowed HERE (before any DB work)
+    public PaymentResult processPayment(PaymentRequest req) {
+        
+        // 1. Quick DB read (2ms)
+        Account account = accountRepository.findById(req.getAccountId()).orElseThrow();
+        
+        // 2. Call payment gateway REST API (avg 800ms, P99 = 5 seconds!)
+        GatewayResponse response = paymentGateway.charge(req.getAmount(), account.getToken());
+        //    ↑↑↑ CONNECTION IS HELD IDLE FOR 800ms-5s WHILE WAITING FOR HTTP RESPONSE ↑↑↑
+        
+        // 3. Quick DB write (3ms)
+        Payment payment = new Payment(account, response.getTransactionId(), req.getAmount());
+        paymentRepository.save(payment);
+        
+        return new PaymentResult(payment);
+    }
+    // Total connection hold time: 2ms + 800ms + 3ms ≈ 805ms
+    // Actual DB time: 5ms (0.6% of hold time!)
+    // Connection idle for 99.4% of the time it's borrowed
+}
+
+// IMPACT CALCULATION:
+// Pool size: 10 connections
+// Avg hold time: 800ms (dominated by HTTP call)
+// Max throughput: 10 / 0.8 = 12.5 requests/second
+// At 50 req/s: pool exhausts in seconds
+// DB CPU: nearly 0% (only doing 5ms of work per request)
+
+// ═══════════════════════════════════════════════════════════════
+// FIX: Separate the HTTP call from the transaction
+// ═══════════════════════════════════════════════════════════════
+
+@Service
+public class PaymentService {
+    
+    public PaymentResult processPayment(PaymentRequest req) {
+        
+        // 1. Read account (short transaction, auto-committed)
+        Account account = accountRepository.findById(req.getAccountId()).orElseThrow();
+        
+        // 2. Call payment gateway — NO connection held!
+        GatewayResponse response = paymentGateway.charge(req.getAmount(), account.getToken());
+        
+        // 3. Write result (short transaction)
+        return savePaymentResult(account, response, req);
+    }
+    
+    @Transactional  // Only holds connection for the 3ms write
+    protected PaymentResult savePaymentResult(Account account, GatewayResponse response, PaymentRequest req) {
+        Payment payment = new Payment(account, response.getTransactionId(), req.getAmount());
+        paymentRepository.save(payment);
+        return new PaymentResult(payment);
+    }
+    // New hold time: 3ms
+    // New max throughput: 10 / 0.003 = 3,333 requests/second (266x improvement!)
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Spring Boot gotcha:</strong> When <code>spring.jpa.open-in-view=true</code> (the DEFAULT!), a connection is borrowed at the start of the HTTP request and held until the response is sent. This means ANY slow operation in your controller holds a connection — even if it's not in a @Transactional method.</p>
+        </div>
+
+        <pre><code class="language-yaml"># ALWAYS disable open-in-view in production
+spring:
+  jpa:
+    open-in-view: false  # Default is TRUE — dangerous for connection pools</code></pre>
+      </details>
+
+      <details>
+        <summary>Cause 5: N+1 queries blocking pool acquisition</summary>
+
+        <pre><code class="language-java">// N+1 PROBLEM AND POOL EXHAUSTION
+// Each query is fast (2ms), but 1000 queries per request = 2 seconds hold time
+
+@Transactional(readOnly = true)
+public List&lt;OrderDTO&gt; getRecentOrders(Long customerId) {
+    List&lt;Order&gt; orders = orderRepository.findByCustomerId(customerId);
+    // ↑ 1 query: SELECT * FROM orders WHERE customer_id = ?
+    
+    return orders.stream().map(order -> {
+        // N queries: each triggers a lazy load
+        List&lt;OrderItem&gt; items = order.getItems();  // SELECT * FROM order_items WHERE order_id = ?
+        Address address = order.getShippingAddress(); // SELECT * FROM addresses WHERE id = ?
+        return new OrderDTO(order, items, address);
+    }).collect(Collectors.toList());
+    // If customer has 200 orders: 1 + 200 + 200 = 401 queries
+    // Each 2ms → total hold time: 802ms per request
+    // With pool=10: only 12 req/s throughput (DB CPU still low — queries are trivial)
+}
+
+// FIX: Eager fetch with JOIN FETCH
+@Query("SELECT o FROM Order o " +
+       "JOIN FETCH o.items " +
+       "JOIN FETCH o.shippingAddress " +
+       "WHERE o.customerId = :customerId")
+List&lt;Order&gt; findByCustomerIdWithDetails(@Param("customerId") Long customerId);
+// Result: 1 query, 5ms total, connection hold time drops from 800ms to 5ms</code></pre>
+      </details>
+
+      <details>
+        <summary>Cause 6: REQUIRES_NEW nesting (holds multiple connections per request)</summary>
+
+        <pre><code class="language-java">// PROBLEM: Each REQUIRES_NEW suspends the parent and borrows a NEW connection
+@Service
+public class TransferService {
+    
+    @Transactional  // Connection #1
+    public void transfer(Long fromId, Long toId, BigDecimal amount) {
+        accountRepository.debit(fromId, amount);
+        accountRepository.credit(toId, amount);
+        
+        // Each of these needs its own connection (REQUIRES_NEW)
+        notificationService.sendDebitNotification(fromId, amount);   // Connection #2
+        notificationService.sendCreditNotification(toId, amount);    // Connection #2 (reused after first returns)
+        auditService.logTransfer(fromId, toId, amount);              // Connection #2
+        fraudService.checkPattern(fromId, amount);                    // Connection #2
+    }
+}
+
+// At peak: 10 concurrent transfers
+// Connection #1 held by all 10 threads = 10 connections
+// Connection #2 needed by all 10 threads = 10 more connections needed
+// Pool size 10 → DEADLOCK (same as Cause 3)
+
+// WORSE: Deeply nested REQUIRES_NEW
+@Transactional  // Connection #1
+public void complexOperation() {
+    serviceA.doSomething();  // REQUIRES_NEW → Connection #2
+    // Inside serviceA:
+    //   serviceB.doMore();  // REQUIRES_NEW → Connection #3
+    //   Inside serviceB:
+    //     serviceC.doFinal(); // REQUIRES_NEW → Connection #4
+    // This single request holds 4 CONNECTIONS simultaneously!
+}
+// Max safe concurrency = poolSize / 4 = 2.5 ≈ 2 requests
+// At 3+ concurrent requests with pool=10: potential deadlock
+
+// FIX OPTIONS:
+// 1. Use REQUIRED (share parent connection) — if business logic allows
+// 2. Use async events instead of synchronous nested transactions
+// 3. Size pool for: maximumPoolSize >= maxConcurrentThreads * maxConnectionsPerThread</code></pre>
+      </details>
+
+      <details>
+        <summary>Cause 7: Slow queries not causing CPU (waiting on locks, I/O)</summary>
+
+        <pre><code class="language-sql">-- Queries that take seconds but don't use CPU:
+
+-- 1. Row-level lock wait (another transaction holds the lock)
+UPDATE accounts SET balance = balance - 100 WHERE id = 42;
+-- If another transaction is updating the same row, this WAITS
+-- DB CPU: idle (just waiting for lock release)
+-- Connection: held for entire wait duration
+
+-- 2. Disk I/O wait (cold data not in buffer pool)
+SELECT * FROM audit_logs WHERE created_at > '2024-01-01' ORDER BY created_at;
+-- 500GB table, 8GB buffer pool → sequential disk scan
+-- DB CPU: low (waiting for disk reads)
+-- Connection: held for 30+ seconds
+
+-- 3. Lock escalation / table lock
+ALTER TABLE large_table ADD COLUMN new_col VARCHAR(255);
+-- DDL takes an ACCESS EXCLUSIVE lock — blocks ALL other queries on this table
+-- All connections waiting for this table: held but idle
+
+-- 4. Waiting for WAL flush (synchronous_commit = on)
+INSERT INTO orders VALUES (...);
+-- Must wait for WAL write to disk before returning
+-- On slow storage: 5-20ms per commit
+-- DB CPU: low (waiting for fsync)
+
+-- Diagnostic query: Find queries waiting on locks
+SELECT 
+    pid,
+    now() - pg_stat_activity.query_start AS duration,
+    query,
+    state,
+    wait_event_type,
+    wait_event
+FROM pg_stat_activity
+WHERE state != 'idle'
+  AND wait_event IS NOT NULL
+ORDER BY duration DESC;</code></pre>
+      </details>
+
+      <details>
+        <summary>Cause 8: Connection validation overhead</summary>
+
+        <pre><code class="language-yaml"># Connection validation can add latency to every borrow
+
+spring:
+  datasource:
+    hikari:
+      # This sends "SELECT 1" or JDBC isValid() on EVERY borrow:
+      connection-test-query: "SELECT 1"  # AVOID — use JDBC4 validation instead
+      
+      # JDBC4 validation (isValid) — much faster, uses TCP ping:
+      # No connection-test-query needed — HikariCP uses isValid() by default
+      
+      # But validation still has a cost:
+      # - Network round-trip to DB: 0.5-2ms per validation
+      # - Under high throughput: 2000 borrows/sec × 1ms = 2 seconds of validation/sec
+      # - Each validation briefly holds the connection in RESERVED state
+      
+      # The real danger: validation timeout
+      validation-timeout: 5000  # Default: 5 seconds
+      # If DB is slow to respond to isValid():
+      # - Connection sits in RESERVED state for up to 5s
+      # - Other threads can't borrow it
+      # - Pool appears exhausted even though connections exist</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>HikariCP optimization:</strong> HikariCP skips validation if the connection was used less than 500ms ago (configurable via internal housekeeping). This means under sustained load, most borrows skip validation entirely. The risk is during idle-to-active transitions.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 6: Leak Detection -->
+    <section id="leak-detection">
+      <h2>Leak Detection Implementation</h2>
+
+      <details>
+        <summary>HikariCP's built-in leak detection and custom strategies</summary>
+
+        <h3>HikariCP Leak Detection Threshold</h3>
+        <pre><code class="language-yaml"># application.yml — enable leak detection
+spring:
+  datasource:
+    hikari:
+      leak-detection-threshold: 10000  # 10 seconds (in milliseconds)
+      # If a connection is borrowed for longer than this, HikariCP logs a WARNING
+      # with the FULL STACK TRACE of where the connection was borrowed
+      # Minimum value: 2000ms (2 seconds). Set to 0 to disable.</code></pre>
+
+        <h3>What the Leak Detection Log Looks Like</h3>
+        <pre><code class="language-bash"># HikariCP leak detection output:
+WARN  com.zaxxer.hikari.pool.ProxyLeakTask - Connection leak detection triggered
+for com.zaxxer.hikari.pool.HikariProxyConnection@3f2a7dd7 on thread http-nio-8080-exec-42,
+stack trace follows
+
+java.lang.Exception: Apparent connection leak detected
+    at com.zaxxer.hikari.HikariDataSource.getConnection(HikariDataSource.java:128)
+    at org.springframework.jdbc.datasource.DataSourceTransactionManager.doBegin(...)
+    at com.example.service.PaymentService.processPayment(PaymentService.java:45)
+    at com.example.controller.PaymentController.pay(PaymentController.java:23)
+    at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+    ...
+
+# The stack trace shows EXACTLY where the connection was borrowed
+# PaymentService.java:45 is your @Transactional method — investigate what it's doing</code></pre>
+
+        <h3>Custom Leak Detection with Micrometer</h3>
+        <pre><code class="language-java">@Configuration
+public class ConnectionLeakMonitor {
+    
+    @Bean
+    public BeanPostProcessor hikariMetricsPostProcessor(MeterRegistry registry) {
+        return new BeanPostProcessor() {
+            @Override
+            public Object postProcessAfterInitialization(Object bean, String beanName) {
+                if (bean instanceof HikariDataSource ds) {
+                    ds.setMetricsTrackerFactory(new MicrometerMetricsTrackerFactory(registry));
+                    
+                    // Custom gauge: connections that have been active > 30 seconds
+                    Gauge.builder("hikaricp.connections.long_running",
+                            ds.getHikariPoolMXBean(),
+                            pool -> pool.getActiveConnections())  // Simplified
+                        .tag("pool", ds.getPoolName())
+                        .register(registry);
+                }
+                return bean;
+            }
+        };
+    }
+}
+
+// Advanced: Track connection borrow duration with custom wrapper
+@Component
+public class ConnectionBorrowTracker implements DataSourceWrapper {
+    private final Timer borrowDurationTimer;
+    private final Counter leakCounter;
+    
+    @Override
+    public Connection getConnection() throws SQLException {
+        long start = System.nanoTime();
+        Connection conn = delegate.getConnection();
+        
+        return (Connection) Proxy.newProxyInstance(
+            conn.getClass().getClassLoader(),
+            new Class[]{Connection.class},
+            (proxy, method, args) -> {
+                if ("close".equals(method.getName())) {
+                    long duration = System.nanoTime() - start;
+                    borrowDurationTimer.record(duration, TimeUnit.NANOSECONDS);
+                    if (duration > TimeUnit.SECONDS.toNanos(30)) {
+                        leakCounter.increment();
+                        log.warn("Connection held for {}s by thread {}",
+                            TimeUnit.NANOSECONDS.toSeconds(duration),
+                            Thread.currentThread().getName());
+                    }
+                }
+                return method.invoke(conn, args);
+            });
+    }
+}</code></pre>
+
+        <h3>Finding Leaks in Production</h3>
+        <pre><code class="language-sql">-- PostgreSQL: Find connections that have been idle in transaction too long
+SELECT 
+    pid,
+    usename,
+    application_name,
+    client_addr,
+    state,
+    now() - state_change AS idle_duration,
+    now() - xact_start AS transaction_duration,
+    query
+FROM pg_stat_activity 
+WHERE state = 'idle in transaction'
+  AND now() - state_change > interval '30 seconds'
+ORDER BY idle_duration DESC;
+
+-- 'idle in transaction' = connection borrowed, transaction open, but NO query running
+-- This is the DB-side view of a leaked or long-held connection
+
+-- Kill a leaked connection (last resort):
+SELECT pg_terminate_backend(pid) 
+FROM pg_stat_activity 
+WHERE state = 'idle in transaction' 
+  AND now() - state_change > interval '5 minutes';</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 7: Monitoring -->
+    <section id="monitoring">
+      <h2>Monitoring HikariCP</h2>
+
+      <details>
+        <summary>Prometheus metrics, MBeans, and alerting thresholds</summary>
+
+        <h3>Key Prometheus Metrics</h3>
+        <pre><code class="language-yaml"># Spring Boot Actuator automatically exposes these with Micrometer:
+# (requires spring-boot-starter-actuator + micrometer-registry-prometheus)
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,metrics
+  metrics:
+    tags:
+      application: payment-service</code></pre>
+
+        <pre><code class="language-bash"># Available HikariCP metrics in Prometheus format:
+
+# Pool size and utilization
+hikaricp_connections_active{pool="HikariPool-1"}       7    # Currently borrowed
+hikaricp_connections_idle{pool="HikariPool-1"}         3    # Available in pool
+hikaricp_connections_total{pool="HikariPool-1"}        10   # Total (active + idle)
+hikaricp_connections_max{pool="HikariPool-1"}          10   # maximumPoolSize
+hikaricp_connections_min{pool="HikariPool-1"}          5    # minimumIdle
+
+# Connection acquisition timing
+hikaricp_connections_acquire_seconds_count             1523  # Total borrows
+hikaricp_connections_acquire_seconds_sum               2.4   # Total wait time
+hikaricp_connections_acquire_seconds_max               0.85  # Max wait time
+
+# Connection usage timing (how long connections are held)
+hikaricp_connections_usage_seconds_count               1520
+hikaricp_connections_usage_seconds_sum                 45.3  # Total hold time
+hikaricp_connections_usage_seconds_max                 12.1  # Max hold time (LEAK?)
+
+# Connection creation timing
+hikaricp_connections_creation_seconds_count            15
+hikaricp_connections_creation_seconds_sum              1.2
+hikaricp_connections_creation_seconds_max              0.3
+
+# Pending threads (CRITICAL — threads waiting for a connection)
+hikaricp_connections_pending{pool="HikariPool-1"}      0    # Should be 0!
+# If pending > 0 for sustained periods → pool exhaustion imminent
+
+# Timeout counter
+hikaricp_connections_timeout_total{pool="HikariPool-1"} 0   # Should be 0!</code></pre>
+
+        <h3>Critical Grafana Alerts</h3>
+        <pre><code class="language-yaml"># Prometheus alerting rules for HikariCP
+
+groups:
+  - name: hikaricp
+    rules:
+      # CRITICAL: Pool is fully exhausted
+      - alert: HikariPoolExhausted
+        expr: hikaricp_connections_active == hikaricp_connections_max
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "HikariCP pool fully exhausted on {{ $labels.instance }}"
+          description: "All {{ $value }} connections are active. Threads are waiting."
+
+      # WARNING: Pool utilization > 80%
+      - alert: HikariPoolHighUtilization
+        expr: hikaricp_connections_active / hikaricp_connections_max > 0.8
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HikariCP pool at {{ $value | humanizePercentage }} utilization"
+
+      # CRITICAL: Threads waiting for connections
+      - alert: HikariPendingConnections
+        expr: hikaricp_connections_pending > 0
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} threads waiting for DB connections"
+
+      # WARNING: Connection acquisition taking too long
+      - alert: HikariSlowAcquisition
+        expr: rate(hikaricp_connections_acquire_seconds_sum[5m]) / rate(hikaricp_connections_acquire_seconds_count[5m]) > 0.1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Avg connection acquisition time > 100ms"
+
+      # WARNING: Connections held too long (potential leak)
+      - alert: HikariLongUsage
+        expr: hikaricp_connections_usage_seconds_max > 30
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Connection held for {{ $value }}s — possible leak"
+
+      # CRITICAL: Connection timeouts occurring
+      - alert: HikariTimeouts
+        expr: rate(hikaricp_connections_timeout_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Connection timeout errors occurring — pool exhausted"</code></pre>
+
+        <h3>JMX MBeans for Live Debugging</h3>
+        <pre><code class="language-bash"># Connect with jconsole or use Actuator JMX endpoint
+# MBean: com.zaxxer.hikari:type=Pool (HikariPool-1)
+
+# Key attributes:
+# ActiveConnections    — currently borrowed
+# IdleConnections      — available
+# TotalConnections     — active + idle  
+# ThreadsAwaitingConnection — CRITICAL: should be 0
+
+# Using JMX via CLI (useful in containers):
+jcmd &lt;pid&gt; VM.system_properties | grep hikari
+
+# Or via Spring Actuator:
+curl http://localhost:8080/actuator/metrics/hikaricp.connections.active
+curl http://localhost:8080/actuator/metrics/hikaricp.connections.pending
+curl http://localhost:8080/actuator/metrics/hikaricp.connections.usage</code></pre>
+
+        <h3>Key Dashboard Panels</h3>
+        <pre class="diagram">
+  HikariCP Grafana Dashboard — Essential Panels
+  ═══════════════════════════════════════════════════════════
+
+  ┌────────────────────────┐  ┌────────────────────────────┐
+  │ Pool Utilization (%)   │  │ Pending Threads            │
+  │ ████████░░ 80%         │  │ Should be 0 at all times   │
+  │ active / max           │  │ Any spike = problem        │
+  └────────────────────────┘  └────────────────────────────┘
+
+  ┌────────────────────────┐  ┌────────────────────────────┐
+  │ Acquisition Time P99   │  │ Usage Time (Hold Duration) │
+  │ Should be &lt; 10ms       │  │ P50: 5ms, P99: 50ms       │
+  │ &gt; 100ms = pool stress  │  │ P99 &gt; 1s = investigate     │
+  └────────────────────────┘  └────────────────────────────┘
+
+  ┌────────────────────────┐  ┌────────────────────────────┐
+  │ Timeout Counter (rate) │  │ Connection Creation Rate   │
+  │ Should be 0            │  │ Spikes = eviction storm    │
+  │ Any &gt; 0 = user impact  │  │ or pool recovering         │
+  └────────────────────────┘  └────────────────────────────┘
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 8: Production Incident -->
+    <section id="production-incident">
+      <h2>Real Production Incident</h2>
+
+      <details>
+        <summary>Connection leak from @Transactional on a method calling a slow REST API — pool exhausted in 2 hours</summary>
+
+        <h3>The Incident</h3>
+        <div class="callout callout-danger">
+          <p><strong>Severity: P1 | Duration: 2 hours 15 minutes | Impact: All payment processing halted</strong></p>
+          <p>Service: payment-service (Spring Boot 3.1, HikariCP 5.0, PostgreSQL 15)</p>
+          <p>Trigger: A new feature was deployed that added fraud checking to the payment flow.</p>
+        </div>
+
+        <h3>Timeline</h3>
+        <pre class="diagram">
+  14:00  Deploy v2.34 to production (adds fraud check API call)
+  14:00  Traffic normal: 200 req/s, pool utilization: 30%
+  
+  14:45  Pool utilization creeping up: 50% → 60% → 70%
+         No alerts yet (threshold at 80%)
+         DB CPU: 8% (normal)
+  
+  15:15  Alert: HikariPoolHighUtilization (82%)
+         On-call checks DB — CPU 12%, no slow queries, no locks
+         Thinks: "Maybe traffic spike?" — checks: traffic is normal
+  
+  15:30  Alert: HikariPendingConnections = 15
+         Users reporting payment failures
+         hikaricp_connections_timeout_total climbing
+         
+  15:45  P1 declared. All 10 connections active. 50+ threads pending.
+         DB CPU: 6% (LOWER than normal — fewer queries getting through)
+         
+  16:00  Thread dump taken:
+         190 threads in TIMED_WAITING at:
+           com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:181)
+         10 threads in RUNNABLE at:
+           java.net.SocketInputStream.read(...)
+           com.example.client.FraudCheckClient.checkTransaction(FraudCheckClient.java:67)
+           com.example.service.PaymentService.processPayment(PaymentService.java:52)
+         
+  16:05  ROOT CAUSE IDENTIFIED:
+         The new fraud check is inside @Transactional
+         Fraud API response time: P50=200ms, P99=8s (degraded service)
+         Some connections held for 8+ seconds
+         
+  16:15  Rollback deployed. Pool recovers in 30 seconds.
+        </pre>
+
+        <h3>The Problematic Code (deployed in v2.34)</h3>
+        <pre><code class="language-java">// THE BUG: @Transactional wraps the entire method including HTTP call
+@Service
+public class PaymentService {
+    
+    @Transactional  // ← Connection borrowed at entry
+    public PaymentResult processPayment(PaymentRequest req) {
+        Account account = accountRepository.findById(req.getAccountId()).orElseThrow();
+        
+        // NEW CODE ADDED IN v2.34:
+        FraudResult fraud = fraudCheckClient.checkTransaction(  // ← HTTP call, 200ms-8s
+            account.getId(), req.getAmount(), req.getMerchant()
+        );
+        if (fraud.isRejected()) {
+            throw new FraudRejectedException(fraud.getReason());
+        }
+        // END NEW CODE
+        
+        Payment payment = paymentRepository.save(new Payment(account, req));
+        return new PaymentResult(payment);
+    }
+    // Connection held for entire fraud check duration (200ms-8s)
+}</code></pre>
+
+        <h3>Why It Wasn't Caught in Testing</h3>
+        <div class="callout callout-warning">
+          <ul>
+            <li><strong>Unit tests:</strong> Fraud client was mocked — returned in 0ms</li>
+            <li><strong>Integration tests:</strong> WireMock stub returned in 5ms</li>
+            <li><strong>Staging:</strong> Only 10 req/s — pool of 10 was sufficient at 200ms hold time (50 req/s capacity)</li>
+            <li><strong>Production:</strong> 200 req/s + fraud API degradation (P99=8s) → pool capacity dropped to 1.25 req/s</li>
+          </ul>
+          <p>The bug only manifests under <strong>production load + downstream degradation</strong> — the combination that load tests rarely simulate.</p>
+        </div>
+
+        <h3>The Fix</h3>
+        <pre><code class="language-java">@Service
+public class PaymentService {
+    
+    // NO @Transactional on the orchestration method
+    public PaymentResult processPayment(PaymentRequest req) {
+        // 1. Read (auto-commit, connection borrowed and returned immediately)
+        Account account = accountRepository.findById(req.getAccountId()).orElseThrow();
+        
+        // 2. Fraud check — NO connection held
+        FraudResult fraud = fraudCheckClient.checkTransaction(
+            account.getId(), req.getAmount(), req.getMerchant()
+        );
+        if (fraud.isRejected()) {
+            throw new FraudRejectedException(fraud.getReason());
+        }
+        
+        // 3. Write — short transaction (3ms)
+        return completePayment(account, req);
+    }
+    
+    @Transactional  // Connection held only for the DB write
+    public PaymentResult completePayment(Account account, PaymentRequest req) {
+        Payment payment = paymentRepository.save(new Payment(account, req));
+        accountRepository.updateBalance(account.getId(), req.getAmount().negate());
+        return new PaymentResult(payment);
+    }
+}</code></pre>
+
+        <h3>Post-Incident Actions</h3>
+        <pre><code class="language-java">// 1. Added architectural fitness function (ArchUnit test)
+@ArchTest
+static final ArchRule transactional_methods_must_not_call_http =
+    methods()
+        .that().areAnnotatedWith(Transactional.class)
+        .should(notCallMethodsIn("com.example.client.."))
+        .because("@Transactional holds a DB connection — never call external services inside");
+
+// 2. Reduced connectionTimeout to fail fast
+// Before: 30s (default) — threads waited 30s then failed
+// After: 3s — fail fast, let circuit breaker handle it</code></pre>
+
+        <pre><code class="language-yaml"># 3. Updated HikariCP configuration post-incident
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 10         # Kept same — increasing would mask the problem
+      connection-timeout: 3000       # Fail fast (was 30000)
+      leak-detection-threshold: 5000 # Alert if connection held > 5s
+      
+# 4. Added fraud check circuit breaker with timeout
+resilience4j:
+  circuitbreaker:
+    instances:
+      fraud-check:
+        sliding-window-size: 100
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+  timelimiter:
+    instances:
+      fraud-check:
+        timeout-duration: 2s  # Never wait more than 2s for fraud check</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 9: Debugging Workflow -->
+    <section id="debugging-workflow">
+      <h2>Step-by-Step Debugging Workflow</h2>
+
+      <details>
+        <summary>Systematic approach to diagnosing pool exhaustion</summary>
+
+        <pre class="diagram">
+  Pool Exhaustion Debugging Decision Tree
+  ═════════════════════════════════════════
+
+  START: "SQLTransientConnectionException: Connection is not available"
+    │
+    ▼
+  ┌─────────────────────────────────┐
+  │ 1. Check pool metrics           │
+  │    - active connections = max?  │
+  │    - pending threads > 0?       │
+  └──────────────┬──────────────────┘
+                 │ YES
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 2. Check DB CPU and connections │
+  │    - DB CPU < 20%? → hold time  │
+  │    - DB CPU > 80%? → slow query │
+  └──────────────┬──────────────────┘
+                 │ DB CPU low
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 3. Take thread dump             │
+  │    - Where are active threads?  │
+  │    - Waiting in HTTP client?    │
+  │    - Waiting on lock?           │
+  │    - Waiting for another conn?  │
+  └──────────────┬──────────────────┘
+                 │
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 4. Check leak detection logs    │
+  │    - Any leak warnings?         │
+  │    - What stack traces?         │
+  └──────────────┬──────────────────┘
+                 │
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 5. Check pg_stat_activity       │
+  │    - 'idle in transaction'?     │
+  │    - Long-running queries?      │
+  │    - Lock waits?                │
+  └─────────────────────────────────┘
+        </pre>
+
+        <h3>Step 1: Confirm Pool Exhaustion</h3>
+        <pre><code class="language-bash"># Via Spring Actuator
+curl -s http://localhost:8080/actuator/metrics/hikaricp.connections.active | jq '.measurements[0].value'
+curl -s http://localhost:8080/actuator/metrics/hikaricp.connections.pending | jq '.measurements[0].value'
+curl -s http://localhost:8080/actuator/metrics/hikaricp.connections.max | jq '.measurements[0].value'
+
+# Quick check: active == max AND pending > 0 → confirmed exhaustion
+
+# Via JMX (in container)
+jcmd $(pgrep java) VM.system_properties 2>/dev/null | grep -i hikari</code></pre>
+
+        <h3>Step 2: Check Database Side</h3>
+        <pre><code class="language-sql">-- Are connections actually doing work?
+SELECT state, count(*) 
+FROM pg_stat_activity 
+WHERE usename = 'app_user'
+GROUP BY state;
+
+-- Expected during pool exhaustion with low CPU:
+--  active              │ 2    ← Only 2 actually running queries
+--  idle in transaction │ 8    ← 8 holding connections but NOT querying (THE PROBLEM)
+--  idle                │ 0    ← No idle connections (all borrowed)
+
+-- What are the idle-in-transaction connections doing?
+SELECT pid, now() - xact_start AS tx_duration, 
+       now() - query_start AS since_last_query, query
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+ORDER BY tx_duration DESC;
+
+-- If since_last_query >> tx_duration: connection is held but app is doing non-DB work
+-- (e.g., HTTP calls, computation, sleeping)</code></pre>
+
+        <h3>Step 3: Thread Dump Analysis</h3>
+        <pre><code class="language-bash"># Take thread dump
+jcmd $(pgrep java) Thread.print > /tmp/thread_dump.txt
+
+# Or via kill signal (dumps to stdout/logs)
+kill -3 $(pgrep java)
+
+# Key patterns to look for:
+
+# Pattern A: Threads waiting for connections (pool exhausted)
+grep -c "HikariPool.getConnection" /tmp/thread_dump.txt
+# If many threads here → confirmed: more demand than supply
+
+# Pattern B: Threads holding connections while in HTTP client
+grep -A5 "SocketInputStream.read" /tmp/thread_dump.txt
+# Shows threads waiting for HTTP responses — check if they're in @Transactional
+
+# Pattern C: Threads holding connections while waiting for locks
+grep -A5 "AbstractQueuedSynchronizer" /tmp/thread_dump.txt
+
+# Pattern D: REQUIRES_NEW deadlock
+# Threads waiting for connections AND they already hold one
+# Look for thread owning a connection AND blocked in HikariPool.getConnection</code></pre>
+
+        <h3>Step 4: Identify Hold Time Culprits</h3>
+        <pre><code class="language-java">// Temporary diagnostic: Add AOP to measure @Transactional hold time
+@Aspect
+@Component
+@Profile("debug")  // Only enable when debugging
+public class TransactionHoldTimeAspect {
+    
+    private static final Logger log = LoggerFactory.getLogger(TransactionHoldTimeAspect.class);
+    private final Timer holdTimer;
+    
+    public TransactionHoldTimeAspect(MeterRegistry registry) {
+        this.holdTimer = Timer.builder("transaction.hold.time")
+            .publishPercentiles(0.5, 0.95, 0.99)
+            .register(registry);
+    }
+    
+    @Around("@annotation(org.springframework.transaction.annotation.Transactional)")
+    public Object measureHoldTime(ProceedingJoinPoint pjp) throws Throwable {
+        long start = System.nanoTime();
+        try {
+            return pjp.proceed();
+        } finally {
+            long duration = System.nanoTime() - start;
+            long durationMs = TimeUnit.NANOSECONDS.toMillis(duration);
+            
+            holdTimer.record(duration, TimeUnit.NANOSECONDS);
+            
+            if (durationMs > 1000) {  // Log any transaction > 1 second
+                log.warn("Long transaction: {}ms in {}.{}()",
+                    durationMs,
+                    pjp.getSignature().getDeclaringType().getSimpleName(),
+                    pjp.getSignature().getName());
+            }
+        }
+    }
+}</code></pre>
+
+        <h3>Step 5: Verify Fix</h3>
+        <pre><code class="language-bash"># After applying fix, verify with load test:
+# Use hey, wrk, or k6 to generate realistic load
+
+# k6 load test script
+cat &lt;&lt;'EOF' > load_test.js
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '30s', target: 50 },   // Ramp to 50 users
+    { duration: '2m', target: 200 },    // Sustain 200 users
+    { duration: '30s', target: 0 },     // Ramp down
+  ],
+};
+
+export default function () {
+  const res = http.post('http://localhost:8080/api/payments', JSON.stringify({
+    accountId: Math.floor(Math.random() * 1000),
+    amount: 99.99,
+  }), { headers: { 'Content-Type': 'application/json' } });
+  
+  check(res, { 'status is 200': (r) => r.status === 200 });
+  sleep(0.1);
+}
+EOF
+
+k6 run load_test.js
+
+# Monitor during test:
+watch -n1 'curl -s http://localhost:8080/actuator/metrics/hikaricp.connections.active | jq ".measurements[0].value"'</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 10: Code Examples -->
+    <section id="code-examples">
+      <h2>Production Code Patterns</h2>
+
+      <details>
+        <summary>Proper pool configuration, separate pools, and connection-scoping patterns</summary>
+
+        <h3>Production-Ready HikariCP Configuration</h3>
+        <pre><code class="language-yaml"># application-production.yml
+spring:
+  datasource:
+    url: jdbc:postgresql://primary.db.internal:5432/payments
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    hikari:
+      pool-name: payment-primary
+      
+      # Pool sizing (4-core DB server, SSD)
+      maximum-pool-size: 10          # (4 cores * 2) + 1 spindle + 1 margin
+      minimum-idle: 5                # Maintain 5 idle connections for burst traffic
+      
+      # Timeouts
+      connection-timeout: 3000       # 3s — fail fast, don't queue for 30s
+      idle-timeout: 300000           # 5 minutes — release idle connections
+      max-lifetime: 1800000          # 30 minutes — recycle before DB/firewall timeout
+      keepalive-time: 60000          # 60s — validate idle connections periodically
+      validation-timeout: 2000       # 2s — max time to validate a connection
+      
+      # Leak detection
+      leak-detection-threshold: 10000  # 10s — alert if connection held longer
+      
+      # Performance
+      auto-commit: true              # Let Spring manage transactions explicitly
+      
+      # Connection properties
+      data-source-properties:
+        prepStmtCacheSize: 250
+        prepStmtCacheSqlLimit: 2048
+        useServerPrepStmts: true
+        cachePrepStmts: true</code></pre>
+
+        <h3>Separate Read/Write Connection Pools</h3>
+        <pre><code class="language-java">@Configuration
+public class DataSourceConfig {
+    
+    @Bean
+    @Primary
+    @ConfigurationProperties("spring.datasource.write")
+    public DataSource writeDataSource() {
+        HikariDataSource ds = new HikariDataSource();
+        ds.setPoolName("write-pool");
+        ds.setMaximumPoolSize(10);         // Small: writes need consistency
+        ds.setConnectionTimeout(3000);
+        ds.setLeakDetectionThreshold(5000);
+        return ds;
+    }
+    
+    @Bean
+    @ConfigurationProperties("spring.datasource.read")
+    public DataSource readDataSource() {
+        HikariDataSource ds = new HikariDataSource();
+        ds.setPoolName("read-pool");
+        ds.setMaximumPoolSize(20);          // Larger: reads are more frequent
+        ds.setConnectionTimeout(2000);
+        ds.setReadOnly(true);               // Connection-level read-only hint
+        ds.setLeakDetectionThreshold(10000);
+        return ds;
+    }
+    
+    @Bean
+    public DataSource routingDataSource(
+            @Qualifier("writeDataSource") DataSource writeDs,
+            @Qualifier("readDataSource") DataSource readDs) {
+        
+        var router = new AbstractRoutingDataSource() {
+            @Override
+            protected Object determineCurrentLookupKey() {
+                return TransactionSynchronizationManager.isCurrentTransactionReadOnly()
+                    ? "read" : "write";
+            }
+        };
+        
+        router.setTargetDataSources(Map.of("write", writeDs, "read", readDs));
+        router.setDefaultTargetDataSource(writeDs);
+        return router;
+    }
+}
+
+// Usage: Spring automatically routes based on @Transactional(readOnly)
+@Service
+public class OrderService {
+    
+    @Transactional(readOnly = true)  // Routes to read replica
+    public List&lt;Order&gt; getOrders(Long customerId) {
+        return orderRepository.findByCustomerId(customerId);
+    }
+    
+    @Transactional  // Routes to primary (write)
+    public Order createOrder(OrderRequest req) {
+        return orderRepository.save(new Order(req));
+    }
+}</code></pre>
+
+        <h3>Connection-Scoping Pattern: Minimize Hold Time</h3>
+        <pre><code class="language-java">// PATTERN: Separate read, process, write phases
+@Service
+public class OrderProcessingService {
+    
+    private final OrderRepository orderRepository;
+    private final InventoryClient inventoryClient;   // HTTP client
+    private final PaymentClient paymentClient;       // HTTP client
+    private final TransactionTemplate txTemplate;
+    
+    // Orchestration method — NO @Transactional
+    public OrderResult processOrder(OrderRequest request) {
+        
+        // Phase 1: READ (short connection borrow, auto-commit)
+        Order order = orderRepository.findById(request.getOrderId())
+            .orElseThrow(() -> new OrderNotFoundException(request.getOrderId()));
+        List&lt;OrderItem&gt; items = order.getItems();  // Eager loaded in query
+        
+        // Phase 2: EXTERNAL CALLS (no connection held!)
+        InventoryResult inventory = inventoryClient.reserve(items);  // 200ms
+        if (!inventory.isAvailable()) {
+            return OrderResult.outOfStock(inventory.getUnavailableItems());
+        }
+        
+        PaymentResult payment = paymentClient.charge(order.getTotal()); // 500ms
+        if (!payment.isSuccess()) {
+            inventoryClient.release(items);  // Compensate
+            return OrderResult.paymentFailed(payment.getReason());
+        }
+        
+        // Phase 3: WRITE (short transaction, ~5ms)
+        return txTemplate.execute(status -> {
+            order.setStatus(OrderStatus.CONFIRMED);
+            order.setPaymentId(payment.getTransactionId());
+            orderRepository.save(order);
+            
+            eventPublisher.publish(new OrderConfirmedEvent(order));
+            return OrderResult.success(order);
+        });
+        
+        // Total connection hold time: ~7ms (read 2ms + write 5ms)
+        // Total method time: ~707ms (dominated by HTTP calls)
+        // Connection utilization: 1% of method duration (99% improvement!)
+    }
+}</code></pre>
+
+        <h3>Programmatic Transaction Management for Complex Flows</h3>
+        <pre><code class="language-java">@Service
+public class BatchImportService {
+    
+    private final PlatformTransactionManager txManager;
+    private final JdbcTemplate jdbcTemplate;
+    
+    // Process 100K records without holding a connection for the entire batch
+    public ImportResult importRecords(List&lt;Record&gt; records) {
+        int success = 0;
+        int failed = 0;
+        
+        // Process in chunks of 500
+        for (List&lt;Record&gt; chunk : Lists.partition(records, 500)) {
+            TransactionTemplate tx = new TransactionTemplate(txManager);
+            tx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+            tx.setTimeout(10);  // 10 second timeout per chunk
+            
+            try {
+                Integer inserted = tx.execute(status -> {
+                    // Connection held only for this chunk (~50ms)
+                    return jdbcTemplate.batchUpdate(
+                        "INSERT INTO records (id, data, created_at) VALUES (?, ?, ?)",
+                        new BatchPreparedStatementSetter() {
+                            @Override
+                            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                                Record r = chunk.get(i);
+                                ps.setLong(1, r.getId());
+                                ps.setString(2, r.getData());
+                                ps.setTimestamp(3, Timestamp.from(Instant.now()));
+                            }
+                            @Override
+                            public int getBatchSize() { return chunk.size(); }
+                        }
+                    ).length;
+                });
+                success += inserted;
+            } catch (Exception e) {
+                failed += chunk.size();
+                log.warn("Chunk failed: {}", e.getMessage());
+            }
+            // Connection returned after each chunk!
+        }
+        
+        return new ImportResult(success, failed);
+    }
+}</code></pre>
+
+        <h3>Circuit Breaker for Pool Protection</h3>
+        <pre><code class="language-java">// Prevent pool exhaustion from cascading to all endpoints
+@Configuration
+public class PoolProtectionConfig {
+    
+    @Bean
+    public Customizer&lt;Resilience4JCircuitBreakerFactory&gt; poolCircuitBreakerCustomizer() {
+        return factory -> factory.configureDefault(id -> 
+            new Resilience4JConfigBuilder(id)
+                .circuitBreakerConfig(CircuitBreakerConfig.custom()
+                    .slidingWindowType(SlidingWindowType.COUNT_BASED)
+                    .slidingWindowSize(20)
+                    .failureRateThreshold(50)
+                    .waitDurationInOpenState(Duration.ofSeconds(10))
+                    // Count connection timeouts as failures
+                    .recordExceptions(SQLTransientConnectionException.class)
+                    .build())
+                .timeLimiterConfig(TimeLimiterConfig.custom()
+                    .timeoutDuration(Duration.ofSeconds(3))
+                    .build())
+                .build()
+        );
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 11: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Table of mistakes, symptoms, and fixes</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Mistake</th>
+              <th>Symptom</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td><strong>@Transactional on controller methods</strong></td>
+              <td>Connection held for entire request including serialization, compression</td>
+              <td>Move @Transactional to service layer, keep transactions short</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td><strong>@Transactional wrapping HTTP calls</strong></td>
+              <td>Pool exhaustion under load; DB CPU is low</td>
+              <td>Restructure: read → call API → write (separate transactions)</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td><strong>Increasing pool size as first fix</strong></td>
+              <td>Temporarily helps, then same problem at slightly higher load</td>
+              <td>Find WHY connections are held long; fix hold time, not pool size</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td><strong>REQUIRES_NEW without pool math</strong></td>
+              <td>Intermittent deadlocks under moderate load</td>
+              <td>Use REQUIRED, or ensure poolSize ≥ threads × connections_per_request</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td><strong>No connectionTimeout configured</strong></td>
+              <td>Threads block for 30s (default) before failing — cascading timeouts</td>
+              <td>Set connectionTimeout=3000ms — fail fast</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td><strong>spring.jpa.open-in-view=true (default!)</strong></td>
+              <td>Connection held from request start to response end</td>
+              <td>Set open-in-view=false; use DTOs and eager fetching</td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td><strong>No leak detection threshold</strong></td>
+              <td>Slow leak goes undetected for days until production incident</td>
+              <td>Set leak-detection-threshold=10000 (10s) in all environments</td>
+            </tr>
+            <tr>
+              <td>8</td>
+              <td><strong>Same pool for OLTP and reporting queries</strong></td>
+              <td>One report query holds a connection for 30s, starves API traffic</td>
+              <td>Separate read/write pools; route reports to read replica</td>
+            </tr>
+            <tr>
+              <td>9</td>
+              <td><strong>Not accounting for rolling deployments</strong></td>
+              <td>During deploy, old + new pods exceed DB max_connections</td>
+              <td>poolSize × (maxPods + surge) ≤ DB max_connections - reserved</td>
+            </tr>
+            <tr>
+              <td>10</td>
+              <td><strong>Connection-test-query instead of JDBC4 isValid()</strong></td>
+              <td>Extra query on every borrow; doubles validation overhead</td>
+              <td>Remove connection-test-query; HikariCP uses isValid() by default</td>
+            </tr>
+            <tr>
+              <td>11</td>
+              <td><strong>maxLifetime &gt; DB/firewall idle timeout</strong></td>
+              <td>Borrowed connections are already dead (reset by firewall)</td>
+              <td>Set maxLifetime 2-3 minutes LESS than DB wait_timeout or firewall idle timeout</td>
+            </tr>
+            <tr>
+              <td>12</td>
+              <td><strong>Manual DataSource.getConnection() without try-with-resources</strong></td>
+              <td>Connection leaks on exception paths; gradual pool drain</td>
+              <td>Always use try-with-resources or let Spring/JPA manage connections</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 12: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs — Pool Sizing and Architecture</h2>
+
+      <details>
+        <summary>Pool size trade-offs and PgBouncer vs HikariCP</summary>
+
+        <h3>Pool Size Trade-offs</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Pool Size</th>
+              <th>Pros</th>
+              <th>Cons</th>
+              <th>When to Use</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Small (5-10)</strong></td>
+              <td>Low DB overhead, minimal lock contention, fast queries</td>
+              <td>Limited concurrency, queuing under burst</td>
+              <td>Default for most microservices; when hold time is low (&lt;10ms)</td>
+            </tr>
+            <tr>
+              <td><strong>Medium (15-25)</strong></td>
+              <td>Handles moderate burst, some headroom</td>
+              <td>More DB memory, slightly more contention</td>
+              <td>Services with occasional long transactions or mixed workloads</td>
+            </tr>
+            <tr>
+              <td><strong>Large (30-50+)</strong></td>
+              <td>Absorbs bursts without queuing</td>
+              <td>DB overload, context switching, diminishing returns</td>
+              <td>Only if hold time is unavoidably long AND DB can handle it</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>PgBouncer vs HikariCP — When You Need Both</h3>
+        <pre class="diagram">
+  Architecture: HikariCP + PgBouncer
+  ══════════════════════════════════════════════════════════════
+
+  Without PgBouncer:
+  ┌─────────┐     ┌─────────┐     ┌─────────┐
+  │ Pod 1   │     │ Pod 2   │     │ Pod 3   │
+  │ Pool=15 │     │ Pool=15 │     │ Pool=15 │
+  └────┬────┘     └────┬────┘     └────┬────┘
+       │               │               │
+       └───────────────┼───────────────┘
+                       │  45 persistent connections
+                       ▼
+              ┌─────────────────┐
+              │   PostgreSQL    │
+              │ max_conn = 100  │
+              │ (55 available)  │
+              └─────────────────┘
+
+  With PgBouncer (transaction pooling):
+  ┌─────────┐     ┌─────────┐     ┌─────────┐
+  │ Pod 1   │     │ Pod 2   │     │ Pod 3   │
+  │ Pool=15 │     │ Pool=15 │     │ Pool=15 │
+  └────┬────┘     └────┬────┘     └────┬────┘
+       │               │               │
+       └───────────────┼───────────────┘
+                       │  45 connections (multiplexed)
+                       ▼
+              ┌─────────────────┐
+              │    PgBouncer    │
+              │ default_pool=20 │
+              │ max_clients=200 │
+              └────────┬────────┘
+                       │  20 actual DB connections
+                       ▼
+              ┌─────────────────┐
+              │   PostgreSQL    │
+              │ max_conn = 30   │
+              │ (lighter load!) │
+              └─────────────────┘
+        </pre>
+
+        <h3>PgBouncer Transaction Pooling Mode</h3>
+        <pre><code class="language-bash"># pgbouncer.ini
+[databases]
+payments = host=primary.db.internal port=5432 dbname=payments
+
+[pgbouncer]
+pool_mode = transaction     # Key: connection returned after each transaction
+max_client_conn = 200       # Accept up to 200 connections from apps
+default_pool_size = 20      # But only keep 20 actual DB connections
+reserve_pool_size = 5       # Extra connections for burst
+reserve_pool_timeout = 3    # Wait 3s before using reserve
+
+# With transaction mode:
+# - App thinks it has a dedicated connection
+# - PgBouncer multiplexes: connection assigned only during transaction
+# - Between transactions, connection returns to PgBouncer pool
+# - 200 app connections → 20 DB connections (10x multiplexing!)
+
+# LIMITATION: Can't use session-level features:
+# - SET statements (per-session variables)
+# - PREPARE/DEALLOCATE (server-side prepared statements)
+# - LISTEN/NOTIFY
+# - Advisory locks
+# - Temp tables</code></pre>
+
+        <h3>When to Use PgBouncer vs HikariCP Alone</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Scenario</th>
+              <th>HikariCP Only</th>
+              <th>HikariCP + PgBouncer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Few pods (1-3), low connection count</td>
+              <td>✓ Simpler architecture</td>
+              <td>Overkill</td>
+            </tr>
+            <tr>
+              <td>Many pods (10+), high total connections</td>
+              <td>Hits max_connections</td>
+              <td>✓ Connection multiplexing</td>
+            </tr>
+            <tr>
+              <td>Short transactions (&lt;10ms)</td>
+              <td>✓ Fast enough</td>
+              <td>✓ Even better multiplexing ratio</td>
+            </tr>
+            <tr>
+              <td>Long transactions (&gt;1s)</td>
+              <td>Pool exhaustion risk</td>
+              <td>Limited benefit (conn held during tx anyway)</td>
+            </tr>
+            <tr>
+              <td>Serverless / Lambda</td>
+              <td>Cold start creates connections</td>
+              <td>✓ Essential — absorbs connection storms</td>
+            </tr>
+            <tr>
+              <td>Need prepared statements</td>
+              <td>✓ Full support</td>
+              <td>⚠️ Only in session mode (less multiplexing)</td>
+            </tr>
+            <tr>
+              <td>Multi-tenant (100+ schemas)</td>
+              <td>Need pool per tenant = explosion</td>
+              <td>✓ Single pool, route via SET search_path</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-info">
+          <p><strong>Key insight:</strong> PgBouncer helps with <em>total connection count</em> (how many connections hit the DB), while HikariCP helps with <em>connection lifecycle management</em> (how the app borrows/returns connections). They solve different problems and complement each other.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 13: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Likely follow-ups and how to answer</summary>
+        <dl>
+          <dt><strong>Q: "How do you decide the right pool size for a new service?"</strong></dt>
+          <dd>Start with the HikariCP formula: <code>(cores × 2) + spindles</code> for the database server. For most microservices with short transactions, 10 connections is plenty. Then validate: measure connection hold time under load. If P99 hold time is 5ms and you need 1000 req/s, you need at least 5 connections (1000 × 0.005). Add 50% headroom. Also account for: number of pods, rolling deployments, and DB max_connections. Formula: <code>poolPerPod ≤ (db_max_connections - reserved) / (maxPods + surgeCount)</code>.</dd>
+
+          <dt><strong>Q: "What happens when you set the pool size too large?"</strong></dt>
+          <dd>Counter-intuitively, throughput <em>decreases</em>. More concurrent queries on the database means more context switching, more lock contention (especially on shared buffers and WAL), higher cache miss rate, and longer individual query times. This increases hold time, which creates a negative feedback loop. The PostgreSQL wiki documents this — a benchmark showed 50 connections performing worse than 10 on a 4-core server.</dd>
+
+          <dt><strong>Q: "How does Spring Boot's @Transactional actually acquire a connection?"</strong></dt>
+          <dd>When a @Transactional method is entered, Spring's TransactionInterceptor calls the PlatformTransactionManager, which calls DataSource.getConnection(). This happens <em>before</em> the first line of your method executes. The connection is bound to the current thread via TransactionSynchronizationManager (ThreadLocal). It's released when the method returns (commit) or throws (rollback). Key point: the connection is borrowed at method <em>entry</em>, not at the first query.</dd>
+
+          <dt><strong>Q: "Can virtual threads (Project Loom) solve pool exhaustion?"</strong></dt>
+          <dd>Partially. Virtual threads solve <em>thread pool</em> exhaustion (you can have millions of virtual threads), but they don't solve <em>connection pool</em> exhaustion. If you have 10,000 virtual threads all needing a database connection, and your pool has 10 connections, 9,990 virtual threads will still wait. However, virtual threads make the wait non-blocking — they don't pin platform threads. The real fix is still reducing hold time. One caveat: synchronized blocks inside virtual threads can pin the carrier thread — use ReentrantLock instead.</dd>
+
+          <dt><strong>Q: "How do you handle pool exhaustion gracefully in production?"</strong></dt>
+          <dd>Three strategies: (1) <strong>Fail fast</strong> — set connectionTimeout to 3s so requests fail quickly rather than queuing for 30s, (2) <strong>Circuit breaker</strong> — after N timeouts, open the circuit and return a degraded response without even trying to get a connection, (3) <strong>Backpressure</strong> — use a semaphore or bulkhead to limit concurrent requests to the DB-dependent code path, shedding excess load at the API layer before it reaches the pool.</dd>
+
+          <dt><strong>Q: "What's the difference between connectionTimeout and socketTimeout?"</strong></dt>
+          <dd><code>connectionTimeout</code> is how long a thread waits to <em>borrow</em> a connection from the pool (HikariCP setting). <code>socketTimeout</code> is how long the JDBC driver waits for a response from the database after sending a query (JDBC/driver setting). Pool exhaustion causes connectionTimeout. A hung database query causes socketTimeout. Both should be configured: connectionTimeout=3s, socketTimeout=30s typically.</dd>
+
+          <dt><strong>Q: "You have a Spring Boot service with 200 Tomcat threads and a pool of 10. Is this a problem?"</strong></dt>
+          <dd>Not necessarily — it depends on hold time. If queries take 2ms, the pool can serve 5,000 req/s (10/0.002), which handles 200 concurrent threads easily. The ratio only becomes a problem when hold time increases: if each request holds a connection for 100ms, pool throughput drops to 100 req/s — only 100 Tomcat threads can be actively served, and the other 100 queue. The rule: <code>maxPoolSize / avgHoldTime ≥ expectedConcurrency</code>.</dd>
+
+          <dt><strong>Q: "How would you detect a connection leak that only happens in a specific error path?"</strong></dt>
+          <dd>Four approaches: (1) Enable leak-detection-threshold — HikariCP logs the stack trace of where the connection was borrowed, (2) Monitor <code>hikaricp_connections_active</code> over days — leaks show a monotonic increase pattern (staircase graph), (3) Check pg_stat_activity for growing 'idle in transaction' connections, (4) Use integration tests with a tiny pool (size=1) and timeout=1s — leaked connections make subsequent tests fail immediately, catching the leak in CI.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- Section 14: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Key Takeaways:</strong></p>
+        <ol>
+          <li><strong>Pool exhaustion ≠ database overload.</strong> Low DB CPU confirms connections are being <em>held</em> without doing work — look at what your application is doing between borrowing and returning the connection.</li>
+          <li><strong>Pool throughput = poolSize / avgHoldTime.</strong> A pool of 10 with 5ms hold time serves 2,000 req/s. The same pool with 2s hold time serves only 5 req/s. Fix hold time, not pool size.</li>
+          <li><strong>@Transactional grabs a connection at method entry.</strong> Any slow operation inside that method (HTTP calls, file I/O, computation) holds the connection idle. Restructure: read → external call → write.</li>
+          <li><strong>REQUIRES_NEW holds multiple connections per thread.</strong> With pool=10 and 2 connections per request, max safe concurrency is 5. Size your pool for the worst-case connections-per-request.</li>
+          <li><strong>Smaller pools are usually faster.</strong> The HikariCP formula is (cores×2)+spindles. More connections = more DB contention = slower queries = longer hold time = worse exhaustion.</li>
+          <li><strong>Set connectionTimeout low (3s).</strong> Fail fast. Don't let 200 Tomcat threads queue for 30 seconds — that's 200 threads doing nothing for 30s, cascading timeouts to callers.</li>
+          <li><strong>Always enable leak detection.</strong> Set leak-detection-threshold=10000. It costs nothing and catches leaks before they become P1 incidents.</li>
+          <li><strong>Thread dump is your best friend.</strong> Take a dump during exhaustion — it shows exactly where threads holding connections are stuck (HTTP client? lock? computation?).</li>
+          <li><strong>Monitor pending threads, not just active connections.</strong> Active=max is a symptom; pending>0 is the pain your users feel.</li>
+          <li><strong>Disable open-in-view.</strong> Spring Boot's <code>spring.jpa.open-in-view=true</code> (default!) holds a connection for the entire HTTP request lifecycle.</li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch03-api-fails-at-scale.html" class="chapter-nav-prev">← Chapter 3: REST API Fails at Scale</a>
+      <a href="ch05-kafka-exactly-once.html" class="chapter-nav-next">Chapter 5: Kafka Exactly-Once Delivery →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

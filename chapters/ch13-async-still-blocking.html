@@ -1,0 +1,2339 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 13: Async Methods Still Blocking | Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="../assets/css/prism.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 13</span>
+      <span class="chapter-title">Async Still Blocking</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#async-models">Async Programming Models</a></li>
+        <li><a href="#why-still-blocking">Why Still Blocking</a></li>
+        <li><a href="#spring-async-internals">Spring @Async Internals</a></li>
+        <li><a href="#thread-pool-config">Thread Pool Configuration</a></li>
+        <li><a href="#virtual-threads">Virtual Threads (Java 21)</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo; <a href="../index.html#part-iii">Part III — Production Engineering &amp; Debugging</a> &rsaquo; <span>Chapter 13</span>
+    </nav>
+
+    <header class="chapter-header">
+      <h1>Your Application Is Using Asynchronous Methods, but Requests Are Still Blocking. Why?</h1>
+      <div class="badges">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">@Async</span>
+        <span class="badge badge-topic">Virtual Threads</span>
+      </div>
+      <div class="search-container">
+        <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search this chapter">
+      </div>
+    </header>
+
+
+    <!-- ============================== SECTION 1 ============================== -->
+    <section id="interviewer-intent">
+      <h2>1. Interviewer Intent</h2>
+      <details>
+        <summary>What is the interviewer really assessing?</summary>
+        <p>When a senior engineer is asked this question at a FAANG-level interview, the interviewer is probing several dimensions simultaneously:</p>
+        <ul>
+          <li><strong>Proxy mechanics understanding:</strong> Does the candidate understand how Spring AOP proxies work, and why self-invocation bypasses @Async?</li>
+          <li><strong>Thread pool expertise:</strong> Can they reason about thread pool saturation, queue sizing, and rejection policies under load?</li>
+          <li><strong>Reactive vs. imperative awareness:</strong> Do they know the difference between non-blocking I/O and merely offloading work to another thread?</li>
+          <li><strong>Production debugging skills:</strong> Can they identify and resolve blocking issues in a live system under time pressure?</li>
+          <li><strong>Modern Java fluency:</strong> Are they current with Virtual Threads (Project Loom) and understand when reactive is still preferable?</li>
+          <li><strong>Systems thinking:</strong> Do they see the full request lifecycle — from Tomcat NIO connector through to downstream I/O?</li>
+        </ul>
+        <p>This question separates engineers who have merely <em>used</em> @Async from those who have <em>debugged production incidents</em> involving async processing at scale.</p>
+      </details>
+      <details>
+        <summary>Expected depth for a 12+ year senior engineer</summary>
+        <ul>
+          <li>Immediate identification of at least 4-5 root causes without prompting</li>
+          <li>Ability to whiteboard the proxy chain and executor selection process</li>
+          <li>Discussion of thread dump analysis and how to identify blocked async threads</li>
+          <li>Contrast between "async" (offloading to thread pool) and "non-blocking" (event loop)</li>
+          <li>Virtual Threads as a paradigm shift — when they help and when they don't</li>
+          <li>Real production war stories with concrete metrics and resolutions</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- ============================== SECTION 2 ============================== -->
+    <section id="quick-answer">
+      <h2>2. Quick Answer (60-Second Version)</h2>
+      <details>
+        <summary>Concise answer for time-pressured interviews</summary>
+        <p>An application using @Async can still block for these primary reasons:</p>
+        <ol>
+          <li><strong>Self-invocation:</strong> Calling an @Async method from within the same class bypasses the proxy — the method runs synchronously on the caller's thread.</li>
+          <li><strong>Missing @EnableAsync:</strong> Without this configuration annotation, Spring never registers the AsyncAnnotationBeanPostProcessor, so @Async is silently ignored.</li>
+          <li><strong>Thread pool exhaustion:</strong> When all threads in the async executor are busy and the queue is full, new tasks block or are rejected.</li>
+          <li><strong>Blocking calls inside async/reactive code:</strong> Using JDBC, Thread.sleep(), or synchronized blocks inside a reactive pipeline or on an event-loop thread blocks the entire pipeline.</li>
+          <li><strong>CompletableFuture.get() on the request thread:</strong> Calling .get() without a timeout blocks the HTTP thread waiting for the async result, negating all benefits.</li>
+          <li><strong>Default executor issues:</strong> SimpleAsyncTaskExecutor creates a new thread per invocation with no pooling, leading to unbounded thread creation under load.</li>
+        </ol>
+        <p><strong>Key insight:</strong> @Async does not make code non-blocking — it offloads execution to another thread. If that thread pool is saturated or the caller blocks waiting for the result, the request still appears to block from the client's perspective.</p>
+      </details>
+    </section>
+
+
+    <!-- ============================== SECTION 3 ============================== -->
+    <section id="async-models">
+      <h2>3. Async Programming Models in Java/Spring</h2>
+      <details>
+        <summary>Thread Pool Based (@Async, ExecutorService)</summary>
+        <p>The most traditional approach in Spring Boot applications. Work is submitted to a thread pool, freeing the caller thread to handle other requests.</p>
+        <pre><code class="language-java">// Traditional ExecutorService approach
+ExecutorService executor = Executors.newFixedThreadPool(10);
+Future&lt;String&gt; future = executor.submit(() -&gt; {
+    return callExternalService(); // Runs on pool thread
+});
+// Caller thread is free... unless you call future.get()
+
+// Spring @Async approach
+@Service
+public class NotificationService {
+
+    @Async("notificationExecutor")
+    public CompletableFuture&lt;NotificationResult&gt; sendNotification(User user) {
+        // Executes on the named executor's thread pool
+        NotificationResult result = emailGateway.send(user.getEmail(), buildTemplate(user));
+        return CompletableFuture.completedFuture(result);
+    }
+}</code></pre>
+        <p><strong>Characteristics:</strong></p>
+        <ul>
+          <li>Offloads work to a different thread — the original thread is freed</li>
+          <li>Bounded by thread pool size (core pool, max pool, queue capacity)</li>
+          <li>Each pool thread can still perform blocking I/O (JDBC, HTTP calls)</li>
+          <li>Does NOT achieve true non-blocking I/O — just thread offloading</li>
+          <li>Simple mental model, well-understood debugging (thread dumps work normally)</li>
+        </ul>
+      </details>
+      <details>
+        <summary>CompletableFuture Composition</summary>
+        <p>Java 8+ CompletableFuture enables composing async operations without blocking the calling thread:</p>
+        <pre><code class="language-java">@Service
+public class OrderService {
+
+    @Autowired private InventoryClient inventoryClient;
+    @Autowired private PricingClient pricingClient;
+    @Autowired private UserClient userClient;
+
+    public CompletableFuture&lt;OrderSummary&gt; buildOrderSummary(String orderId) {
+        CompletableFuture&lt;Inventory&gt; inventoryFuture =
+            CompletableFuture.supplyAsync(() -&gt; inventoryClient.check(orderId), asyncExecutor);
+
+        CompletableFuture&lt;Pricing&gt; pricingFuture =
+            CompletableFuture.supplyAsync(() -&gt; pricingClient.calculate(orderId), asyncExecutor);
+
+        CompletableFuture&lt;UserProfile&gt; userFuture =
+            CompletableFuture.supplyAsync(() -&gt; userClient.getProfile(orderId), asyncExecutor);
+
+        // Compose all three — no thread blocks waiting
+        return CompletableFuture.allOf(inventoryFuture, pricingFuture, userFuture)
+            .thenApply(ignored -&gt; new OrderSummary(
+                inventoryFuture.join(),
+                pricingFuture.join(),
+                userFuture.join()
+            ));
+    }
+}</code></pre>
+        <p><strong>Key pitfall:</strong> If you call <code>.get()</code> or <code>.join()</code> on the HTTP request thread, you convert the async pipeline back into a synchronous, blocking call.</p>
+      </details>
+      <details>
+        <summary>WebFlux / Project Reactor (Reactive Streams)</summary>
+        <p>Spring WebFlux uses an event-loop model with non-blocking I/O throughout the entire stack:</p>
+        <pre><code class="language-java">@RestController
+public class ReactiveOrderController {
+
+    @Autowired private ReactiveInventoryClient inventoryClient;
+    @Autowired private ReactivePricingClient pricingClient;
+
+    @GetMapping("/orders/{id}/summary")
+    public Mono&lt;OrderSummary&gt; getOrderSummary(@PathVariable String id) {
+        Mono&lt;Inventory&gt; inventory = inventoryClient.check(id);   // Non-blocking
+        Mono&lt;Pricing&gt; pricing = pricingClient.calculate(id);     // Non-blocking
+
+        return Mono.zip(inventory, pricing)
+            .map(tuple -&gt; new OrderSummary(tuple.getT1(), tuple.getT2()));
+    }
+}</code></pre>
+        <p><strong>Critical distinction:</strong> WebFlux is non-blocking at the I/O level. A single event-loop thread can handle thousands of concurrent requests because it never blocks waiting for network responses. However, introducing a single blocking call (JDBC, Thread.sleep, synchronized) on the event-loop thread will block ALL concurrent requests on that thread.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>@Async (Thread Pool)</th>
+              <th>WebFlux (Reactive)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Concurrency model</td>
+              <td>Thread-per-task</td>
+              <td>Event loop</td>
+            </tr>
+            <tr>
+              <td>Blocking I/O allowed?</td>
+              <td>Yes (on pool threads)</td>
+              <td>No — kills throughput</td>
+            </tr>
+            <tr>
+              <td>Thread count under load</td>
+              <td>Grows to max pool size</td>
+              <td>Fixed (CPU cores × 2)</td>
+            </tr>
+            <tr>
+              <td>Debugging</td>
+              <td>Standard thread dumps</td>
+              <td>Complex (assembly traces)</td>
+            </tr>
+            <tr>
+              <td>Backpressure</td>
+              <td>Queue + rejection policy</td>
+              <td>Built-in (Reactive Streams)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>Virtual Threads (Java 21+ / Project Loom)</summary>
+        <p>Virtual Threads fundamentally change the async landscape by making blocking cheap:</p>
+        <pre><code class="language-java">// Spring Boot 3.2+ with virtual threads enabled
+// application.yml:
+// spring.threads.virtual.enabled: true
+
+// Every HTTP request gets its own virtual thread
+// Blocking I/O is fine — the JVM unmounts the virtual thread from the carrier
+
+@RestController
+public class OrderController {
+
+    @GetMapping("/orders/{id}")
+    public OrderSummary getOrder(@PathVariable String id) {
+        // These look blocking but virtual threads make them cheap
+        Inventory inv = inventoryClient.check(id);        // Blocks virtual thread, not carrier
+        Pricing price = pricingClient.calculate(id);      // Same — carrier is released
+        return new OrderSummary(inv, price);
+    }
+}</code></pre>
+        <p><strong>Why this matters:</strong> Virtual Threads allow you to write straightforward synchronous-looking code while achieving the throughput of asynchronous systems. The JVM handles the multiplexing — when a virtual thread blocks on I/O, its carrier (platform) thread is released to run other virtual threads.</p>
+        <ul>
+          <li>Millions of virtual threads can exist simultaneously</li>
+          <li>Blocking I/O automatically yields the carrier thread</li>
+          <li>No need for reactive APIs or callback chains</li>
+          <li>Standard debugging tools work (stack traces are preserved)</li>
+          <li><strong>Caveat:</strong> synchronized blocks and native methods can "pin" the virtual thread to its carrier</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Comparison Matrix: When to Use Each Model</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Scenario</th>
+              <th>Recommended Model</th>
+              <th>Rationale</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Fire-and-forget tasks (email, logging)</td>
+              <td>@Async with bounded pool</td>
+              <td>Simple, well-understood, no result needed</td>
+            </tr>
+            <tr>
+              <td>Fan-out to multiple services</td>
+              <td>CompletableFuture or Virtual Threads</td>
+              <td>Parallel execution with result composition</td>
+            </tr>
+            <tr>
+              <td>High-concurrency streaming (WebSocket, SSE)</td>
+              <td>WebFlux / Reactor</td>
+              <td>Backpressure needed, event-driven nature</td>
+            </tr>
+            <tr>
+              <td>Traditional CRUD with high throughput</td>
+              <td>Virtual Threads (Java 21+)</td>
+              <td>Simple code, blocking JDBC is fine</td>
+            </tr>
+            <tr>
+              <td>Legacy migration (Java 8-17)</td>
+              <td>@Async + ThreadPoolTaskExecutor</td>
+              <td>Pragmatic, incremental improvement</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+
+    <!-- ============================== SECTION 4 ============================== -->
+    <section id="why-still-blocking">
+      <h2>4. Why Async Methods Still Block — Root Causes</h2>
+      <details>
+        <summary>4.1 @Async Self-Invocation (Proxy Bypass)</summary>
+        <p>The most common and insidious cause. When a method within the same class calls an @Async method, the call bypasses the Spring proxy — exactly the same issue as @Transactional self-invocation.</p>
+        <pre><code class="language-java">@Service
+public class ReportService {
+
+    // THIS WILL NOT RUN ASYNCHRONOUSLY!
+    public void generateFullReport(String reportId) {
+        // Self-invocation — bypasses the proxy
+        generatePdfAsync(reportId);  // Runs synchronously on caller's thread!
+    }
+
+    @Async("reportExecutor")
+    public void generatePdfAsync(String reportId) {
+        // Intended to run on async thread, but won't if called internally
+        pdfEngine.generate(reportId);  // Takes 30 seconds
+    }
+}</code></pre>
+        <p><strong>Why this happens:</strong></p>
+        <pre><code class="language-java">// What Spring actually creates:
+// ReportService$$SpringCGLIB$$Proxy extends ReportService
+//
+// External call path (WORKS):
+//   caller → proxy.generatePdfAsync() → interceptor → executor.submit() → target.generatePdfAsync()
+//
+// Self-invocation path (BROKEN):
+//   caller → proxy.generateFullReport() → target.generateFullReport() → target.generatePdfAsync()
+//                                                                         ↑ Direct call, no proxy!</code></pre>
+        <p><strong>Solutions:</strong></p>
+        <pre><code class="language-java">// Solution 1: Inject self reference
+@Service
+public class ReportService {
+    @Lazy @Autowired private ReportService self;
+
+    public void generateFullReport(String reportId) {
+        self.generatePdfAsync(reportId);  // Goes through proxy!
+    }
+
+    @Async("reportExecutor")
+    public void generatePdfAsync(String reportId) {
+        pdfEngine.generate(reportId);
+    }
+}
+
+// Solution 2: Extract to separate service
+@Service
+public class ReportOrchestrator {
+    @Autowired private AsyncReportGenerator generator;
+
+    public void generateFullReport(String reportId) {
+        generator.generatePdfAsync(reportId);  // Different bean = goes through proxy
+    }
+}
+
+@Service
+public class AsyncReportGenerator {
+    @Async("reportExecutor")
+    public void generatePdfAsync(String reportId) {
+        pdfEngine.generate(reportId);
+    }
+}
+
+// Solution 3: Use AopContext (requires exposeProxy=true)
+@EnableAspectJAutoProxy(exposeProxy = true)
+@Configuration
+public class AopConfig {}
+
+@Service
+public class ReportService {
+    public void generateFullReport(String reportId) {
+        ((ReportService) AopContext.currentProxy()).generatePdfAsync(reportId);
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>4.2 Missing @EnableAsync Configuration</summary>
+        <p>Without @EnableAsync, Spring never registers the <code>AsyncAnnotationBeanPostProcessor</code>. The @Async annotation is completely ignored — no warnings, no errors, just synchronous execution.</p>
+        <pre><code class="language-java">// BROKEN — @Async annotations are silently ignored
+@SpringBootApplication
+public class MyApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(MyApplication.class, args);
+    }
+}
+
+// FIXED — @EnableAsync activates async processing
+@SpringBootApplication
+@EnableAsync
+public class MyApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(MyApplication.class, args);
+    }
+}</code></pre>
+        <p><strong>Detection:</strong> Add a log statement in your @Async method that prints <code>Thread.currentThread().getName()</code>. If it prints the HTTP thread name (e.g., <code>http-nio-8080-exec-1</code>), @Async is not active.</p>
+        <pre><code class="language-java">@Async
+public void processOrder(Order order) {
+    log.info("Running on thread: {}", Thread.currentThread().getName());
+    // If output is "http-nio-8080-exec-3" instead of "async-executor-1"
+    // then @EnableAsync is missing!
+}</code></pre>
+        <p><strong>Spring Boot auto-configuration note:</strong> Spring Boot's <code>TaskExecutionAutoConfiguration</code> creates an executor bean, but it does NOT enable @Async processing. You must explicitly add @EnableAsync.</p>
+      </details>
+      <details>
+        <summary>4.3 Thread Pool Exhaustion</summary>
+        <p>When all threads in the async executor's pool are busy and the work queue is full, new async task submissions will either block or be rejected depending on the rejection policy.</p>
+        <pre><code class="language-java">@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+    @Bean("emailExecutor")
+    public ThreadPoolTaskExecutor emailExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(25);   // Only 25 tasks can wait
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setThreadNamePrefix("email-async-");
+        executor.initialize();
+        return executor;
+    }
+}</code></pre>
+        <p><strong>Scenario leading to blocking:</strong></p>
+        <ol>
+          <li>10 email tasks are running (max pool reached)</li>
+          <li>25 tasks are queued (queue full)</li>
+          <li>Task #36 arrives → <code>CallerRunsPolicy</code> executes it on the caller's thread (HTTP thread)</li>
+          <li>The HTTP thread is now blocked sending an email!</li>
+        </ol>
+        <pre><code class="language-java">// Monitoring thread pool saturation
+@Scheduled(fixedRate = 5000)
+public void monitorAsyncPool() {
+    ThreadPoolTaskExecutor executor = (ThreadPoolTaskExecutor) asyncExecutor;
+    log.info("Async Pool Status - Active: {}, Pool Size: {}, Queue Size: {}, Completed: {}",
+        executor.getActiveCount(),
+        executor.getPoolSize(),
+        executor.getThreadPoolExecutor().getQueue().size(),
+        executor.getThreadPoolExecutor().getCompletedTaskCount());
+
+    double utilization = (double) executor.getActiveCount() / executor.getMaxPoolSize();
+    if (utilization > 0.8) {
+        log.warn("Async thread pool utilization at {}% - risk of saturation!", 
+            (int)(utilization * 100));
+    }
+}</code></pre>
+        <p><strong>Rejection policies and their blocking behavior:</strong></p>
+        <table>
+          <thead>
+            <tr>
+              <th>Policy</th>
+              <th>Behavior When Pool + Queue Full</th>
+              <th>Blocks Caller?</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>AbortPolicy (default)</td>
+              <td>Throws RejectedExecutionException</td>
+              <td>No (fails fast)</td>
+            </tr>
+            <tr>
+              <td>CallerRunsPolicy</td>
+              <td>Executes on caller's thread</td>
+              <td><strong>YES — blocks HTTP thread</strong></td>
+            </tr>
+            <tr>
+              <td>DiscardPolicy</td>
+              <td>Silently drops the task</td>
+              <td>No (data loss risk)</td>
+            </tr>
+            <tr>
+              <td>DiscardOldestPolicy</td>
+              <td>Drops oldest queued task, retries</td>
+              <td>No (data loss risk)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>4.4 Blocking Calls Inside Reactive Chain (JDBC in WebFlux)</summary>
+        <p>The deadliest anti-pattern in reactive programming: performing blocking I/O on an event-loop thread. Since WebFlux uses a small, fixed-size thread pool (typically CPU cores × 2), blocking one thread blocks a significant percentage of your application's capacity.</p>
+        <pre><code class="language-java">// DEADLY — Blocking JDBC call on reactor-http-nio thread
+@GetMapping("/users/{id}")
+public Mono&lt;User&gt; getUser(@PathVariable Long id) {
+    return Mono.fromCallable(() -&gt; {
+        // This blocks the event-loop thread!
+        return jdbcTemplate.queryForObject(
+            "SELECT * FROM users WHERE id = ?", userRowMapper, id);
+    });
+    // Without subscribeOn(Schedulers.boundedElastic()), this runs on the event-loop!
+}
+
+// CORRECT — Offload blocking call to bounded elastic scheduler
+@GetMapping("/users/{id}")
+public Mono&lt;User&gt; getUser(@PathVariable Long id) {
+    return Mono.fromCallable(() -&gt; {
+        return jdbcTemplate.queryForObject(
+            "SELECT * FROM users WHERE id = ?", userRowMapper, id);
+    }).subscribeOn(Schedulers.boundedElastic());  // Runs on a separate thread pool
+}
+
+// BEST — Use reactive database driver (R2DBC)
+@GetMapping("/users/{id}")
+public Mono&lt;User&gt; getUser(@PathVariable Long id) {
+    return r2dbcTemplate.selectOne(
+        query(where("id").is(id)), User.class);  // Truly non-blocking
+}</code></pre>
+        <p><strong>How to detect blocking calls in reactive chains:</strong></p>
+        <pre><code class="language-java">// Enable Reactor's BlockHound in tests
+// build.gradle: testImplementation 'io.projectreactor.tools:blockhound:1.0.8.RELEASE'
+@BeforeAll
+static void setupBlockHound() {
+    BlockHound.install();
+    // Will throw an exception if any blocking call is detected on a non-blocking thread
+}
+
+// Reactor debug mode — shows where the blocking subscription originated
+Hooks.onOperatorDebug();  // Expensive — use only in development</code></pre>
+        <p><strong>Common blocking operations that sneak into reactive chains:</strong></p>
+        <ul>
+          <li><code>Thread.sleep()</code></li>
+          <li>JDBC calls (Connection.prepareStatement, ResultSet.next)</li>
+          <li><code>synchronized</code> blocks</li>
+          <li><code>ReentrantLock.lock()</code></li>
+          <li><code>InputStream.read()</code> / <code>OutputStream.write()</code></li>
+          <li><code>InetAddress.getByName()</code> (DNS lookup)</li>
+          <li>Logging frameworks writing to disk (Log4j2 without async appender)</li>
+        </ul>
+      </details>
+      <details>
+        <summary>4.5 CompletableFuture.get() Called on Request Thread</summary>
+        <p>The async work happens on a pool thread, but if the HTTP request thread calls <code>.get()</code> to retrieve the result, it blocks waiting — effectively converting async back to sync.</p>
+        <pre><code class="language-java">// BROKEN — .get() blocks the HTTP thread
+@GetMapping("/report/{id}")
+public ResponseEntity&lt;Report&gt; getReport(@PathVariable String id) {
+    CompletableFuture&lt;Report&gt; future = reportService.generateAsync(id);
+    try {
+        Report report = future.get();  // BLOCKS HTTP THREAD!
+        return ResponseEntity.ok(report);
+    } catch (InterruptedException | ExecutionException e) {
+        return ResponseEntity.status(500).build();
+    }
+}
+
+// BETTER — Use DeferredResult for async HTTP response
+@GetMapping("/report/{id}")
+public DeferredResult&lt;ResponseEntity&lt;Report&gt;&gt; getReport(@PathVariable String id) {
+    DeferredResult&lt;ResponseEntity&lt;Report&gt;&gt; deferredResult = new DeferredResult&lt;&gt;(30000L);
+
+    reportService.generateAsync(id).thenAccept(report -&gt; {
+        deferredResult.setResult(ResponseEntity.ok(report));
+    }).exceptionally(ex -&gt; {
+        deferredResult.setErrorResult(ResponseEntity.status(500).build());
+        return null;
+    });
+
+    return deferredResult;  // HTTP thread released immediately
+}
+
+// BEST (Spring MVC) — Return CompletableFuture directly
+@GetMapping("/report/{id}")
+public CompletableFuture&lt;ResponseEntity&lt;Report&gt;&gt; getReport(@PathVariable String id) {
+    return reportService.generateAsync(id)
+        .thenApply(ResponseEntity::ok)
+        .exceptionally(ex -&gt; ResponseEntity.status(500).build());
+    // Spring MVC handles the async completion automatically
+}</code></pre>
+        <p><strong>Thread timeline comparison:</strong></p>
+        <pre><code class="language-bash"># Blocking pattern (.get())
+HTTP-thread-1:  |---receive-request---|---BLOCKED waiting for future.get()---|---send-response---|
+Async-thread-1: |                     |---doing actual work-------------------|
+
+# Non-blocking pattern (DeferredResult)
+HTTP-thread-1:  |---receive-request---|---FREE for other requests---...
+Async-thread-1: |                     |---doing actual work---|---setResult()---|
+HTTP-thread-1:  |...                                          |---send-response---|</code></pre>
+      </details>
+      <details>
+        <summary>4.6 @Async Returns void but Caller Waits for Result</summary>
+        <p>When @Async returns void, there's no Future to await. But developers sometimes work around this by adding external synchronization, reintroducing blocking:</p>
+        <pre><code class="language-java">// Anti-pattern: External synchronization defeats @Async
+@Service
+public class ProcessingService {
+
+    @Async
+    public void processLargeFile(String fileId) {
+        // Long-running processing...
+        fileProcessor.process(fileId);
+        statusStore.markComplete(fileId);
+    }
+}
+
+@RestController
+public class FileController {
+
+    @PostMapping("/process/{fileId}")
+    public ResponseEntity&lt;String&gt; processFile(@PathVariable String fileId) {
+        processingService.processLargeFile(fileId);
+
+        // ANTI-PATTERN: Polling/waiting for the void async to complete
+        while (!statusStore.isComplete(fileId)) {
+            Thread.sleep(100);  // BLOCKS HTTP THREAD!
+        }
+        return ResponseEntity.ok("Done");
+    }
+}
+
+// CORRECT: Return Future and let the client poll or use WebSocket
+@Service
+public class ProcessingService {
+
+    @Async("fileProcessorExecutor")
+    public CompletableFuture&lt;ProcessingResult&gt; processLargeFile(String fileId) {
+        ProcessingResult result = fileProcessor.process(fileId);
+        return CompletableFuture.completedFuture(result);
+    }
+}
+
+@RestController
+public class FileController {
+
+    @PostMapping("/process/{fileId}")
+    public ResponseEntity&lt;String&gt; submitProcessing(@PathVariable String fileId) {
+        processingService.processLargeFile(fileId);  // Fire and forget
+        return ResponseEntity.accepted()
+            .header("Location", "/process/" + fileId + "/status")
+            .build();
+    }
+
+    @GetMapping("/process/{fileId}/status")
+    public ResponseEntity&lt;ProcessingStatus&gt; getStatus(@PathVariable String fileId) {
+        return ResponseEntity.ok(statusStore.getStatus(fileId));
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>4.7 Default SimpleAsyncTaskExecutor — No Pooling</summary>
+        <p>When no custom executor is defined, Spring falls back to <code>SimpleAsyncTaskExecutor</code>, which creates a <strong>new thread for every invocation</strong> without any pooling or reuse:</p>
+        <pre><code class="language-java">// Spring's default behavior when no Executor bean is defined:
+public class SimpleAsyncTaskExecutor implements AsyncTaskExecutor {
+    @Override
+    public void execute(Runnable task) {
+        // Creates a NEW thread every single time!
+        Thread t = new Thread(task, getThreadNamePrefix() + this.threadCount.incrementAndGet());
+        t.start();
+    }
+    // No pool, no queue, no upper bound (unless concurrencyLimit is set)
+}</code></pre>
+        <p><strong>Under high load, this means:</strong></p>
+        <ul>
+          <li>1000 concurrent async calls = 1000 OS threads created</li>
+          <li>Each thread consumes ~1MB of stack memory by default</li>
+          <li>Thread creation/destruction overhead dominates execution time</li>
+          <li>OS-level thread limits may be hit (<code>unable to create native thread</code>)</li>
+          <li>Context switching overhead degrades performance for ALL threads</li>
+        </ul>
+        <p><strong>Why this appears as "blocking":</strong> The system becomes so overloaded with threads that all requests slow to a crawl. The OS scheduler cannot efficiently context-switch thousands of threads, causing every request to appear blocked.</p>
+        <pre><code class="language-bash"># Symptoms in production
+$ jstack &lt;pid&gt; | grep "SimpleAsyncTaskExecutor" | wc -l
+4847
+
+$ cat /proc/&lt;pid&gt;/status | grep Threads
+Threads: 5012
+
+# OOM kill follows shortly
+$ dmesg | grep -i "out of memory"
+[423156.789] Out of memory: Killed process 12345 (java) total-vm:8234512kB</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================== SECTION 5 ============================== -->
+    <section id="spring-async-internals">
+      <h2>5. Spring @Async Internals</h2>
+      <details>
+        <summary>AsyncAnnotationBeanPostProcessor — Registration</summary>
+        <p>When <code>@EnableAsync</code> is present, Spring registers <code>AsyncAnnotationBeanPostProcessor</code> which scans beans for @Async annotations and wraps them with an intercepting proxy:</p>
+        <pre><code class="language-java">// Simplified internal flow:
+// 1. @EnableAsync imports AsyncConfigurationSelector
+// 2. AsyncConfigurationSelector imports ProxyAsyncConfiguration
+// 3. ProxyAsyncConfiguration creates AsyncAnnotationBeanPostProcessor bean
+// 4. BeanPostProcessor wraps @Async-annotated beans with AOP proxy
+
+// Key class: AsyncAnnotationBeanPostProcessor
+public class AsyncAnnotationBeanPostProcessor extends AbstractBeanFactoryAwareAdvisingPostProcessor {
+
+    @Override
+    public void setBeanFactory(BeanFactory beanFactory) {
+        super.setBeanFactory(beanFactory);
+        // Creates an advisor with AsyncAnnotationAdvisor
+        this.advisor = new AsyncAnnotationAdvisor(this.executor, this.exceptionHandler);
+    }
+}
+
+// The advisor contains:
+// - Pointcut: matches methods annotated with @Async
+// - Advice: AsyncExecutionInterceptor (wraps method call in executor.submit())</code></pre>
+      </details>
+      <details>
+        <summary>Proxy Creation and Method Interception</summary>
+        <p>The async proxy intercepts method calls and submits them to an executor:</p>
+        <pre><code class="language-java">// Simplified AsyncExecutionInterceptor logic:
+public class AsyncExecutionInterceptor implements MethodInterceptor {
+
+    @Override
+    public Object invoke(MethodInvocation invocation) throws Throwable {
+        // 1. Determine which executor to use
+        AsyncTaskExecutor executor = determineAsyncExecutor(invocation.getMethod());
+
+        // 2. Wrap the method call as a Callable
+        Callable&lt;Object&gt; task = () -&gt; {
+            try {
+                Object result = invocation.proceed();  // Actual method execution
+                if (result instanceof Future) {
+                    return ((Future&lt;?&gt;) result).get();
+                }
+            } catch (ExecutionException ex) {
+                handleError(ex.getCause(), invocation.getMethod(), invocation.getArguments());
+            } catch (Throwable ex) {
+                handleError(ex, invocation.getMethod(), invocation.getArguments());
+            }
+            return null;
+        };
+
+        // 3. Submit to executor — returns immediately to caller
+        return doSubmit(task, executor, invocation.getMethod().getReturnType());
+    }
+
+    // Return type handling:
+    // - void: executor.submit(task), return null
+    // - Future/CompletableFuture: executor.submit(task), return the Future
+    // - ListenableFuture: wrap in ListenableFutureTask
+}</code></pre>
+      </details>
+      <details>
+        <summary>Executor Selection Strategy</summary>
+        <p>Spring uses a specific strategy to determine which executor runs the async method:</p>
+        <pre><code class="language-java">// Executor resolution order:
+// 1. Qualifier specified in @Async("executorBeanName")
+// 2. Executor configured via AsyncConfigurer.getAsyncExecutor()
+// 3. Bean of type TaskExecutor in the context (if exactly one)
+// 4. Bean named "taskExecutor" of type Executor
+// 5. Fallback: SimpleAsyncTaskExecutor (no pooling!)
+
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+
+    @Override
+    public Executor getAsyncExecutor() {
+        // This becomes the default for all @Async without qualifier
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("default-async-");
+        executor.initialize();
+        return executor;
+    }
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (throwable, method, params) -&gt; {
+            log.error("Uncaught async exception in {}.{}(): {}",
+                method.getDeclaringClass().getSimpleName(),
+                method.getName(),
+                throwable.getMessage(), throwable);
+        };
+    }
+}
+
+// Named executors for different workloads
+@Configuration
+public class ExecutorConfig {
+
+    @Bean("emailExecutor")
+    public ThreadPoolTaskExecutor emailExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);
+        executor.setMaxPoolSize(20);
+        executor.setQueueCapacity(50);
+        executor.setThreadNamePrefix("email-");
+        return executor;
+    }
+
+    @Bean("reportExecutor")
+    public ThreadPoolTaskExecutor reportExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(2);
+        executor.setMaxPoolSize(5);
+        executor.setQueueCapacity(10);
+        executor.setThreadNamePrefix("report-");
+        return executor;
+    }
+}
+
+// Usage with qualifier
+@Async("emailExecutor")
+public void sendEmail(String to, String body) { ... }
+
+@Async("reportExecutor")
+public CompletableFuture&lt;Report&gt; generateReport(ReportRequest req) { ... }</code></pre>
+      </details>
+      <details>
+        <summary>Exception Handling in @Async Methods</summary>
+        <p>Error handling differs based on return type:</p>
+        <pre><code class="language-java">// Void return type — exceptions are lost without custom handler!
+@Async
+public void processEvent(Event event) {
+    throw new RuntimeException("Processing failed");
+    // Without AsyncUncaughtExceptionHandler, this exception is SWALLOWED
+}
+
+// Future return type — exception is captured in the Future
+@Async
+public CompletableFuture&lt;Result&gt; processEvent(Event event) {
+    throw new RuntimeException("Processing failed");
+    // Caller can catch via future.exceptionally() or future.get() throws ExecutionException
+}
+
+// Custom exception handler
+@Component
+public class GlobalAsyncExceptionHandler implements AsyncUncaughtExceptionHandler {
+    @Override
+    public void handleUncaughtException(Throwable ex, Method method, Object... params) {
+        log.error("Async exception in {}: {}", method.getName(), ex.getMessage());
+        metricsService.incrementCounter("async.errors", 
+            Tags.of("method", method.getName(), "exception", ex.getClass().getSimpleName()));
+        alertService.sendAlert("Async method failed: " + method.getName());
+    }
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================== SECTION 6 ============================== -->
+    <section id="thread-pool-config">
+      <h2>6. Proper Thread Pool Configuration</h2>
+      <details>
+        <summary>ThreadPoolTaskExecutor — Core Parameters</summary>
+        <pre><code class="language-java">@Bean("orderProcessingExecutor")
+public ThreadPoolTaskExecutor orderProcessingExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+
+    // Core pool: threads kept alive even when idle
+    executor.setCorePoolSize(10);
+
+    // Max pool: upper limit under load (only used when queue is FULL)
+    executor.setMaxPoolSize(50);
+
+    // Queue: tasks waiting when all core threads are busy
+    // WARNING: Max pool threads are only created AFTER queue is full!
+    executor.setQueueCapacity(100);
+
+    // Keep-alive: how long excess threads (above core) survive idle
+    executor.setKeepAliveSeconds(60);
+
+    // Allow core threads to timeout (scale down to zero under no load)
+    executor.setAllowCoreThreadTimeOut(true);
+
+    // Thread naming for debugging
+    executor.setThreadNamePrefix("order-proc-");
+
+    // Rejection policy when both pool and queue are saturated
+    executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+
+    // Wait for tasks to complete on shutdown
+    executor.setWaitForTasksToCompleteOnShutdown(true);
+    executor.setAwaitTerminationSeconds(30);
+
+    executor.initialize();
+    return executor;
+}</code></pre>
+        <p><strong>Critical insight about queue behavior:</strong> Java's ThreadPoolExecutor creates new threads (up to maxPoolSize) only when the queue is FULL. This means with an unbounded queue (LinkedBlockingQueue default), maxPoolSize is never reached!</p>
+        <pre><code class="language-java">// Common misconception:
+// corePoolSize=10, maxPoolSize=50, queueCapacity=Integer.MAX_VALUE
+// Under load: core threads busy → tasks go to queue → queue never fills → max threads NEVER created!
+
+// Correct sizing for responsive scaling:
+// corePoolSize=10, maxPoolSize=50, queueCapacity=25
+// Under load: core threads busy → 25 tasks queue → queue full → new threads created up to 50</code></pre>
+      </details>
+      <details>
+        <summary>Sizing Guidelines</summary>
+        <p>Thread pool sizing depends on the nature of the work:</p>
+        <pre><code class="language-java">// CPU-bound tasks (computation, serialization, encryption)
+int cpuBoundPoolSize = Runtime.getRuntime().availableProcessors() + 1;
+
+// I/O-bound tasks (HTTP calls, database queries, file I/O)
+// Formula: threads = numCPUs * targetUtilization * (1 + waitTime/computeTime)
+// Example: 8 CPUs, 90% target, wait/compute ratio of 10:1
+int ioBoundPoolSize = (int)(8 * 0.9 * (1 + 10));  // = 79 threads
+
+// Mixed workload — separate pools for CPU and I/O work
+@Bean("cpuExecutor")
+public ThreadPoolTaskExecutor cpuExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(Runtime.getRuntime().availableProcessors());
+    executor.setMaxPoolSize(Runtime.getRuntime().availableProcessors());
+    executor.setQueueCapacity(50);
+    executor.setThreadNamePrefix("cpu-");
+    return executor;
+}
+
+@Bean("ioExecutor")
+public ThreadPoolTaskExecutor ioExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(20);
+    executor.setMaxPoolSize(100);
+    executor.setQueueCapacity(200);
+    executor.setThreadNamePrefix("io-");
+    return executor;
+}</code></pre>
+        <table>
+          <thead>
+            <tr>
+              <th>Workload Type</th>
+              <th>Core Pool</th>
+              <th>Max Pool</th>
+              <th>Queue</th>
+              <th>Rationale</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>CPU-bound</td>
+              <td>N (cores)</td>
+              <td>N</td>
+              <td>Short (N × 2)</td>
+              <td>More threads = more context switching, less throughput</td>
+            </tr>
+            <tr>
+              <td>I/O-bound (fast calls)</td>
+              <td>N × 2</td>
+              <td>N × 10</td>
+              <td>Medium (100-500)</td>
+              <td>Threads mostly waiting on I/O, can handle more</td>
+            </tr>
+            <tr>
+              <td>I/O-bound (slow calls)</td>
+              <td>N × 5</td>
+              <td>N × 20</td>
+              <td>Small (25-50)</td>
+              <td>Small queue forces scaling to max quickly</td>
+            </tr>
+            <tr>
+              <td>Fire-and-forget (email)</td>
+              <td>5</td>
+              <td>20</td>
+              <td>Large (1000+)</td>
+              <td>Can tolerate latency, queue absorbs bursts</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>Rejection Policies in Practice</summary>
+        <pre><code class="language-java">// Custom rejection handler with metrics and circuit breaking
+public class MonitoredRejectionHandler implements RejectedExecutionHandler {
+
+    private final MeterRegistry meterRegistry;
+    private final String executorName;
+    private final AtomicInteger rejectionCount = new AtomicInteger(0);
+
+    @Override
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+        int count = rejectionCount.incrementAndGet();
+        meterRegistry.counter("async.rejected",
+            Tags.of("executor", executorName)).increment();
+
+        log.warn("Task rejected by {} (rejection #{}). Pool: {}/{}, Queue: {}/{}",
+            executorName, count,
+            executor.getActiveCount(), executor.getMaximumPoolSize(),
+            executor.getQueue().size(), executor.getQueue().remainingCapacity());
+
+        // Strategy: try a fallback executor or fail fast
+        if (executor.isShutdown()) {
+            throw new RejectedExecutionException("Executor shut down");
+        }
+
+        // Option A: Run on caller's thread (backpressure)
+        // r.run();
+
+        // Option B: Fail fast with clear error
+        throw new RejectedExecutionException(
+            String.format("Async executor '%s' saturated. Active: %d, Queue: %d",
+                executorName, executor.getActiveCount(), executor.getQueue().size()));
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Monitoring with Micrometer</summary>
+        <pre><code class="language-java">@Configuration
+public class ExecutorMetricsConfig {
+
+    @Bean("monitoredExecutor")
+    public ThreadPoolTaskExecutor monitoredExecutor(MeterRegistry registry) {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("monitored-");
+        executor.initialize();
+
+        // Register Micrometer metrics
+        ExecutorServiceMetrics.monitor(registry,
+            executor.getThreadPoolExecutor(), "async.order.executor");
+
+        return executor;
+    }
+}
+
+// application.yml — expose via actuator
+// management:
+//   endpoints:
+//     web:
+//       exposure:
+//         include: metrics,health,prometheus
+//   metrics:
+//     tags:
+//       application: order-service</code></pre>
+        <pre><code class="language-yaml"># Grafana alert rule for thread pool saturation
+# Alert when pool utilization exceeds 80% for 5 minutes
+groups:
+  - name: async-pool-alerts
+    rules:
+      - alert: AsyncPoolSaturation
+        expr: |
+          (executor_active_threads{name="async.order.executor"} /
+           executor_pool_max_threads{name="async.order.executor"}) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Async thread pool near saturation"
+          description: "Pool {{ $labels.name }} at {{ $value | humanizePercentage }} utilization"
+
+      - alert: AsyncQueueBacklog
+        expr: executor_queued_threads{name="async.order.executor"} > 80
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Async task queue growing rapidly"</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================== SECTION 7 ============================== -->
+    <section id="virtual-threads">
+      <h2>7. Virtual Threads (Java 21) — The Paradigm Shift</h2>
+      <details>
+        <summary>How Virtual Threads Solve the Blocking Problem</summary>
+        <p>Virtual Threads decouple the application thread from the OS thread. When a virtual thread blocks on I/O, the JVM unmounts it from the carrier (platform) thread, allowing the carrier to run other virtual threads. This makes blocking <em>cheap</em>.</p>
+        <pre><code class="language-java">// Traditional: 200 platform threads = 200 concurrent requests max
+// Virtual Threads: 200 platform threads can serve 100,000+ concurrent requests
+
+// Spring Boot 3.2+ — enable virtual threads
+// application.yml:
+// spring:
+//   threads:
+//     virtual:
+//       enabled: true
+
+// What happens under the hood:
+// 1. Tomcat uses virtual threads for request handling
+// 2. When code blocks (JDBC, HTTP call), the virtual thread is unmounted
+// 3. The carrier thread picks up another virtual thread
+// 4. When I/O completes, virtual thread is scheduled back on a carrier
+
+// Memory comparison:
+// Platform thread: ~1MB stack (1000 threads = 1GB RAM)
+// Virtual thread:  ~1KB initially, grows as needed (1M threads = ~1GB RAM)</code></pre>
+        <pre><code class="language-java">// Manual virtual thread usage (Java 21+)
+try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    List&lt;Future&lt;OrderResult&gt;&gt; futures = orders.stream()
+        .map(order -&gt; executor.submit(() -&gt; processOrder(order)))
+        .toList();
+
+    // Each .get() blocks a virtual thread, NOT a platform thread
+    List&lt;OrderResult&gt; results = futures.stream()
+        .map(f -&gt; {
+            try { return f.get(); }
+            catch (Exception e) { throw new RuntimeException(e); }
+        })
+        .toList();
+}</code></pre>
+      </details>
+      <details>
+        <summary>Pinning — When Virtual Threads Lose Their Advantage</summary>
+        <p>"Pinning" occurs when a virtual thread cannot be unmounted from its carrier thread, typically due to <code>synchronized</code> blocks or native method frames:</p>
+        <pre><code class="language-java">// PROBLEM: synchronized pins the virtual thread to its carrier
+public class LegacyConnectionPool {
+    private final Object lock = new Object();
+
+    public Connection getConnection() {
+        synchronized (lock) {  // PINS the virtual thread!
+            // If this blocks waiting for a connection,
+            // the carrier thread is also blocked
+            return pool.borrowConnection();
+        }
+    }
+}
+
+// SOLUTION: Replace synchronized with ReentrantLock
+public class ModernConnectionPool {
+    private final ReentrantLock lock = new ReentrantLock();
+
+    public Connection getConnection() {
+        lock.lock();  // Virtual thread can unmount while waiting
+        try {
+            return pool.borrowConnection();
+        } finally {
+            lock.unlock();
+        }
+    }
+}</code></pre>
+        <p><strong>Detecting pinning at runtime:</strong></p>
+        <pre><code class="language-bash"># JVM flag to detect pinning events
+java -Djdk.tracePinnedThreads=full -jar app.jar
+
+# Output when pinning occurs:
+# Thread[#42,ForkJoinPool-1-worker-3,5,CarrierThreads]
+#     java.base/java.lang.VirtualThread$VThreadContinuation.onPinned(VirtualThread.java:180)
+#     java.base/java.lang.VirtualThread.parkOnCarrierThread(VirtualThread.java:650)
+#     ...
+#     com.example.LegacyConnectionPool.getConnection(LegacyConnectionPool.java:15) &lt;== monitors:1</code></pre>
+        <p><strong>Common sources of pinning in production:</strong></p>
+        <ul>
+          <li>Legacy JDBC drivers using <code>synchronized</code> internally (older MySQL Connector/J)</li>
+          <li><code>synchronized</code> blocks in third-party libraries</li>
+          <li>JNI/native method calls (file I/O via native methods on some JDKs)</li>
+          <li><code>Object.wait()</code> inside synchronized blocks</li>
+          <li>Class loading (ClassLoader uses synchronized internally)</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Structured Concurrency (JEP 453 — Preview)</summary>
+        <p>Structured concurrency ensures child tasks have a clear lifecycle tied to their parent scope, preventing thread leaks and orphaned operations:</p>
+        <pre><code class="language-java">// Java 21+ (Preview feature)
+// --enable-preview required
+
+import java.util.concurrent.StructuredTaskScope;
+
+public OrderSummary fetchOrderSummary(String orderId) throws Exception {
+    try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+        // Fork subtasks — each runs on its own virtual thread
+        Subtask&lt;Inventory&gt; inventory = scope.fork(() -&gt; inventoryService.check(orderId));
+        Subtask&lt;Pricing&gt; pricing = scope.fork(() -&gt; pricingService.calculate(orderId));
+        Subtask&lt;UserProfile&gt; user = scope.fork(() -&gt; userService.getProfile(orderId));
+
+        // Wait for all subtasks to complete (or first failure)
+        scope.join();              // Blocks the (virtual) thread — cheap!
+        scope.throwIfFailed();     // Propagate exception from any failed subtask
+
+        // All succeeded — compose result
+        return new OrderSummary(inventory.get(), pricing.get(), user.get());
+    }
+    // Scope ensures: if any task fails, others are cancelled
+    // No orphaned virtual threads possible
+}
+
+// ShutdownOnSuccess — return first successful result, cancel others
+public String fetchFromFastestMirror(String url) throws Exception {
+    try (var scope = new StructuredTaskScope.ShutdownOnSuccess&lt;String&gt;()) {
+        scope.fork(() -&gt; httpClient.get(mirror1 + url));
+        scope.fork(() -&gt; httpClient.get(mirror2 + url));
+        scope.fork(() -&gt; httpClient.get(mirror3 + url));
+
+        scope.join();
+        return scope.result();  // First successful result
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Virtual Threads + Spring Boot Configuration</summary>
+        <pre><code class="language-yaml"># application.yml — Spring Boot 3.2+
+spring:
+  threads:
+    virtual:
+      enabled: true   # Tomcat/Jetty uses virtual threads for request handling
+
+# This single property:
+# 1. Configures Tomcat to use virtual threads for HTTP request handling
+# 2. Configures @Async to use virtual thread executor
+# 3. Configures @Scheduled to use virtual threads
+# 4. Configures Spring MVC async support with virtual threads</code></pre>
+        <pre><code class="language-java">// Custom virtual thread executor for @Async (if you need fine-grained control)
+@Configuration
+@EnableAsync
+public class VirtualThreadAsyncConfig {
+
+    @Bean("virtualExecutor")
+    public Executor virtualExecutor() {
+        return Executors.newVirtualThreadPerTaskExecutor();
+    }
+
+    // Use it:
+    @Async("virtualExecutor")
+    public CompletableFuture&lt;Report&gt; generateReport(String id) {
+        // Runs on a virtual thread — blocking is fine
+        Report report = reportEngine.generate(id);  // Blocking call is cheap
+        return CompletableFuture.completedFuture(report);
+    }
+}
+
+// Migrating from ThreadPoolTaskExecutor to Virtual Threads
+// Before (Java 17):
+@Bean("orderExecutor")
+public ThreadPoolTaskExecutor orderExecutor() {
+    ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();
+    e.setCorePoolSize(20);
+    e.setMaxPoolSize(100);
+    e.setQueueCapacity(500);
+    return e;
+}
+
+// After (Java 21+):
+@Bean("orderExecutor")
+public Executor orderExecutor() {
+    return Executors.newVirtualThreadPerTaskExecutor();
+    // No sizing needed — virtual threads are nearly unlimited
+}</code></pre>
+      </details>
+      <details>
+        <summary>When NOT to Use Virtual Threads</summary>
+        <ul>
+          <li><strong>CPU-bound tasks:</strong> Virtual threads don't help with computation — you still need N platform threads for N CPUs. Use a fixed platform thread pool for CPU-intensive work.</li>
+          <li><strong>When you need backpressure:</strong> Virtual threads are unlimited — there's no queue to provide backpressure. If downstream services can't handle unlimited concurrency, you need semaphores or bulkheads.</li>
+          <li><strong>Libraries with heavy synchronized usage:</strong> If core dependencies pin extensively, you lose the virtual thread advantage.</li>
+          <li><strong>ThreadLocal-intensive code:</strong> Virtual threads support ThreadLocal but ScopedValues (Preview) are preferred. Millions of virtual threads with large ThreadLocals = large memory footprint.</li>
+        </ul>
+        <pre><code class="language-java">// When you need to limit concurrency with virtual threads, use Semaphore
+private final Semaphore databasePermits = new Semaphore(50); // Max 50 concurrent DB calls
+
+public Record fetchRecord(String id) {
+    databasePermits.acquire();  // Virtual thread unmounts while waiting
+    try {
+        return jdbcTemplate.queryForObject("SELECT ...", mapper, id);
+    } finally {
+        databasePermits.release();
+    }
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================== SECTION 8 ============================== -->
+    <section id="production-incident">
+      <h2>8. Production Incident: @Async with Default Executor OOM Kill</h2>
+      <details>
+        <summary>Incident Timeline</summary>
+        <p><strong>Service:</strong> Order notification microservice at an e-commerce platform<br>
+        <strong>Stack:</strong> Spring Boot 2.7, Java 17, Kubernetes (4GB memory limit)<br>
+        <strong>Traffic:</strong> Normal 500 req/s, flash sale spike to 8000 req/s</p>
+
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Event</th><th>Metrics</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>14:00</td><td>Flash sale starts, traffic ramps up</td><td>500 → 3000 req/s</td></tr>
+            <tr><td>14:02</td><td>Thread count starts climbing rapidly</td><td>200 → 800 threads</td></tr>
+            <tr><td>14:05</td><td>P99 latency spikes from 200ms to 5s</td><td>Thread count: 2100</td></tr>
+            <tr><td>14:08</td><td>JVM spending 40% time in GC (thread stacks consuming heap)</td><td>Thread count: 3500</td></tr>
+            <tr><td>14:11</td><td>First OOM errors in logs</td><td>Thread count: 4847</td></tr>
+            <tr><td>14:12</td><td>Kubernetes OOM-kill triggers, pod restarts</td><td>RSS: 4.1GB (limit: 4GB)</td></tr>
+            <tr><td>14:12-14:25</td><td>Cascading restarts — new pods immediately overwhelmed</td><td>Restart loop</td></tr>
+            <tr><td>14:25</td><td>On-call scales down traffic via feature flag</td><td>Stabilized at 1000 req/s</td></tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>Root Cause Analysis</summary>
+        <p>The notification service used @Async to send push notifications, SMS, and email after each order:</p>
+        <pre><code class="language-java">// The problematic code — no executor configured
+@Service
+public class NotificationService {
+
+    @Async  // No qualifier — uses SimpleAsyncTaskExecutor!
+    public void sendOrderConfirmation(Order order) {
+        pushService.send(order.getUserId(), "Order confirmed!");    // 200ms avg
+        smsGateway.send(order.getPhone(), buildSmsBody(order));    // 500ms avg
+        emailService.send(order.getEmail(), buildEmailBody(order)); // 300ms avg
+    }
+}
+
+// @EnableAsync was present, but NO custom executor bean defined
+@SpringBootApplication
+@EnableAsync
+public class NotificationApp { ... }</code></pre>
+        <p><strong>What happened:</strong></p>
+        <ol>
+          <li>Each order triggered <code>sendOrderConfirmation()</code> which ran on a new thread (SimpleAsyncTaskExecutor)</li>
+          <li>At 8000 orders/sec, 8000 new threads were created per second</li>
+          <li>Each notification took ~1 second (push + SMS + email sequentially)</li>
+          <li>Steady state: 8000 concurrent threads, each consuming ~1MB stack</li>
+          <li>Total thread stack memory: ~8GB (exceeding the 4GB container limit)</li>
+          <li>Context switching overhead made every operation slower, creating a death spiral</li>
+        </ol>
+        <pre><code class="language-bash"># Thread dump excerpt (taken during incident via kubectl exec)
+$ jstack $(pgrep java) | grep "SimpleAsyncTaskExecutor" | head -20
+"SimpleAsyncTaskExecutor-1847" #1849 daemon prio=5 RUNNABLE
+"SimpleAsyncTaskExecutor-1848" #1850 daemon prio=5 WAITING (on object monitor)
+"SimpleAsyncTaskExecutor-1849" #1851 daemon prio=5 RUNNABLE
+...
+
+$ jstack $(pgrep java) | grep "SimpleAsyncTaskExecutor" | wc -l
+4847
+
+# Native memory usage
+$ jcmd $(pgrep java) VM.native_memory summary
+Thread (reserved=4956160KB, committed=4956160KB)
+       (thread #4847)
+       (stack: reserved=4940800KB, committed=4940800KB)  # 4.7GB in thread stacks!</code></pre>
+      </details>
+      <details>
+        <summary>The Fix</summary>
+        <pre><code class="language-java">// Immediate fix: Configure bounded thread pool
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+
+    @Override
+    public Executor getAsyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(20);
+        executor.setMaxPoolSize(50);         // Hard limit: 50 threads max
+        executor.setQueueCapacity(1000);     // Queue 1000 tasks before rejecting
+        executor.setThreadNamePrefix("notif-");
+        executor.setRejectedExecutionHandler((r, e) -&gt; {
+            log.warn("Notification task rejected — pool saturated. Queued: {}", 
+                e.getQueue().size());
+            // Graceful degradation: log and drop rather than block
+            metricsService.increment("notification.dropped");
+        });
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60);
+        executor.initialize();
+        return executor;
+    }
+}
+
+// Longer-term fix: Separate executors per notification type with bulkheading
+@Bean("pushExecutor")
+public ThreadPoolTaskExecutor pushExecutor() {
+    // Push notifications: fast, high throughput
+    return buildExecutor(10, 30, 500, "push-");
+}
+
+@Bean("smsExecutor")
+public ThreadPoolTaskExecutor smsExecutor() {
+    // SMS: slower gateway, needs rate limiting
+    return buildExecutor(5, 15, 200, "sms-");
+}
+
+@Bean("emailExecutor")
+public ThreadPoolTaskExecutor emailExecutor() {
+    // Email: moderate speed, can tolerate delays
+    return buildExecutor(5, 20, 1000, "email-");
+}
+
+// Split the monolithic notification into separate async calls
+@Service
+public class NotificationService {
+
+    @Async("pushExecutor")
+    public void sendPush(Order order) {
+        pushService.send(order.getUserId(), "Order confirmed!");
+    }
+
+    @Async("smsExecutor")
+    public void sendSms(Order order) {
+        smsGateway.send(order.getPhone(), buildSmsBody(order));
+    }
+
+    @Async("emailExecutor")
+    public void sendEmail(Order order) {
+        emailService.send(order.getEmail(), buildEmailBody(order));
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Prevention Measures Implemented</summary>
+        <ul>
+          <li><strong>Architecture decision record:</strong> All @Async usage must specify a named executor — no default executor allowed</li>
+          <li><strong>Custom Spring BeanPostProcessor:</strong> Fails application startup if any @Async method lacks a qualifier</li>
+          <li><strong>Alerting:</strong> Alert on thread count > 500 (warning) and > 1000 (critical)</li>
+          <li><strong>Resource limits:</strong> JVM flag <code>-XX:ActiveProcessorCount=4</code> to cap perceived CPUs</li>
+          <li><strong>Load shedding:</strong> Queue-based rate limiting with graceful degradation for non-critical notifications</li>
+        </ul>
+        <pre><code class="language-java">// Startup validator — prevents deploying without executor configuration
+@Component
+public class AsyncConfigValidator implements ApplicationListener&lt;ContextRefreshedEvent&gt; {
+
+    @Override
+    public void onApplicationEvent(ContextRefreshedEvent event) {
+        ApplicationContext ctx = event.getApplicationContext();
+        String[] beanNames = ctx.getBeanNamesForType(Object.class);
+
+        for (String beanName : beanNames) {
+            Class&lt;?&gt; beanType = ctx.getType(beanName);
+            if (beanType == null) continue;
+
+            for (Method method : beanType.getDeclaredMethods()) {
+                Async asyncAnnotation = method.getAnnotation(Async.class);
+                if (asyncAnnotation != null &amp;&amp; asyncAnnotation.value().isEmpty()) {
+                    throw new IllegalStateException(
+                        String.format("@Async without executor qualifier found: %s.%s() " +
+                            "— all async methods must specify a named executor",
+                            beanType.getSimpleName(), method.getName()));
+                }
+            }
+        }
+        log.info("Async configuration validation passed");
+    }
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================== SECTION 9 ============================== -->
+    <section id="debugging-workflow">
+      <h2>9. Debugging Workflow</h2>
+      <details>
+        <summary>Step 1: Confirm @Async Is Actually Active</summary>
+        <pre><code class="language-java">// Add diagnostic logging to verify async execution
+@Async("myExecutor")
+public CompletableFuture&lt;Result&gt; process(Request request) {
+    String threadName = Thread.currentThread().getName();
+    log.info("Executing on thread: {} (is virtual: {})", 
+        threadName, Thread.currentThread().isVirtual());
+    // Expected: "myExecutor-3" or "virtual-thread-42"
+    // Problem indicator: "http-nio-8080-exec-7" (running on HTTP thread!)
+    ...
+}</code></pre>
+        <pre><code class="language-bash"># Check if @EnableAsync is registered
+$ curl localhost:8080/actuator/beans | jq '.contexts[].beans | keys[] | select(contains("async"))'
+"org.springframework.scheduling.annotation.ProxyAsyncConfiguration"
+"internalAsyncAnnotationProcessor"
+
+# If these beans are missing → @EnableAsync is not present</code></pre>
+      </details>
+      <details>
+        <summary>Step 2: Thread Dump Analysis</summary>
+        <pre><code class="language-bash"># Take thread dump
+$ jstack $(pgrep -f "myapp.jar") > thread_dump.txt
+
+# Count threads by pool/prefix
+$ grep "^\"" thread_dump.txt | sed 's/-.*//' | sort | uniq -c | sort -rn | head -20
+   847 "SimpleAsyncTaskExecutor
+   200 "http-nio-8080-exec
+    50 "scheduling
+    12 "HikariPool-1
+
+# Find BLOCKED threads (potential deadlocks or lock contention)
+$ grep -A1 "BLOCKED" thread_dump.txt | head -40
+
+# Find threads WAITING for CompletableFuture.get()
+$ grep -B2 -A5 "CompletableFuture.get" thread_dump.txt
+
+# Look for HTTP threads stuck in async-related blocking
+$ grep -B5 "http-nio.*WAITING\|http-nio.*TIMED_WAITING" thread_dump.txt</code></pre>
+      </details>
+      <details>
+        <summary>Step 3: Identify Self-Invocation Issues</summary>
+        <pre><code class="language-java">// AOP diagnostic aspect — detects self-invocation at runtime
+@Aspect
+@Component
+@Profile("debug")
+public class AsyncSelfInvocationDetector {
+
+    @Around("@annotation(org.springframework.scheduling.annotation.Async)")
+    public Object detectSelfInvocation(ProceedingJoinPoint pjp) throws Throwable {
+        String threadName = Thread.currentThread().getName();
+
+        // If executing on an HTTP thread, the @Async proxy was bypassed
+        if (threadName.contains("http-nio") || threadName.contains("exec")) {
+            log.error("SELF-INVOCATION DETECTED! @Async method {}.{}() " +
+                "running on HTTP thread: {}",
+                pjp.getTarget().getClass().getSimpleName(),
+                pjp.getSignature().getName(),
+                threadName);
+
+            // Print call stack to identify the caller
+            new Exception("Stack trace for self-invocation detection")
+                .printStackTrace();
+        }
+
+        return pjp.proceed();
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Step 4: Monitor Thread Pool Health</summary>
+        <pre><code class="language-bash"># Via actuator metrics endpoint
+$ curl -s localhost:8080/actuator/metrics/executor.active | jq
+{
+  "name": "executor.active",
+  "measurements": [{"statistic": "VALUE", "value": 48.0}],
+  "availableTags": [{"tag": "name", "values": ["orderExecutor"]}]
+}
+
+$ curl -s localhost:8080/actuator/metrics/executor.pool.max | jq '.measurements[0].value'
+50.0
+
+$ curl -s localhost:8080/actuator/metrics/executor.queued | jq '.measurements[0].value'
+89.0
+
+# If active == max AND queued is growing → pool is saturated</code></pre>
+        <pre><code class="language-java">// Programmatic health check
+@Component
+public class AsyncPoolHealthIndicator implements HealthIndicator {
+
+    @Autowired @Qualifier("orderExecutor")
+    private ThreadPoolTaskExecutor executor;
+
+    @Override
+    public Health health() {
+        ThreadPoolExecutor tpe = executor.getThreadPoolExecutor();
+        double utilization = (double) tpe.getActiveCount() / tpe.getMaximumPoolSize();
+        int queueRemaining = tpe.getQueue().remainingCapacity();
+
+        if (utilization > 0.9 || queueRemaining < 10) {
+            return Health.down()
+                .withDetail("utilization", String.format("%.1f%%", utilization * 100))
+                .withDetail("activeThreads", tpe.getActiveCount())
+                .withDetail("maxThreads", tpe.getMaximumPoolSize())
+                .withDetail("queueRemaining", queueRemaining)
+                .build();
+        }
+
+        return Health.up()
+            .withDetail("utilization", String.format("%.1f%%", utilization * 100))
+            .withDetail("queueSize", tpe.getQueue().size())
+            .build();
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Step 5: BlockHound for Reactive Applications</summary>
+        <pre><code class="language-java">// build.gradle
+// testImplementation 'io.projectreactor.tools:blockhound:1.0.8.RELEASE'
+
+// Install in test setup
+@BeforeAll
+static void installBlockHound() {
+    BlockHound.install(builder -&gt; builder
+        // Allow specific blocking calls if needed
+        .allowBlockingCallsInside("com.zaxxer.hikari.pool.HikariPool", "getConnection")
+        // Customize detection
+        .blockingMethodCallback(m -&gt; {
+            throw new BlockingOperationError(m);
+        })
+    );
+}
+
+// Integration test that verifies no blocking on event-loop threads
+@Test
+void endpointShouldNotBlockEventLoop() {
+    webTestClient.get().uri("/api/orders/123")
+        .exchange()
+        .expectStatus().isOk();
+    // BlockHound will throw if any blocking call happens on a reactor thread
+}
+
+// Production monitoring (lighter weight)
+@Configuration
+@Profile("staging")
+public class BlockingDetectorConfig {
+
+    @PostConstruct
+    void setupBlockingDetection() {
+        Schedulers.onSchedulerHook("blocking-detector", scheduler -&gt; {
+            // Log when blocking operations are detected on non-blocking schedulers
+            return Schedulers.decorateExecutorService(scheduler, 
+                new BlockingDetectorExecutorService());
+        });
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Decision Flowchart: Debugging Async Blocking</summary>
+        <pre><code class="language-bash"># Diagnostic flowchart (text representation)
+#
+# 1. Is @EnableAsync present?
+#    NO  → Add it. Problem solved.
+#    YES → Continue to 2.
+#
+# 2. Is the @Async method running on the expected thread?
+#    Check: Thread.currentThread().getName()
+#    HTTP thread name → Self-invocation or proxy issue → Go to 3.
+#    Correct async thread → Go to 4.
+#
+# 3. Is the call coming from within the same class?
+#    YES → Self-invocation. Extract to separate bean or inject self.
+#    NO  → Check if bean is proxied (final class? private method?)
+#
+# 4. Is the response slow despite async execution?
+#    YES → Check if caller is blocking on the result:
+#          - CompletableFuture.get() on HTTP thread?
+#          - Polling loop waiting for void async to complete?
+#          - CallerRunsPolicy executing on HTTP thread due to pool saturation?
+#
+# 5. Is the thread pool saturated?
+#    Check: actuator metrics or thread dump
+#    YES → Increase pool size, add queue capacity, or fix slow tasks
+#    NO  → Check for blocking I/O in reactive chain (BlockHound)</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================== SECTION 10 ============================== -->
+    <section id="code-examples">
+      <h2>10. Code Examples</h2>
+      <details>
+        <summary>Complete @Async Setup with Best Practices</summary>
+        <pre><code class="language-java">// 1. Configuration
+@Configuration
+@EnableAsync
+public class AsyncConfiguration implements AsyncConfigurer {
+
+    @Override
+    public Executor getAsyncExecutor() {
+        return buildExecutor("default-async", 10, 30, 200);
+    }
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return new CustomAsyncExceptionHandler();
+    }
+
+    @Bean("orderExecutor")
+    public ThreadPoolTaskExecutor orderExecutor() {
+        return buildExecutor("order", 5, 20, 100);
+    }
+
+    @Bean("notificationExecutor")
+    public ThreadPoolTaskExecutor notificationExecutor() {
+        return buildExecutor("notif", 10, 40, 500);
+    }
+
+    private ThreadPoolTaskExecutor buildExecutor(String prefix, int core, int max, int queue) {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(core);
+        executor.setMaxPoolSize(max);
+        executor.setQueueCapacity(queue);
+        executor.setThreadNamePrefix(prefix + "-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(30);
+        executor.initialize();
+        return executor;
+    }
+}
+
+// 2. Custom exception handler
+@Slf4j
+public class CustomAsyncExceptionHandler implements AsyncUncaughtExceptionHandler {
+
+    @Autowired(required = false)
+    private MeterRegistry meterRegistry;
+
+    @Override
+    public void handleUncaughtException(Throwable ex, Method method, Object... params) {
+        log.error("Async exception in {}.{}({}): {}",
+            method.getDeclaringClass().getSimpleName(),
+            method.getName(),
+            Arrays.stream(params).map(Object::toString).collect(Collectors.joining(",")),
+            ex.getMessage(), ex);
+
+        if (meterRegistry != null) {
+            meterRegistry.counter("async.uncaught.exceptions",
+                "class", method.getDeclaringClass().getSimpleName(),
+                "method", method.getName(),
+                "exception", ex.getClass().getSimpleName()
+            ).increment();
+        }
+    }
+}
+
+// 3. Service with proper @Async usage
+@Service
+@Slf4j
+public class OrderProcessingService {
+
+    @Autowired private InventoryClient inventoryClient;
+    @Autowired private PaymentClient paymentClient;
+    @Autowired private NotificationService notificationService;
+
+    @Async("orderExecutor")
+    public CompletableFuture&lt;OrderResult&gt; processOrderAsync(Order order) {
+        log.info("Processing order {} on thread {}", order.getId(), Thread.currentThread().getName());
+        MDC.put("orderId", order.getId());  // Propagate MDC context
+
+        try {
+            inventoryClient.reserve(order.getItems());
+            PaymentResult payment = paymentClient.charge(order.getPayment());
+
+            if (payment.isSuccessful()) {
+                notificationService.sendConfirmation(order);
+                return CompletableFuture.completedFuture(
+                    OrderResult.success(order.getId(), payment.getTransactionId()));
+            } else {
+                inventoryClient.release(order.getItems());
+                return CompletableFuture.completedFuture(
+                    OrderResult.failed(order.getId(), payment.getErrorReason()));
+            }
+        } finally {
+            MDC.remove("orderId");
+        }
+    }
+}
+
+// 4. Controller returning async response properly
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @Autowired private OrderProcessingService orderService;
+
+    @PostMapping
+    public CompletableFuture&lt;ResponseEntity&lt;OrderResult&gt;&gt; createOrder(
+            @Valid @RequestBody OrderRequest request) {
+        Order order = Order.from(request);
+        return orderService.processOrderAsync(order)
+            .thenApply(result -&gt; {
+                if (result.isSuccess()) {
+                    return ResponseEntity.status(HttpStatus.CREATED).body(result);
+                }
+                return ResponseEntity.unprocessableEntity().body(result);
+            })
+            .exceptionally(ex -&gt; {
+                log.error("Order processing failed: {}", ex.getMessage());
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+            });
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>CompletableFuture Composition Patterns</summary>
+        <pre><code class="language-java">@Service
+public class DashboardService {
+
+    @Autowired private UserClient userClient;
+    @Autowired private OrderClient orderClient;
+    @Autowired private RecommendationClient recClient;
+    @Autowired @Qualifier("ioExecutor") private Executor ioExecutor;
+
+    // Pattern 1: Parallel independent calls
+    public CompletableFuture&lt;Dashboard&gt; buildDashboard(String userId) {
+        CompletableFuture&lt;UserProfile&gt; profileFuture =
+            CompletableFuture.supplyAsync(() -&gt; userClient.getProfile(userId), ioExecutor);
+
+        CompletableFuture&lt;List&lt;Order&gt;&gt; ordersFuture =
+            CompletableFuture.supplyAsync(() -&gt; orderClient.getRecent(userId, 10), ioExecutor);
+
+        CompletableFuture&lt;List&lt;Product&gt;&gt; recsFuture =
+            CompletableFuture.supplyAsync(() -&gt; recClient.getRecommendations(userId), ioExecutor);
+
+        return CompletableFuture.allOf(profileFuture, ordersFuture, recsFuture)
+            .thenApply(v -&gt; new Dashboard(
+                profileFuture.join(),
+                ordersFuture.join(),
+                recsFuture.join()
+            ));
+    }
+
+    // Pattern 2: Sequential dependent calls with error handling
+    public CompletableFuture&lt;EnrichedOrder&gt; enrichOrder(String orderId) {
+        return CompletableFuture.supplyAsync(() -&gt; orderClient.getOrder(orderId), ioExecutor)
+            .thenCompose(order -&gt;
+                CompletableFuture.supplyAsync(() -&gt; userClient.getProfile(order.getUserId()), ioExecutor)
+                    .thenApply(profile -&gt; new EnrichedOrder(order, profile))
+            )
+            .thenCompose(enriched -&gt;
+                CompletableFuture.supplyAsync(
+                    () -&gt; recClient.getSimilar(enriched.getOrder().getProductId()), ioExecutor)
+                    .thenApply(enriched::withRecommendations)
+            )
+            .exceptionally(ex -&gt; {
+                log.error("Failed to enrich order {}: {}", orderId, ex.getMessage());
+                return EnrichedOrder.partial(orderId, ex.getMessage());
+            });
+    }
+
+    // Pattern 3: Timeout with fallback
+    public CompletableFuture&lt;List&lt;Product&gt;&gt; getRecommendationsWithFallback(String userId) {
+        return CompletableFuture.supplyAsync(() -&gt; recClient.getRecommendations(userId), ioExecutor)
+            .orTimeout(2, TimeUnit.SECONDS)
+            .exceptionally(ex -&gt; {
+                if (ex.getCause() instanceof TimeoutException) {
+                    log.warn("Recommendations timed out for user {}, returning defaults", userId);
+                    return recClient.getDefaultRecommendations();
+                }
+                throw new CompletionException(ex);
+            });
+    }
+
+    // Pattern 4: First successful result (racing)
+    public CompletableFuture&lt;PriceQuote&gt; getBestPrice(String productId) {
+        CompletableFuture&lt;PriceQuote&gt; supplier1 =
+            CompletableFuture.supplyAsync(() -&gt; priceClient.getQuote("supplier-a", productId), ioExecutor);
+        CompletableFuture&lt;PriceQuote&gt; supplier2 =
+            CompletableFuture.supplyAsync(() -&gt; priceClient.getQuote("supplier-b", productId), ioExecutor);
+        CompletableFuture&lt;PriceQuote&gt; supplier3 =
+            CompletableFuture.supplyAsync(() -&gt; priceClient.getQuote("supplier-c", productId), ioExecutor);
+
+        return CompletableFuture.anyOf(supplier1, supplier2, supplier3)
+            .thenApply(result -&gt; (PriceQuote) result);
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>WebFlux vs Imperative Comparison</summary>
+        <pre><code class="language-java">// ==================== IMPERATIVE (Spring MVC + @Async) ====================
+@RestController
+@RequestMapping("/api/v1/orders")
+public class ImperativeOrderController {
+
+    @Autowired private OrderService orderService;
+
+    @GetMapping("/{id}/details")
+    public CompletableFuture&lt;ResponseEntity&lt;OrderDetails&gt;&gt; getOrderDetails(
+            @PathVariable String id) {
+        return orderService.getOrderDetailsAsync(id)
+            .thenApply(ResponseEntity::ok)
+            .exceptionally(ex -&gt; ResponseEntity.notFound().build());
+    }
+}
+
+@Service
+public class ImperativeOrderService {
+
+    @Autowired @Qualifier("ioExecutor") private Executor executor;
+
+    @Async("ioExecutor")
+    public CompletableFuture&lt;OrderDetails&gt; getOrderDetailsAsync(String orderId) {
+        // These block individual pool threads — that's OK with enough threads
+        Order order = orderRepository.findById(orderId).orElseThrow();
+        UserProfile user = userClient.getProfile(order.getUserId());  // HTTP call, blocks
+        List&lt;ShipmentStatus&gt; shipments = shipmentClient.track(orderId);  // HTTP call, blocks
+
+        return CompletableFuture.completedFuture(
+            new OrderDetails(order, user, shipments));
+    }
+}
+
+// ==================== REACTIVE (Spring WebFlux) ====================
+@RestController
+@RequestMapping("/api/v1/orders")
+public class ReactiveOrderController {
+
+    @Autowired private ReactiveOrderService orderService;
+
+    @GetMapping("/{id}/details")
+    public Mono&lt;ResponseEntity&lt;OrderDetails&gt;&gt; getOrderDetails(@PathVariable String id) {
+        return orderService.getOrderDetails(id)
+            .map(ResponseEntity::ok)
+            .defaultIfEmpty(ResponseEntity.notFound().build());
+    }
+}
+
+@Service
+public class ReactiveOrderService {
+
+    @Autowired private ReactiveOrderRepository orderRepository;
+    @Autowired private WebClient userClient;
+    @Autowired private WebClient shipmentClient;
+
+    public Mono&lt;OrderDetails&gt; getOrderDetails(String orderId) {
+        return orderRepository.findById(orderId)
+            .flatMap(order -&gt; {
+                // Parallel non-blocking calls
+                Mono&lt;UserProfile&gt; userMono = userClient.get()
+                    .uri("/users/{id}", order.getUserId())
+                    .retrieve()
+                    .bodyToMono(UserProfile.class)
+                    .timeout(Duration.ofSeconds(2))
+                    .onErrorReturn(UserProfile.anonymous());
+
+                Mono&lt;List&lt;ShipmentStatus&gt;&gt; shipmentsMono = shipmentClient.get()
+                    .uri("/shipments/order/{id}", orderId)
+                    .retrieve()
+                    .bodyToFlux(ShipmentStatus.class)
+                    .collectList()
+                    .timeout(Duration.ofSeconds(3))
+                    .onErrorReturn(Collections.emptyList());
+
+                return Mono.zip(userMono, shipmentsMono)
+                    .map(tuple -&gt; new OrderDetails(order, tuple.getT1(), tuple.getT2()));
+            });
+    }
+}
+
+// ==================== VIRTUAL THREADS (Java 21 + Spring Boot 3.2+) ====================
+// application.yml: spring.threads.virtual.enabled: true
+
+@RestController
+@RequestMapping("/api/v1/orders")
+public class VirtualThreadOrderController {
+
+    @Autowired private OrderService orderService;
+
+    @GetMapping("/{id}/details")
+    public ResponseEntity&lt;OrderDetails&gt; getOrderDetails(@PathVariable String id) {
+        // Looks synchronous but runs on virtual thread — blocking is cheap
+        return ResponseEntity.ok(orderService.getOrderDetails(id));
+    }
+}
+
+@Service
+public class VirtualThreadOrderService {
+
+    @Autowired private OrderRepository orderRepository;
+    @Autowired private RestClient userClient;
+    @Autowired private RestClient shipmentClient;
+
+    public OrderDetails getOrderDetails(String orderId) {
+        Order order = orderRepository.findById(orderId).orElseThrow();
+
+        // Parallel execution via structured concurrency
+        try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+            var userTask = scope.fork(() -&gt; userClient.get()
+                .uri("/users/{id}", order.getUserId())
+                .retrieve()
+                .body(UserProfile.class));
+
+            var shipmentsTask = scope.fork(() -&gt; shipmentClient.get()
+                .uri("/shipments/order/{id}", orderId)
+                .retrieve()
+                .body(new ParameterizedTypeReference&lt;List&lt;ShipmentStatus&gt;&gt;() {}));
+
+            scope.join();
+            scope.throwIfFailed();
+
+            return new OrderDetails(order, userTask.get(), shipmentsTask.get());
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to build order details", e);
+        }
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>MDC Context Propagation with @Async</summary>
+        <pre><code class="language-java">// Problem: MDC (Mapped Diagnostic Context) is ThreadLocal-based
+// When @Async switches threads, MDC context is lost!
+
+// Solution: Custom TaskDecorator that copies MDC context
+public class MdcTaskDecorator implements TaskDecorator {
+
+    @Override
+    public Runnable decorate(Runnable runnable) {
+        // Capture MDC from the calling thread
+        Map&lt;String, String&gt; contextMap = MDC.getCopyOfContextMap();
+
+        return () -&gt; {
+            try {
+                // Set MDC on the async thread
+                if (contextMap != null) {
+                    MDC.setContextMap(contextMap);
+                }
+                runnable.run();
+            } finally {
+                MDC.clear();  // Clean up after execution
+            }
+        };
+    }
+}
+
+// Apply to executor
+@Bean("tracedExecutor")
+public ThreadPoolTaskExecutor tracedExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(10);
+    executor.setMaxPoolSize(30);
+    executor.setQueueCapacity(100);
+    executor.setThreadNamePrefix("traced-");
+    executor.setTaskDecorator(new MdcTaskDecorator());  // Context propagation!
+    executor.initialize();
+    return executor;
+}
+
+// Now MDC context (requestId, userId, traceId) flows to async threads
+@Async("tracedExecutor")
+public CompletableFuture&lt;Result&gt; processWithContext(Request req) {
+    // MDC.get("requestId") will return the value from the calling thread
+    log.info("Processing request");  // Log will include requestId from MDC
+    return CompletableFuture.completedFuture(doProcess(req));
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================== SECTION 11 ============================== -->
+    <section id="common-mistakes">
+      <h2>11. Common Mistakes</h2>
+      <details>
+        <summary>Mistakes Table</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Mistake</th>
+              <th>Why It Happens</th>
+              <th>Consequence</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>Self-invocation of @Async method</td>
+              <td>Developer doesn't understand Spring proxy model</td>
+              <td>Method runs synchronously, blocking the caller</td>
+              <td>Extract to separate bean or inject self reference</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>Forgetting @EnableAsync</td>
+              <td>Copy-paste from tutorial that assumes auto-config</td>
+              <td>All @Async annotations silently ignored</td>
+              <td>Add @EnableAsync to any @Configuration class</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>No custom executor defined</td>
+              <td>Relies on Spring's SimpleAsyncTaskExecutor default</td>
+              <td>Unbounded thread creation → OOM under load</td>
+              <td>Define ThreadPoolTaskExecutor with bounded pool</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Calling .get() on HTTP thread</td>
+              <td>Need the async result to build HTTP response</td>
+              <td>HTTP thread blocks, negating async benefit</td>
+              <td>Return CompletableFuture from controller or use DeferredResult</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>JDBC inside WebFlux chain</td>
+              <td>No reactive DB driver available or unknown</td>
+              <td>Event-loop thread blocked, all concurrent requests stall</td>
+              <td>Use R2DBC, or subscribeOn(Schedulers.boundedElastic())</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>Unbounded queue capacity</td>
+              <td>Default LinkedBlockingQueue is Integer.MAX_VALUE</td>
+              <td>Tasks accumulate indefinitely → memory exhaustion</td>
+              <td>Set explicit queueCapacity matching expected burst size</td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td>@Async on private methods</td>
+              <td>Doesn't realize only public methods are proxied</td>
+              <td>@Async ignored (CGLIB can proxy protected, but not private)</td>
+              <td>Make method public (or package-private with CGLIB)</td>
+            </tr>
+            <tr>
+              <td>8</td>
+              <td>@Async on final class or method</td>
+              <td>CGLIB cannot subclass final classes/methods</td>
+              <td>Proxy creation fails or annotation ignored</td>
+              <td>Remove final modifier, or use interface-based proxy</td>
+            </tr>
+            <tr>
+              <td>9</td>
+              <td>No error handling for void @Async</td>
+              <td>Void methods can't propagate exceptions to caller</td>
+              <td>Exceptions swallowed silently, data loss</td>
+              <td>Implement AsyncUncaughtExceptionHandler</td>
+            </tr>
+            <tr>
+              <td>10</td>
+              <td>CallerRunsPolicy without understanding consequences</td>
+              <td>Chosen as "safe" rejection policy</td>
+              <td>Under saturation, HTTP threads execute async tasks directly</td>
+              <td>Use custom handler with metrics, or AbortPolicy with retry</td>
+            </tr>
+            <tr>
+              <td>11</td>
+              <td>Missing MDC propagation</td>
+              <td>MDC is thread-local, not propagated to async threads</td>
+              <td>Logs from async execution lose correlation IDs</td>
+              <td>Use TaskDecorator to copy MDC context</td>
+            </tr>
+            <tr>
+              <td>12</td>
+              <td>synchronized in virtual thread code</td>
+              <td>Legacy code or library using synchronized blocks</td>
+              <td>Pins virtual thread to carrier, negating benefits</td>
+              <td>Replace with ReentrantLock</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- ============================== SECTION 12 ============================== -->
+    <section id="trade-offs">
+      <h2>12. Trade-offs: Reactive vs Virtual Threads vs Thread Pools</h2>
+      <details>
+        <summary>Comprehensive Comparison</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>Thread Pool (@Async)</th>
+              <th>Reactive (WebFlux)</th>
+              <th>Virtual Threads (Java 21+)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Code complexity</td>
+              <td>Low — imperative style</td>
+              <td>High — functional/declarative chains</td>
+              <td>Low — imperative style</td>
+            </tr>
+            <tr>
+              <td>Max concurrency</td>
+              <td>Limited by pool size (100s)</td>
+              <td>Very high (10K+ on few threads)</td>
+              <td>Very high (millions of virtual threads)</td>
+            </tr>
+            <tr>
+              <td>Blocking I/O</td>
+              <td>Fine (blocks pool thread)</td>
+              <td>Forbidden (blocks event loop)</td>
+              <td>Fine (unmounts from carrier)</td>
+            </tr>
+            <tr>
+              <td>Backpressure</td>
+              <td>Queue + rejection policy</td>
+              <td>Built-in (Reactive Streams spec)</td>
+              <td>Must implement manually (Semaphore)</td>
+            </tr>
+            <tr>
+              <td>Debugging</td>
+              <td>Easy (thread dumps, breakpoints)</td>
+              <td>Hard (assembly traces, no stack)</td>
+              <td>Easy (full stack traces preserved)</td>
+            </tr>
+            <tr>
+              <td>Learning curve</td>
+              <td>Low</td>
+              <td>Steep (Mono/Flux operators)</td>
+              <td>Low (just enable it)</td>
+            </tr>
+            <tr>
+              <td>Library ecosystem</td>
+              <td>All libraries work</td>
+              <td>Requires reactive drivers (R2DBC, WebClient)</td>
+              <td>Most libraries work (watch for pinning)</td>
+            </tr>
+            <tr>
+              <td>Memory per connection</td>
+              <td>~1MB (thread stack)</td>
+              <td>~KB (no thread per connection)</td>
+              <td>~KB (virtual thread stack grows as needed)</td>
+            </tr>
+            <tr>
+              <td>CPU overhead</td>
+              <td>Context switching at OS level</td>
+              <td>Minimal (event loop, no switching)</td>
+              <td>JVM-level scheduling (cheaper than OS)</td>
+            </tr>
+            <tr>
+              <td>Maturity</td>
+              <td>20+ years, battle-tested</td>
+              <td>~7 years, mature</td>
+              <td>~2 years (since Java 21 GA)</td>
+            </tr>
+            <tr>
+              <td>Streaming support</td>
+              <td>Limited</td>
+              <td>Excellent (Flux, backpressure)</td>
+              <td>Limited (structured concurrency helps)</td>
+            </tr>
+            <tr>
+              <td>Testing</td>
+              <td>Standard JUnit</td>
+              <td>StepVerifier, virtual time</td>
+              <td>Standard JUnit</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>Decision Framework</summary>
+        <pre><code class="language-bash"># When to choose each approach:
+
+# THREAD POOL (@Async)
+# - Java &lt; 21 and cannot upgrade
+# - Simple fire-and-forget tasks
+# - Team unfamiliar with reactive
+# - Existing blocking libraries that cannot be replaced
+# - Well-understood load patterns with clear pool sizing
+
+# REACTIVE (WebFlux)
+# - Streaming use cases (SSE, WebSocket, file streaming)
+# - Need built-in backpressure
+# - Already using reactive drivers (R2DBC, reactive Redis, etc.)
+# - Gateway/proxy services (minimal transformation, high throughput)
+# - Team has reactive expertise
+
+# VIRTUAL THREADS
+# - Java 21+ available
+# - High concurrency with blocking I/O (many HTTP/DB calls)
+# - Want simple imperative code with high throughput
+# - Migrating from thread-pool-based async
+# - New greenfield projects on Java 21+</code></pre>
+        <p><strong>Can you combine them?</strong> Yes! Common patterns:</p>
+        <ul>
+          <li><strong>Virtual Threads + Semaphore:</strong> Get unlimited concurrency with controlled downstream pressure</li>
+          <li><strong>WebFlux for gateway + Virtual Threads for business logic:</strong> Best of both worlds</li>
+          <li><strong>@Async with Virtual Thread executor:</strong> Easy migration — swap ThreadPoolTaskExecutor for newVirtualThreadPerTaskExecutor()</li>
+        </ul>
+        <pre><code class="language-java">// Hybrid: Reactive gateway with virtual thread backend calls
+@RestController
+public class HybridController {
+
+    @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux&lt;ServerSentEvent&lt;Data&gt;&gt; streamData() {
+        // WebFlux for streaming (backpressure, SSE)
+        return dataService.streamUpdates()
+            .map(data -&gt; ServerSentEvent.builder(data).build());
+    }
+
+    @GetMapping("/aggregate")
+    public AggregateResult getAggregate(@RequestParam String id) {
+        // Virtual threads for parallel blocking calls (simple code)
+        try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+            var task1 = scope.fork(() -&gt; service1.fetch(id));
+            var task2 = scope.fork(() -&gt; service2.fetch(id));
+            scope.join().throwIfFailed();
+            return new AggregateResult(task1.get(), task2.get());
+        }
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================== SECTION 13 ============================== -->
+    <section id="follow-up-questions">
+      <h2>13. Follow-Up Questions</h2>
+      <details>
+        <summary>Questions the interviewer might ask next</summary>
+        <ol>
+          <li>
+            <strong>"How would you size a thread pool for a service that makes downstream HTTP calls averaging 200ms?"</strong>
+            <p>Apply Little's Law: threads = throughput × latency. If target is 1000 req/s with 200ms calls: threads = 1000 × 0.2 = 200 threads. Add 20% headroom → 240 max threads. Consider connection pool limits of downstream services.</p>
+          </li>
+          <li>
+            <strong>"What happens to @Async methods during a graceful shutdown?"</strong>
+            <p>Without configuration, tasks may be interrupted mid-execution. Set <code>setWaitForTasksToCompleteOnShutdown(true)</code> and <code>setAwaitTerminationSeconds(N)</code>. Spring Boot's graceful shutdown period should exceed this value.</p>
+          </li>
+          <li>
+            <strong>"How do you propagate security context to @Async threads?"</strong>
+            <p>Spring Security's SecurityContext is ThreadLocal. Configure <code>SecurityContextHolder.setStrategyName(MODE_INHERITABLETHREADLOCAL)</code> or use a <code>DelegatingSecurityContextExecutor</code> / custom TaskDecorator.</p>
+          </li>
+          <li>
+            <strong>"If you have a WebFlux application and one endpoint needs JDBC, what do you do?"</strong>
+            <p>Three options: (1) Use R2DBC for reactive DB access, (2) Wrap JDBC calls in <code>Mono.fromCallable().subscribeOn(Schedulers.boundedElastic())</code>, (3) Consider if that endpoint should be in a separate MVC service.</p>
+          </li>
+          <li>
+            <strong>"How would you implement a rate limiter for @Async tasks without blocking the caller?"</strong>
+            <p>Use a Semaphore within the async method (acquires on async thread, not caller). Or implement a custom executor wrapper that uses a token bucket. With virtual threads, Semaphore.acquire() is cheap — the virtual thread unmounts while waiting.</p>
+          </li>
+          <li>
+            <strong>"What's the difference between @Async and @Scheduled for background processing?"</strong>
+            <p>@Async is triggered by method invocation — fire-and-forget from caller. @Scheduled is timer-driven — runs at fixed intervals regardless of invocation. Both use thread pools and have the same proxy/self-invocation issues.</p>
+          </li>
+          <li>
+            <strong>"How do virtual threads interact with connection pools (HikariCP)?"</strong>
+            <p>Connection pools become the bottleneck. 10,000 virtual threads all wanting a DB connection will queue at HikariCP (typically 10-50 connections). The virtual threads unmount while waiting for a connection, so carriers aren't wasted. But you need to limit effective concurrency via Semaphore or pool sizing.</p>
+          </li>
+          <li>
+            <strong>"Can you use @Transactional with @Async?"</strong>
+            <p>Yes, but the transaction runs on the async thread, NOT the caller's thread. The caller's transaction context is not propagated. If the @Async method needs its own transaction, annotate it with @Transactional. Ordering: @Async applies first (submits to pool), then @Transactional begins on the pool thread.</p>
+          </li>
+          <li>
+            <strong>"How would you test that @Async is actually running asynchronously?"</strong>
+            <p>Use a CountDownLatch or awaitility to verify concurrent execution. Assert that the executing thread name matches the expected executor prefix. Use a SlowService stub that takes N seconds and verify the caller returns before N seconds.</p>
+          </li>
+          <li>
+            <strong>"What's the impact of virtual threads on thread-local caches?"</strong>
+            <p>Thread-local caches (common in serialization, date formatting) become ineffective because millions of virtual threads each get their own copy. Migration path: use ScopedValues (Preview) or instance caches with object pooling.</p>
+          </li>
+        </ol>
+      </details>
+    </section>
+
+    <!-- ============================== SECTION 14 ============================== -->
+    <section id="summary">
+      <h2>14. Summary</h2>
+      <details>
+        <summary>Key Takeaways</summary>
+        <ul>
+          <li><strong>@Async ≠ non-blocking.</strong> It offloads work to another thread. If that thread pool saturates or the caller blocks for the result, the request still blocks from the client's perspective.</li>
+          <li><strong>Self-invocation is the #1 issue.</strong> Same-class calls bypass the proxy — the method runs synchronously. This catches even experienced developers.</li>
+          <li><strong>Always define a bounded executor.</strong> The default SimpleAsyncTaskExecutor creates threads without limits. Under load, this leads to OOM.</li>
+          <li><strong>Never call .get() on the HTTP thread.</strong> Return CompletableFuture from the controller, or use DeferredResult/WebAsyncTask for true non-blocking HTTP responses.</li>
+          <li><strong>Reactive ≠ always better.</strong> WebFlux offers true non-blocking I/O but demands the entire stack be non-blocking. One JDBC call breaks the contract.</li>
+          <li><strong>Virtual Threads change the calculus.</strong> With Java 21+, blocking becomes cheap. You can write simple synchronous code and achieve reactive-level throughput. Watch for pinning.</li>
+          <li><strong>Monitor your async pools.</strong> Expose thread pool metrics via Micrometer/Prometheus. Alert on utilization > 80% and queue growth.</li>
+          <li><strong>Separate pools for separate workloads.</strong> Bulkheading prevents one slow downstream from exhausting threads needed for other operations.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>One-Liner for the Interview</summary>
+        <p>"@Async requests still block because the proxy was bypassed (self-invocation), the pool is saturated (CallerRunsPolicy kicks in), the caller blocks on .get(), or you're mixing blocking I/O into a reactive pipeline. The fix is proper pool configuration, correct proxy usage, and — on Java 21+ — virtual threads that make blocking cheap."</p>
+      </details>
+    </section>
+
+    <!-- ============================== CHAPTER NAVIGATION ============================== -->
+    <nav class="chapter-nav" aria-label="Chapter navigation">
+      <a href="ch12-jvm-gc-latency.html" class="prev">&larr; Chapter 12: JVM &amp; GC Latency</a>
+      <a href="ch14-memory-leak-production.html" class="next">Chapter 14: Memory Leak in Production &rarr;</a>
+    </nav>
+
+  </main>
+
+  <script src="../assets/js/prism.js" data-manual></script>
+  <script>
+    // Load Prism language components
+    Prism.languages.java = Prism.languages.java || {};
+    Prism.languages.yaml = Prism.languages.yaml || {};
+    Prism.languages.bash = Prism.languages.bash || {};
+  </script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

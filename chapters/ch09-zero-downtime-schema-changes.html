@@ -1,0 +1,1384 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 9: Zero-Downtime Database Schema Changes | Senior Backend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 9</span>
+      <span class="chapter-title">Zero-Downtime Schema Changes</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#expand-contract">Expand-Contract Pattern</a></li>
+        <li><a href="#backward-compatibility">Backward Compatibility</a></li>
+        <li><a href="#migration-tools">Migration Tools</a></li>
+        <li><a href="#dual-write">Dual-Write Pattern</a></li>
+        <li><a href="#feature-flags">Feature Flags</a></li>
+        <li><a href="#deployment-strategies">Deployment Strategies</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-Offs</a></li>
+        <li><a href="#follow-up-questions">Follow-Up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-ii">Part II — Distributed Systems &amp; Infrastructure</a> &rsaquo;
+      <span>Chapter 9</span>
+    </nav>
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">Migrations</span>
+        <span class="badge badge-topic">Blue-Green</span>
+      </div>
+      <h1>How Would You Safely Deploy a Breaking Database Schema Change Without Downtime?</h1>
+      <p class="chapter-takeaway"><strong>Key Takeaway:</strong> Use the Expand-Contract (parallel change) pattern — never make destructive schema changes in a single deployment. Instead, expand the schema to support both old and new code, migrate data, then contract by removing deprecated elements once all consumers have moved on.</p>
+    </header>
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search..." aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>What the interviewer is really evaluating</summary>
+        <div class="callout callout-info">
+          <p>This question tests whether you understand the operational realities of deploying schema changes in a distributed system with multiple application instances. The interviewer wants to see:</p>
+        </div>
+        <ul>
+          <li><strong>Awareness of the deployment gap:</strong> During rolling deployments, old and new application versions coexist — both must work against the same database schema.</li>
+          <li><strong>Knowledge of safe migration patterns:</strong> Expand-Contract, dual-write, backfill strategies, and versioned migrations.</li>
+          <li><strong>Tool proficiency:</strong> Familiarity with Flyway, Liquibase, or similar migration frameworks in a CI/CD pipeline.</li>
+          <li><strong>Incident awareness:</strong> Understanding what goes wrong when teams skip these patterns — broken queries, data loss, extended outages.</li>
+          <li><strong>Communication skills:</strong> Ability to explain a multi-step deployment plan to stakeholders who want "just rename the column."</li>
+        </ul>
+        <p>Senior engineers are expected to have <em>done</em> this, not just read about it. The interviewer may probe for war stories, timelines, and rollback strategies.</p>
+      </details>
+    </section>
+
+    <!-- Section 2: Quick Answer -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <details>
+        <summary>30-second interview response</summary>
+        <div class="callout callout-tip">
+          <blockquote>
+            <p>"I use the Expand-Contract pattern. First, I <strong>expand</strong> the schema by adding the new structure alongside the old one — for example, adding a new column without removing the old one. I deploy application code that writes to both old and new locations (dual-write). Then I run a backfill migration to populate the new structure with historical data. Once all application instances use the new schema and data is verified, I <strong>contract</strong> by removing the deprecated column in a subsequent release. This ensures zero downtime because at every step, both old and new application versions can function correctly against the database."</p>
+          </blockquote>
+        </div>
+        <p>This answer demonstrates understanding of the core pattern. The sections below expand on each aspect with production-grade detail.</p>
+      </details>
+    </section>
+
+    <!-- Section 3: Expand-Contract Pattern -->
+    <section id="expand-contract">
+      <h2>Expand-Contract Pattern</h2>
+      <details>
+        <summary>The fundamental pattern for zero-downtime schema evolution</summary>
+        <div class="callout callout-info">
+          <p><strong>Also known as:</strong> Parallel Change, Expand-Migrate-Contract, or the "Three-Phase Migration" pattern.</p>
+        </div>
+
+        <h3>The Three Phases</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Phase</th>
+              <th>Schema State</th>
+              <th>Application State</th>
+              <th>Duration</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>1. Expand</strong></td>
+              <td>Add new column/table alongside old</td>
+              <td>Write to both, read from old</td>
+              <td>1 deployment cycle</td>
+            </tr>
+            <tr>
+              <td><strong>2. Migrate</strong></td>
+              <td>Both structures exist, data synced</td>
+              <td>Write to both, read from new</td>
+              <td>Hours to days</td>
+            </tr>
+            <tr>
+              <td><strong>3. Contract</strong></td>
+              <td>Remove old column/table</td>
+              <td>Only uses new structure</td>
+              <td>1 deployment cycle</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Example 1: Renaming a Column</h3>
+        <p>Suppose you need to rename <code>user.userName</code> to <code>user.username</code> (fixing case convention).</p>
+
+        <h4>Phase 1 — Expand (Release N)</h4>
+        <pre><code class="language-sql">-- V2023.09.01__expand_add_username_column.sql
+ALTER TABLE users ADD COLUMN username VARCHAR(255);
+
+-- Trigger to keep columns in sync during transition
+CREATE OR REPLACE FUNCTION sync_username_columns()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
+    IF NEW.username IS NULL AND NEW.userName IS NOT NULL THEN
+      NEW.username := NEW.userName;
+    ELSIF NEW.userName IS NULL AND NEW.username IS NOT NULL THEN
+      NEW.userName := NEW.username;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_sync_username
+  BEFORE INSERT OR UPDATE ON users
+  FOR EACH ROW EXECUTE FUNCTION sync_username_columns();</code></pre>
+
+        <h4>Phase 1 — Backfill</h4>
+        <pre><code class="language-sql">-- V2023.09.02__backfill_username.sql
+-- Batch update to avoid locking entire table
+DO $$
+DECLARE
+  batch_size INT := 10000;
+  rows_updated INT;
+BEGIN
+  LOOP
+    UPDATE users
+    SET username = userName
+    WHERE username IS NULL
+      AND id IN (
+        SELECT id FROM users
+        WHERE username IS NULL
+        LIMIT batch_size
+        FOR UPDATE SKIP LOCKED
+      );
+    GET DIAGNOSTICS rows_updated = ROW_COUNT;
+    EXIT WHEN rows_updated = 0;
+    PERFORM pg_sleep(0.1); -- throttle to reduce replication lag
+    RAISE NOTICE 'Updated % rows', rows_updated;
+  END LOOP;
+END $$;</code></pre>
+
+        <h4>Phase 2 — Migrate Application (Release N+1)</h4>
+        <pre><code class="language-java">// Entity now reads from new column, writes to both
+@Entity
+@Table(name = "users")
+public class User {
+
+    @Column(name = "username")
+    private String username;
+
+    // Keep writing to old column for rollback safety
+    @Column(name = "userName", insertable = true, updatable = true)
+    private String userNameLegacy;
+
+    public void setUsername(String value) {
+        this.username = value;
+        this.userNameLegacy = value; // dual-write
+    }
+}</code></pre>
+
+        <h4>Phase 3 — Contract (Release N+2)</h4>
+        <pre><code class="language-sql">-- V2023.10.01__contract_remove_old_username.sql
+-- Only run after ALL pods are on Release N+1 or later
+DROP TRIGGER IF EXISTS trg_sync_username ON users;
+DROP FUNCTION IF EXISTS sync_username_columns();
+ALTER TABLE users DROP COLUMN IF EXISTS userName;</code></pre>
+
+        <h3>Example 2: Changing Column Type (INT → BIGINT)</h3>
+        <p>This is common when an ID column approaches INTEGER overflow (~2.1 billion).</p>
+
+        <h4>Phase 1 — Expand</h4>
+        <pre><code class="language-sql">-- V2024.01.01__expand_order_id_bigint.sql
+ALTER TABLE orders ADD COLUMN order_id_new BIGINT;
+
+-- Trigger for new inserts
+CREATE OR REPLACE FUNCTION sync_order_id()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.order_id_new := NEW.order_id::BIGINT;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_sync_order_id
+  BEFORE INSERT OR UPDATE ON orders
+  FOR EACH ROW EXECUTE FUNCTION sync_order_id();</code></pre>
+
+        <h4>Phase 2 — Backfill + Swap</h4>
+        <pre><code class="language-sql">-- Backfill in batches
+UPDATE orders SET order_id_new = order_id::BIGINT
+WHERE order_id_new IS NULL AND id BETWEEN 1 AND 1000000;
+
+-- After full backfill and app migration:
+ALTER TABLE orders RENAME COLUMN order_id TO order_id_old;
+ALTER TABLE orders RENAME COLUMN order_id_new TO order_id;</code></pre>
+
+        <h4>Phase 3 — Contract</h4>
+        <pre><code class="language-sql">-- V2024.02.01__contract_remove_old_order_id.sql
+DROP TRIGGER IF EXISTS trg_sync_order_id ON orders;
+DROP FUNCTION IF EXISTS sync_order_id();
+ALTER TABLE orders DROP COLUMN IF EXISTS order_id_old;</code></pre>
+
+        <h3>Example 3: Splitting a Table</h3>
+        <p>Splitting <code>users</code> into <code>users</code> + <code>user_profiles</code> for performance.</p>
+
+        <h4>Phase 1 — Create new table, dual-write</h4>
+        <pre><code class="language-sql">-- V2024.03.01__expand_create_user_profiles.sql
+CREATE TABLE user_profiles (
+  user_id BIGINT PRIMARY KEY REFERENCES users(id),
+  bio TEXT,
+  avatar_url VARCHAR(512),
+  location VARCHAR(255),
+  website VARCHAR(512),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Backfill from existing users table
+INSERT INTO user_profiles (user_id, bio, avatar_url, location, website)
+SELECT id, bio, avatar_url, location, website
+FROM users
+WHERE bio IS NOT NULL OR avatar_url IS NOT NULL;</code></pre>
+
+        <h4>Phase 2 — Application reads from new table</h4>
+        <pre><code class="language-java">@Service
+public class UserProfileService {
+
+    @Autowired
+    private UserProfileRepository profileRepo;
+
+    @Autowired
+    private UserRepository userRepo; // legacy
+
+    @Transactional
+    public void updateProfile(Long userId, ProfileDTO dto) {
+        // Write to new table
+        UserProfile profile = profileRepo.findByUserId(userId)
+            .orElse(new UserProfile(userId));
+        profile.setBio(dto.getBio());
+        profile.setAvatarUrl(dto.getAvatarUrl());
+        profileRepo.save(profile);
+
+        // Dual-write to old table for rollback safety
+        User user = userRepo.findById(userId).orElseThrow();
+        user.setBio(dto.getBio());
+        user.setAvatarUrl(dto.getAvatarUrl());
+        userRepo.save(user);
+    }
+}</code></pre>
+
+        <h4>Phase 3 — Remove columns from original table</h4>
+        <pre><code class="language-sql">-- V2024.04.01__contract_remove_profile_from_users.sql
+ALTER TABLE users DROP COLUMN IF EXISTS bio;
+ALTER TABLE users DROP COLUMN IF EXISTS avatar_url;
+ALTER TABLE users DROP COLUMN IF EXISTS location;
+ALTER TABLE users DROP COLUMN IF EXISTS website;</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Timing matters:</strong> Never execute the Contract phase until you are 100% certain no running application instance reads from the old structure. In Kubernetes, this means waiting for all old pods to terminate after a rolling deployment completes.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: Backward Compatibility -->
+    <section id="backward-compatibility">
+      <h2>Backward Compatibility</h2>
+      <details>
+        <summary>What's safe vs. what's breaking</summary>
+        <p>Not all schema changes are equal. Understanding which operations are backward-compatible helps you decide which ones need the full Expand-Contract treatment.</p>
+
+        <h3>Safety Classification</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Operation</th>
+              <th>Safety Level</th>
+              <th>Reason</th>
+              <th>Pattern Needed</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Add nullable column</td>
+              <td>✅ Safe</td>
+              <td>Old code ignores unknown columns</td>
+              <td>Direct migration</td>
+            </tr>
+            <tr>
+              <td>Add column with default</td>
+              <td>✅ Safe</td>
+              <td>Old code ignores it, new rows get default</td>
+              <td>Direct migration</td>
+            </tr>
+            <tr>
+              <td>Add new table</td>
+              <td>✅ Safe</td>
+              <td>No existing code references it</td>
+              <td>Direct migration</td>
+            </tr>
+            <tr>
+              <td>Add index</td>
+              <td>⚠️ Caution</td>
+              <td>Can lock table; use CONCURRENTLY</td>
+              <td>CREATE INDEX CONCURRENTLY</td>
+            </tr>
+            <tr>
+              <td>Remove column</td>
+              <td>❌ Breaking</td>
+              <td>Old code SELECTs/INSERTs it</td>
+              <td>Expand-Contract</td>
+            </tr>
+            <tr>
+              <td>Rename column</td>
+              <td>❌ Breaking</td>
+              <td>Old code references old name</td>
+              <td>Expand-Contract</td>
+            </tr>
+            <tr>
+              <td>Change column type</td>
+              <td>❌ Breaking (usually)</td>
+              <td>May fail casting or truncate data</td>
+              <td>Expand-Contract</td>
+            </tr>
+            <tr>
+              <td>Add NOT NULL constraint</td>
+              <td>❌ Breaking</td>
+              <td>Old code may insert NULLs</td>
+              <td>Add with DEFAULT first, then constraint</td>
+            </tr>
+            <tr>
+              <td>Drop table</td>
+              <td>❌ Breaking</td>
+              <td>Any reference causes failure</td>
+              <td>Expand-Contract</td>
+            </tr>
+            <tr>
+              <td>Modify enum values</td>
+              <td>⚠️ Depends</td>
+              <td>Adding is safe, removing is breaking</td>
+              <td>Add=direct, Remove=Expand-Contract</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>The Golden Rule</h3>
+        <div class="callout callout-warning">
+          <p><strong>If the schema change could cause any currently-deployed code to fail, it is a breaking change and requires the Expand-Contract pattern.</strong></p>
+          <p>In a rolling deployment, "currently deployed" includes the version you're replacing — it will still be running for several minutes during rollout.</p>
+        </div>
+
+        <h3>PostgreSQL-Specific Safe Operations</h3>
+        <pre><code class="language-sql">-- Safe: Add nullable column (no table rewrite in PG 11+)
+ALTER TABLE orders ADD COLUMN notes TEXT;
+
+-- Safe: Add column with volatile default (PG 11+ does NOT rewrite table)
+ALTER TABLE orders ADD COLUMN created_at TIMESTAMP DEFAULT NOW();
+
+-- Safe: Create index without locking
+CREATE INDEX CONCURRENTLY idx_orders_customer_id ON orders(customer_id);
+
+-- UNSAFE: This locks the table!
+ALTER TABLE orders ALTER COLUMN amount TYPE NUMERIC(12,2);
+
+-- UNSAFE: Adding NOT NULL without default rewrites table
+ALTER TABLE orders ALTER COLUMN status SET NOT NULL;</code></pre>
+
+        <h3>MySQL/InnoDB Considerations</h3>
+        <pre><code class="language-sql">-- MySQL 8.0+: INSTANT algorithm for adding columns
+ALTER TABLE orders ADD COLUMN notes TEXT, ALGORITHM=INSTANT;
+
+-- pt-online-schema-change for type changes (Percona Toolkit)
+-- This creates a shadow table, copies data, then swaps
+pt-online-schema-change --alter "MODIFY COLUMN amount DECIMAL(12,2)" \
+  --execute D=mydb,t=orders</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Migration Tools -->
+    <section id="migration-tools">
+      <h2>Migration Tools: Flyway &amp; Liquibase Patterns</h2>
+      <details>
+        <summary>Versioned migrations for multi-version deployments</summary>
+
+        <h3>Flyway Configuration for Expand-Contract</h3>
+        <p>Flyway's versioned migrations map naturally to the Expand-Contract phases. The key is structuring your version numbers to make the deployment order explicit.</p>
+
+        <pre><code class="language-bash"># Directory structure
+src/main/resources/db/migration/
+├── V2024.01.01.1__expand_add_email_verified.sql    # Phase 1: Expand
+├── V2024.01.01.2__backfill_email_verified.sql      # Phase 1: Backfill
+├── V2024.01.15.1__contract_email_status.sql        # Phase 3: Contract (later release)
+└── R__create_reporting_views.sql                    # Repeatable migration</code></pre>
+
+        <h4>Flyway Spring Boot Configuration</h4>
+        <pre><code class="language-yaml"># application.yml
+spring:
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+    baseline-version: '0'
+    # Critical for zero-downtime: don't fail if migration already applied
+    ignore-migration-patterns: '*:missing'
+    # Validate checksums to prevent tampering
+    validate-on-migrate: true
+    # Use a lock to prevent concurrent migration execution
+    lock-retry-count: 50
+    # Separate schema for migration metadata
+    schemas: public
+    table: flyway_schema_history
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/myapp
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 20
+      connection-timeout: 5000</code></pre>
+
+        <h4>Multi-Version Deployment Support</h4>
+        <div class="callout callout-info">
+          <p><strong>Problem:</strong> During a rolling deployment, pod A runs migration V5 (expand), but pod B hasn't restarted yet and only knows about V4. Pod B must still function against the V5 schema.</p>
+          <p><strong>Solution:</strong> Expand migrations only ADD structures. Old code simply ignores new columns/tables it doesn't know about.</p>
+        </div>
+
+        <pre><code class="language-java">// Flyway callback to verify schema compatibility
+@Component
+public class SchemaCompatibilityCallback implements Callback {
+
+    @Override
+    public boolean supports(Event event, Context context) {
+        return event == Event.AFTER_MIGRATE;
+    }
+
+    @Override
+    public boolean canHandleInTransaction(Event event, Context context) {
+        return true;
+    }
+
+    @Override
+    public void handle(Event event, Context context) {
+        // Verify the schema is compatible with current application version
+        try (Statement stmt = context.getConnection().createStatement()) {
+            ResultSet rs = stmt.executeQuery(
+                "SELECT column_name FROM information_schema.columns " +
+                "WHERE table_name = 'users' AND column_name = 'username'"
+            );
+            if (!rs.next()) {
+                throw new FlywayException(
+                    "Required column 'users.username' not found. " +
+                    "Schema incompatible with application version."
+                );
+            }
+        } catch (SQLException e) {
+            throw new FlywayException("Schema validation failed", e);
+        }
+    }
+}</code></pre>
+
+        <h3>Liquibase Patterns</h3>
+        <p>Liquibase uses changesets with preconditions, which can be more expressive for complex migrations.</p>
+
+        <pre><code class="language-yaml"># db/changelog/2024/01-expand-username.yaml
+databaseChangeLog:
+  - changeSet:
+      id: expand-add-username
+      author: team-platform
+      comment: "Phase 1: Add new username column alongside userName"
+      preConditions:
+        - onFail: MARK_RAN
+        - not:
+            - columnExists:
+                tableName: users
+                columnName: username
+      changes:
+        - addColumn:
+            tableName: users
+            columns:
+              - column:
+                  name: username
+                  type: VARCHAR(255)
+                  constraints:
+                    nullable: true
+      rollback:
+        - dropColumn:
+            tableName: users
+            columnName: username
+
+  - changeSet:
+      id: backfill-username
+      author: team-platform
+      comment: "Phase 1: Backfill username from userName"
+      preConditions:
+        - onFail: MARK_RAN
+        - columnExists:
+            tableName: users
+            columnName: username
+        - columnExists:
+            tableName: users
+            columnName: userName
+      changes:
+        - sql:
+            sql: "UPDATE users SET username = userName WHERE username IS NULL"
+      rollback:
+        - sql:
+            sql: "UPDATE users SET username = NULL"</code></pre>
+
+        <h3>Repeatable Migrations</h3>
+        <p>Use repeatable migrations for objects that should be recreated on every change (views, functions, stored procedures):</p>
+
+        <pre><code class="language-sql">-- R__user_summary_view.sql (Flyway repeatable migration)
+-- This gets re-executed whenever the file checksum changes
+CREATE OR REPLACE VIEW user_summary AS
+SELECT
+  u.id,
+  u.username,  -- Uses new column name
+  u.email,
+  up.bio,
+  up.avatar_url,
+  COUNT(o.id) as order_count,
+  MAX(o.created_at) as last_order_date
+FROM users u
+LEFT JOIN user_profiles up ON up.user_id = u.id
+LEFT JOIN orders o ON o.user_id = u.id
+GROUP BY u.id, u.username, u.email, up.bio, up.avatar_url;</code></pre>
+
+        <h3>CI/CD Pipeline Integration</h3>
+        <pre><code class="language-yaml"># .github/workflows/migration-check.yml
+name: Migration Safety Check
+on: [pull_request]
+
+jobs:
+  migration-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check migration naming convention
+        run: |
+          for file in src/main/resources/db/migration/V*.sql; do
+            if ! echo "$file" | grep -qP 'V\d{4}\.\d{2}\.\d{2}\.\d+__'; then
+              echo "ERROR: $file does not follow naming convention"
+              exit 1
+            fi
+          done
+
+      - name: Detect dangerous operations
+        run: |
+          for file in $(git diff --name-only origin/main -- '*.sql'); do
+            if grep -iP '(DROP COLUMN|DROP TABLE|ALTER.*TYPE|SET NOT NULL)' "$file"; then
+              echo "WARNING: $file contains potentially breaking change"
+              echo "Ensure this is a Contract phase migration with proper guards"
+              # Don't fail, but flag for review
+              echo "::warning file=$file::Contains breaking schema change"
+            fi
+          done
+
+      - name: Run migrations against test DB
+        run: |
+          docker-compose up -d postgres
+          sleep 5
+          ./gradlew flywayMigrate -Dflyway.url=jdbc:postgresql://localhost:5432/test</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 6: Dual-Write Pattern -->
+    <section id="dual-write">
+      <h2>Dual-Write Pattern</h2>
+      <details>
+        <summary>Writing to old AND new schema during transition</summary>
+        <p>The dual-write pattern ensures data consistency during the migration window. Every write operation updates both the old and new schema locations simultaneously.</p>
+
+        <h3>When to Use Dual-Write</h3>
+        <ul>
+          <li>Column renames where both old and new code must function</li>
+          <li>Table splits where data must exist in both locations</li>
+          <li>Type changes where both representations must stay in sync</li>
+          <li>Any scenario where rollback must be instantaneous (just switch read source)</li>
+        </ul>
+
+        <h3>Implementation Pattern</h3>
+        <pre><code class="language-java">@Service
+@Slf4j
+public class OrderDualWriteService {
+
+    private final JdbcTemplate jdbc;
+    private final MeterRegistry metrics;
+
+    @Value("${migration.orders.read-from-new:false}")
+    private boolean readFromNew;
+
+    @Transactional
+    public Order createOrder(CreateOrderRequest request) {
+        Order order = new Order();
+        order.setCustomerId(request.getCustomerId());
+        order.setAmount(request.getAmount());
+        order.setStatus(OrderStatus.PENDING);
+
+        // Write to BOTH schemas within same transaction
+        Long orderId = insertIntoOldSchema(order);
+        insertIntoNewSchema(orderId, order);
+
+        metrics.counter("orders.dual_write.success").increment();
+        log.debug("Dual-write completed for order {}", orderId);
+
+        // Read from whichever schema is "primary"
+        return readFromNew ? readFromNewSchema(orderId) : readFromOldSchema(orderId);
+    }
+
+    private Long insertIntoOldSchema(Order order) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(connection -> {
+            PreparedStatement ps = connection.prepareStatement(
+                "INSERT INTO orders (customer_id, amount, status, created_at) " +
+                "VALUES (?, ?, ?, NOW())",
+                Statement.RETURN_GENERATED_KEYS
+            );
+            ps.setLong(1, order.getCustomerId());
+            ps.setBigDecimal(2, order.getAmount());
+            ps.setString(3, order.getStatus().name());
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    private void insertIntoNewSchema(Long orderId, Order order) {
+        jdbc.update(
+            "INSERT INTO orders_v2 (id, customer_id, amount_cents, status, created_at) " +
+            "VALUES (?, ?, ?, ?, NOW())",
+            orderId,
+            order.getCustomerId(),
+            order.getAmount().multiply(BigDecimal.valueOf(100)).longValue(),
+            order.getStatus().name()
+        );
+    }
+
+    private Order readFromOldSchema(Long orderId) {
+        return jdbc.queryForObject(
+            "SELECT * FROM orders WHERE id = ?",
+            new OrderRowMapper(),
+            orderId
+        );
+    }
+
+    private Order readFromNewSchema(Long orderId) {
+        return jdbc.queryForObject(
+            "SELECT * FROM orders_v2 WHERE id = ?",
+            new OrderV2RowMapper(),
+            orderId
+        );
+    }
+}</code></pre>
+
+        <h3>Consistency Verification</h3>
+        <p>Always verify that dual-writes are consistent. Run a background job that compares records:</p>
+
+        <pre><code class="language-java">@Scheduled(fixedDelay = 60000) // Every minute
+public void verifyDualWriteConsistency() {
+    List&lt;Long&gt; sampleIds = jdbc.queryForList(
+        "SELECT id FROM orders ORDER BY RANDOM() LIMIT 100",
+        Long.class
+    );
+
+    int mismatches = 0;
+    for (Long id : sampleIds) {
+        Order oldRecord = readFromOldSchema(id);
+        Order newRecord = readFromNewSchema(id);
+
+        if (!isConsistent(oldRecord, newRecord)) {
+            mismatches++;
+            log.warn("Dual-write inconsistency detected for order {}. " +
+                     "Old: {}, New: {}", id, oldRecord, newRecord);
+            metrics.counter("dual_write.inconsistency").increment();
+
+            // Auto-repair: copy from source of truth (old) to new
+            repairNewSchemaRecord(id, oldRecord);
+        }
+    }
+
+    metrics.gauge("dual_write.mismatch_rate",
+        (double) mismatches / sampleIds.size());
+
+    if (mismatches > sampleIds.size() * 0.01) { // >1% mismatch
+        alerting.fire("dual-write-inconsistency-high",
+            "Mismatch rate: " + mismatches + "/" + sampleIds.size());
+    }
+}
+
+private boolean isConsistent(Order old, Order newRec) {
+    if (old == null || newRec == null) return old == newRec;
+    return old.getCustomerId().equals(newRec.getCustomerId())
+        && old.getAmount().compareTo(
+            BigDecimal.valueOf(newRec.getAmountCents(), 2)) == 0
+        && old.getStatus().equals(newRec.getStatus());
+}</code></pre>
+
+        <h3>Dual-Write Pitfalls</h3>
+        <div class="callout callout-danger">
+          <p><strong>Transaction boundaries matter!</strong> Both writes MUST be in the same database transaction. If you write to old, commit, then write to new and that fails — you have inconsistent data.</p>
+        </div>
+
+        <div class="callout callout-warning">
+          <p><strong>Performance impact:</strong> Dual-writes double your write load. Monitor connection pool usage, replication lag, and response times during the migration window. Consider off-peak hours for the backfill.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 7: Feature Flags -->
+    <section id="feature-flags">
+      <h2>Feature Flags for Schema Transitions</h2>
+      <details>
+        <summary>Toggle which schema path code uses</summary>
+        <p>Feature flags decouple deployment from activation. You can deploy dual-write code, but only enable the new schema path gradually.</p>
+
+        <h3>Flag Strategy for Schema Migration</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Flag</th>
+              <th>Phase 1 (Expand)</th>
+              <th>Phase 2 (Migrate)</th>
+              <th>Phase 3 (Contract)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>schema.orders.dual-write</code></td>
+              <td>ON</td>
+              <td>ON</td>
+              <td>OFF (removed)</td>
+            </tr>
+            <tr>
+              <td><code>schema.orders.read-from-new</code></td>
+              <td>OFF</td>
+              <td>ON (gradual)</td>
+              <td>ON (removed)</td>
+            </tr>
+            <tr>
+              <td><code>schema.orders.write-only-new</code></td>
+              <td>OFF</td>
+              <td>OFF</td>
+              <td>ON → remove flag</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Spring Boot Feature Flag Implementation</h3>
+        <pre><code class="language-java">@Configuration
+public class SchemaFeatureFlags {
+
+    @Bean
+    public FeatureFlagService schemaFlags(Environment env) {
+        return new FeatureFlagService(env);
+    }
+}
+
+@Component
+@RefreshScope // Supports runtime toggle without restart
+public class FeatureFlagService {
+
+    @Value("${feature.schema.orders.dual-write:false}")
+    private boolean ordersDualWrite;
+
+    @Value("${feature.schema.orders.read-from-new:false}")
+    private boolean ordersReadFromNew;
+
+    @Value("${feature.schema.orders.write-only-new:false}")
+    private boolean ordersWriteOnlyNew;
+
+    public boolean isOrdersDualWriteEnabled() {
+        return ordersDualWrite;
+    }
+
+    public boolean shouldReadFromNewOrdersSchema() {
+        return ordersReadFromNew;
+    }
+
+    public boolean isLegacyWriteDisabled() {
+        return ordersWriteOnlyNew;
+    }
+}</code></pre>
+
+        <h3>Flag-Aware Repository</h3>
+        <pre><code class="language-java">@Repository
+@Slf4j
+public class OrderRepositoryAdapter implements OrderRepository {
+
+    private final OrderLegacyRepository legacy;
+    private final OrderNewRepository newRepo;
+    private final FeatureFlagService flags;
+
+    @Override
+    @Transactional
+    public Order save(Order order) {
+        Order saved;
+
+        if (flags.isLegacyWriteDisabled()) {
+            // Phase 3: Only write to new schema
+            saved = newRepo.save(toNewEntity(order));
+        } else if (flags.isOrdersDualWriteEnabled()) {
+            // Phase 1-2: Write to both
+            saved = legacy.save(toLegacyEntity(order));
+            newRepo.save(toNewEntity(order));
+        } else {
+            // Pre-migration: Only old schema
+            saved = legacy.save(toLegacyEntity(order));
+        }
+
+        return saved;
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public Optional&lt;Order&gt; findById(Long id) {
+        if (flags.shouldReadFromNewOrdersSchema()) {
+            return newRepo.findById(id).map(this::fromNewEntity);
+        }
+        return legacy.findById(id).map(this::fromLegacyEntity);
+    }
+}</code></pre>
+
+        <h3>Gradual Rollout with Percentage-Based Flags</h3>
+        <pre><code class="language-java">@Component
+public class GradualSchemaRollout {
+
+    @Value("${feature.schema.orders.new-read-percentage:0}")
+    private int readPercentage; // 0-100
+
+    private final Random random = new Random();
+
+    public boolean shouldUseNewSchema(Long entityId) {
+        // Deterministic: same entity always goes to same schema
+        // Avoids read-your-write issues
+        int bucket = Math.abs(entityId.hashCode() % 100);
+        return bucket < readPercentage;
+    }
+}
+
+// Usage in repository:
+@Override
+public Optional&lt;Order&gt; findById(Long id) {
+    if (gradualRollout.shouldUseNewSchema(id)) {
+        return newRepo.findById(id).map(this::fromNewEntity);
+    }
+    return legacy.findById(id).map(this::fromLegacyEntity);
+}</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Pro tip:</strong> Use deterministic bucketing (based on entity ID hash) rather than random selection. This ensures the same record is always read from the same source, preventing read-your-write inconsistencies.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 8: Deployment Strategies -->
+    <section id="deployment-strategies">
+      <h2>Deployment Strategies for Schema Changes</h2>
+
+      <details>
+        <summary>Blue-Green vs Rolling vs Canary — how they interact with schema migrations</summary>
+        <pre class="diagram">
+  Rolling Deployment with Schema Change (DANGEROUS without expand-contract):
+  ═════════════════════════════════════════════════════════════════════════
+
+  Time ──────────────────────────────────────────────────────▶
+
+  DB:     [old schema]──────── migration runs ────────[new schema]
+                                     │
+  Pod v1: ████████████████████       │  ████ (terminating)
+                                     │        ↑ uses OLD column that's now gone!
+  Pod v2:                  ██████████████████████████████████
+                                     │        ↑ uses NEW column
+                                     │
+                              DANGER ZONE: old pods + new schema = 500 errors
+
+  Safe Approach: Expand-Contract with Rolling Deployment:
+  ══════════════════════════════════════════════════════════
+
+  Phase 1: EXPAND (add new, keep old)
+  DB:     [old schema] → [old + new columns exist]
+  Pod v1: ████████████████████████████████  (reads/writes old column — still works!)
+  Pod v2:            ████████████████████████████████  (reads/writes new column)
+
+  Phase 2: MIGRATE (backfill data)
+  DB:     [old + new columns, data synced]
+  Pod v2: ████████████████████████████████████████████  (all pods on v2 now)
+
+  Phase 3: CONTRACT (remove old)
+  DB:     [new schema only] — safe because no pod uses old column
+  Pod v2: ████████████████████████████████████████████
+        </pre>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Schema Change Safety</th>
+              <th>Rollback</th>
+              <th>Downtime Risk</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Rolling Deploy</strong></td>
+              <td>⚠️ Old + new pods coexist — schema must be backward-compatible</td>
+              <td>Easy (keep old pods)</td>
+              <td>Medium (if migration breaks old pods)</td>
+            </tr>
+            <tr>
+              <td><strong>Blue-Green</strong></td>
+              <td>✅ All pods switch at once — no mixed versions</td>
+              <td>Easy (switch back to blue)</td>
+              <td>Low (but DB migration must be applied to shared DB)</td>
+            </tr>
+            <tr>
+              <td><strong>Canary</strong></td>
+              <td>⚠️ Canary pods use new code against shared DB</td>
+              <td>Easy (kill canary)</td>
+              <td>Low (only canary affected)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>GitOps workflow for database migrations</summary>
+        <pre><code class="language-yaml"># Deployment pipeline with schema migration gates
+# .github/workflows/deploy.yml
+jobs:
+  migrate-database:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Flyway migrate (expand phase only)
+        run: |
+          flyway -url=$DB_URL -user=$DB_USER -password=$DB_PASS migrate
+        env:
+          FLYWAY_LOCATIONS: classpath:db/migration/expand
+      
+      - name: Verify old app still works against new schema
+        run: |
+          # Run integration tests with OLD app version against NEW schema
+          docker run old-app:current ./gradlew integrationTest
+
+  deploy-new-version:
+    needs: migrate-database
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rolling deploy new pods
+        run: kubectl rollout restart deployment/order-service
+      
+      - name: Wait for rollout complete
+        run: kubectl rollout status deployment/order-service --timeout=300s
+
+  contract-schema:
+    needs: deploy-new-version
+    # Run days/weeks later after confirming no rollback needed
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'  # Manual trigger only!
+    steps:
+      - name: Run contract migration (remove old columns)
+        run: |
+          flyway -url=$DB_URL -user=$DB_USER -password=$DB_PASS migrate
+        env:
+          FLYWAY_LOCATIONS: classpath:db/migration/contract</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 9: Production Incident -->
+    <section id="production-incident">
+      <h2>Real Production Incident</h2>
+
+      <details>
+        <summary>The 8-minute outage: DROP COLUMN during rolling deployment</summary>
+        <div class="callout callout-danger">
+          <p><strong>Severity:</strong> P1 — 500 errors for all order-related endpoints for 8 minutes</p>
+        </div>
+
+        <h4>Context</h4>
+        <p>Microservices platform, 12 pods running order-service. Team decided to rename <code>orders.customer_name</code> to <code>orders.buyer_name</code>. A junior engineer wrote a single migration that dropped the old column and added the new one.</p>
+
+        <h4>Timeline</h4>
+        <pre class="diagram">
+  14:00 — Deploy starts. Flyway migration runs first:
+           ALTER TABLE orders DROP COLUMN customer_name;
+           ALTER TABLE orders ADD COLUMN buyer_name VARCHAR(255);
+  14:01 — Migration completes. Pod-1 (new code) starts, uses buyer_name ✅
+  14:02 — Pods 2-12 still running OLD code, querying customer_name
+           → "ERROR: column 'customer_name' does not exist" 
+           → 500 errors on all 11 old pods
+  14:03 — Load balancer routes 11/12 requests to old pods → 91% error rate
+  14:05 — Alert fires: "Error rate > 50%"
+  14:07 — On-call identifies the issue via error logs
+  14:08 — Emergency: kubectl rollout undo deployment/order-service
+           But DB migration already ran — old code STILL can't find the column!
+  14:09 — DBA manually adds column back: ALTER TABLE orders ADD COLUMN customer_name VARCHAR(255);
+  14:10 — Old pods recover. Error rate drops to 0.
+        </pre>
+
+        <h4>Root Cause</h4>
+        <pre><code class="language-sql">-- The WRONG migration (single step, destructive)
+-- V5__rename_customer_to_buyer.sql
+ALTER TABLE orders DROP COLUMN customer_name;
+ALTER TABLE orders ADD COLUMN buyer_name VARCHAR(255);
+-- ❌ This is a breaking change! Old code immediately fails.</code></pre>
+
+        <h4>What Should Have Been Done</h4>
+        <pre><code class="language-sql">-- V5__expand_add_buyer_name.sql (Phase 1: EXPAND)
+ALTER TABLE orders ADD COLUMN buyer_name VARCHAR(255);
+
+-- Application v2 writes to BOTH columns (dual-write)
+-- Backfill old data:
+UPDATE orders SET buyer_name = customer_name WHERE buyer_name IS NULL;
+
+-- After ALL pods are on v2 and stable for days:
+-- V6__contract_drop_customer_name.sql (Phase 3: CONTRACT)
+ALTER TABLE orders DROP COLUMN customer_name;</code></pre>
+
+        <h4>Preventive Measures</h4>
+        <ul>
+          <li><strong>CI check:</strong> Added a linter that rejects migrations containing <code>DROP COLUMN</code>, <code>RENAME COLUMN</code>, or <code>ALTER COLUMN ... TYPE</code> without a paired expand migration</li>
+          <li><strong>Mandatory staging test:</strong> Run old app version against new schema in CI before merging</li>
+          <li><strong>Migration review checklist:</strong> PR template requires confirming backward compatibility</li>
+          <li><strong>Separation of concerns:</strong> Schema migrations are now in a separate repo/pipeline from app deployment</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 10: Code Examples -->
+    <section id="code-examples">
+      <h2>Production-Ready Code Examples</h2>
+
+      <details>
+        <summary>Complete Flyway expand-contract migration set</summary>
+        <pre><code class="language-sql">-- V10__expand_rename_email.sql
+-- Goal: rename users.email_address to users.email
+-- Phase 1: Add new column
+
+ALTER TABLE users ADD COLUMN email VARCHAR(255);
+
+-- Backfill in batches to avoid locking entire table
+DO $$
+DECLARE
+  batch_size INT := 10000;
+  updated INT;
+BEGIN
+  LOOP
+    UPDATE users 
+    SET email = email_address 
+    WHERE email IS NULL 
+    LIMIT batch_size;
+    
+    GET DIAGNOSTICS updated = ROW_COUNT;
+    EXIT WHEN updated = 0;
+    
+    PERFORM pg_sleep(0.1); -- Throttle to avoid overwhelming DB
+  END LOOP;
+END $$;
+
+-- Add constraint after backfill
+ALTER TABLE users ALTER COLUMN email SET NOT NULL;
+CREATE INDEX CONCURRENTLY idx_users_email ON users(email);
+
+-- Add trigger to keep both columns in sync during transition
+CREATE OR REPLACE FUNCTION sync_email_columns() RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
+    IF NEW.email IS NOT NULL AND NEW.email_address IS DISTINCT FROM NEW.email THEN
+      NEW.email_address := NEW.email;
+    ELSIF NEW.email_address IS NOT NULL AND NEW.email IS DISTINCT FROM NEW.email_address THEN
+      NEW.email := NEW.email_address;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_sync_email
+  BEFORE INSERT OR UPDATE ON users
+  FOR EACH ROW EXECUTE FUNCTION sync_email_columns();</code></pre>
+        <pre><code class="language-sql">-- V11__contract_remove_email_address.sql (run weeks later)
+-- Phase 3: Remove old column (ONLY after all code uses new column)
+
+DROP TRIGGER IF EXISTS trg_sync_email ON users;
+DROP FUNCTION IF EXISTS sync_email_columns();
+DROP INDEX IF EXISTS idx_users_email_address;
+ALTER TABLE users DROP COLUMN email_address;</code></pre>
+      </details>
+
+      <details>
+        <summary>Spring Boot entity supporting both schema versions</summary>
+        <pre><code class="language-java">// During transition: entity maps both columns
+@Entity
+@Table(name = "users")
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    // New column (primary after migration)
+    @Column(name = "email")
+    private String email;
+
+    // Old column (kept during transition for backward compatibility)
+    @Column(name = "email_address", insertable = false, updatable = false)
+    private String emailAddress;
+
+    // Dual-write: setter updates both
+    public void setEmail(String email) {
+        this.email = email;
+        this.emailAddress = email; // Sync for old code reading this column
+    }
+
+    // Getter always returns from new column
+    public String getEmail() {
+        return email != null ? email : emailAddress; // Fallback during migration
+    }
+}
+
+// After contract phase: simplified entity
+@Entity
+@Table(name = "users")
+public class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "email", nullable = false)
+    private String email;
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Safe column type change (INT → BIGINT)</summary>
+        <pre><code class="language-sql">-- Changing orders.amount from INT to BIGINT (breaking if done directly)
+-- Direct approach: ALTER TABLE orders ALTER COLUMN amount TYPE BIGINT;
+-- This takes an ACCESS EXCLUSIVE lock on large tables — minutes of downtime!
+
+-- Safe approach: expand-contract with concurrent index creation
+
+-- V20__expand_amount_bigint.sql
+ALTER TABLE orders ADD COLUMN amount_big BIGINT;
+
+-- Backfill (batched, non-blocking)
+UPDATE orders SET amount_big = amount WHERE amount_big IS NULL; -- do in batches
+
+-- Add trigger for dual-write sync
+CREATE OR REPLACE FUNCTION sync_amount() RETURNS TRIGGER AS $$
+BEGIN
+  NEW.amount_big := NEW.amount;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_sync_amount BEFORE INSERT OR UPDATE ON orders
+  FOR EACH ROW EXECUTE FUNCTION sync_amount();
+
+-- V21__contract_swap_amount.sql (after all code uses amount_big)
+ALTER TABLE orders DROP COLUMN amount;
+ALTER TABLE orders RENAME COLUMN amount_big TO amount;
+DROP TRIGGER trg_sync_amount ON orders;
+DROP FUNCTION sync_amount();</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 11: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Schema migration anti-patterns</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Mistake</th>
+              <th>Impact</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>DROP COLUMN in same deploy as code change</td>
+              <td>Old pods fail immediately on rolling deploy</td>
+              <td>Expand-contract: add new first, remove old weeks later</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>RENAME COLUMN directly</td>
+              <td>Same as DROP — old code references old name</td>
+              <td>Add new column, dual-write, migrate, drop old</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>ALTER COLUMN TYPE on large table</td>
+              <td>ACCESS EXCLUSIVE lock — blocks all reads/writes for minutes</td>
+              <td>Add new column with target type, backfill, swap</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Adding NOT NULL without default on existing column</td>
+              <td>Fails if any NULL rows exist; blocks on large tables</td>
+              <td>Add nullable first, backfill, then add constraint</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>CREATE INDEX without CONCURRENTLY</td>
+              <td>Locks table for writes during index build (minutes on large tables)</td>
+              <td>Always use <code>CREATE INDEX CONCURRENTLY</code></td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>Running backfill in single UPDATE statement</td>
+              <td>Locks all rows, WAL bloat, replication lag</td>
+              <td>Batch updates (10K rows per batch, with sleep between)</td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td>No rollback plan for migrations</td>
+              <td>Broken migration requires emergency manual SQL</td>
+              <td>Write paired rollback migration scripts for every expand</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 12: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+
+      <details>
+        <summary>Migration strategy comparison</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Complexity</th>
+              <th>Downtime Risk</th>
+              <th>Rollback Safety</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Expand-Contract</strong></td>
+              <td>High (3 phases)</td>
+              <td>Zero</td>
+              <td>Excellent (each phase reversible)</td>
+              <td>Breaking changes on critical tables</td>
+            </tr>
+            <tr>
+              <td><strong>Blue-Green + instant cutover</strong></td>
+              <td>Medium</td>
+              <td>Seconds (DNS switch)</td>
+              <td>Good (switch back to blue)</td>
+              <td>Small databases, infrequent deploys</td>
+            </tr>
+            <tr>
+              <td><strong>Maintenance window</strong></td>
+              <td>Low</td>
+              <td>Planned (minutes-hours)</td>
+              <td>Medium (restore from backup)</td>
+              <td>Internal tools, low-traffic services</td>
+            </tr>
+            <tr>
+              <td><strong>Shadow tables + swap</strong></td>
+              <td>Very High</td>
+              <td>Seconds (rename)</td>
+              <td>Good (rename back)</td>
+              <td>Massive tables needing restructuring (gh-ost, pt-online-schema-change)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 13: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Questions the interviewer will ask next</summary>
+        <dl>
+          <dt><strong>Q: "How would you handle a migration that needs to run on a table with 500M rows?"</strong></dt>
+          <dd>Never alter in place. Use pt-online-schema-change (MySQL) or pg_repack (PostgreSQL) for online table rebuilds. For backfills: batch in 10K chunks with throttling, run during off-peak, monitor replication lag. Consider doing it over days with a background job rather than a one-time migration.</dd>
+
+          <dt><strong>Q: "What if you need to split one table into two?"</strong></dt>
+          <dd>Phase 1: Create new table, dual-write to both old and new. Phase 2: Backfill new table from old. Phase 3: Update reads to query new table. Phase 4: Stop writing to old table. Phase 5: Drop old table (weeks later). Each phase is a separate deployment with its own migration.</dd>
+
+          <dt><strong>Q: "How do you coordinate schema changes across multiple microservices that share a database?"</strong></dt>
+          <dd>Ideally: don't share databases. If you must, the schema owner service controls migrations. Other services must tolerate additive changes (new columns/tables) without code changes. Use schema versioning and API contracts rather than direct table access.</dd>
+
+          <dt><strong>Q: "How do you test that a migration is backward-compatible?"</strong></dt>
+          <dd>In CI: (1) Apply the migration to a test DB, (2) Run the CURRENT (old) app's integration tests against the new schema, (3) If they pass, the migration is backward-compatible. This catches DROP/RENAME issues before they reach production.</dd>
+
+          <dt><strong>Q: "What tools exist for zero-downtime schema changes?"</strong></dt>
+          <dd>PostgreSQL: pg_repack, Flyway, Liquibase. MySQL: pt-online-schema-change, gh-ost (GitHub's online schema migration tool), Flyway. General: Flyway/Liquibase for version management, feature flags for code transition, custom tooling for backfills.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- Section 14: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Interview Takeaways:</strong></p>
+        <ol>
+          <li>Never make <strong>destructive schema changes</strong> (DROP, RENAME, ALTER TYPE) in the same deploy as code changes.</li>
+          <li>Use the <strong>Expand-Contract</strong> pattern: add new → migrate data → remove old. Each phase is a separate deployment.</li>
+          <li>During rolling deploys, <strong>old and new code coexist</strong> — the schema must work with both versions simultaneously.</li>
+          <li><code>CREATE INDEX CONCURRENTLY</code> — always. Regular CREATE INDEX takes an ACCESS EXCLUSIVE lock.</li>
+          <li><strong>Backfill in batches</strong> with throttling — never a single UPDATE statement on large tables.</li>
+          <li>Use <strong>triggers for dual-write sync</strong> during the transition period (remove after contract phase).</li>
+          <li><strong>Test backward compatibility in CI</strong> — run old app tests against new schema before merging.</li>
+          <li>The contract phase should be a <strong>manual trigger</strong>, not automatic — give yourself days/weeks to confirm stability.</li>
+          <li>Consider tools like <strong>gh-ost</strong> (MySQL) or <strong>pg_repack</strong> (PostgreSQL) for large table restructuring.</li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch08-optimistic-locking-failures.html" class="chapter-nav-prev">← Chapter 8: Optimistic Locking</a>
+      <a href="ch10-cache-hit-ratio-drop.html" class="chapter-nav-next">Chapter 10: Cache Hit Ratio Drop →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

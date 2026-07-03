@@ -1,0 +1,1940 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 2: Duplicate Records After Enabling Retries | Senior Backend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <!-- Sidebar Navigation -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 2</span>
+      <span class="chapter-title">Duplicate Records & Retries</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#retry-architecture">Retry Architecture</a></li>
+        <li><a href="#spring-retry">Spring Retry Deep Dive</a></li>
+        <li><a href="#why-duplicates-happen">Why Duplicates Happen</a></li>
+        <li><a href="#idempotency">Idempotency Patterns</a></li>
+        <li><a href="#idempotency-keys">Idempotency Keys</a></li>
+        <li><a href="#database-constraints">Database Constraints</a></li>
+        <li><a href="#outbox-pattern">Outbox Pattern</a></li>
+        <li><a href="#distributed-retries">Distributed Retries</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-i">Part I — Spring Boot Core Internals</a> &rsaquo;
+      <span>Chapter 2</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Idempotency</span>
+        <span class="badge badge-topic">Retries</span>
+        <span class="badge badge-topic">Distributed Systems</span>
+      </div>
+      <h1>Duplicate Records After Enabling Retries — How Would You Fix It?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Retries are necessary for resilience, but without idempotency guarantees, every retry is a potential duplicate. The fix is never "disable retries" — it's making your writes idempotent through idempotency keys, database constraints, and conditional operations.
+      </p>
+    </header>
+
+    <!-- Search -->
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter... (e.g., idempotency key, outbox, Spring Retry)" aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <div class="callout callout-info">
+        <p><strong>What they're really testing:</strong></p>
+        <ul>
+          <li>Do you understand that retries and idempotency are <em>inseparable</em> concerns?</li>
+          <li>Can you design systems that are safe to retry at every layer (client, server, message broker)?</li>
+          <li>Do you know the trade-offs between different idempotency strategies?</li>
+          <li>Have you dealt with this in production — payment systems, order processing, event-driven architectures?</li>
+          <li>Can you think across network boundaries — client retries, load balancer retries, framework retries?</li>
+        </ul>
+      </div>
+      <p>This question tests whether you understand that <strong>at-least-once delivery</strong> is the reality of distributed systems. Networks fail, pods restart, timeouts trigger retries — and if your service isn't prepared, every retry creates a duplicate. The interviewer wants to see that you think about this from the ground up, not as an afterthought.</p>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Interview Answer</h2>
+      <div class="callout callout-tip">
+        <p><strong>Use this in the interview:</strong></p>
+        <blockquote>
+          "Retries without idempotency guarantees are a recipe for duplicates. When we enabled Spring Retry, network timeouts that previously caused failures now triggered 3 retries — each potentially creating a new record because the server couldn't distinguish a retry from a new request.
+          <br><br>
+          The fix is multi-layered:
+          <br><br>
+          <strong>1. Idempotency keys</strong> — client generates a unique key per logical operation. Server stores it and returns the cached result on duplicates.<br>
+          <strong>2. Database unique constraints</strong> — a natural business key (order_id + item_id) or a dedicated idempotency_key column prevents duplicates at the storage layer.<br>
+          <strong>3. Conditional writes</strong> — use INSERT ... ON CONFLICT DO NOTHING or compare-and-swap with version columns.<br>
+          <strong>4. Transactional outbox</strong> — for event publishing, store the event in the same transaction as the write, then publish asynchronously.
+          <br><br>
+          The critical insight is that retries can happen at <em>every layer</em> — HTTP client, load balancer, Spring Retry, Kafka consumer. Each layer needs its own idempotency story."
+        </blockquote>
+      </div>
+    </section>
+
+    <!-- Section 3: Retry Architecture -->
+    <section id="retry-architecture">
+      <h2>Retry Architecture — Where Do Retries Happen?</h2>
+
+      <details>
+        <summary>The retry layers in a typical Spring Boot microservice</summary>
+        <pre class="diagram">
+  Client (Mobile/Web)
+    │
+    │  ← Retry #1: Client-side retry (exponential backoff)
+    ▼
+  API Gateway / Load Balancer (e.g., AWS ALB, Nginx, Envoy)
+    │
+    │  ← Retry #2: LB retry on 502/503 (configured retries: 1-2)
+    ▼
+  Spring Boot Application
+    │
+    │  ← Retry #3: Spring Retry / Resilience4j (@Retryable)
+    ▼
+  HTTP Client (RestTemplate / WebClient / Feign)
+    │
+    │  ← Retry #4: HTTP client retry on connection reset
+    ▼
+  Downstream Service
+    │
+    ▼
+  Message Broker (Kafka / RabbitMQ)
+    │
+    │  ← Retry #5: Consumer retry on processing failure
+    │  ← Retry #6: DLQ reprocessing
+    ▼
+  Database
+    │
+    │  ← Retry #7: Transaction retry on deadlock/serialization failure
+    ▼
+
+  ╔═══════════════════════════════════════════════════════════════╗
+  ║  A single user action can trigger 2×2×3×2 = 24 attempts!    ║
+  ║  Without idempotency, that's 24 potential duplicate records. ║
+  ╚═══════════════════════════════════════════════════════════════╝
+        </pre>
+      </details>
+
+      <details>
+        <summary>The fundamental problem: ambiguous failures</summary>
+        <pre class="diagram">
+  Scenario: Client sends POST /orders
+
+  Case 1: Request never reached server
+  ──────────────────────────────────────
+  Client ──✗── Server         Result: No record created
+           ↑                  Safe to retry? ✅ YES
+     Network failure
+
+  Case 2: Server processed, response lost
+  ──────────────────────────────────────────
+  Client ──── Server          Result: Record CREATED
+         ✗──                  Safe to retry? ❌ NO (duplicate!)
+           ↑
+     Response lost (timeout)
+
+  Case 3: Server crashed mid-processing
+  ──────────────────────────────────────────
+  Client ──── Server          Result: Unknown (partial write?)
+         ✗──                  Safe to retry? ⚠️ DEPENDS
+           ↑
+     Connection reset
+
+  THE PROBLEM: The client CANNOT distinguish Case 1 from Case 2.
+  From the client's perspective, both look like a timeout.
+        </pre>
+        <div class="callout callout-warning">
+          <p><strong>Key Insight:</strong> In distributed systems, failure is <em>ambiguous</em>. A timeout doesn't tell you whether the operation succeeded or failed. This is why you must design for safe retries from the start — not bolt them on later.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: Spring Retry Deep Dive -->
+    <section id="spring-retry">
+      <h2>Spring Retry Deep Dive</h2>
+
+      <details>
+        <summary>How Spring Retry works — the retry interceptor chain</summary>
+        <pre><code class="language-java">// Enable retry support
+@Configuration
+@EnableRetry
+public class RetryConfig {
+    // Spring creates a MethodInterceptor (RetryOperationsInterceptor)
+    // that wraps @Retryable methods — similar to @Transactional proxy
+}
+
+@Service
+public class PaymentService {
+
+    @Retryable(
+        retryFor = {TransientException.class, SocketTimeoutException.class},
+        noRetryFor = {ValidationException.class},
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 1000, multiplier = 2, maxDelay = 10000)
+    )
+    public PaymentResult charge(PaymentRequest request) {
+        return paymentGateway.process(request);
+    }
+
+    @Recover
+    public PaymentResult chargeFallback(TransientException e, PaymentRequest request) {
+        log.error("Payment failed after all retries for request: {}", request.getId(), e);
+        return PaymentResult.failed("Service temporarily unavailable");
+    }
+}</code></pre>
+        <pre class="diagram">
+  Spring Retry Execution Flow:
+  ─────────────────────────────
+
+  Call charge()
+       │
+       ▼
+  ┌────────────────────────────────────────┐
+  │  RetryOperationsInterceptor            │
+  │                                        │
+  │  Attempt 1 ──▶ paymentGateway.process()│
+  │       │                                │
+  │       ├── Success? ──▶ return result   │
+  │       │                                │
+  │       └── TransientException?          │
+  │               │                        │
+  │         wait 1000ms (backoff)          │
+  │               │                        │
+  │  Attempt 2 ──▶ paymentGateway.process()│
+  │       │                                │
+  │       ├── Success? ──▶ return result   │
+  │       │                                │
+  │       └── TransientException?          │
+  │               │                        │
+  │         wait 2000ms (backoff × 2)      │
+  │               │                        │
+  │  Attempt 3 ──▶ paymentGateway.process()│
+  │       │                                │
+  │       ├── Success? ──▶ return result   │
+  │       │                                │
+  │       └── TransientException?          │
+  │               │                        │
+  │         MAX ATTEMPTS REACHED           │
+  │               │                        │
+  │         @Recover method                │
+  │               │                        │
+  └───────────────┼────────────────────────┘
+                  ▼
+           return fallback result
+        </pre>
+      </details>
+
+      <details>
+        <summary>The critical ordering: @Retryable OUTSIDE @Transactional</summary>
+        <pre><code class="language-java">// ❌ WRONG: Retry inside transaction
+// Transaction starts → attempt 1 fails → tx marked for rollback
+// → attempt 2 runs inside a DEAD transaction → always fails
+@Service
+public class OrderService {
+
+    @Transactional
+    @Retryable(maxAttempts = 3) // ❌ Retries inside the same transaction!
+    public Order createOrder(OrderRequest request) {
+        Order order = orderRepository.save(new Order(request));
+        inventoryService.reserve(order); // Throws on timeout
+        return order;
+    }
+}
+
+// ✅ CORRECT: Retry wraps the transaction
+// Each retry gets a FRESH transaction
+@Service
+public class OrderService {
+
+    @Retryable(
+        retryFor = TransientException.class,
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 500, multiplier = 2)
+    )
+    @Transactional // New transaction per attempt
+    public Order createOrder(OrderRequest request) {
+        Order order = orderRepository.save(new Order(request));
+        inventoryService.reserve(order);
+        return order;
+    }
+}</code></pre>
+        <div class="callout callout-danger">
+          <p><strong>Critical:</strong> The ordering of AOP aspects matters. By default, <code>@Retryable</code> has lower precedence than <code>@Transactional</code>, meaning retry wraps the transaction (correct). But if you customize aspect ordering, you can break this. Always verify with: <code>logging.level.org.springframework.retry=DEBUG</code></p>
+        </div>
+
+        <pre><code class="language-java">// Verify the correct proxy ordering
+@Aspect
+@Order(Ordered.LOWEST_PRECEDENCE - 1) // Retry should be OUTER (higher number = lower priority)
+public class RetryAspect { ... }
+
+@Aspect  
+@Order(Ordered.LOWEST_PRECEDENCE) // Transaction should be INNER
+public class TransactionAspect { ... }
+
+// Execution flow with correct ordering:
+// Caller → RetryInterceptor → TransactionInterceptor → Your Method
+//                │                       │
+//                │  On failure:           │ Rollback tx
+//                │  Wait & retry ────────▶│ Start NEW tx
+//                │                       │ Call method again</code></pre>
+      </details>
+
+      <details>
+        <summary>Spring Retry with RetryTemplate — programmatic control</summary>
+        <pre><code class="language-java">@Configuration
+public class RetryConfig {
+
+    @Bean
+    public RetryTemplate retryTemplate() {
+        return RetryTemplate.builder()
+            .maxAttempts(3)
+            .exponentialBackoff(1000, 2.0, 10000)
+            .retryOn(TransientDataAccessException.class)
+            .retryOn(OptimisticLockingFailureException.class)
+            .traversingCauses() // Check cause chain, not just top-level exception
+            .withListener(new RetryListenerSupport() {
+                @Override
+                public &lt;T, E extends Throwable&gt; void onError(
+                        RetryContext ctx, RetryCallback&lt;T, E&gt; callback, Throwable t) {
+                    log.warn("Retry attempt {} failed: {}", 
+                        ctx.getRetryCount(), t.getMessage());
+                    meterRegistry.counter("retry.attempts", 
+                        "method", ctx.getAttribute("method").toString()).increment();
+                }
+            })
+            .build();
+    }
+}
+
+@Service
+public class OrderService {
+
+    private final RetryTemplate retryTemplate;
+
+    public Order createOrderWithRetry(OrderRequest request) {
+        return retryTemplate.execute(context -> {
+            context.setAttribute("method", "createOrder");
+            return createOrder(request);
+        }, context -> {
+            // Recovery callback — all retries exhausted
+            log.error("All retries exhausted for order: {}", request.getId());
+            throw new OrderCreationFailedException(request.getId(), context.getLastThrowable());
+        });
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Why Duplicates Happen -->
+    <section id="why-duplicates-happen">
+      <h2>Why Duplicates Happen — The Mechanics</h2>
+
+      <details>
+        <summary>Timeline of a duplicate creation</summary>
+        <pre class="diagram">
+  Timeline: Duplicate order creation with retries enabled
+  ═══════════════════════════════════════════════════════
+
+  t=0ms    Client sends POST /orders {item: "laptop", qty: 1}
+  t=50ms   Server begins processing
+  t=100ms  Server inserts: INSERT INTO orders(id, item, qty) VALUES(gen_id(), 'laptop', 1)
+  t=150ms  Server calls payment service...
+  t=5000ms Payment service is slow — client hits 5s timeout
+  
+  ─── CLIENT PERSPECTIVE: "Request failed (timeout)" ───
+  
+  t=5001ms Client RETRIES: POST /orders {item: "laptop", qty: 1}  ← SAME request!
+  t=5050ms Server begins processing (doesn't know this is a retry)
+  t=5100ms Server inserts: INSERT INTO orders(id, item, qty) VALUES(gen_id(), 'laptop', 1)
+           ↑ DUPLICATE! New ID generated — DB sees this as a new record
+  
+  t=5200ms Meanwhile, original request's payment succeeds!
+  t=5300ms Original request commits: order #1 ← PAID
+  t=5400ms Retry request's payment also succeeds
+  t=5500ms Retry request commits: order #2 ← ALSO PAID!
+
+  Result: Customer charged TWICE, two orders shipped.
+        </pre>
+      </details>
+
+      <details>
+        <summary>All the ways duplicates sneak in</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Retry Source</th>
+              <th>When It Happens</th>
+              <th>Example</th>
+              <th>Visibility</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Client retry</strong></td>
+              <td>User clicks "Submit" twice, or JS retry logic</td>
+              <td>Double-click on "Place Order" button</td>
+              <td>High (obvious UX issue)</td>
+            </tr>
+            <tr>
+              <td><strong>Load balancer retry</strong></td>
+              <td>502/503 from one instance, LB retries on another</td>
+              <td>AWS ALB retries on connection error</td>
+              <td>Low (silent, logged as separate request)</td>
+            </tr>
+            <tr>
+              <td><strong>Spring Retry</strong></td>
+              <td>Transient exception triggers @Retryable</td>
+              <td>DB deadlock → retry → re-insert</td>
+              <td>Medium (visible in retry logs)</td>
+            </tr>
+            <tr>
+              <td><strong>HTTP client retry</strong></td>
+              <td>RestTemplate/WebClient retry on I/O error</td>
+              <td>Connection reset to downstream service</td>
+              <td>Low (buried in HTTP client config)</td>
+            </tr>
+            <tr>
+              <td><strong>Kafka consumer retry</strong></td>
+              <td>Consumer fails, offset not committed, message redelivered</td>
+              <td>OOM during processing → consumer restart</td>
+              <td>Medium (consumer lag visible)</td>
+            </tr>
+            <tr>
+              <td><strong>Kubernetes restart</strong></td>
+              <td>Pod killed during processing, request retried by client</td>
+              <td>OOMKilled during order processing</td>
+              <td>Low (pod events only)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 6: Idempotency Patterns -->
+    <section id="idempotency">
+      <h2>Idempotency Patterns</h2>
+
+      <details>
+        <summary>What makes an operation idempotent?</summary>
+        <div class="callout callout-info">
+          <p><strong>Definition:</strong> An operation is <em>idempotent</em> if executing it multiple times produces the same result as executing it once. Formally: <code>f(f(x)) = f(x)</code></p>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>HTTP Method</th>
+              <th>Idempotent?</th>
+              <th>Safe?</th>
+              <th>Example</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>GET</code></td>
+              <td>✅ Yes</td>
+              <td>✅ Yes</td>
+              <td>Read orders — no side effects</td>
+            </tr>
+            <tr>
+              <td><code>PUT</code></td>
+              <td>✅ Yes</td>
+              <td>❌ No</td>
+              <td>Set order status to SHIPPED (same result each time)</td>
+            </tr>
+            <tr>
+              <td><code>DELETE</code></td>
+              <td>✅ Yes</td>
+              <td>❌ No</td>
+              <td>Delete order #123 (second delete is a no-op)</td>
+            </tr>
+            <tr>
+              <td><code>POST</code></td>
+              <td>❌ <strong>No</strong></td>
+              <td>❌ No</td>
+              <td>Create order — each call may create new record!</td>
+            </tr>
+            <tr>
+              <td><code>PATCH</code></td>
+              <td>⚠️ Depends</td>
+              <td>❌ No</td>
+              <td><code>balance += 10</code> (not idempotent) vs <code>balance = 100</code> (idempotent)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Idempotency strategies ranked by reliability</summary>
+        <pre class="diagram">
+  Reliability (highest to lowest):
+  ═════════════════════════════════
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ 1. Database unique constraint (natural key)                      │
+  │    "INSERT ... ON CONFLICT DO NOTHING"                           │
+  │    Pros: Bulletproof, no extra infrastructure                    │
+  │    Cons: Need natural business key, constraint violations costly │
+  ├─────────────────────────────────────────────────────────────────┤
+  │ 2. Idempotency key table (server-side dedup)                     │
+  │    Store (key → response) mapping in same transaction            │
+  │    Pros: Works for any operation, returns cached response        │
+  │    Cons: Extra table, key lifecycle management                   │
+  ├─────────────────────────────────────────────────────────────────┤
+  │ 3. Conditional write (compare-and-swap)                          │
+  │    "UPDATE ... WHERE version = X" / "IF NOT EXISTS"              │
+  │    Pros: No extra state, natural for updates                     │
+  │    Cons: Only works for updates, not creates                     │
+  ├─────────────────────────────────────────────────────────────────┤
+  │ 4. Client-generated ID (UUID)                                    │
+  │    Client creates UUID, sends with request                       │
+  │    Pros: Simple, stateless on server                             │
+  │    Cons: Relies on client behavior, UUID collision (theoretical) │
+  ├─────────────────────────────────────────────────────────────────┤
+  │ 5. Deduplication window (time-based)                             │
+  │    Reject duplicate payloads within N minutes                    │
+  │    Pros: Simple to implement                                     │
+  │    Cons: Hash collisions, window expiry edge cases               │
+  └─────────────────────────────────────────────────────────────────┘
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 7: Idempotency Keys -->
+    <section id="idempotency-keys">
+      <h2>Idempotency Keys — Production Implementation</h2>
+
+      <details>
+        <summary>Architecture: how idempotency keys work end-to-end</summary>
+        <pre class="diagram">
+  Client                    Server                         Database
+    │                         │                              │
+    │ POST /orders            │                              │
+    │ Idempotency-Key: abc123 │                              │
+    │────────────────────────▶│                              │
+    │                         │                              │
+    │                         │ SELECT * FROM idempotency_keys
+    │                         │ WHERE key = 'abc123'         │
+    │                         │─────────────────────────────▶│
+    │                         │                              │
+    │                         │ Not found (first request)    │
+    │                         │◀─────────────────────────────│
+    │                         │                              │
+    │                         │ BEGIN TRANSACTION            │
+    │                         │─────────────────────────────▶│
+    │                         │                              │
+    │                         │ INSERT INTO idempotency_keys  │
+    │                         │ (key, status) = ('abc123', 'PROCESSING')
+    │                         │─────────────────────────────▶│
+    │                         │                              │
+    │                         │ ... business logic ...        │
+    │                         │ INSERT INTO orders ...        │
+    │                         │─────────────────────────────▶│
+    │                         │                              │
+    │                         │ UPDATE idempotency_keys       │
+    │                         │ SET status='COMPLETE',        │
+    │                         │     response_body='{...}'     │
+    │                         │─────────────────────────────▶│
+    │                         │                              │
+    │                         │ COMMIT                       │
+    │                         │─────────────────────────────▶│
+    │                         │                              │
+    │     200 OK {order: ...} │                              │
+    │◀────────────────────────│                              │
+    │                         │                              │
+    │ ─── RETRY (same key) ── │                              │
+    │                         │                              │
+    │ POST /orders            │                              │
+    │ Idempotency-Key: abc123 │                              │
+    │────────────────────────▶│                              │
+    │                         │                              │
+    │                         │ SELECT * FROM idempotency_keys
+    │                         │ WHERE key = 'abc123'         │
+    │                         │─────────────────────────────▶│
+    │                         │                              │
+    │                         │ Found! status=COMPLETE       │
+    │                         │ response_body='{...}'        │
+    │                         │◀─────────────────────────────│
+    │                         │                              │
+    │     200 OK {order: ...} │ ← Return CACHED response     │
+    │◀────────────────────────│   (no duplicate created)     │
+    │                         │                              │
+        </pre>
+      </details>
+
+      <details>
+        <summary>Complete implementation — Spring Boot idempotency filter</summary>
+        <pre><code class="language-java">// 1. Idempotency key entity
+@Entity
+@Table(name = "idempotency_keys")
+public class IdempotencyKey {
+
+    @Id
+    private String key;
+
+    @Enumerated(EnumType.STRING)
+    private Status status; // PROCESSING, COMPLETE, FAILED
+
+    @Column(columnDefinition = "TEXT")
+    private String responseBody;
+
+    private Integer responseStatus;
+    private String responseContentType;
+
+    @Column(name = "created_at")
+    private Instant createdAt;
+
+    @Column(name = "expires_at")
+    private Instant expiresAt;
+
+    public enum Status {
+        PROCESSING, COMPLETE, FAILED
+    }
+}</code></pre>
+
+        <pre><code class="language-sql">-- Schema with proper indexing
+CREATE TABLE idempotency_keys (
+    key             VARCHAR(255) PRIMARY KEY,
+    status          VARCHAR(20) NOT NULL DEFAULT 'PROCESSING',
+    response_body   TEXT,
+    response_status INTEGER,
+    response_content_type VARCHAR(100),
+    created_at      TIMESTAMP NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMP NOT NULL DEFAULT (NOW() + INTERVAL '24 hours'),
+    
+    -- Cleanup index for expired keys
+    INDEX idx_idempotency_expires (expires_at)
+);
+
+-- Scheduled cleanup (run every hour)
+DELETE FROM idempotency_keys WHERE expires_at &lt; NOW();</code></pre>
+
+        <pre><code class="language-java">// 2. Idempotency interceptor (Spring HandlerInterceptor)
+@Component
+public class IdempotencyInterceptor implements HandlerInterceptor {
+
+    private static final String IDEMPOTENCY_HEADER = "Idempotency-Key";
+    private final IdempotencyKeyRepository repository;
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, 
+                            HttpServletResponse response, 
+                            Object handler) throws Exception {
+        
+        // Only apply to non-idempotent methods
+        if (!"POST".equalsIgnoreCase(request.getMethod())) {
+            return true;
+        }
+
+        String key = request.getHeader(IDEMPOTENCY_HEADER);
+        if (key == null || key.isBlank()) {
+            return true; // No idempotency key — proceed normally
+        }
+
+        Optional&lt;IdempotencyKey&gt; existing = repository.findById(key);
+        
+        if (existing.isPresent()) {
+            IdempotencyKey record = existing.get();
+            
+            switch (record.getStatus()) {
+                case COMPLETE:
+                    // Return cached response — no duplicate processing
+                    response.setStatus(record.getResponseStatus());
+                    response.setContentType(record.getResponseContentType());
+                    response.getWriter().write(record.getResponseBody());
+                    return false; // Short-circuit — don't call controller
+                    
+                case PROCESSING:
+                    // Another request with same key is still in-flight
+                    response.setStatus(HttpStatus.CONFLICT.value());
+                    response.getWriter().write(
+                        "{\"error\": \"Request with this idempotency key is still processing\"}");
+                    return false;
+                    
+                case FAILED:
+                    // Previous attempt failed — allow retry
+                    repository.delete(record);
+                    break;
+            }
+        }
+
+        // First time seeing this key — create PROCESSING record
+        IdempotencyKey newKey = new IdempotencyKey();
+        newKey.setKey(key);
+        newKey.setStatus(IdempotencyKey.Status.PROCESSING);
+        newKey.setCreatedAt(Instant.now());
+        newKey.setExpiresAt(Instant.now().plus(Duration.ofHours(24)));
+        
+        try {
+            repository.save(newKey);
+        } catch (DataIntegrityViolationException e) {
+            // Race condition — another thread just created it
+            response.setStatus(HttpStatus.CONFLICT.value());
+            response.getWriter().write(
+                "{\"error\": \"Duplicate request detected\"}");
+            return false;
+        }
+
+        // Store key in request attribute for post-processing
+        request.setAttribute("idempotencyKey", key);
+        return true;
+    }
+}
+
+// 3. Response wrapper to capture and store the response
+@Component
+public class IdempotencyResponseAdvice implements ResponseBodyAdvice&lt;Object&gt; {
+
+    private final IdempotencyKeyRepository repository;
+
+    @Override
+    public boolean supports(MethodParameter param, Class converterType) {
+        return true;
+    }
+
+    @Override
+    public Object beforeBodyWrite(Object body, MethodParameter param,
+                                  MediaType contentType, Class converterType,
+                                  ServerHttpRequest request, ServerHttpResponse response) {
+        
+        String key = ((ServletServerHttpRequest) request)
+            .getServletRequest().getAttribute("idempotencyKey") != null 
+            ? (String) ((ServletServerHttpRequest) request)
+                .getServletRequest().getAttribute("idempotencyKey") 
+            : null;
+            
+        if (key != null) {
+            repository.findById(key).ifPresent(record -> {
+                record.setStatus(IdempotencyKey.Status.COMPLETE);
+                record.setResponseBody(toJson(body));
+                record.setResponseStatus(
+                    ((ServletServerHttpResponse) response).getServletResponse().getStatus());
+                record.setResponseContentType(contentType.toString());
+                repository.save(record);
+            });
+        }
+        
+        return body;
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Stripe's approach to idempotency (industry standard)</summary>
+        <pre><code class="language-java">// How Stripe handles idempotency — simplified recreation
+// Reference: https://stripe.com/docs/api/idempotent_requests
+
+@RestController
+@RequestMapping("/api/payments")
+public class PaymentController {
+
+    @PostMapping
+    public ResponseEntity&lt;PaymentResponse&gt; createPayment(
+            @RequestHeader(value = "Idempotency-Key", required = true) String idempotencyKey,
+            @RequestBody PaymentRequest request) {
+        
+        // Stripe's rules:
+        // 1. Key is scoped to the API key (multi-tenant safe)
+        // 2. Key expires after 24 hours
+        // 3. If request body differs for same key → 400 error
+        // 4. If still processing → 409 Conflict
+        // 5. If complete → return cached response (same status code)
+        
+        return paymentService.processIdempotent(idempotencyKey, request);
+    }
+}
+
+@Service
+public class PaymentService {
+
+    @Transactional
+    public ResponseEntity&lt;PaymentResponse&gt; processIdempotent(
+            String key, PaymentRequest request) {
+        
+        // Lock row to prevent race conditions
+        Optional&lt;IdempotencyKey&gt; existing = 
+            idempotencyRepo.findByKeyForUpdate(key); // SELECT ... FOR UPDATE
+        
+        if (existing.isPresent()) {
+            IdempotencyKey record = existing.get();
+            
+            // Stripe validates request body matches — prevents key reuse
+            String requestFingerprint = sha256(toJson(request));
+            if (!requestFingerprint.equals(record.getRequestFingerprint())) {
+                throw new IdempotencyKeyReusedException(
+                    "Idempotency key already used with different parameters");
+            }
+            
+            if (record.getStatus() == Status.COMPLETE) {
+                return ResponseEntity
+                    .status(record.getResponseStatus())
+                    .body(fromJson(record.getResponseBody(), PaymentResponse.class));
+            }
+        }
+        
+        // Process the payment (first time or retry after failure)
+        PaymentResponse result = processPayment(request);
+        
+        // Store result atomically
+        saveIdempotencyResult(key, request, result);
+        
+        return ResponseEntity.status(HttpStatus.CREATED).body(result);
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 8: Database Constraints -->
+    <section id="database-constraints">
+      <h2>Database Unique Constraints — The Last Line of Defense</h2>
+
+      <details>
+        <summary>Natural keys vs surrogate keys for deduplication</summary>
+        <pre><code class="language-sql">-- Strategy 1: Natural business key constraint
+CREATE TABLE orders (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT NOT NULL,
+    cart_id         BIGINT NOT NULL,
+    amount          DECIMAL(10,2) NOT NULL,
+    status          VARCHAR(20) NOT NULL,
+    created_at      TIMESTAMP NOT NULL DEFAULT NOW(),
+    
+    -- Natural dedup: one order per cart per user
+    UNIQUE (user_id, cart_id)
+);
+
+-- Insert with conflict handling (PostgreSQL)
+INSERT INTO orders (user_id, cart_id, amount, status)
+VALUES (123, 456, 99.99, 'CREATED')
+ON CONFLICT (user_id, cart_id) DO NOTHING
+RETURNING id;
+-- Returns empty if duplicate — caller knows it was already created
+
+-- Strategy 2: Idempotency key column
+CREATE TABLE orders (
+    id              BIGSERIAL PRIMARY KEY,
+    idempotency_key VARCHAR(255) UNIQUE NOT NULL,  -- ← client-provided
+    user_id         BIGINT NOT NULL,
+    amount          DECIMAL(10,2) NOT NULL,
+    status          VARCHAR(20) NOT NULL,
+    created_at      TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO orders (idempotency_key, user_id, amount, status)
+VALUES ('req_abc123', 123, 99.99, 'CREATED')
+ON CONFLICT (idempotency_key) DO NOTHING
+RETURNING id;
+
+-- Strategy 3: Upsert with conditional update (MySQL)
+INSERT INTO orders (idempotency_key, user_id, amount, status)
+VALUES ('req_abc123', 123, 99.99, 'CREATED')
+ON DUPLICATE KEY UPDATE id = id;  -- No-op update, prevents duplicate
+-- affected_rows = 0 means duplicate, 1 means new</code></pre>
+      </details>
+
+      <details>
+        <summary>Spring Data JPA implementation with conflict handling</summary>
+        <pre><code class="language-java">@Service
+public class OrderService {
+
+    @Transactional
+    public OrderResult createOrder(String idempotencyKey, OrderRequest request) {
+        // Check if already processed
+        Optional&lt;Order&gt; existing = orderRepository.findByIdempotencyKey(idempotencyKey);
+        if (existing.isPresent()) {
+            log.info("Duplicate request detected: key={}", idempotencyKey);
+            return OrderResult.alreadyExists(existing.get());
+        }
+
+        // Create order with idempotency key
+        Order order = Order.builder()
+            .idempotencyKey(idempotencyKey)
+            .userId(request.getUserId())
+            .amount(request.getAmount())
+            .status(OrderStatus.CREATED)
+            .build();
+
+        try {
+            order = orderRepository.saveAndFlush(order); // Force immediate INSERT
+            return OrderResult.created(order);
+        } catch (DataIntegrityViolationException e) {
+            // Race condition: another thread inserted between our check and insert
+            // This is fine — fetch and return the existing order
+            Order existingOrder = orderRepository.findByIdempotencyKey(idempotencyKey)
+                .orElseThrow(() -> new IllegalStateException("Constraint violation but no record found"));
+            return OrderResult.alreadyExists(existingOrder);
+        }
+    }
+}
+
+// Repository with custom query for natural key lookup
+public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+
+    Optional&lt;Order&gt; findByIdempotencyKey(String idempotencyKey);
+    
+    // Native query for INSERT ... ON CONFLICT (faster, avoids SELECT+INSERT race)
+    @Modifying
+    @Query(value = """
+        INSERT INTO orders (idempotency_key, user_id, amount, status, created_at)
+        VALUES (:key, :userId, :amount, 'CREATED', NOW())
+        ON CONFLICT (idempotency_key) DO NOTHING
+        """, nativeQuery = true)
+    int insertIfNotExists(@Param("key") String key, 
+                          @Param("userId") Long userId,
+                          @Param("amount") BigDecimal amount);
+    // Returns 1 if inserted, 0 if duplicate
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 9: Outbox Pattern -->
+    <section id="outbox-pattern">
+      <h2>Transactional Outbox Pattern</h2>
+
+      <details>
+        <summary>The dual-write problem that the Outbox pattern solves</summary>
+        <pre class="diagram">
+  ❌ The Dual-Write Problem:
+  ══════════════════════════
+
+  @Transactional
+  public void createOrder(Order order) {
+      orderRepository.save(order);           // Write #1: Database
+      kafkaTemplate.send("orders", event);   // Write #2: Kafka
+  }
+
+  What can go wrong:
+  ┌─────────────────────────────────────────────────────────┐
+  │ Scenario 1: DB succeeds, Kafka fails                     │
+  │ → Order exists but no event published                    │
+  │ → Downstream services never know about it                │
+  │                                                          │
+  │ Scenario 2: Kafka succeeds, DB rolls back                │
+  │ → Event published for non-existent order                 │
+  │ → Downstream services process phantom event              │
+  │                                                          │
+  │ Scenario 3: Both succeed, but app crashes before commit  │
+  │ → DB rolls back (autocommit=false), Kafka already sent   │
+  │ → Same as Scenario 2                                     │
+  └─────────────────────────────────────────────────────────┘
+
+  ✅ Outbox Pattern Solution:
+  ════════════════════════════
+
+  @Transactional  ← SINGLE atomic transaction
+  public void createOrder(Order order) {
+      orderRepository.save(order);           // Write #1: Database
+      outboxRepository.save(outboxEvent);    // Write #2: Same Database (outbox table)
+  }
+  // Kafka is written LATER by a background poller or CDC
+
+  ┌──────────────────────┐      ┌─────────────────────┐
+  │ orders table         │      │ outbox_events table  │
+  │                      │      │                      │
+  │ id: 1               │      │ id: 1                │
+  │ amount: 99.99       │      │ aggregate_id: 1      │
+  │ status: CREATED     │      │ event_type: ORDER    │
+  │                      │      │ payload: {...}       │
+  │ (same transaction)   │      │ published: false     │
+  └──────────────────────┘      └──────────┬───────────┘
+                                           │
+                         CDC/Poller reads ──┘
+                                           │
+                                           ▼
+                                    ┌─────────────┐
+                                    │   Kafka     │
+                                    │  (eventual) │
+                                    └─────────────┘
+        </pre>
+      </details>
+
+      <details>
+        <summary>Complete Outbox implementation with Spring Boot</summary>
+        <pre><code class="language-java">// 1. Outbox entity
+@Entity
+@Table(name = "outbox_events")
+public class OutboxEvent {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "aggregate_type")
+    private String aggregateType; // e.g., "Order"
+
+    @Column(name = "aggregate_id")
+    private String aggregateId; // e.g., order ID
+
+    @Column(name = "event_type")
+    private String eventType; // e.g., "OrderCreated"
+
+    @Column(columnDefinition = "JSONB")
+    private String payload;
+
+    @Column(name = "created_at")
+    private Instant createdAt;
+
+    @Column(name = "published")
+    private boolean published;
+
+    @Column(name = "published_at")
+    private Instant publishedAt;
+}
+
+// 2. Service that writes business data + outbox in same transaction
+@Service
+public class OrderService {
+
+    @Transactional
+    public Order createOrder(OrderRequest request) {
+        // Business write
+        Order order = orderRepository.save(Order.from(request));
+        
+        // Outbox write (same transaction — atomic!)
+        OutboxEvent event = OutboxEvent.builder()
+            .aggregateType("Order")
+            .aggregateId(order.getId().toString())
+            .eventType("OrderCreated")
+            .payload(toJson(new OrderCreatedEvent(order)))
+            .createdAt(Instant.now())
+            .published(false)
+            .build();
+        outboxRepository.save(event);
+        
+        return order;
+        // Both writes commit or both rollback — guaranteed consistency
+    }
+}
+
+// 3. Background publisher (polls outbox table)
+@Component
+public class OutboxPublisher {
+
+    @Scheduled(fixedDelay = 1000) // Poll every second
+    @Transactional
+    public void publishPendingEvents() {
+        List&lt;OutboxEvent&gt; pending = outboxRepository
+            .findTop100ByPublishedFalseOrderByCreatedAtAsc();
+        
+        for (OutboxEvent event : pending) {
+            try {
+                kafkaTemplate.send(
+                    event.getAggregateType().toLowerCase() + ".events",
+                    event.getAggregateId(),
+                    event.getPayload()
+                ).get(5, TimeUnit.SECONDS); // Synchronous send for reliability
+                
+                event.setPublished(true);
+                event.setPublishedAt(Instant.now());
+                outboxRepository.save(event);
+            } catch (Exception e) {
+                log.warn("Failed to publish event {}: {}", event.getId(), e.getMessage());
+                break; // Preserve ordering — don't skip failed events
+            }
+        }
+    }
+
+    // Cleanup old published events
+    @Scheduled(cron = "0 0 */6 * * *") // Every 6 hours
+    @Transactional
+    public void cleanupPublishedEvents() {
+        Instant cutoff = Instant.now().minus(Duration.ofDays(7));
+        int deleted = outboxRepository.deleteByPublishedTrueAndPublishedAtBefore(cutoff);
+        log.info("Cleaned up {} published outbox events", deleted);
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Alternative: CDC with Debezium (no polling)</summary>
+        <pre class="diagram">
+  Debezium CDC Approach:
+  ═══════════════════════
+
+  ┌────────────────┐     ┌──────────────────┐     ┌──────────────┐
+  │ Spring Boot    │     │ PostgreSQL       │     │ Debezium     │
+  │                │     │                  │     │ Connector    │
+  │ @Transactional │     │ orders table     │     │              │
+  │ save(order)    │────▶│ outbox table     │     │ Reads WAL    │
+  │ save(event)    │     │                  │────▶│ (pg_logical) │
+  │                │     │ WAL (write-ahead │     │              │
+  └────────────────┘     │  log)            │     └──────┬───────┘
+                         └──────────────────┘            │
+                                                         │ Publishes to
+                                                         ▼
+                                                  ┌──────────────┐
+                                                  │   Kafka      │
+                                                  │              │
+                                                  │ Topic:       │
+                                                  │ order.events │
+                                                  └──────────────┘
+
+  Advantages over polling:
+  • Near real-time (ms latency vs seconds)
+  • No polling overhead on DB
+  • Guaranteed ordering (follows WAL sequence)
+  • Handles table deletions (for cleanup)
+        </pre>
+        <pre><code class="language-json">// Debezium connector configuration
+{
+  "name": "outbox-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "db-primary",
+    "database.port": "5432",
+    "database.dbname": "orders_db",
+    "table.include.list": "public.outbox_events",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.table.field.event.key": "aggregate_id",
+    "transforms.outbox.table.field.event.type": "event_type",
+    "transforms.outbox.table.field.event.payload": "payload",
+    "transforms.outbox.route.topic.replacement": "${routedByValue}.events"
+  }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 10: Distributed Retries -->
+    <section id="distributed-retries">
+      <h2>Distributed Retries — Kafka, gRPC, and Message Brokers</h2>
+
+      <details>
+        <summary>Kafka consumer retries and exactly-once semantics</summary>
+        <pre><code class="language-java">// Kafka consumer with retry and idempotency
+@Component
+public class OrderEventConsumer {
+
+    @KafkaListener(topics = "order.events", groupId = "payment-service")
+    @Retryable(
+        retryFor = TransientException.class,
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 1000, multiplier = 2)
+    )
+    public void processOrderEvent(ConsumerRecord&lt;String, String&gt; record) {
+        String eventId = record.headers().lastHeader("event-id") != null
+            ? new String(record.headers().lastHeader("event-id").value())
+            : record.topic() + "-" + record.partition() + "-" + record.offset();
+
+        // Idempotency check using the event ID
+        if (processedEventRepository.existsById(eventId)) {
+            log.debug("Skipping already-processed event: {}", eventId);
+            return;
+        }
+
+        OrderCreatedEvent event = deserialize(record.value());
+        
+        // Process in a transaction that also records the event ID
+        paymentService.processPayment(eventId, event);
+    }
+}
+
+@Service
+public class PaymentService {
+
+    @Transactional
+    public void processPayment(String eventId, OrderCreatedEvent event) {
+        // Record that we've processed this event (same transaction as business logic)
+        processedEventRepository.save(new ProcessedEvent(eventId, Instant.now()));
+        
+        // Business logic
+        Payment payment = Payment.builder()
+            .orderId(event.getOrderId())
+            .amount(event.getAmount())
+            .status(PaymentStatus.PENDING)
+            .build();
+        paymentRepository.save(payment);
+        
+        // Charge payment gateway
+        chargeGateway(payment);
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Dead Letter Queue (DLQ) strategy for permanent failures</summary>
+        <pre><code class="language-java">@Configuration
+public class KafkaRetryConfig {
+
+    @Bean
+    public DefaultErrorHandler errorHandler(KafkaTemplate&lt;String, String&gt; kafkaTemplate) {
+        // Retry 3 times with backoff, then send to DLQ
+        DeadLetterPublishingRecoverer recoverer = 
+            new DeadLetterPublishingRecoverer(kafkaTemplate,
+                (record, ex) -> new TopicPartition(
+                    record.topic() + ".DLQ", record.partition()));
+
+        DefaultErrorHandler handler = new DefaultErrorHandler(
+            recoverer,
+            new ExponentialBackOff(1000L, 2.0) // 1s, 2s, 4s
+        );
+        
+        // Don't retry on these — send directly to DLQ
+        handler.addNotRetryableExceptions(
+            DeserializationException.class,
+            ValidationException.class,
+            NullPointerException.class
+        );
+        
+        return handler;
+    }
+}
+
+// DLQ processor — manual review and replay
+@KafkaListener(topics = "order.events.DLQ", groupId = "dlq-processor")
+public void processDLQ(ConsumerRecord&lt;String, String&gt; record) {
+    log.error("DLQ message from partition={} offset={}: {}", 
+        record.partition(), record.offset(), record.value());
+    
+    // Store for manual review
+    dlqRepository.save(DlqEntry.builder()
+        .originalTopic(extractOriginalTopic(record))
+        .payload(record.value())
+        .errorReason(extractErrorReason(record))
+        .timestamp(Instant.now())
+        .status(DlqStatus.PENDING_REVIEW)
+        .build());
+    
+    alertService.notifyOncall("DLQ message received", record);
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Resilience4j retry with circuit breaker (modern approach)</summary>
+        <pre><code class="language-java">@Configuration
+public class ResilienceConfig {
+
+    @Bean
+    public RetryRegistry retryRegistry() {
+        RetryConfig config = RetryConfig.custom()
+            .maxAttempts(3)
+            .waitDuration(Duration.ofMillis(500))
+            .exponentialBackoffMultiplier(2.0)
+            .retryOnException(e -> e instanceof TransientException)
+            .ignoreExceptions(ValidationException.class)
+            .failAfterMaxAttempts(true)
+            .build();
+        return RetryRegistry.of(config);
+    }
+
+    @Bean
+    public CircuitBreakerRegistry circuitBreakerRegistry() {
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+            .failureRateThreshold(50)
+            .slowCallRateThreshold(80)
+            .slowCallDurationThreshold(Duration.ofSeconds(3))
+            .waitDurationInOpenState(Duration.ofSeconds(30))
+            .slidingWindowSize(10)
+            .minimumNumberOfCalls(5)
+            .build();
+        return CircuitBreakerRegistry.of(config);
+    }
+}
+
+@Service
+public class PaymentGatewayClient {
+
+    // Circuit breaker WRAPS retry — don't retry when circuit is open
+    @CircuitBreaker(name = "paymentGateway", fallbackMethod = "chargeFallback")
+    @Retry(name = "paymentGateway")
+    public PaymentResult charge(PaymentRequest request) {
+        return restClient.post()
+            .uri("/v1/charges")
+            .header("Idempotency-Key", request.getIdempotencyKey()) // ← KEY!
+            .body(request)
+            .retrieve()
+            .body(PaymentResult.class);
+    }
+
+    private PaymentResult chargeFallback(PaymentRequest request, Exception e) {
+        log.error("Payment gateway circuit open for request: {}", request.getId(), e);
+        return PaymentResult.deferred("Payment will be retried asynchronously");
+    }
+}</code></pre>
+        <pre class="diagram">
+  Correct ordering of resilience patterns:
+  ═════════════════════════════════════════
+
+  Request ──▶ [Rate Limiter] ──▶ [Circuit Breaker] ──▶ [Retry] ──▶ [Timeout] ──▶ Service
+                                        │                    │
+                                        │ Open? ─── Fallback │ Max attempts? ─── @Recover
+                                        │                    │
+                                        
+  Why this order matters:
+  • Rate Limiter: Don't overwhelm the system — reject early
+  • Circuit Breaker: Don't retry when service is known-down
+  • Retry: Only retry transient failures when circuit is closed
+  • Timeout: Each individual attempt has a deadline
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 11: Production Incident -->
+    <section id="production-incident">
+      <h2>Real Production Incident</h2>
+
+      <details>
+        <summary>The $47,000 duplicate charge incident</summary>
+        <div class="callout callout-danger">
+          <p><strong>Severity:</strong> P0 — Financial loss, customer trust impact, regulatory reporting required</p>
+        </div>
+
+        <h4>Context</h4>
+        <p>E-commerce platform, Black Friday traffic. Team enabled Spring Retry on payment processing to handle increased gateway timeouts.</p>
+
+        <h4>Timeline</h4>
+        <pre class="diagram">
+  11:00 — Deployment: Added @Retryable(maxAttempts=3) to PaymentService.charge()
+  11:30 — Traffic ramps up, payment gateway latency increases (P95: 2s → 8s)
+  11:45 — Gateway starts timing out (5s timeout, 8s actual)
+  11:46 — Retries kick in: 3 attempts × 1000 concurrent requests = 3000 charge attempts
+  11:47 — Some original requests complete (delayed, not failed)
+  11:48 — Retry attempts ALSO complete → duplicate charges
+  12:15 — Customer support flooded with "charged twice" complaints
+  12:30 — P0 declared, retries disabled (hotfix)
+  13:00 — Damage assessment: 847 duplicate charges, $47,382 total
+        </pre>
+
+        <h4>Root Cause</h4>
+        <pre><code class="language-java">// The problematic code
+@Service
+public class PaymentService {
+
+    @Retryable(maxAttempts = 3, backoff = @Backoff(delay = 1000))
+    @Transactional
+    public PaymentResult charge(Order order) {
+        // ❌ Problem 1: No idempotency key sent to payment gateway
+        PaymentResult result = paymentClient.charge(
+            order.getAmount(), 
+            order.getUserPaymentMethod()
+        );
+        
+        // ❌ Problem 2: Each retry creates a NEW payment intent
+        // because there's no deduplication on the gateway side
+        
+        Payment payment = new Payment(order.getId(), result.getTransactionId());
+        paymentRepository.save(payment);
+        
+        return result;
+    }
+}</code></pre>
+
+        <h4>What Went Wrong</h4>
+        <ol>
+          <li><strong>No idempotency key</strong> sent to the payment gateway — each retry was a new charge</li>
+          <li><strong>Timeout ≠ failure</strong> — the original request was still being processed when the retry fired</li>
+          <li><strong>No deduplication</strong> at the database level — each payment got a new transaction ID</li>
+          <li><strong>@Retryable inside @Transactional</strong> — retry created a new transaction, not reusing the old one (correct ordering, but business logic was wrong)</li>
+        </ol>
+
+        <h4>Resolution</h4>
+        <pre><code class="language-java">// Fixed implementation
+@Service
+public class PaymentService {
+
+    @Retryable(
+        retryFor = {SocketTimeoutException.class, ConnectionResetException.class},
+        noRetryFor = {PaymentDeclinedException.class},
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 2000, multiplier = 2)
+    )
+    @Transactional
+    public PaymentResult charge(Order order) {
+        // ✅ Fix 1: Generate deterministic idempotency key
+        String idempotencyKey = "order-" + order.getId() + "-charge";
+        
+        // ✅ Fix 2: Check if already charged (local dedup)
+        Optional&lt;Payment&gt; existingPayment = paymentRepository
+            .findByOrderIdAndStatus(order.getId(), PaymentStatus.COMPLETED);
+        if (existingPayment.isPresent()) {
+            return PaymentResult.alreadyCharged(existingPayment.get());
+        }
+        
+        // ✅ Fix 3: Send idempotency key to gateway
+        PaymentResult result = paymentClient.charge(
+            ChargeRequest.builder()
+                .amount(order.getAmount())
+                .paymentMethod(order.getUserPaymentMethod())
+                .idempotencyKey(idempotencyKey) // ← Gateway deduplicates!
+                .build()
+        );
+        
+        // ✅ Fix 4: Unique constraint on (order_id, status)
+        Payment payment = new Payment(order.getId(), result.getTransactionId());
+        paymentRepository.save(payment);
+        
+        return result;
+    }
+}</code></pre>
+
+        <h4>Preventive Measures Added</h4>
+        <ul>
+          <li>Mandatory idempotency key for all payment gateway calls (enforced by linter)</li>
+          <li>Database unique constraint: <code>UNIQUE (order_id, payment_status)</code> where status = 'COMPLETED'</li>
+          <li>Monitoring alert: "duplicate payment count > 0 in last 5 minutes"</li>
+          <li>Circuit breaker on payment gateway (open at 50% failure rate)</li>
+          <li>Increased gateway timeout from 5s to 15s (aligned with actual P99)</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 12: Debugging Workflow -->
+    <section id="debugging-workflow">
+      <h2>Debugging Workflow</h2>
+
+      <details>
+        <summary>How to investigate duplicate records in production</summary>
+        <ol>
+          <li>
+            <strong>Identify the duplicate pattern:</strong>
+            <pre><code class="language-sql">-- Find duplicates by natural key
+SELECT user_id, cart_id, COUNT(*) as cnt, 
+       MIN(created_at) as first, MAX(created_at) as last,
+       MAX(created_at) - MIN(created_at) as time_gap
+FROM orders
+GROUP BY user_id, cart_id
+HAVING COUNT(*) > 1
+ORDER BY cnt DESC;
+
+-- Time gap tells you a lot:
+-- < 5s   → Retry (client, LB, or Spring Retry)
+-- 5-30s  → Timeout + retry
+-- > 30s  → Probably user re-submission</code></pre>
+          </li>
+          <li>
+            <strong>Trace the request flow:</strong>
+            <pre><code class="language-bash"># Search for the duplicate order's trace ID
+grep "order_id=12345" /var/log/app/application.log | grep "trace_id"
+
+# Look for retry indicators
+grep "Retrying" /var/log/app/application.log | grep "payment"
+
+# Check if multiple instances processed it
+grep "order_id=12345" /var/log/app/application.log | awk '{print $3}' | sort -u
+# If multiple hostnames appear → LB retry or Kafka redelivery</code></pre>
+          </li>
+          <li>
+            <strong>Check Kafka consumer lag and rebalancing:</strong>
+            <pre><code class="language-bash"># Consumer group lag
+kafka-consumer-groups --bootstrap-server kafka:9092 \
+  --group payment-service --describe
+
+# Look for rebalance events around the duplicate timestamp
+grep "Rebalancing\|partitions assigned\|partitions revoked" \
+  /var/log/app/application.log</code></pre>
+          </li>
+          <li>
+            <strong>Inspect retry metrics:</strong>
+            <pre><code class="language-java">// Add retry metrics (if not already)
+@Bean
+public RetryListenerSupport retryMetricsListener(MeterRegistry registry) {
+    return new RetryListenerSupport() {
+        @Override
+        public &lt;T, E extends Throwable&gt; void onError(RetryContext ctx, 
+                RetryCallback&lt;T, E&gt; callback, Throwable throwable) {
+            registry.counter("spring.retry.error",
+                "method", ctx.getAttribute(RetryContext.NAME).toString(),
+                "attempt", String.valueOf(ctx.getRetryCount()),
+                "exception", throwable.getClass().getSimpleName()
+            ).increment();
+        }
+    };
+}
+
+// Prometheus query to find retry spikes:
+// rate(spring_retry_error_total[5m])</code></pre>
+          </li>
+        </ol>
+      </details>
+    </section>
+
+    <!-- Section 13: Advanced Code Examples -->
+    <section id="code-examples">
+      <h2>Advanced Code Examples</h2>
+
+      <details>
+        <summary>Pattern: Distributed lock for cross-service deduplication</summary>
+        <pre><code class="language-java">@Service
+public class DistributedIdempotencyService {
+
+    private final StringRedisTemplate redis;
+    private final Duration lockTtl = Duration.ofMinutes(5);
+
+    /**
+     * Acquire a distributed lock for the idempotency key.
+     * Returns true if this is the first processor, false if duplicate.
+     */
+    public boolean tryAcquire(String idempotencyKey) {
+        Boolean acquired = redis.opsForValue().setIfAbsent(
+            "idemp:" + idempotencyKey,
+            Instant.now().toString(),
+            lockTtl
+        );
+        return Boolean.TRUE.equals(acquired);
+    }
+
+    /**
+     * Mark processing as complete (extend TTL for cached response).
+     */
+    public void markComplete(String idempotencyKey, String responseJson) {
+        redis.opsForValue().set(
+            "idemp:" + idempotencyKey,
+            responseJson,
+            Duration.ofHours(24) // Keep result for 24h
+        );
+    }
+
+    /**
+     * Release lock on failure (allow retry).
+     */
+    public void release(String idempotencyKey) {
+        redis.delete("idemp:" + idempotencyKey);
+    }
+
+    /**
+     * Get cached response if already processed.
+     */
+    public Optional&lt;String&gt; getCachedResponse(String idempotencyKey) {
+        String value = redis.opsForValue().get("idemp:" + idempotencyKey);
+        if (value != null &amp;&amp; !value.startsWith("202")) { // Not a timestamp
+            return Optional.of(value);
+        }
+        return Optional.empty();
+    }
+}
+
+// Usage in service
+@Service
+public class OrderService {
+
+    @Transactional
+    public OrderResult createOrder(String idempotencyKey, OrderRequest request) {
+        // Check Redis first (fast path)
+        Optional&lt;String&gt; cached = idempotencyService.getCachedResponse(idempotencyKey);
+        if (cached.isPresent()) {
+            return fromJson(cached.get(), OrderResult.class);
+        }
+
+        // Try to acquire the lock
+        if (!idempotencyService.tryAcquire(idempotencyKey)) {
+            throw new DuplicateRequestException("Request already being processed");
+        }
+
+        try {
+            Order order = orderRepository.save(Order.from(request));
+            OrderResult result = OrderResult.created(order);
+            
+            // Cache the result in Redis
+            idempotencyService.markComplete(idempotencyKey, toJson(result));
+            
+            return result;
+        } catch (Exception e) {
+            // Release lock so the client can retry
+            idempotencyService.release(idempotencyKey);
+            throw e;
+        }
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Pattern: Conditional INSERT with returning clause</summary>
+        <pre><code class="language-java">// PostgreSQL-specific: atomic INSERT with deduplication
+@Repository
+public class OrderRepositoryCustomImpl implements OrderRepositoryCustom {
+
+    @PersistenceContext
+    private EntityManager em;
+
+    /**
+     * Atomically insert an order if not already exists.
+     * Returns the order (new or existing) and whether it was newly created.
+     */
+    public InsertResult&lt;Order&gt; insertIfNotExists(Order order) {
+        // Use native query for ON CONFLICT ... DO UPDATE with a trick
+        // to distinguish insert from no-op
+        String sql = """
+            WITH inserted AS (
+                INSERT INTO orders (idempotency_key, user_id, amount, status, created_at)
+                VALUES (:key, :userId, :amount, :status, NOW())
+                ON CONFLICT (idempotency_key) DO NOTHING
+                RETURNING *, TRUE as is_new
+            )
+            SELECT * FROM inserted
+            UNION ALL
+            SELECT *, FALSE as is_new FROM orders 
+            WHERE idempotency_key = :key 
+              AND NOT EXISTS (SELECT 1 FROM inserted)
+            """;
+
+        Object[] result = (Object[]) em.createNativeQuery(sql)
+            .setParameter("key", order.getIdempotencyKey())
+            .setParameter("userId", order.getUserId())
+            .setParameter("amount", order.getAmount())
+            .setParameter("status", order.getStatus().name())
+            .getSingleResult();
+
+        boolean isNew = (Boolean) result[result.length - 1];
+        Order resultOrder = mapToOrder(result);
+        
+        return new InsertResult&lt;&gt;(resultOrder, isNew);
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Pattern: Request fingerprinting for deduplication without explicit keys</summary>
+        <pre><code class="language-java">@Component
+public class RequestFingerprintGenerator {
+
+    /**
+     * Generate a deterministic fingerprint for a request.
+     * Same request body + user + endpoint = same fingerprint.
+     * Useful when clients don't send idempotency keys.
+     */
+    public String generate(HttpServletRequest request, byte[] body) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(request.getMethod());
+        sb.append("|");
+        sb.append(request.getRequestURI());
+        sb.append("|");
+        sb.append(request.getHeader("Authorization")); // Ties to user
+        sb.append("|");
+        sb.append(new String(body, StandardCharsets.UTF_8));
+        
+        return DigestUtils.sha256Hex(sb.toString());
+    }
+}
+
+// Automatic deduplication filter for all POST endpoints
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE + 10)
+public class AutoDeduplicationFilter extends OncePerRequestFilter {
+
+    private final StringRedisTemplate redis;
+    private final RequestFingerprintGenerator fingerprintGen;
+    private final Duration window = Duration.ofSeconds(5); // 5s dedup window
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, 
+                                    HttpServletResponse response, 
+                                    FilterChain chain) throws IOException, ServletException {
+        if (!"POST".equals(request.getMethod())) {
+            chain.doFilter(request, response);
+            return;
+        }
+
+        // Read body (need ContentCachingRequestWrapper)
+        ContentCachingRequestWrapper wrappedRequest = 
+            new ContentCachingRequestWrapper(request);
+        
+        chain.doFilter(wrappedRequest, response);
+        
+        // After processing, store fingerprint (for next 5s dedup window)
+        String fingerprint = fingerprintGen.generate(wrappedRequest, 
+            wrappedRequest.getContentAsByteArray());
+        redis.opsForValue().setIfAbsent("dedup:" + fingerprint, "1", window);
+    }
+
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        // Skip if client provides explicit idempotency key
+        return request.getHeader("Idempotency-Key") != null;
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 14: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Mistakes that cause duplicate records in production</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Mistake</th>
+              <th>Why It's Dangerous</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>Enabling retries without idempotency</td>
+              <td>Every retry is a potential duplicate write</td>
+              <td>Always pair <code>@Retryable</code> with an idempotency strategy</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>Using auto-generated IDs for dedup</td>
+              <td><code>BIGSERIAL</code> / UUID generates new ID each time — can't detect duplicates</td>
+              <td>Use a natural business key or client-provided idempotency key</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>Check-then-insert without locking</td>
+              <td>Race condition: two threads both pass the check, both insert</td>
+              <td>Use <code>INSERT ... ON CONFLICT</code> or <code>SELECT FOR UPDATE</code></td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Retrying after timeout (not after failure)</td>
+              <td>Timeout means "unknown" — the original request may still complete</td>
+              <td>Only retry on definitive failures (connection refused, 5xx response body)</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>Not sending idempotency key to external APIs</td>
+              <td>Your retry + their retry = exponential duplicates</td>
+              <td>Always forward idempotency keys to downstream services</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>Idempotency key with too-short TTL</td>
+              <td>Key expires before retry happens → duplicate accepted</td>
+              <td>TTL should be >= max retry window (e.g., 24h for Stripe)</td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td>Ignoring Kafka consumer rebalancing</td>
+              <td>Partition reassignment → message redelivery → duplicate processing</td>
+              <td>Store processed event IDs in same transaction as business logic</td>
+            </tr>
+            <tr>
+              <td>8</td>
+              <td>Retrying non-idempotent increment operations</td>
+              <td><code>balance += 10</code> retried 3 times = balance += 30</td>
+              <td>Use absolute sets (<code>balance = X</code>) or versioned updates</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 15: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+
+      <details>
+        <summary>Idempotency strategy trade-off matrix</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Complexity</th>
+              <th>Performance</th>
+              <th>Reliability</th>
+              <th>Infrastructure</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>DB unique constraint</strong></td>
+              <td>Low</td>
+              <td>High (single query)</td>
+              <td>Very High</td>
+              <td>None extra</td>
+              <td>Simple CRUD with natural keys</td>
+            </tr>
+            <tr>
+              <td><strong>Idempotency key table</strong></td>
+              <td>Medium</td>
+              <td>Medium (extra read/write)</td>
+              <td>Very High</td>
+              <td>None extra</td>
+              <td>APIs following Stripe pattern</td>
+            </tr>
+            <tr>
+              <td><strong>Redis dedup lock</strong></td>
+              <td>Medium</td>
+              <td>Very High (in-memory)</td>
+              <td>High (Redis failure = no dedup)</td>
+              <td>Redis cluster</td>
+              <td>High-throughput APIs</td>
+            </tr>
+            <tr>
+              <td><strong>Outbox + CDC</strong></td>
+              <td>High</td>
+              <td>High (no dual write)</td>
+              <td>Very High</td>
+              <td>Debezium/Kafka Connect</td>
+              <td>Event-driven architectures</td>
+            </tr>
+            <tr>
+              <td><strong>Client-generated UUID</strong></td>
+              <td>Low</td>
+              <td>High</td>
+              <td>Medium (trusts client)</td>
+              <td>None</td>
+              <td>Mobile apps, SPAs</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Retry strategy trade-offs</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Latency Impact</th>
+              <th>Throughput Impact</th>
+              <th>Risk</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Immediate retry</strong></td>
+              <td>Low (if succeeds fast)</td>
+              <td>High (hammers service)</td>
+              <td>Retry storms, cascading failure</td>
+            </tr>
+            <tr>
+              <td><strong>Fixed backoff</strong></td>
+              <td>Predictable</td>
+              <td>Medium</td>
+              <td>Synchronized retries (thundering herd)</td>
+            </tr>
+            <tr>
+              <td><strong>Exponential backoff</strong></td>
+              <td>Grows with attempts</td>
+              <td>Low (backs off nicely)</td>
+              <td>High latency on 3rd+ retry</td>
+            </tr>
+            <tr>
+              <td><strong>Exponential + jitter</strong></td>
+              <td>Grows with attempts</td>
+              <td>Low (best for many clients)</td>
+              <td>Minimal — industry standard</td>
+            </tr>
+            <tr>
+              <td><strong>Circuit breaker + retry</strong></td>
+              <td>Fails fast when open</td>
+              <td>Minimal (stops hammering)</td>
+              <td>Needs tuning (thresholds)</td>
+            </tr>
+          </tbody>
+        </table>
+        <pre><code class="language-java">// Exponential backoff with full jitter (AWS recommended)
+public long calculateBackoff(int attempt, long baseDelay, long maxDelay) {
+    long exponentialDelay = (long) (baseDelay * Math.pow(2, attempt));
+    long cappedDelay = Math.min(exponentialDelay, maxDelay);
+    // Full jitter: random value between 0 and capped delay
+    return ThreadLocalRandom.current().nextLong(0, cappedDelay + 1);
+}
+
+// Example results for baseDelay=1000ms, maxDelay=30000ms:
+// Attempt 0: random(0, 1000)   → ~500ms avg
+// Attempt 1: random(0, 2000)   → ~1000ms avg
+// Attempt 2: random(0, 4000)   → ~2000ms avg
+// Attempt 3: random(0, 8000)   → ~4000ms avg
+// Attempt 4: random(0, 16000)  → ~8000ms avg
+// Attempt 5: random(0, 30000)  → ~15000ms avg (capped)</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 16: Follow-up Interview Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Questions the interviewer will ask next</summary>
+        <dl>
+          <dt><strong>Q: "How do you handle idempotency for operations that have side effects beyond the database?"</strong></dt>
+          <dd>Use the Outbox pattern — write the business state and the side-effect intent in the same transaction. A background process then performs the side effects (send email, publish event, call API). If it fails, it retries from the outbox. The side effect itself should also be idempotent (e.g., email service deduplicates by message ID).</dd>
+
+          <dt><strong>Q: "What happens when your idempotency key store (Redis) goes down?"</strong></dt>
+          <dd>Depends on your consistency requirements. Options: (1) Fall back to database-level dedup (unique constraint), (2) Reject all requests until Redis recovers (fail-closed), (3) Accept duplicates and reconcile later (fail-open). For payments, always fail-closed. For analytics events, fail-open is acceptable.</dd>
+
+          <dt><strong>Q: "How would you implement exactly-once processing with Kafka?"</strong></dt>
+          <dd>True exactly-once is achieved through the combination of: (1) Kafka's idempotent producer + transactional producer, (2) Consumer-side deduplication using the event ID stored in the same transaction as the business write, (3) Manual offset management — commit offset only after successful processing. See Chapter 5 for deep dive.</dd>
+
+          <dt><strong>Q: "Should the client or server generate the idempotency key?"</strong></dt>
+          <dd>Client generates, server validates. The client knows the user's intent — if they click "Submit" once, that's one key. If they intentionally submit a new order, that's a new key. Server can't distinguish intent. But the server must validate: reject empty keys, enforce format, and compare request bodies for the same key (Stripe's approach).</dd>
+
+          <dt><strong>Q: "How do you handle partial failures in a saga with retries?"</strong></dt>
+          <dd>Each saga step must be idempotent and have a compensating action. If step 3 fails and retries exhaust, trigger compensation for steps 1 and 2. Each compensation must also be idempotent (can be retried safely). Use a saga orchestrator that tracks step state and persists its own state atomically.</dd>
+
+          <dt><strong>Q: "What's the difference between at-most-once, at-least-once, and exactly-once?"</strong></dt>
+          <dd>At-most-once: fire and forget, may lose messages. At-least-once: retry until acknowledged, may create duplicates. Exactly-once: at-least-once delivery + idempotent processing = appears exactly-once. True exactly-once in distributed systems is impossible (FLP theorem); we simulate it through idempotency.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- Section 17: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Interview Takeaways:</strong></p>
+        <ol>
+          <li><strong>Retries without idempotency = duplicates.</strong> They are inseparable concerns.</li>
+          <li>Failures are <strong>ambiguous</strong> — a timeout doesn't tell you if the operation succeeded. Design for this reality.</li>
+          <li><strong>@Retryable must wrap @Transactional</strong>, not the other way around. Each retry needs a fresh transaction.</li>
+          <li>The <strong>Outbox pattern</strong> solves the dual-write problem — write business state and events in one transaction.</li>
+          <li>Idempotency keys should be <strong>client-generated, server-validated</strong>, stored atomically with the business write.</li>
+          <li><strong>Database unique constraints</strong> are your last line of defense — even if application-level dedup fails.</li>
+          <li>Use <strong>exponential backoff with jitter</strong> to prevent thundering herd on retries.</li>
+          <li><strong>Circuit breakers wrap retries</strong> — don't retry when the downstream is known-dead.</li>
+          <li>For Kafka: store <strong>processed event IDs</strong> in the same transaction as business logic for consumer-side dedup.</li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch01-transactional-failures.html" class="chapter-nav-prev">← Chapter 1: @Transactional Failures</a>
+      <a href="ch03-api-fails-at-scale.html" class="chapter-nav-next">Chapter 3: API Fails at Scale →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

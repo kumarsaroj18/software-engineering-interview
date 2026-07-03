@@ -1,0 +1,2383 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ch 15 — Intermittent Failures with No Logs | Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css" />
+  <link rel="stylesheet" href="../assets/css/prism.css" />
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 15</span>
+      <span class="chapter-title">Intermittent Failures</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#invisible-failures">Why Failures Are Invisible</a></li>
+        <li><a href="#observability-stack">Observability Stack</a></li>
+        <li><a href="#distributed-tracing">Distributed Tracing</a></li>
+        <li><a href="#correlation-ids">Correlation IDs &amp; MDC</a></li>
+        <li><a href="#network-debugging">Network Debugging</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo; <a href="../index.html#part-iii">Part III — Production Engineering &amp; Debugging</a> &rsaquo; <span>Chapter 15</span>
+    </nav>
+
+    <header>
+      <h1>Chapter 15 — Intermittent Failures with No Logs</h1>
+      <span class="badge badge-hard">Hard</span>
+      <span class="badge badge-topic">Tracing</span>
+      <span class="badge badge-topic">Observability</span>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search" />
+    </div>
+
+    <blockquote class="callout-interview">
+      <strong>Interview Question:</strong> "If users report intermittent failures but logs show no exceptions, what would be your debugging strategy?"
+    </blockquote>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 1 — INTERVIEWER INTENT
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>What the interviewer is really assessing</summary>
+        <p>This question is a senior-level litmus test. It separates engineers who have actually debugged
+        production systems from those who only work with well-behaved local environments. The interviewer
+        wants to evaluate:</p>
+        <ul>
+          <li><strong>Systems thinking:</strong> Can you reason about failures that span multiple layers
+          (application, JVM, OS, network, infrastructure)?</li>
+          <li><strong>Observability maturity:</strong> Do you know how to instrument systems proactively
+          so that "invisible" failures become visible?</li>
+          <li><strong>Structured debugging:</strong> Do you have a repeatable methodology, or do you
+          thrash randomly across log files?</li>
+          <li><strong>Tool mastery:</strong> Familiarity with distributed tracing, metrics pipelines,
+          network debugging utilities, and JVM diagnostics.</li>
+          <li><strong>Production awareness:</strong> Understanding of constraints like "you can't attach
+          a debugger to production" and "you can't reproduce it locally."</li>
+          <li><strong>Communication:</strong> Can you explain the debugging process in a way that an
+          incident commander or product manager can follow?</li>
+        </ul>
+        <p>A weak answer focuses solely on "add more logging." A strong answer demonstrates a layered
+        approach combining metrics, traces, network tooling, and JVM diagnostics — acknowledging that
+        the absence of log entries is itself a diagnostic signal.</p>
+      </details>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 2 — QUICK ANSWER
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <details>
+        <summary>60-second structured response</summary>
+        <blockquote class="callout-tip">
+          <p><strong>Strategy overview (use this in the interview):</strong></p>
+          <ol>
+            <li><strong>Accept that logs are insufficient</strong> — Intermittent failures with no
+            exceptions mean the failure is happening outside your application's observable surface area.
+            The code paths that fail are likely not logging at ERROR level, or the failure occurs in
+            infrastructure below your application.</li>
+            <li><strong>Correlate with metrics first</strong> — Check p99 latency spikes, error rate
+            dashboards, connection pool exhaustion counters, and GC pause metrics. Metrics are often
+            the first place intermittent issues become visible.</li>
+            <li><strong>Use distributed tracing</strong> — If you have OpenTelemetry or similar, look
+            for traces with abnormal durations or missing spans. A missing span tells you exactly where
+            the request was lost.</li>
+            <li><strong>Investigate infrastructure</strong> — DNS resolution, TCP connection resets,
+            firewall rules, load balancer health checks, and Kubernetes pod evictions can all cause
+            failures invisible to application logs.</li>
+            <li><strong>Reproduce with controlled load</strong> — Many intermittent issues only appear
+            under specific concurrency patterns. Use load testing with correlation IDs to identify the
+            exact conditions.</li>
+            <li><strong>Instrument proactively</strong> — Add custom metrics for "near-miss" scenarios:
+            retry counts, connection pool wait times, DNS resolution latency, and thread pool queue
+            depths.</li>
+          </ol>
+        </blockquote>
+      </details>
+    </section>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 3 — INVISIBLE FAILURES
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="invisible-failures">
+      <h2>Why Failures Don't Appear in Logs</h2>
+
+      <details>
+        <summary>Swallowed Exceptions (catch + log.debug instead of log.error)</summary>
+        <p>The most common reason for "invisible" failures: a developer catches an exception and logs
+        it at DEBUG or TRACE level, which is typically disabled in production.</p>
+        <pre><code class="language-java">// BAD: Exception is swallowed — production only logs at INFO+
+public Optional&lt;User&gt; findUser(String id) {
+    try {
+        return Optional.of(userRepository.findById(id));
+    } catch (Exception e) {
+        log.debug("Failed to find user: {}", id, e);  // Never visible in production!
+        return Optional.empty();
+    }
+}
+
+// The caller sees Optional.empty() and assumes "user not found"
+// No error is ever logged — the failure is completely invisible</code></pre>
+        <p><strong>Why it happens:</strong></p>
+        <ul>
+          <li>Developers add catch blocks during development to avoid noisy logs during testing</li>
+          <li>Code reviews miss the log level because the code "looks reasonable"</li>
+          <li>Fallback logic masks the error — the system returns a default value instead of failing</li>
+          <li>Generic catch blocks (catching <code>Exception</code>) hide unexpected failure modes</li>
+        </ul>
+        <p><strong>Detection strategy:</strong></p>
+        <ul>
+          <li>Audit code for <code>catch</code> blocks that log below WARN level</li>
+          <li>Add a custom metric counter inside every catch block: <code>meterRegistry.counter("exceptions.swallowed", "class", e.getClass().getSimpleName()).increment()</code></li>
+          <li>Use bytecode instrumentation (e.g., Elastic APM, New Relic) to detect caught exceptions even without explicit logging</li>
+        </ul>
+        <pre><code class="language-java">// GOOD: Always log exceptions at WARN+ and emit a metric
+public Optional&lt;User&gt; findUser(String id) {
+    try {
+        return Optional.of(userRepository.findById(id));
+    } catch (DataAccessException e) {
+        log.warn("Database error finding user: {}", id, e);
+        meterRegistry.counter("user.lookup.failure",
+            "exception", e.getClass().getSimpleName(),
+            "userId", id
+        ).increment();
+        return Optional.empty();
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Timeout Without Exception (HTTP client returns empty/default)</summary>
+        <p>Many HTTP clients and libraries are configured to return a default value on timeout rather
+        than throwing an exception. This is especially common with resilience libraries like Resilience4j
+        or Hystrix fallbacks.</p>
+        <pre><code class="language-java">// Resilience4j fallback — timeout silently returns empty list
+@CircuitBreaker(name = "inventory", fallbackMethod = "fallbackInventory")
+@TimeLimiter(name = "inventory")
+public CompletableFuture&lt;List&lt;Item&gt;&gt; getInventory(String warehouseId) {
+    return CompletableFuture.supplyAsync(() -&gt;
+        inventoryClient.getItems(warehouseId)
+    );
+}
+
+// This fallback fires on EVERY timeout — but no exception is logged
+public CompletableFuture&lt;List&lt;Item&gt;&gt; fallbackInventory(String warehouseId, Throwable t) {
+    log.debug("Inventory fallback triggered for warehouse: {}", warehouseId);
+    return CompletableFuture.completedFuture(Collections.emptyList());
+}</code></pre>
+        <p><strong>Impact:</strong> Users see partial data (empty inventory) but the system reports no errors.
+        The failure rate is proportional to the timeout frequency, making it intermittent.</p>
+        <p><strong>Detection:</strong></p>
+        <ul>
+          <li>Monitor fallback invocation rates as a first-class metric</li>
+          <li>Alert on fallback rate exceeding baseline (e.g., &gt;1% of calls)</li>
+          <li>Track p99/p999 latency per downstream service — timeouts manifest as latency cliffs</li>
+        </ul>
+        <pre><code class="language-java">// GOOD: Instrument fallbacks explicitly
+public CompletableFuture&lt;List&lt;Item&gt;&gt; fallbackInventory(String warehouseId, Throwable t) {
+    log.warn("Inventory fallback triggered for warehouse={}, cause={}",
+        warehouseId, t.getClass().getSimpleName());
+    meterRegistry.counter("resilience.fallback.triggered",
+        "service", "inventory",
+        "cause", t.getClass().getSimpleName()
+    ).increment();
+    Span.current().setAttribute("fallback.triggered", true);
+    Span.current().setAttribute("fallback.cause", t.getMessage());
+    return CompletableFuture.completedFuture(Collections.emptyList());
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Race Conditions (timing-dependent, only under specific load)</summary>
+        <p>Race conditions are the quintessential intermittent failure. They only manifest under specific
+        timing conditions that are nearly impossible to reproduce in development.</p>
+        <pre><code class="language-java">// Classic race condition: check-then-act without synchronization
+@Service
+public class OrderService {
+    private final InventoryRepository inventoryRepo;
+
+    public OrderResult placeOrder(String itemId, int quantity) {
+        // Thread A reads inventory = 1
+        int available = inventoryRepo.getAvailableQuantity(itemId);
+
+        // Thread B also reads inventory = 1 (before A's update)
+        if (available &gt;= quantity) {
+            // Both threads pass this check
+            inventoryRepo.decrementQuantity(itemId, quantity);
+            // Result: inventory goes negative, one order will fail downstream
+            return OrderResult.success();
+        }
+        return OrderResult.outOfStock();
+    }
+}</code></pre>
+        <p><strong>Why it's invisible in logs:</strong></p>
+        <ul>
+          <li>No exception is thrown — both threads execute successfully</li>
+          <li>The data corruption (negative inventory) may only cause a failure minutes or hours later</li>
+          <li>Under low load, the race window is so small it never triggers</li>
+          <li>Under high load, it triggers for 0.01-0.1% of requests — the exact "intermittent" pattern</li>
+        </ul>
+        <p><strong>Detection:</strong></p>
+        <ul>
+          <li>Add business logic assertions that check invariants: <code>assert available &gt;= 0</code></li>
+          <li>Use database-level constraints (CHECK constraints, optimistic locking with version columns)</li>
+          <li>Load test with high concurrency on shared resources</li>
+          <li>Use tools like <code>jcstress</code> for low-level concurrency testing</li>
+        </ul>
+        <pre><code class="language-java">// FIXED: Optimistic locking with retry
+@Retryable(value = OptimisticLockingFailureException.class, maxAttempts = 3)
+@Transactional
+public OrderResult placeOrder(String itemId, int quantity) {
+    Inventory inventory = inventoryRepo.findByIdWithLock(itemId);
+    if (inventory.getAvailable() &gt;= quantity) {
+        inventory.decrementBy(quantity);  // version field auto-incremented
+        inventoryRepo.save(inventory);
+        return OrderResult.success();
+    }
+    return OrderResult.outOfStock();
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>DNS Resolution Intermittent Failure</summary>
+        <p>DNS failures are particularly insidious because they happen below the application layer and
+        often don't generate Java exceptions — the connection simply times out.</p>
+        <pre><code class="language-bash"># Check DNS resolution time from a Kubernetes pod
+$ kubectl exec -it app-pod -- nslookup payment-service.payments.svc.cluster.local
+;; connection timed out; no servers could be reached
+
+# Or intermittently slow resolution
+$ kubectl exec -it app-pod -- dig +stats payment-service.payments.svc.cluster.local
+;; Query time: 4987 msec   &lt;-- 5 seconds for DNS! Normal is &lt;5ms</code></pre>
+        <p><strong>Common causes in Kubernetes:</strong></p>
+        <ul>
+          <li><strong>CoreDNS overload:</strong> Too many pods, not enough CoreDNS replicas</li>
+          <li><strong>ndots:5 default:</strong> Kubernetes default causes 4-5 DNS lookups before the correct one</li>
+          <li><strong>Conntrack table overflow:</strong> UDP DNS packets get dropped at high scale</li>
+          <li><strong>Node-local DNS cache miss:</strong> If using NodeLocal DNSCache and it restarts</li>
+        </ul>
+        <pre><code class="language-yaml"># Fix: Reduce ndots in pod spec to minimize DNS lookup chains
+apiVersion: v1
+kind: Pod
+spec:
+  dnsConfig:
+    options:
+      - name: ndots
+        value: "2"
+      - name: timeout
+        value: "2"
+      - name: attempts
+        value: "3"
+  containers:
+    - name: app
+      image: myapp:latest</code></pre>
+        <p><strong>Java-specific DNS caching issues:</strong></p>
+        <pre><code class="language-java">// JVM caches DNS results — can cause issues when IPs change
+// Default: successful lookups cached for 30s, failed lookups cached for 10s
+// In security manager: successful lookups cached FOREVER
+
+// Check current settings
+System.out.println(java.security.Security.getProperty("networkaddress.cache.ttl"));
+System.out.println(java.security.Security.getProperty("networkaddress.cache.negative.ttl"));
+
+// Fix: Set reasonable TTL in JVM args
+// -Dsun.net.inetaddr.ttl=30
+// -Dsun.net.inetaddr.negative.ttl=10</code></pre>
+      </details>
+
+      <details>
+        <summary>TCP Connection Reset (kernel level, not app level)</summary>
+        <p>TCP RST packets are handled by the operating system kernel. When a connection is reset,
+        the application may see a <code>SocketException</code>, a zero-length read, or simply a
+        timeout — depending on timing and the HTTP client implementation.</p>
+        <pre><code class="language-bash"># Monitor TCP resets at the OS level
+$ netstat -s | grep -i reset
+    234 connection resets received
+    12 resets sent
+
+# Watch for resets in real-time
+$ ss -tn state close-wait | wc -l
+47    # High number indicates connection cleanup issues
+
+# Capture RST packets with tcpdump
+$ tcpdump -i eth0 'tcp[tcpflags] & (tcp-rst) != 0' -nn
+14:23:15.445123 IP 10.0.1.45.8080 &gt; 10.0.2.23.54321: Flags [R.], ...</code></pre>
+        <p><strong>Common causes:</strong></p>
+        <ul>
+          <li><strong>Load balancer idle timeout:</strong> AWS ALB closes connections after 60s idle;
+          if your connection pool keeps them longer, the next request gets a RST</li>
+          <li><strong>Connection pool stale connections:</strong> Pool returns a connection that the
+          server already closed</li>
+          <li><strong>Kernel backlog overflow:</strong> <code>net.core.somaxconn</code> too low,
+          kernel drops SYN packets</li>
+          <li><strong>Firewall stateful tracking timeout:</strong> Stateful firewalls drop long-idle
+          TCP connections without sending FIN</li>
+        </ul>
+        <pre><code class="language-yaml"># HikariCP configuration to handle stale connections
+spring:
+  datasource:
+    hikari:
+      connection-timeout: 5000
+      max-lifetime: 1800000      # 30 min — less than DB/LB idle timeout
+      keepalive-time: 300000     # 5 min — validates connections proactively
+      validation-timeout: 3000
+      leak-detection-threshold: 60000
+      connection-test-query: SELECT 1</code></pre>
+      </details>
+
+      <details>
+        <summary>Thread Starvation (request never reaches handler)</summary>
+        <p>When all threads in the server's thread pool are busy, new requests queue up. If the queue
+        is also full, requests are rejected at the connector level — before any application code
+        (including exception handlers and logging) executes.</p>
+        <pre><code class="language-yaml"># Tomcat thread pool configuration
+server:
+  tomcat:
+    threads:
+      max: 200            # Maximum worker threads
+      min-spare: 10       # Minimum idle threads
+    max-connections: 8192 # Maximum connections (includes queued)
+    accept-count: 100     # Queue size when all threads busy
+    connection-timeout: 20000</code></pre>
+        <pre><code class="language-java">// What the client sees when thread starvation occurs:
+// 1. Connection accepted (TCP handshake completes)
+// 2. Request sits in accept-count queue
+// 3. If not processed within connection-timeout: client gets timeout
+// 4. NO log entry on the server — the request never reached Spring's DispatcherServlet
+
+// Detection: expose Tomcat thread pool metrics
+@Bean
+public MeterBinder tomcatMetrics() {
+    return registry -&gt; {
+        // These metrics reveal thread starvation before it causes failures
+        Gauge.builder("tomcat.threads.busy",
+            () -&gt; getThreadPoolMetric("currentThreadsBusy"))
+            .register(registry);
+        Gauge.builder("tomcat.threads.max",
+            () -&gt; getThreadPoolMetric("maxThreads"))
+            .register(registry);
+        Gauge.builder("tomcat.connections.current",
+            () -&gt; getConnectorMetric("connectionCount"))
+            .register(registry);
+    };
+}</code></pre>
+        <p><strong>Alert condition:</strong> <code>tomcat_threads_busy / tomcat_threads_max &gt; 0.8</code>
+        for more than 30 seconds indicates approaching starvation.</p>
+      </details>
+
+      <details>
+        <summary>GC Pauses Appearing as Timeouts to Clients</summary>
+        <p>A long GC pause (Stop-The-World) freezes all application threads. To clients, this looks
+        like the server stopped responding. When GC completes, the server resumes normally — but
+        client-side timeouts have already fired.</p>
+        <pre><code class="language-bash"># Enable GC logging in production (always — it has minimal overhead)
+java -Xlog:gc*:file=/var/log/gc.log:time,uptime,level,tags:filecount=10,filesize=100m \
+     -XX:+UseG1GC \
+     -XX:MaxGCPauseMillis=200 \
+     -jar app.jar
+
+# Analyze GC logs for long pauses
+$ grep "pause" gc.log | awk '{print $NF}' | sort -n | tail -5
+[2.345s] GC(142) Pause Full (Allocation Failure) 4521.234ms  &lt;-- 4.5 second pause!</code></pre>
+        <p><strong>Why it's invisible in application logs:</strong></p>
+        <ul>
+          <li>During a GC pause, NO application code runs — including logging</li>
+          <li>After the pause, the server processes the next request normally</li>
+          <li>Only the client sees the failure (timeout) — the server has no record of it</li>
+          <li>The GC log is separate from application logs and often not monitored</li>
+        </ul>
+        <pre><code class="language-java">// Expose GC metrics via Micrometer (auto-configured in Spring Boot)
+// These are already available if you use spring-boot-starter-actuator:
+// jvm_gc_pause_seconds_max — longest GC pause in the window
+// jvm_gc_pause_seconds_count — number of GC pauses
+// jvm_gc_memory_promoted_bytes_total — rate of old gen growth
+
+// Alert: jvm_gc_pause_seconds_max > 1.0 requires investigation
+// Alert: jvm_gc_pause_seconds_max > client_timeout means invisible failures</code></pre>
+        <p><strong>Mitigation strategies:</strong></p>
+        <ul>
+          <li>Use low-pause collectors: ZGC (<code>-XX:+UseZGC</code>) or Shenandoah for sub-ms pauses</li>
+          <li>Right-size heap: too large = longer full GC, too small = frequent GC</li>
+          <li>Monitor allocation rate and promotion rate to catch issues before they cause pauses</li>
+          <li>Set client timeouts higher than max expected GC pause, or implement retry logic</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>Firewall/Security Group Intermittent Drops</summary>
+        <p>Cloud security groups and firewalls can drop packets without sending RST or ICMP unreachable
+        messages. This causes connections to hang until TCP retransmission timeout (typically 15-30 seconds).</p>
+        <pre><code class="language-bash"># Detect dropped packets at the network level
+$ iptables -L -v -n | grep DROP
+    1234  98765 DROP  all  --  *  *  0.0.0.0/0  0.0.0.0/0  /* rate limit */
+
+# AWS: Check VPC Flow Logs for REJECT actions
+$ aws logs filter-log-events \
+    --log-group-name "/aws/vpc/flowlogs" \
+    --filter-pattern "REJECT" \
+    --start-time $(date -d '1 hour ago' +%s000)
+
+# Common pattern: security group allows inbound but not outbound for ephemeral ports
+# Or: NACLs with explicit DENY rules that override security group ALLOW</code></pre>
+        <p><strong>Intermittent patterns:</strong></p>
+        <ul>
+          <li><strong>Rate limiting:</strong> Some firewalls/WAFs drop packets above a threshold —
+          only visible under load spikes</li>
+          <li><strong>Stateful inspection timeout:</strong> Long-running TCP connections lose their
+          state entry in the firewall; subsequent packets are dropped</li>
+          <li><strong>IP-based rules during scaling:</strong> New pods/instances get IPs not in
+          allowlists; traffic fails until rules propagate</li>
+          <li><strong>Availability Zone issues:</strong> Cross-AZ traffic may traverse different
+          network paths with different firewall rules</li>
+        </ul>
+        <p><strong>Detection approach:</strong></p>
+        <ul>
+          <li>Enable VPC Flow Logs and monitor REJECT entries</li>
+          <li>Compare successful vs failed request source/destination IPs</li>
+          <li>Use TCP retransmission counters as a signal: <code>netstat -s | grep retransmit</code></li>
+          <li>Correlate failures with auto-scaling events or deployment times</li>
+        </ul>
+      </details>
+    </section>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 4 — OBSERVABILITY STACK
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="observability-stack">
+      <h2>Building Proper Observability</h2>
+
+      <details>
+        <summary>The Three Pillars: Metrics, Traces, Logs</summary>
+        <p>Effective observability requires all three pillars working together. No single pillar is
+        sufficient for debugging intermittent failures:</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Pillar</th>
+              <th>Strength</th>
+              <th>Weakness</th>
+              <th>Tools</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Metrics</strong></td>
+              <td>Cheap, aggregated, good for alerting and trends</td>
+              <td>No individual request detail</td>
+              <td>Prometheus, Grafana, CloudWatch</td>
+            </tr>
+            <tr>
+              <td><strong>Traces</strong></td>
+              <td>Full request lifecycle, cross-service visibility</td>
+              <td>Sampling may miss rare events</td>
+              <td>OpenTelemetry, Jaeger, Zipkin</td>
+            </tr>
+            <tr>
+              <td><strong>Logs</strong></td>
+              <td>Rich context, human-readable, flexible</td>
+              <td>Expensive at scale, no aggregation</td>
+              <td>ELK, Loki, CloudWatch Logs</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Distributed Tracing (OpenTelemetry + Jaeger)</summary>
+        <p>OpenTelemetry (OTel) is the CNCF standard for distributed tracing. It provides automatic
+        instrumentation for Spring Boot, JDBC, HTTP clients, and messaging systems.</p>
+        <pre><code class="language-yaml"># build.gradle — OpenTelemetry dependencies for Spring Boot
+dependencies {
+    implementation 'io.opentelemetry.instrumentation:opentelemetry-spring-boot-starter:2.1.0'
+    implementation 'io.opentelemetry:opentelemetry-exporter-otlp:1.35.0'
+}
+
+# application.yml — OTel configuration
+otel:
+  exporter:
+    otlp:
+      endpoint: http://otel-collector:4317
+  resource:
+    attributes:
+      service.name: order-service
+      service.version: ${APP_VERSION:unknown}
+      deployment.environment: ${SPRING_PROFILES_ACTIVE:local}
+  traces:
+    sampler:
+      type: parentbased_traceidratio
+      arg: 0.1   # Sample 10% of traces in production</code></pre>
+        <p><strong>Key concepts for debugging intermittent failures:</strong></p>
+        <ul>
+          <li><strong>Trace:</strong> Complete lifecycle of a request across all services</li>
+          <li><strong>Span:</strong> A single operation within a trace (DB call, HTTP request, etc.)</li>
+          <li><strong>Missing spans:</strong> If a trace shows Service A → [gap] → Service C, the failure
+          is in Service B or the network between A and B</li>
+          <li><strong>Span attributes:</strong> Custom key-value pairs that provide debugging context</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>Metrics (Prometheus + Grafana)</summary>
+        <p>Metrics are the foundation of observability for intermittent issues because they capture
+        aggregate behavior even when individual requests leave no trace.</p>
+        <pre><code class="language-java">@Component
+public class CustomMetricsConfig {
+
+    private final MeterRegistry registry;
+
+    public CustomMetricsConfig(MeterRegistry registry) {
+        this.registry = registry;
+    }
+
+    // RED metrics: Rate, Errors, Duration — per endpoint
+    @Bean
+    public TimedAspect timedAspect() {
+        return new TimedAspect(registry);
+    }
+
+    // Connection pool health — critical for invisible failures
+    @EventListener(ApplicationReadyEvent.class)
+    public void registerConnectionPoolMetrics() {
+        // HikariCP metrics are auto-registered by Spring Boot
+        // But add custom ones for downstream HTTP clients:
+        Gauge.builder("http.client.pool.available",
+            () -&gt; httpClientPool.getAvailableConnections())
+            .tag("target", "payment-service")
+            .register(registry);
+
+        Gauge.builder("http.client.pool.pending",
+            () -&gt; httpClientPool.getPendingRequests())
+            .tag("target", "payment-service")
+            .register(registry);
+    }
+}</code></pre>
+        <pre><code class="language-bash"># Prometheus queries for intermittent failure detection
+
+# Error rate by endpoint (should be &lt; 0.1%)
+sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+/ sum(rate(http_server_requests_seconds_count[5m]))
+
+# P99 latency spike detection
+histogram_quantile(0.99, rate(http_server_requests_seconds_bucket[5m])) > 2.0
+
+# Connection pool saturation (approaching starvation)
+hikaricp_connections_active / hikaricp_connections_max > 0.8
+
+# GC pause correlation with errors
+increase(jvm_gc_pause_seconds_count{action="end of major GC"}[5m]) > 0</code></pre>
+      </details>
+
+      <details>
+        <summary>Structured Logging with Correlation IDs</summary>
+        <p>Structured logging (JSON format) with correlation IDs enables connecting logs across services
+        and correlating with traces and metrics.</p>
+        <pre><code class="language-java">// logback-spring.xml — JSON structured logging
+// &lt;encoder class="net.logstash.logback.encoder.LogstashEncoder"&gt;
+//   &lt;includeMdcKeyName&gt;traceId&lt;/includeMdcKeyName&gt;
+//   &lt;includeMdcKeyName&gt;spanId&lt;/includeMdcKeyName&gt;
+//   &lt;includeMdcKeyName&gt;requestId&lt;/includeMdcKeyName&gt;
+//   &lt;customFields&gt;{"service":"order-service"}&lt;/customFields&gt;
+// &lt;/encoder&gt;
+
+// Output:
+// {"timestamp":"2024-01-15T14:23:45.123Z","level":"WARN",
+//  "message":"Inventory fallback triggered","service":"order-service",
+//  "traceId":"abc123def456","spanId":"span789",
+//  "requestId":"req-uuid-001","warehouse":"US-WEST-2"}</code></pre>
+        <pre><code class="language-java">// Filter to inject correlation ID into every request
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class CorrelationIdFilter extends OncePerRequestFilter {
+
+    private static final String CORRELATION_HEADER = "X-Correlation-ID";
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain chain) throws ServletException, IOException {
+        String correlationId = request.getHeader(CORRELATION_HEADER);
+        if (correlationId == null || correlationId.isBlank()) {
+            correlationId = UUID.randomUUID().toString();
+        }
+
+        MDC.put("correlationId", correlationId);
+        MDC.put("requestPath", request.getRequestURI());
+        MDC.put("clientIp", request.getRemoteAddr());
+
+        response.setHeader(CORRELATION_HEADER, correlationId);
+
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            MDC.clear();
+        }
+    }
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 5 — DISTRIBUTED TRACING DEEP DIVE
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="distributed-tracing">
+      <h2>OpenTelemetry Deep Dive</h2>
+
+      <details>
+        <summary>Spans, Traces, and Context Propagation</summary>
+        <p>Understanding the anatomy of a distributed trace is essential for debugging invisible failures.
+        A trace represents the complete journey of a single request through your system.</p>
+        <pre><code class="language-json">{
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "spans": [
+    {
+      "spanId": "00f067aa0ba902b7",
+      "operationName": "POST /api/orders",
+      "service": "api-gateway",
+      "duration": "3245ms",
+      "status": "OK"
+    },
+    {
+      "spanId": "01f067aa0ba902b8",
+      "parentSpanId": "00f067aa0ba902b7",
+      "operationName": "validateOrder",
+      "service": "order-service",
+      "duration": "45ms",
+      "status": "OK"
+    },
+    {
+      "spanId": "02f067aa0ba902b9",
+      "parentSpanId": "01f067aa0ba902b8",
+      "operationName": "GET /inventory/check",
+      "service": "inventory-service",
+      "duration": "3100ms",
+      "status": "DEADLINE_EXCEEDED",
+      "attributes": {
+        "http.status_code": 504,
+        "net.peer.name": "inventory-db.cluster.local",
+        "db.statement": "SELECT available FROM stock WHERE item_id = ?"
+      }
+    }
+  ]
+}</code></pre>
+        <p><strong>Reading traces for invisible failures:</strong></p>
+        <ul>
+          <li><strong>Duration anomalies:</strong> A span that normally takes 20ms taking 3000ms indicates a bottleneck</li>
+          <li><strong>Missing child spans:</strong> If a parent span has no children where you expect them, the request was dropped</li>
+          <li><strong>Status codes:</strong> DEADLINE_EXCEEDED, UNAVAILABLE, and INTERNAL indicate infrastructure issues</li>
+          <li><strong>Gap analysis:</strong> Time between parent span start and child span start reveals queuing/scheduling delays</li>
+        </ul>
+        <pre><code class="language-java">// Manual span creation for critical sections
+@Service
+public class PaymentProcessor {
+
+    private final Tracer tracer;
+
+    public PaymentResult processPayment(PaymentRequest request) {
+        Span span = tracer.spanBuilder("processPayment")
+            .setAttribute("payment.amount", request.getAmount().doubleValue())
+            .setAttribute("payment.currency", request.getCurrency())
+            .setAttribute("payment.provider", request.getProvider())
+            .startSpan();
+
+        try (Scope scope = span.makeCurrent()) {
+            // DNS resolution — often the hidden culprit
+            Span dnsSpan = tracer.spanBuilder("dns-resolve")
+                .startSpan();
+            InetAddress address = InetAddress.getByName(paymentGatewayHost);
+            dnsSpan.setAttribute("resolved.ip", address.getHostAddress());
+            dnsSpan.end();
+
+            // Actual HTTP call
+            PaymentResult result = paymentClient.charge(request);
+            span.setAttribute("payment.result", result.getStatus().name());
+            return result;
+
+        } catch (Exception e) {
+            span.setStatus(StatusCode.ERROR, e.getMessage());
+            span.recordException(e);
+            throw e;
+        } finally {
+            span.end();
+        }
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Context Propagation Across Async Boundaries</summary>
+        <p>One of the most common causes of "broken traces" — and therefore invisible failures — is
+        lost context propagation across async boundaries (thread pools, message queues, reactive streams).</p>
+        <pre><code class="language-java">// PROBLEM: Context lost when using @Async or CompletableFuture
+@Async
+public CompletableFuture&lt;Result&gt; asyncProcess(Request req) {
+    // Span context is NOT propagated — this span is orphaned!
+    // It won't appear in the parent trace
+    return CompletableFuture.completedFuture(process(req));
+}
+
+// SOLUTION 1: Context-aware executor
+@Configuration
+public class TracingAsyncConfig {
+
+    @Bean("tracingExecutor")
+    public Executor tracingExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("traced-async-");
+        executor.initialize();
+
+        // Wrap with OpenTelemetry context propagation
+        return Context.taskWrapping(executor);
+    }
+}
+
+// SOLUTION 2: Manual context propagation
+public CompletableFuture&lt;Result&gt; asyncProcessWithContext(Request req) {
+    Context currentContext = Context.current();
+
+    return CompletableFuture.supplyAsync(() -&gt; {
+        try (Scope scope = currentContext.makeCurrent()) {
+            return process(req);
+        }
+    }, tracingExecutor);
+}</code></pre>
+        <pre><code class="language-java">// Context propagation for Kafka consumers
+@KafkaListener(topics = "order-events")
+public void handleOrderEvent(ConsumerRecord&lt;String, OrderEvent&gt; record) {
+    // Extract trace context from Kafka headers
+    Context extractedContext = openTelemetry.getPropagators()
+        .getTextMapPropagator()
+        .extract(Context.current(), record.headers(), new KafkaHeaderGetter());
+
+    try (Scope scope = extractedContext.makeCurrent()) {
+        Span span = tracer.spanBuilder("process-order-event")
+            .setSpanKind(SpanKind.CONSUMER)
+            .setAttribute("messaging.kafka.topic", record.topic())
+            .setAttribute("messaging.kafka.partition", record.partition())
+            .startSpan();
+        try {
+            processEvent(record.value());
+        } finally {
+            span.end();
+        }
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Sampling Strategies for Rare Failures</summary>
+        <p>Standard sampling (e.g., 10% of traces) can miss intermittent failures that affect 0.1%
+        of requests. You need intelligent sampling strategies:</p>
+        <pre><code class="language-java">// Tail-based sampling: Decide whether to keep a trace AFTER it completes
+// This requires the OpenTelemetry Collector with tail_sampling processor
+
+// Collector configuration (otel-collector-config.yaml):
+// processors:
+//   tail_sampling:
+//     decision_wait: 10s
+//     policies:
+//       - name: error-policy
+//         type: status_code
+//         status_code: {status_codes: [ERROR]}
+//       - name: latency-policy
+//         type: latency
+//         latency: {threshold_ms: 2000}
+//       - name: probabilistic-policy
+//         type: probabilistic
+//         probabilistic: {sampling_percentage: 10}</code></pre>
+        <pre><code class="language-java">// Custom sampler: Always sample requests that show warning signs
+public class FailureAwareSampler implements Sampler {
+
+    private final Sampler defaultSampler;
+
+    public FailureAwareSampler(double defaultRate) {
+        this.defaultSampler = Sampler.traceIdRatioBased(defaultRate);
+    }
+
+    @Override
+    public SamplingResult shouldSample(
+            Context parentContext,
+            String traceId,
+            String name,
+            SpanKind spanKind,
+            Attributes attributes,
+            List&lt;LinkData&gt; parentLinks) {
+
+        // Always sample if parent was sampled (maintain trace completeness)
+        if (Span.fromContext(parentContext).getSpanContext().isSampled()) {
+            return SamplingResult.recordAndSample();
+        }
+
+        // Always sample retried requests (they indicate a prior failure)
+        if (attributes.get(AttributeKey.longKey("http.retry_count")) != null) {
+            return SamplingResult.recordAndSample();
+        }
+
+        // Always sample requests to known-problematic endpoints
+        String httpTarget = attributes.get(AttributeKey.stringKey("http.target"));
+        if (httpTarget != null &amp;&amp; PROBLEMATIC_ENDPOINTS.contains(httpTarget)) {
+            return SamplingResult.recordAndSample();
+        }
+
+        return defaultSampler.shouldSample(
+            parentContext, traceId, name, spanKind, attributes, parentLinks);
+    }
+
+    @Override
+    public String getDescription() {
+        return "FailureAwareSampler";
+    }
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 6 — CORRELATION IDS
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="correlation-ids">
+      <h2>MDC and Trace Propagation</h2>
+
+      <details>
+        <summary>MDC (Mapped Diagnostic Context) Fundamentals</summary>
+        <p>MDC provides thread-local storage for logging context. When combined with OpenTelemetry,
+        it bridges the gap between structured logs and distributed traces.</p>
+        <pre><code class="language-java">// Comprehensive MDC filter that enriches every log line
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class ObservabilityFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain chain)
+            throws ServletException, IOException {
+
+        String traceId = Optional.ofNullable(Span.current().getSpanContext().getTraceId())
+            .filter(id -&gt; !id.equals("00000000000000000000000000000000"))
+            .orElse(UUID.randomUUID().toString().replace("-", ""));
+
+        String spanId = Span.current().getSpanContext().getSpanId();
+        String correlationId = request.getHeader("X-Correlation-ID");
+        if (correlationId == null) {
+            correlationId = traceId;
+        }
+
+        // Set MDC values — these appear in every log line
+        MDC.put("traceId", traceId);
+        MDC.put("spanId", spanId);
+        MDC.put("correlationId", correlationId);
+        MDC.put("requestMethod", request.getMethod());
+        MDC.put("requestPath", request.getRequestURI());
+        MDC.put("clientIp", getClientIp(request));
+        MDC.put("userAgent", request.getHeader("User-Agent"));
+
+        // Track request timing
+        long startTime = System.nanoTime();
+        MDC.put("requestStartTime", String.valueOf(startTime));
+
+        response.setHeader("X-Trace-ID", traceId);
+        response.setHeader("X-Correlation-ID", correlationId);
+
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            long duration = (System.nanoTime() - startTime) / 1_000_000;
+            MDC.put("responseStatus", String.valueOf(response.getStatus()));
+            MDC.put("durationMs", String.valueOf(duration));
+
+            // Log completion with all context
+            if (response.getStatus() &gt;= 400) {
+                log.warn("Request completed with error status");
+            }
+
+            MDC.clear();
+        }
+    }
+
+    private String getClientIp(HttpServletRequest request) {
+        String xff = request.getHeader("X-Forwarded-For");
+        return xff != null ? xff.split(",")[0].trim() : request.getRemoteAddr();
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Trace Propagation Across Thread Boundaries</summary>
+        <p>MDC is thread-local. When you use <code>@Async</code>, <code>CompletableFuture</code>,
+        or parallel streams, MDC context is lost. This must be handled explicitly.</p>
+        <pre><code class="language-java">// MDC-aware TaskDecorator for Spring's ThreadPoolTaskExecutor
+public class MdcTaskDecorator implements TaskDecorator {
+
+    @Override
+    public Runnable decorate(Runnable runnable) {
+        // Capture MDC from the calling thread
+        Map&lt;String, String&gt; contextMap = MDC.getCopyOfContextMap();
+        // Capture OTel context
+        Context otelContext = Context.current();
+
+        return () -&gt; {
+            try {
+                // Restore MDC in the worker thread
+                if (contextMap != null) {
+                    MDC.setContextMap(contextMap);
+                }
+                // Restore OTel context
+                try (Scope scope = otelContext.makeCurrent()) {
+                    runnable.run();
+                }
+            } finally {
+                MDC.clear();
+            }
+        };
+    }
+}
+
+// Register the decorator
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+
+    @Override
+    public Executor getAsyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(200);
+        executor.setThreadNamePrefix("async-");
+        executor.setTaskDecorator(new MdcTaskDecorator());
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Propagation Across Services (HTTP, Kafka, gRPC)</summary>
+        <pre><code class="language-java">// RestTemplate interceptor for outbound trace propagation
+@Configuration
+public class RestTemplateConfig {
+
+    @Bean
+    public RestTemplate restTemplate(RestTemplateBuilder builder) {
+        return builder
+            .interceptors(new TracePropagatingInterceptor())
+            .requestFactory(() -&gt; {
+                HttpComponentsClientHttpRequestFactory factory =
+                    new HttpComponentsClientHttpRequestFactory();
+                factory.setConnectTimeout(Duration.ofSeconds(3));
+                factory.setReadTimeout(Duration.ofSeconds(10));
+                return factory;
+            })
+            .build();
+    }
+}
+
+public class TracePropagatingInterceptor implements ClientHttpRequestInterceptor {
+
+    @Override
+    public ClientHttpResponse intercept(HttpRequest request, byte[] body,
+                                         ClientHttpRequestExecution execution)
+            throws IOException {
+
+        // Inject trace context into outbound headers
+        openTelemetry.getPropagators().getTextMapPropagator().inject(
+            Context.current(),
+            request.getHeaders(),
+            (headers, key, value) -&gt; headers.set(key, value)
+        );
+
+        // Also propagate correlation ID
+        String correlationId = MDC.get("correlationId");
+        if (correlationId != null) {
+            request.getHeaders().set("X-Correlation-ID", correlationId);
+        }
+
+        return execution.execute(request, body);
+    }
+}
+
+// WebClient variant for reactive propagation
+@Bean
+public WebClient webClient() {
+    return WebClient.builder()
+        .filter((request, next) -&gt; {
+            // OpenTelemetry auto-instruments WebClient if on classpath
+            // But ensure correlation ID is passed
+            String correlationId = MDC.get("correlationId");
+            if (correlationId != null) {
+                request.headers().set("X-Correlation-ID", correlationId);
+            }
+            return next.exchange(request);
+        })
+        .build();
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 7 — NETWORK DEBUGGING
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="network-debugging">
+      <h2>Network-Level Investigation</h2>
+
+      <details>
+        <summary>tcpdump — Capturing Network Issues</summary>
+        <p>When application logs show nothing, network packet capture reveals the truth. <code>tcpdump</code>
+        is available on most Linux systems and Kubernetes nodes.</p>
+        <pre><code class="language-bash"># Capture traffic to a specific service (payment gateway on port 443)
+tcpdump -i eth0 host payment-gateway.example.com and port 443 -w /tmp/payment.pcap
+
+# Capture only TCP control packets (SYN, FIN, RST) — minimal overhead
+tcpdump -i eth0 'tcp[tcpflags] & (tcp-syn|tcp-fin|tcp-rst) != 0' -nn
+
+# Look for retransmissions (sign of packet loss)
+tcpdump -i eth0 'tcp[tcpflags] & tcp-syn != 0' -nn | grep -c "retransmit"
+
+# Capture DNS queries and responses
+tcpdump -i eth0 port 53 -nn -l
+
+# In Kubernetes — capture from a specific pod's network namespace
+POD_ID=$(crictl pods --name my-app -q)
+NETNS=$(crictl inspectp $POD_ID | jq -r '.info.runtimeSpec.linux.namespaces[] | select(.type=="network").path')
+nsenter --net=$NETNS tcpdump -i eth0 -nn -c 100</code></pre>
+        <p><strong>What to look for:</strong></p>
+        <ul>
+          <li><strong>TCP RST without FIN:</strong> Connection was killed abruptly (load balancer, firewall, or app crash)</li>
+          <li><strong>SYN without SYN-ACK:</strong> Target port not listening or packet dropped</li>
+          <li><strong>Retransmissions:</strong> Packet loss on the network path</li>
+          <li><strong>Window size = 0:</strong> Receiver overwhelmed, causing sender to pause (backpressure)</li>
+          <li><strong>DNS timeout:</strong> Query sent but no response within 5 seconds</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>ss and netstat — Connection State Analysis</summary>
+        <pre><code class="language-bash"># Check connection states to downstream services
+ss -tn state established dst payment-service.internal
+
+# Count connections in each state
+ss -s
+# Total: 1532 (kernel 1887)
+# TCP:   1245 (estab 892, closed 12, orphaned 3, timewait 234, close-wait 47)
+
+# CLOSE_WAIT indicates the remote side closed, but local app hasn't — potential leak
+ss -tn state close-wait
+# Many CLOSE_WAIT connections = connection pool not cleaning up properly
+
+# TIME_WAIT accumulation — normal but excessive count indicates rapid connect/disconnect
+ss -tn state time-wait | wc -l
+
+# Check socket buffer overflow (recv-Q building up = app not reading fast enough)
+ss -tn | awk '$2 > 0 {print $0}'
+# Recv-Q  Send-Q  Local Address   Peer Address
+# 65535   0       10.0.1.5:8080   10.0.2.3:54321   &lt;-- Buffer full!</code></pre>
+      </details>
+
+      <details>
+        <summary>DNS Debugging in Production</summary>
+        <pre><code class="language-bash"># Check DNS resolution time
+dig +stats payment-service.payments.svc.cluster.local
+# ;; Query time: 2 msec   (normal)
+# ;; Query time: 4800 msec (problem!)
+
+# Check which DNS server is being used
+cat /etc/resolv.conf
+# nameserver 10.96.0.10   (CoreDNS ClusterIP in Kubernetes)
+# search payments.svc.cluster.local svc.cluster.local cluster.local
+# options ndots:5          &lt;-- This causes extra lookups!
+
+# Trace DNS resolution path (shows all intermediate queries)
+dig +trace payment-service.payments.svc.cluster.local
+
+# Monitor DNS query rate and failures on CoreDNS
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100 | grep -i "error\|NXDOMAIN\|SERVFAIL"
+
+# Check if conntrack table is full (causes DNS packet drops)
+cat /proc/sys/net/netfilter/nf_conntrack_count
+cat /proc/sys/net/netfilter/nf_conntrack_max
+# If count approaches max, DNS (UDP) packets get silently dropped</code></pre>
+      </details>
+
+      <details>
+        <summary>TCP Retransmissions and Latency</summary>
+        <pre><code class="language-bash"># Monitor TCP retransmissions (strong signal of network issues)
+# Method 1: /proc/net/snmp
+watch -n 1 'cat /proc/net/snmp | grep Tcp'
+# Tcp: ... RetransSegs ...
+# Compare RetransSegs over time — should be near zero
+
+# Method 2: ss with extended info
+ss -ti dst payment-service.internal | grep -E "retrans|rto"
+# retrans:2/4 — 2 retransmissions in current window, 4 total
+# rto:3000 — retransmission timeout is 3 seconds (doubled from initial)
+
+# Method 3: nstat for per-second counters
+nstat -a | grep -i retrans
+# TcpRetransSegs    45    0.0
+# TcpTimeouts       12    0.0
+
+# Check RTT to downstream services
+ss -ti dst payment-service.internal | grep rtt
+# rtt:2.5/1.2 — 2.5ms avg, 1.2ms variance (healthy)
+# rtt:450/200 — 450ms avg, 200ms variance (problem!)
+
+# Correlate with specific pod IPs
+kubectl get endpoints payment-service -o json | \
+  jq '.subsets[].addresses[].ip' | \
+  xargs -I {} sh -c 'echo "=== {} ===" && ss -ti dst {}'</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 8 — PRODUCTION INCIDENT
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="production-incident">
+      <h2>Real Incident: DNS TTL Caching Causes 0.1% Timeouts</h2>
+
+      <details>
+        <summary>Incident Report: Payment Service Intermittent Failures</summary>
+        <p><strong>Severity:</strong> P2 — 0.1% of payment requests timing out intermittently<br/>
+        <strong>Duration:</strong> 3 days before root cause identified<br/>
+        <strong>Impact:</strong> ~$47,000 in failed transactions per day<br/>
+        <strong>Root cause:</strong> JVM DNS caching holding stale IP after backend service migration</p>
+
+        <h3>Timeline</h3>
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Event</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Day 0, 14:00</td><td>Infrastructure team migrates payment-processor service to new nodes. IP changes from 10.0.5.23 to 10.0.5.47.</td></tr>
+            <tr><td>Day 0, 14:05</td><td>Kubernetes DNS (CoreDNS) updated with new IP. TTL = 30s.</td></tr>
+            <tr><td>Day 0, 14:05+</td><td>Most pods resolve new IP within 30s. But JVM DNS cache holds old IP.</td></tr>
+            <tr><td>Day 0, 14:30</td><td>First user reports: "payment failed, please try again." Retry succeeds (different pod).</td></tr>
+            <tr><td>Day 0, 15:00</td><td>Support team checks logs — no exceptions found. Payment service logs show successful processing.</td></tr>
+            <tr><td>Day 1, 09:00</td><td>Failure rate stable at 0.1%. Engineering investigates. Application logs clean.</td></tr>
+            <tr><td>Day 1, 14:00</td><td>Team checks metrics: p99 latency spiked for 3 specific pods (out of 24).</td></tr>
+            <tr><td>Day 1, 16:00</td><td>Those 3 pods started before the IP change and haven't restarted since.</td></tr>
+            <tr><td>Day 2, 10:00</td><td>Engineer execs into affected pod, runs <code>nslookup</code> — returns correct IP. But Java resolves old IP.</td></tr>
+            <tr><td>Day 2, 11:00</td><td>Root cause confirmed: JVM security manager caching DNS indefinitely.</td></tr>
+            <tr><td>Day 2, 11:30</td><td>Rolling restart of affected pods. Failure rate drops to 0%.</td></tr>
+            <tr><td>Day 3</td><td>Permanent fix deployed: <code>-Dsun.net.inetaddr.ttl=30</code> in JVM args.</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Technical Deep Dive: Why It Was Invisible</summary>
+        <pre><code class="language-java">// The JVM's InetAddress caches DNS results
+// Default behavior:
+//   - No SecurityManager: cache for 30 seconds
+//   - With SecurityManager: cache FOREVER (networkaddress.cache.ttl = -1)
+//
+// Many Docker base images (especially older ones) have a security.policy
+// that triggers SecurityManager-like caching behavior.
+
+// The affected code:
+HttpClient client = HttpClient.newBuilder()
+    .connectTimeout(Duration.ofSeconds(3))
+    .build();
+
+// This resolves "payment-processor.internal" to an IP
+// The resolved IP is cached by the JVM — NOT by HttpClient
+HttpRequest request = HttpRequest.newBuilder()
+    .uri(URI.create("http://payment-processor.internal:8080/charge"))
+    .POST(HttpRequest.BodyPublishers.ofString(payload))
+    .build();
+
+// After IP change:
+// - DNS returns 10.0.5.47 (new, correct)
+// - JVM cache still holds 10.0.5.23 (old, unreachable)
+// - Connection attempt to 10.0.5.23 times out after 3 seconds
+// - HttpClient throws ConnectTimeoutException
+// - BUT: the calling code had a fallback that returned a generic error to the user
+// - No exception logged at ERROR level — only at DEBUG</code></pre>
+        <pre><code class="language-bash"># Verification commands used during incident
+
+# From inside the affected pod:
+$ java -XshowSettings:all 2>&1 | grep -i cache
+# networkaddress.cache.ttl = -1   &lt;-- FOREVER!
+
+# Confirm which IP Java is using vs DNS
+$ python3 -c "import socket; print(socket.gethostbyname('payment-processor.internal'))"
+# 10.0.5.47  (correct — Python doesn't use JVM cache)
+
+# Compare with Java resolution
+$ java -cp /app/lib/* com.example.DnsCheck payment-processor.internal
+# Resolved to: 10.0.5.23  (STALE!)
+
+# Network confirmation — old IP is unreachable
+$ curl -m 3 http://10.0.5.23:8080/health
+# curl: (28) Connection timed out after 3000 milliseconds
+
+$ curl -m 3 http://10.0.5.47:8080/health
+# {"status": "UP"}</code></pre>
+      </details>
+
+      <details>
+        <summary>Prevention: DNS Configuration for Java Services</summary>
+        <pre><code class="language-java">// Option 1: JVM argument (preferred — works for all DNS resolution)
+// Add to JAVA_OPTS or JVM_ARGS in Dockerfile/deployment:
+// -Dsun.net.inetaddr.ttl=30
+// -Dsun.net.inetaddr.negative.ttl=10
+
+// Option 2: Programmatic (early in application startup)
+public static void main(String[] args) {
+    // Must be set before any DNS resolution occurs
+    java.security.Security.setProperty("networkaddress.cache.ttl", "30");
+    java.security.Security.setProperty("networkaddress.cache.negative.ttl", "10");
+    SpringApplication.run(Application.class, args);
+}
+
+// Option 3: Security properties file
+// $JAVA_HOME/conf/security/java.security:
+// networkaddress.cache.ttl=30
+// networkaddress.cache.negative.ttl=10</code></pre>
+        <pre><code class="language-yaml"># Kubernetes deployment with proper DNS settings
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  template:
+    spec:
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
+          - name: timeout
+            value: "2"
+          - name: attempts
+            value: "3"
+      containers:
+        - name: app
+          image: order-service:latest
+          env:
+            - name: JAVA_OPTS
+              value: >-
+                -Dsun.net.inetaddr.ttl=30
+                -Dsun.net.inetaddr.negative.ttl=10
+                -XX:+UseG1GC
+                -Xlog:gc*:file=/var/log/gc.log:time,uptime:filecount=5,filesize=50m</code></pre>
+        <pre><code class="language-java">// Custom health check that detects DNS staleness
+@Component
+public class DnsHealthIndicator implements HealthIndicator {
+
+    @Value("${downstream.payment.host}")
+    private String paymentHost;
+
+    @Override
+    public Health health() {
+        try {
+            long start = System.nanoTime();
+            InetAddress[] addresses = InetAddress.getAllByName(paymentHost);
+            long durationMs = (System.nanoTime() - start) / 1_000_000;
+
+            if (durationMs &gt; 1000) {
+                return Health.down()
+                    .withDetail("host", paymentHost)
+                    .withDetail("resolutionTimeMs", durationMs)
+                    .withDetail("resolvedIps", Arrays.toString(addresses))
+                    .build();
+            }
+
+            return Health.up()
+                .withDetail("host", paymentHost)
+                .withDetail("resolutionTimeMs", durationMs)
+                .withDetail("resolvedIps", Arrays.toString(addresses))
+                .build();
+
+        } catch (UnknownHostException e) {
+            return Health.down()
+                .withDetail("host", paymentHost)
+                .withException(e)
+                .build();
+        }
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 9 — DEBUGGING WORKFLOW
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="debugging-workflow">
+      <h2>Systematic Debugging Strategy</h2>
+
+      <details>
+        <summary>Step 1: Start from the User Report</summary>
+        <p>Never dismiss user reports. "It works on my machine" or "logs look clean" is not a valid
+        response. Extract maximum signal from the user report:</p>
+        <ul>
+          <li><strong>When:</strong> Exact timestamp — correlate with metrics/deployments/scaling events</li>
+          <li><strong>Who:</strong> Specific user/tenant — check if issue is isolated to one customer or one geography</li>
+          <li><strong>What:</strong> Exact error message/behavior — "timeout" vs "empty response" vs "wrong data"</li>
+          <li><strong>Frequency:</strong> Every time? 1 in 10? Only at certain times? — helps identify load-dependent issues</li>
+          <li><strong>Context:</strong> Browser, mobile, API client — rules out client-side issues</li>
+        </ul>
+        <pre><code class="language-json">// Create a structured incident record
+{
+  "incident_id": "INC-2024-0142",
+  "reported_at": "2024-01-15T14:23:00Z",
+  "reporter": "support-team",
+  "symptoms": {
+    "description": "Payment intermittently fails with generic error",
+    "frequency": "~1 in 1000 requests",
+    "affected_users": "random distribution, no pattern by geo/account",
+    "user_visible_error": "Something went wrong. Please try again.",
+    "retry_behavior": "Usually succeeds on retry"
+  },
+  "initial_observations": {
+    "application_logs": "No ERROR entries during reported timeframe",
+    "error_rate_dashboard": "Shows 0.1% error rate (within SLO but elevated)",
+    "recent_changes": "Backend IP migration 3 days ago"
+  }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Step 2: Correlate with Metrics</summary>
+        <p>Metrics provide the "big picture" view. Before diving into individual traces or logs,
+        understand the pattern:</p>
+        <pre><code class="language-bash"># Key metrics to check (Prometheus/Grafana queries):
+
+# 1. Error rate by service and endpoint
+sum by (service, uri) (rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+
+# 2. Latency percentiles — p50 vs p99 gap indicates intermittent slowness
+histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket[5m])))
+histogram_quantile(0.50, sum by (le) (rate(http_server_requests_seconds_bucket[5m])))
+
+# 3. Correlation with infrastructure events
+# - Check if errors align with pod scaling events
+# - Check if errors correlate with GC pauses
+# - Check if errors map to specific pods (not distributed evenly)
+
+# 4. Downstream dependency health
+sum by (target) (rate(http_client_requests_seconds_count{status=~"5.."}[5m]))
+
+# 5. Resource saturation
+# CPU throttling:
+rate(container_cpu_cfs_throttled_periods_total[5m])
+/ rate(container_cpu_cfs_periods_total[5m]) > 0.1
+
+# Memory pressure:
+container_memory_working_set_bytes / container_spec_memory_limit_bytes > 0.85</code></pre>
+        <p><strong>Key insight:</strong> If error rate is 0.1% and evenly distributed across pods,
+        the issue is likely external (network, DNS, downstream). If concentrated on specific pods,
+        it's likely a pod-specific issue (GC, connection pool, stale DNS cache).</p>
+      </details>
+
+      <details>
+        <summary>Step 3: Narrow Down with Distributed Traces</summary>
+        <p>Once you have a timeframe and pattern from metrics, use traces to find specific failing requests:</p>
+        <pre><code class="language-bash"># Jaeger query: Find slow traces in the affected timeframe
+# Filter: service=order-service, minDuration=2s, operation=POST /api/orders
+
+# Look for:
+# 1. Traces with ERROR status
+# 2. Traces with abnormally long spans
+# 3. Traces with MISSING spans (the request was lost between services)
+# 4. Traces where the last span has no response attributes
+
+# Using Jaeger API to find anomalous traces:
+curl "http://jaeger:16686/api/traces?service=order-service&amp;operation=POST%20/api/orders&amp;minDuration=2s&amp;start=$(date -d '1 hour ago' +%s)000000&amp;limit=20" | \
+  jq '.data[].spans[] | select(.duration > 2000000) | {operationName, duration, tags}'</code></pre>
+        <pre><code class="language-java">// Add custom span events for debugging intermittent issues
+@Service
+public class OrderService {
+
+    private final Tracer tracer;
+
+    public Order createOrder(CreateOrderRequest request) {
+        Span currentSpan = Span.current();
+
+        // Record the exact state at each step — helps post-mortem analysis
+        currentSpan.addEvent("order.validation.start",
+            Attributes.of(AttributeKey.stringKey("order.items.count"),
+                String.valueOf(request.getItems().size())));
+
+        Order order = validateAndCreate(request);
+
+        currentSpan.addEvent("order.payment.start",
+            Attributes.of(AttributeKey.stringKey("payment.provider"),
+                order.getPaymentProvider()));
+
+        PaymentResult payment = processPayment(order);
+
+        currentSpan.setAttribute("payment.status", payment.getStatus().name());
+        currentSpan.setAttribute("payment.latency_ms", payment.getLatencyMs());
+
+        if (payment.getLatencyMs() &gt; 2000) {
+            currentSpan.addEvent("payment.slow",
+                Attributes.of(
+                    AttributeKey.longKey("latency_ms"), payment.getLatencyMs(),
+                    AttributeKey.stringKey("provider_response_code"),
+                        payment.getProviderResponseCode()
+                ));
+        }
+
+        return order;
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Step 4: Confirm with Thread/Heap Dumps</summary>
+        <p>When traces point to a specific service but the cause isn't clear, thread dumps and heap
+        dumps provide the definitive answer:</p>
+        <pre><code class="language-bash"># Take thread dump from a running pod (non-destructive)
+kubectl exec -it order-service-pod-abc123 -- jstack $(pgrep java) > /tmp/threaddump.txt
+
+# Take multiple thread dumps 3 seconds apart (shows thread progression)
+for i in 1 2 3 4 5; do
+  kubectl exec -it order-service-pod-abc123 -- jstack $(pgrep java) > /tmp/thread_$i.txt
+  sleep 3
+done
+
+# Analyze: Look for threads stuck in the same state across dumps
+# Common patterns for intermittent failures:
+# - Threads BLOCKED on a lock → lock contention under load
+# - Threads WAITING in connection pool → pool exhaustion
+# - Threads in RUNNABLE doing socket read → downstream not responding
+# - Many threads in TIMED_WAITING → thread starvation (all waiting for work)
+
+# Heap dump for memory-related intermittent issues
+kubectl exec -it order-service-pod-abc123 -- \
+  jmap -dump:live,format=b,file=/tmp/heap.hprof $(pgrep java)
+
+# Or trigger on OOM (should already be configured):
+# -XX:+HeapDumpOnOutOfMemoryError
+# -XX:HeapDumpPath=/var/log/heap-dumps/</code></pre>
+        <pre><code class="language-java">// Programmatic thread dump via actuator endpoint (Spring Boot)
+// Available at: /actuator/threaddump (enable in application.yml)
+
+// Custom diagnostic endpoint for production debugging
+@RestController
+@RequestMapping("/internal/diagnostics")
+public class DiagnosticsController {
+
+    @GetMapping("/thread-summary")
+    public Map&lt;Thread.State, Long&gt; threadSummary() {
+        return Thread.getAllStackTraces().keySet().stream()
+            .collect(Collectors.groupingBy(Thread::getState, Collectors.counting()));
+    }
+
+    @GetMapping("/connection-pools")
+    public Map&lt;String, Object&gt; connectionPoolStatus() {
+        return Map.of(
+            "hikari.active", hikariDataSource.getHikariPoolMXBean().getActiveConnections(),
+            "hikari.idle", hikariDataSource.getHikariPoolMXBean().getIdleConnections(),
+            "hikari.waiting", hikariDataSource.getHikariPoolMXBean().getThreadsAwaitingConnection(),
+            "hikari.total", hikariDataSource.getHikariPoolMXBean().getTotalConnections()
+        );
+    }
+
+    @GetMapping("/dns-check/{host}")
+    public Map&lt;String, Object&gt; dnsCheck(@PathVariable String host) throws Exception {
+        long start = System.nanoTime();
+        InetAddress[] addresses = InetAddress.getAllByName(host);
+        long durationNs = System.nanoTime() - start;
+        return Map.of(
+            "host", host,
+            "resolvedIps", Arrays.stream(addresses).map(InetAddress::getHostAddress).toList(),
+            "resolutionTimeMs", durationNs / 1_000_000
+        );
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Step 5: Formulate Hypothesis and Validate</summary>
+        <p>After gathering data from all sources, formulate a specific, testable hypothesis:</p>
+        <pre><code class="language-json">// Hypothesis template
+{
+  "hypothesis": "DNS cache staleness causes 3 specific pods to send traffic to old IP",
+  "evidence_for": [
+    "Error rate is 0.1% — matches proportion of pods affected (3/24 = 12.5% of pods, each pod handles equal traffic, so affected requests = same percentage)",
+    "Wait — 3/24 pods would be 12.5% of requests, not 0.1%. Re-examine.",
+    "Actually: 3 pods sometimes resolve the old IP (cache hit) and sometimes the new (cache refresh) — stochastic failure within those pods",
+    "Affected pods started before IP change — confirmed via kubectl get pods",
+    "Java resolves different IP than system DNS on affected pods"
+  ],
+  "evidence_against": [
+    "Error rate should be ~12.5% if all requests from those pods fail — but it's only 0.1%",
+    "Explanation: JVM cache has a TTL, but it was set to 600s (10 min) not infinity. So the cache refreshes periodically, and only requests during the stale window fail."
+  ],
+  "validation_steps": [
+    "1. Exec into affected pod, confirm Java DNS resolution returns old IP",
+    "2. Restart one affected pod, confirm its error contribution drops to zero",
+    "3. Add -Dsun.net.inetaddr.ttl=30 to deployment, rolling restart",
+    "4. Monitor error rate for 30 minutes — should drop to baseline"
+  ],
+  "result": "Hypothesis CONFIRMED — fix deployed, error rate at 0%"
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 10 — CODE EXAMPLES
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="code-examples">
+      <h2>Production-Ready Code Examples</h2>
+
+      <details>
+        <summary>OpenTelemetry Auto-Configuration for Spring Boot</summary>
+        <pre><code class="language-java">// build.gradle.kts
+dependencies {
+    // OpenTelemetry Spring Boot starter (auto-instruments Spring MVC, WebFlux, JDBC, etc.)
+    implementation("io.opentelemetry.instrumentation:opentelemetry-spring-boot-starter:2.1.0")
+    // OTLP exporter
+    implementation("io.opentelemetry:opentelemetry-exporter-otlp:1.35.0")
+    // Micrometer bridge (connects OTel with Micrometer metrics)
+    implementation("io.opentelemetry.instrumentation:opentelemetry-micrometer-1.5:2.1.0-alpha")
+}
+
+// application.yml
+// otel:
+//   exporter:
+//     otlp:
+//       endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4317}
+//       protocol: grpc
+//   resource:
+//     attributes:
+//       service.name: ${spring.application.name}
+//       service.version: ${app.version:unknown}
+//       deployment.environment: ${ENVIRONMENT:local}
+//   traces:
+//     sampler:
+//       type: parentbased_traceidratio
+//       arg: ${OTEL_TRACES_SAMPLER_ARG:1.0}</code></pre>
+        <pre><code class="language-java">// Custom OTel configuration with failure-aware sampling
+@Configuration
+public class OpenTelemetryConfig {
+
+    @Bean
+    public OpenTelemetry openTelemetry(
+            @Value("${otel.exporter.otlp.endpoint}") String endpoint,
+            @Value("${otel.resource.attributes.service.name}") String serviceName,
+            @Value("${otel.traces.sampler.arg:0.1}") double samplingRate) {
+
+        Resource resource = Resource.getDefault().toBuilder()
+            .put(ResourceAttributes.SERVICE_NAME, serviceName)
+            .put(ResourceAttributes.SERVICE_VERSION, getAppVersion())
+            .build();
+
+        OtlpGrpcSpanExporter spanExporter = OtlpGrpcSpanExporter.builder()
+            .setEndpoint(endpoint)
+            .setTimeout(Duration.ofSeconds(10))
+            .build();
+
+        // Use failure-aware sampler that always captures errors
+        Sampler sampler = new FailureAwareSampler(samplingRate);
+
+        SdkTracerProvider tracerProvider = SdkTracerProvider.builder()
+            .setResource(resource)
+            .addSpanProcessor(BatchSpanProcessor.builder(spanExporter)
+                .setMaxQueueSize(2048)
+                .setScheduleDelay(Duration.ofSeconds(5))
+                .build())
+            .setSampler(sampler)
+            .build();
+
+        return OpenTelemetrySdk.builder()
+            .setTracerProvider(tracerProvider)
+            .setPropagators(ContextPropagators.create(
+                TextMapPropagator.composite(
+                    W3CTraceContextPropagator.getInstance(),
+                    W3CBaggagePropagator.getInstance()
+                )))
+            .build();
+    }
+
+    private String getAppVersion() {
+        try {
+            Properties props = new Properties();
+            props.load(getClass().getResourceAsStream("/git.properties"));
+            return props.getProperty("git.commit.id.abbrev", "unknown");
+        } catch (Exception e) {
+            return "unknown";
+        }
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Custom Span Attributes for Debugging Invisible Failures</summary>
+        <pre><code class="language-java">// Aspect that adds rich debugging context to every span
+@Aspect
+@Component
+public class SpanEnrichmentAspect {
+
+    private final Tracer tracer;
+    private final MeterRegistry meterRegistry;
+
+    @Around("@annotation(org.springframework.web.bind.annotation.RequestMapping) || " +
+            "@annotation(org.springframework.web.bind.annotation.GetMapping) || " +
+            "@annotation(org.springframework.web.bind.annotation.PostMapping)")
+    public Object enrichSpan(ProceedingJoinPoint joinPoint) throws Throwable {
+        Span span = Span.current();
+        long startNanos = System.nanoTime();
+
+        // Add method-level context
+        span.setAttribute("code.function", joinPoint.getSignature().getName());
+        span.setAttribute("code.namespace", joinPoint.getTarget().getClass().getName());
+
+        // Track thread pool state at request time (detects approaching starvation)
+        ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
+        span.setAttribute("jvm.threads.live", threadMXBean.getThreadCount());
+        span.setAttribute("jvm.threads.daemon", threadMXBean.getDaemonThreadCount());
+
+        // Track memory pressure
+        MemoryMXBean memoryMXBean = ManagementFactory.getMemoryMXBean();
+        long heapUsed = memoryMXBean.getHeapMemoryUsage().getUsed();
+        long heapMax = memoryMXBean.getHeapMemoryUsage().getMax();
+        span.setAttribute("jvm.memory.heap.utilization",
+            (double) heapUsed / heapMax);
+
+        try {
+            Object result = joinPoint.proceed();
+            span.setAttribute("response.type", result != null ?
+                result.getClass().getSimpleName() : "null");
+            return result;
+        } catch (Exception e) {
+            span.setStatus(StatusCode.ERROR, e.getMessage());
+            span.recordException(e);
+
+            // Record additional context on failure
+            span.setAttribute("error.type", e.getClass().getName());
+            span.setAttribute("error.stack_depth",
+                e.getStackTrace().length);
+
+            // Check if this was a timeout
+            if (e instanceof TimeoutException ||
+                e instanceof SocketTimeoutException) {
+                span.setAttribute("failure.type", "timeout");
+                long durationMs = (System.nanoTime() - startNanos) / 1_000_000;
+                span.setAttribute("timeout.duration_ms", durationMs);
+            }
+
+            throw e;
+        }
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>MDC Filter with Comprehensive Context</summary>
+        <pre><code class="language-java">@Component
+@Order(Ordered.HIGHEST_PRECEDENCE + 1) // After security filters
+public class ComprehensiveMdcFilter extends OncePerRequestFilter {
+
+    private static final Logger log = LoggerFactory.getLogger(ComprehensiveMdcFilter.class);
+    private final MeterRegistry meterRegistry;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain chain)
+            throws ServletException, IOException {
+
+        long startTime = System.nanoTime();
+        String requestId = extractOrGenerateRequestId(request);
+
+        // Populate MDC with all relevant context
+        MDC.put("requestId", requestId);
+        MDC.put("traceId", getCurrentTraceId());
+        MDC.put("spanId", getCurrentSpanId());
+        MDC.put("method", request.getMethod());
+        MDC.put("path", request.getRequestURI());
+        MDC.put("query", sanitizeQueryString(request.getQueryString()));
+        MDC.put("clientIp", extractClientIp(request));
+        MDC.put("userAgent", truncate(request.getHeader("User-Agent"), 100));
+        MDC.put("contentLength", String.valueOf(request.getContentLengthLong()));
+
+        // Add to response headers for client-side correlation
+        response.setHeader("X-Request-ID", requestId);
+        response.setHeader("X-Trace-ID", getCurrentTraceId());
+
+        try {
+            chain.doFilter(request, response);
+        } catch (Exception e) {
+            // This catch block ensures we log even for unhandled exceptions
+            MDC.put("errorClass", e.getClass().getName());
+            MDC.put("errorMessage", e.getMessage());
+            log.error("Unhandled exception in request processing", e);
+            throw e;
+        } finally {
+            long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+            int status = response.getStatus();
+
+            MDC.put("status", String.valueOf(status));
+            MDC.put("durationMs", String.valueOf(durationMs));
+
+            // Log request completion — this creates a record even for "invisible" failures
+            if (status &gt;= 500) {
+                log.error("Request completed: {} {} -> {} ({}ms)",
+                    request.getMethod(), request.getRequestURI(), status, durationMs);
+            } else if (status &gt;= 400) {
+                log.warn("Request completed: {} {} -> {} ({}ms)",
+                    request.getMethod(), request.getRequestURI(), status, durationMs);
+            } else if (durationMs &gt; 2000) {
+                // Log slow requests even if they succeeded
+                log.warn("Slow request: {} {} -> {} ({}ms)",
+                    request.getMethod(), request.getRequestURI(), status, durationMs);
+            }
+
+            // Emit metrics for every request
+            meterRegistry.timer("http.server.requests.detailed",
+                "method", request.getMethod(),
+                "uri", normalizeUri(request.getRequestURI()),
+                "status", String.valueOf(status),
+                "outcome", status &lt; 400 ? "SUCCESS" : "FAILURE"
+            ).record(durationMs, TimeUnit.MILLISECONDS);
+
+            MDC.clear();
+        }
+    }
+
+    private String extractOrGenerateRequestId(HttpServletRequest request) {
+        String id = request.getHeader("X-Request-ID");
+        if (id == null) id = request.getHeader("X-Correlation-ID");
+        if (id == null) id = UUID.randomUUID().toString();
+        return id;
+    }
+
+    private String getCurrentTraceId() {
+        SpanContext ctx = Span.current().getSpanContext();
+        return ctx.isValid() ? ctx.getTraceId() : "none";
+    }
+
+    private String getCurrentSpanId() {
+        SpanContext ctx = Span.current().getSpanContext();
+        return ctx.isValid() ? ctx.getSpanId() : "none";
+    }
+
+    private String extractClientIp(HttpServletRequest request) {
+        String xff = request.getHeader("X-Forwarded-For");
+        if (xff != null &amp;&amp; !xff.isBlank()) {
+            return xff.split(",")[0].trim();
+        }
+        return request.getRemoteAddr();
+    }
+
+    private String sanitizeQueryString(String query) {
+        if (query == null) return "";
+        // Remove sensitive params
+        return query.replaceAll("(password|token|secret|key)=[^&amp;]*", "$1=REDACTED");
+    }
+
+    private String truncate(String value, int maxLength) {
+        if (value == null) return "";
+        return value.length() &gt; maxLength ? value.substring(0, maxLength) : value;
+    }
+
+    private String normalizeUri(String uri) {
+        // Replace path variables with placeholders for metric cardinality
+        return uri.replaceAll("/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "/{uuid}")
+                  .replaceAll("/\\d+", "/{id}");
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Network Health Check Endpoint</summary>
+        <pre><code class="language-java">@Component
+public class NetworkHealthIndicator implements HealthIndicator {
+
+    private static final Logger log = LoggerFactory.getLogger(NetworkHealthIndicator.class);
+
+    @Value("${app.downstream.hosts:payment-service.internal,inventory-service.internal}")
+    private List&lt;String&gt; downstreamHosts;
+
+    @Value("${app.health.dns.timeout-ms:2000}")
+    private long dnsTimeoutMs;
+
+    @Override
+    public Health health() {
+        Map&lt;String, Object&gt; details = new LinkedHashMap&lt;&gt;();
+        boolean allHealthy = true;
+
+        for (String host : downstreamHosts) {
+            Map&lt;String, Object&gt; hostDetails = checkHost(host);
+            details.put(host, hostDetails);
+
+            if ("UNHEALTHY".equals(hostDetails.get("status"))) {
+                allHealthy = false;
+            }
+        }
+
+        // Check network-level metrics
+        details.put("tcp.connections.established", getTcpConnectionCount("ESTABLISHED"));
+        details.put("tcp.connections.close_wait", getTcpConnectionCount("CLOSE_WAIT"));
+        details.put("tcp.connections.time_wait", getTcpConnectionCount("TIME_WAIT"));
+
+        Health.Builder builder = allHealthy ? Health.up() : Health.down();
+        return builder.withDetails(details).build();
+    }
+
+    private Map&lt;String, Object&gt; checkHost(String host) {
+        Map&lt;String, Object&gt; result = new LinkedHashMap&lt;&gt;();
+        result.put("host", host);
+
+        // DNS resolution check
+        long dnsStart = System.nanoTime();
+        try {
+            InetAddress[] addresses = InetAddress.getAllByName(host);
+            long dnsTimeMs = (System.nanoTime() - dnsStart) / 1_000_000;
+            result.put("dns.resolution_ms", dnsTimeMs);
+            result.put("dns.resolved_ips",
+                Arrays.stream(addresses).map(InetAddress::getHostAddress).toList());
+
+            if (dnsTimeMs &gt; dnsTimeoutMs) {
+                result.put("status", "UNHEALTHY");
+                result.put("reason", "DNS resolution too slow: " + dnsTimeMs + "ms");
+                return result;
+            }
+
+            // TCP connectivity check (port 80 or 443)
+            long tcpStart = System.nanoTime();
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(addresses[0], 80), 3000);
+                long tcpTimeMs = (System.nanoTime() - tcpStart) / 1_000_000;
+                result.put("tcp.connect_ms", tcpTimeMs);
+                result.put("status", "HEALTHY");
+            } catch (IOException e) {
+                long tcpTimeMs = (System.nanoTime() - tcpStart) / 1_000_000;
+                result.put("tcp.connect_ms", tcpTimeMs);
+                result.put("tcp.error", e.getMessage());
+                result.put("status", "UNHEALTHY");
+            }
+
+        } catch (UnknownHostException e) {
+            long dnsTimeMs = (System.nanoTime() - dnsStart) / 1_000_000;
+            result.put("dns.resolution_ms", dnsTimeMs);
+            result.put("dns.error", e.getMessage());
+            result.put("status", "UNHEALTHY");
+        }
+
+        return result;
+    }
+
+    private int getTcpConnectionCount(String state) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("ss", "-tn", "state", state.toLowerCase());
+            Process process = pb.start();
+            long count = new BufferedReader(new InputStreamReader(process.getInputStream()))
+                .lines().count() - 1; // subtract header
+            return (int) Math.max(0, count);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Client-Side Retry with Trace ID Preservation</summary>
+        <pre><code class="language-java">// Resilient HTTP client that preserves trace context across retries
+@Configuration
+public class ResilientHttpClientConfig {
+
+    @Bean
+    public RestClient resilientRestClient(
+            OpenTelemetry openTelemetry,
+            MeterRegistry meterRegistry) {
+
+        // Connection pool with proper lifecycle management
+        PoolingHttpClientConnectionManager connectionManager =
+            PoolingHttpClientConnectionManagerBuilder.create()
+                .setMaxConnTotal(200)
+                .setMaxConnPerRoute(50)
+                .setDefaultConnectionConfig(ConnectionConfig.custom()
+                    .setConnectTimeout(Timeout.ofSeconds(3))
+                    .setSocketTimeout(Timeout.ofSeconds(10))
+                    .setValidateAfterInactivity(TimeValue.ofSeconds(10))
+                    .build())
+                .build();
+
+        CloseableHttpClient httpClient = HttpClients.custom()
+            .setConnectionManager(connectionManager)
+            .setDefaultRequestConfig(RequestConfig.custom()
+                .setResponseTimeout(Timeout.ofSeconds(10))
+                .build())
+            .evictIdleConnections(TimeValue.ofMinutes(1))
+            .build();
+
+        return RestClient.builder()
+            .requestFactory(new HttpComponentsClientHttpRequestFactory(httpClient))
+            .requestInterceptor(new RetryWithTraceInterceptor(openTelemetry, meterRegistry))
+            .build();
+    }
+}
+
+public class RetryWithTraceInterceptor implements ClientHttpRequestInterceptor {
+
+    private static final Logger log = LoggerFactory.getLogger(RetryWithTraceInterceptor.class);
+    private static final int MAX_RETRIES = 3;
+    private static final long[] BACKOFF_MS = {100, 500, 2000};
+
+    private final OpenTelemetry openTelemetry;
+    private final MeterRegistry meterRegistry;
+
+    @Override
+    public ClientHttpResponse intercept(HttpRequest request, byte[] body,
+                                         ClientHttpRequestExecution execution)
+            throws IOException {
+
+        // Inject trace context into outbound request
+        openTelemetry.getPropagators().getTextMapPropagator().inject(
+            Context.current(), request.getHeaders(),
+            (headers, key, value) -&gt; headers.set(key, value));
+
+        // Propagate correlation ID
+        String correlationId = MDC.get("correlationId");
+        if (correlationId != null) {
+            request.getHeaders().set("X-Correlation-ID", correlationId);
+        }
+
+        IOException lastException = null;
+        for (int attempt = 0; attempt &lt;= MAX_RETRIES; attempt++) {
+            Span retrySpan = null;
+            if (attempt &gt; 0) {
+                retrySpan = GlobalOpenTelemetry.getTracer("http-client")
+                    .spanBuilder("http.retry")
+                    .setAttribute("http.retry.attempt", attempt)
+                    .setAttribute("http.url", request.getURI().toString())
+                    .startSpan();
+            }
+
+            try {
+                if (attempt &gt; 0) {
+                    Thread.sleep(BACKOFF_MS[attempt - 1]);
+                    request.getHeaders().set("X-Retry-Attempt", String.valueOf(attempt));
+                    log.warn("Retrying request: {} {} (attempt {}/{})",
+                        request.getMethod(), request.getURI(), attempt, MAX_RETRIES);
+                }
+
+                ClientHttpResponse response = execution.execute(request, body);
+                int statusCode = response.getStatusCode().value();
+
+                // Record attempt metrics
+                meterRegistry.counter("http.client.request",
+                    "method", request.getMethod().name(),
+                    "status", String.valueOf(statusCode),
+                    "retry", String.valueOf(attempt)
+                ).increment();
+
+                if (statusCode &gt;= 500 &amp;&amp; attempt &lt; MAX_RETRIES) {
+                    // Server error — retry
+                    lastException = new IOException("Server returned " + statusCode);
+                    continue;
+                }
+
+                if (retrySpan != null) {
+                    retrySpan.setAttribute("http.status_code", statusCode);
+                    retrySpan.setStatus(StatusCode.OK);
+                    retrySpan.end();
+                }
+
+                return response;
+
+            } catch (IOException e) {
+                lastException = e;
+                meterRegistry.counter("http.client.error",
+                    "method", request.getMethod().name(),
+                    "error", e.getClass().getSimpleName(),
+                    "retry", String.valueOf(attempt)
+                ).increment();
+
+                if (retrySpan != null) {
+                    retrySpan.setStatus(StatusCode.ERROR, e.getMessage());
+                    retrySpan.recordException(e);
+                    retrySpan.end();
+                }
+
+                if (attempt == MAX_RETRIES) {
+                    log.error("All retry attempts exhausted for {} {}",
+                        request.getMethod(), request.getURI(), e);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Retry interrupted", e);
+            }
+        }
+
+        throw lastException;
+    }
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 11 — COMMON MISTAKES
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Anti-patterns in debugging intermittent failures</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Mistake</th>
+              <th>Why It's Wrong</th>
+              <th>Better Approach</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Adding <code>log.error()</code> everywhere and redeploying</td>
+              <td>Changes timing, may mask race conditions; log volume explosion in production</td>
+              <td>Use existing metrics and traces first; add targeted structured logging only where needed</td>
+            </tr>
+            <tr>
+              <td>Trying to reproduce locally</td>
+              <td>Intermittent production issues depend on scale, network topology, and timing that can't be replicated locally</td>
+              <td>Use production observability tools; reproduce with load testing at scale in staging</td>
+            </tr>
+            <tr>
+              <td>Blaming the user ("works for me")</td>
+              <td>User reports are data — dismissing them delays resolution</td>
+              <td>Collect exact timestamps, correlation IDs, and client context from the user</td>
+            </tr>
+            <tr>
+              <td>Sampling all traces at 100%</td>
+              <td>Costs explode exponentially; can itself cause performance issues (I/O overhead)</td>
+              <td>Use tail-based sampling: always keep errors and slow traces, sample the rest</td>
+            </tr>
+            <tr>
+              <td>Only checking application logs</td>
+              <td>Intermittent failures often occur below the application layer (network, OS, JVM)</td>
+              <td>Check infrastructure metrics, GC logs, network counters, kernel logs</td>
+            </tr>
+            <tr>
+              <td>Catching <code>Exception</code> and returning defaults</td>
+              <td>Hides failures from all observability; makes debugging nearly impossible</td>
+              <td>Catch specific exceptions; always emit metrics from catch blocks; log at WARN minimum</td>
+            </tr>
+            <tr>
+              <td>Setting aggressive client timeouts without retry</td>
+              <td>Clients time out during GC pauses or network blips; user sees error</td>
+              <td>Implement retry with exponential backoff; set timeout slightly above p99.9 latency</td>
+            </tr>
+            <tr>
+              <td>Ignoring DNS TTL in JVM</td>
+              <td>JVM can cache DNS forever with SecurityManager; causes failures after IP changes</td>
+              <td>Always set <code>-Dsun.net.inetaddr.ttl=30</code> in containerized environments</td>
+            </tr>
+            <tr>
+              <td>Not correlating across services</td>
+              <td>Each team says "our service looks fine" — the failure is between services</td>
+              <td>Distributed tracing with end-to-end correlation IDs across all services</td>
+            </tr>
+            <tr>
+              <td>Restarting pods as a "fix"</td>
+              <td>May temporarily resolve symptoms but destroys diagnostic state (thread dumps, heap, connections)</td>
+              <td>Capture diagnostics first (thread dump, heap dump, network state), then restart</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 12 — TRADE-OFFS
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+
+      <details>
+        <summary>Observability Cost vs Insight</summary>
+        <p>Every observability decision involves a cost-benefit trade-off. At FAANG scale, these costs
+        are significant and must be explicitly managed.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Decision</th>
+              <th>More Investment</th>
+              <th>Less Investment</th>
+              <th>Recommendation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Trace sampling rate</td>
+              <td>100% sampling: complete visibility, massive storage cost ($$$), I/O overhead on app</td>
+              <td>1% sampling: cheap, but misses rare events (0.1% failures won't appear)</td>
+              <td>Use tail-based sampling: 100% of errors, p99+ latency, and 5-10% of normal traffic</td>
+            </tr>
+            <tr>
+              <td>Log verbosity</td>
+              <td>DEBUG in production: complete request tracing, huge volume (TB/day)</td>
+              <td>ERROR only: minimal cost, but most intermittent issues log nothing at ERROR</td>
+              <td>INFO level baseline + WARN for fallbacks/retries + dynamic log level adjustment per request</td>
+            </tr>
+            <tr>
+              <td>Metric cardinality</td>
+              <td>Per-user, per-endpoint, per-tenant metrics: precise debugging, cardinality explosion</td>
+              <td>Aggregate only: cheap, but can't isolate which users/endpoints are affected</td>
+              <td>Use exemplars (link metric data points to specific traces) instead of high-cardinality labels</td>
+            </tr>
+            <tr>
+              <td>Custom instrumentation</td>
+              <td>Instrument every method: complete visibility into code paths</td>
+              <td>Auto-instrumentation only: misses business logic details</td>
+              <td>Auto-instrument everything + manual spans for critical business operations</td>
+            </tr>
+            <tr>
+              <td>Retention period</td>
+              <td>1 year retention: can compare to seasonal patterns, expensive storage</td>
+              <td>7 day retention: cheap, but can't correlate with events from weeks ago</td>
+              <td>Hot (7 days, full resolution) → Warm (30 days, downsampled) → Cold (1 year, aggregates only)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Sampling Rate Decisions</summary>
+        <p>Choosing the right sampling strategy is critical for debugging rare failures without
+        bankrupting the observability budget:</p>
+        <pre><code class="language-yaml"># OpenTelemetry Collector tail-sampling configuration
+# This runs on the collector, NOT the application — zero app overhead for decision-making
+
+processors:
+  tail_sampling:
+    decision_wait: 30s       # Wait 30s for all spans to arrive before deciding
+    num_traces: 100000       # Number of traces to hold in memory
+    expected_new_traces_per_sec: 1000
+    policies:
+      # Policy 1: Always keep errors (most important for debugging)
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+
+      # Policy 2: Always keep slow requests
+      - name: high-latency
+        type: latency
+        latency:
+          threshold_ms: 3000
+
+      # Policy 3: Always keep requests with retries
+      - name: retried-requests
+        type: string_attribute
+        string_attribute:
+          key: http.retry_count
+          values: ["1", "2", "3"]
+
+      # Policy 4: Always keep requests to problematic endpoints
+      - name: problem-endpoints
+        type: string_attribute
+        string_attribute:
+          key: http.target
+          values: ["/api/payments/charge", "/api/orders/create"]
+
+      # Policy 5: Probabilistic sampling for everything else
+      - name: baseline
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 5
+
+      # Policy 6: Rate-limited catch-all (prevent budget explosion)
+      - name: rate-limit
+        type: rate_limiting
+        rate_limiting:
+          spans_per_second: 500</code></pre>
+        <p><strong>Cost estimation formula:</strong></p>
+        <pre><code class="language-bash"># Back-of-envelope calculation for trace storage cost:
+# 
+# Requests/second: 10,000
+# Average spans/trace: 8
+# Average span size: 500 bytes
+# Sampling rate: 10%
+#
+# Data volume = 10,000 * 8 * 500 * 0.10 = 4 MB/second = 345 GB/day
+#
+# At $0.50/GB ingestion (typical managed service):
+# Cost = 345 * $0.50 = $172/day = $5,175/month
+#
+# With tail-based sampling (5% normal + 100% errors):
+# Assuming 0.1% error rate: error traces = 10,000 * 0.001 * 8 * 500 = 40 KB/s
+# Normal traces: 10,000 * 0.05 * 8 * 500 = 2 MB/s
+# Total = ~2 MB/s = 172 GB/day
+# Cost = 172 * $0.50 = $86/day = $2,580/month (50% savings)</code></pre>
+      </details>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 13 — FOLLOW-UP QUESTIONS
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Questions the interviewer might ask next</summary>
+        <ol>
+          <li>
+            <strong>"How would you handle this in a serverless environment (AWS Lambda) where you can't install tcpdump or take thread dumps?"</strong>
+            <p>Use X-Ray for distributed tracing, CloudWatch Embedded Metrics for custom metrics,
+            VPC Flow Logs for network visibility, and Lambda Extensions for resource monitoring.
+            Focus on structured logging with correlation IDs since traditional debugging tools
+            aren't available.</p>
+          </li>
+          <li>
+            <strong>"What if the failure only happens in one availability zone?"</strong>
+            <p>This points to AZ-specific issues: regional network problems, specific hardware
+            failures, NLB cross-zone load balancing configuration, or AZ-specific DNS resolvers.
+            Add AZ as a label to all metrics and traces to quickly isolate.</p>
+          </li>
+          <li>
+            <strong>"How do you debug an issue that only appears at 3 AM?"</strong>
+            <p>Time-correlated failures suggest: batch jobs competing for resources, database
+            maintenance windows, certificate rotation, cron-based operations, or traffic pattern
+            shifts (different geography = different load). Set up recording rules in Prometheus
+            and ensure traces are captured with high-sampling during that window.</p>
+          </li>
+          <li>
+            <strong>"How would you convince management to invest in observability before an incident?"</strong>
+            <p>Frame it as MTTR (Mean Time To Resolution) reduction. Calculate: cost of P1 incident
+            (lost revenue × duration) vs. cost of observability tooling. Show that the DNS incident
+            above took 3 days to resolve without proper tracing — with proper observability, it
+            would take 30 minutes. $47K/day × 3 days = $141K lost vs. $5K/month for tracing.</p>
+          </li>
+          <li>
+            <strong>"What's your approach when two services blame each other?"</strong>
+            <p>This is exactly what distributed tracing solves. The trace shows exactly which service
+            introduced latency or dropped the request. If traces aren't available, compare timestamps
+            on both sides: Service A's "request sent at T1" vs Service B's "request received at T2".
+            If T2 - T1 is large, the problem is network. If B never received it, check load balancer
+            and DNS.</p>
+          </li>
+          <li>
+            <strong>"How do you handle the 'Heisenbug' — a bug that disappears when you try to observe it?"</strong>
+            <p>Classic example: adding logging changes timing and eliminates a race condition.
+            Solutions: use always-on metrics (counters are essentially free), non-invasive tracing
+            (OTel auto-instrumentation has &lt;3% overhead), and BPF-based tools (bpftrace, BCC)
+            that observe the kernel without modifying application behavior.</p>
+          </li>
+          <li>
+            <strong>"What SLOs would you set for an intermittent failure like this?"</strong>
+            <p>Error budget approach: 99.9% availability = 43.8 minutes of downtime/month.
+            0.1% error rate = 0.1% of requests fail = consumes error budget at 10x normal rate.
+            Set SLOs on: success rate (≥99.9%), p99 latency (≤2s), and fallback invocation
+            rate (≤0.01%). Alert when burn rate exceeds 10x.</p>
+          </li>
+          <li>
+            <strong>"How do you ensure observability doesn't become a performance bottleneck itself?"</strong>
+            <p>Key strategies: async export (never block the request path for telemetry), batched
+            writes (buffer and flush periodically), sampling (don't capture everything),
+            metric pre-aggregation (aggregate in-process, not in the backend), and circuit
+            breakers on telemetry export (if Jaeger is down, don't retry indefinitely).</p>
+          </li>
+        </ol>
+      </details>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SECTION 14 — SUMMARY
+         ═══════════════════════════════════════════════════════════════════ -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Key Takeaways</summary>
+        <blockquote class="callout-tip">
+          <p><strong>The absence of log entries is itself a diagnostic signal.</strong> It means the
+          failure is happening in a layer that your current instrumentation doesn't cover.</p>
+        </blockquote>
+        <h3>Debugging Strategy Hierarchy</h3>
+        <ol>
+          <li><strong>Metrics first:</strong> Check error rates, latency percentiles, resource saturation,
+          and connection pool metrics. Metrics capture aggregate behavior that individual logs miss.</li>
+          <li><strong>Traces second:</strong> Use distributed traces to find specific failing requests.
+          Look for missing spans, abnormal durations, and error status codes.</li>
+          <li><strong>Infrastructure third:</strong> Investigate DNS, TCP connections, GC pauses, thread
+          pools, and firewall rules. These are the most common causes of "invisible" failures.</li>
+          <li><strong>Code audit last:</strong> Search for swallowed exceptions, silent fallbacks, and
+          catch blocks that log below WARN level.</li>
+        </ol>
+        <h3>Prevention Checklist</h3>
+        <ul>
+          <li>☐ All catch blocks emit a metric counter (even if they don't log at ERROR)</li>
+          <li>☐ All fallback methods log at WARN and record a span event</li>
+          <li>☐ JVM DNS TTL explicitly set to 30 seconds in container environments</li>
+          <li>☐ Connection pool max-lifetime is less than load balancer idle timeout</li>
+          <li>☐ GC logging enabled with max pause time target configured</li>
+          <li>☐ Distributed tracing with tail-based sampling captures all errors</li>
+          <li>☐ Correlation IDs propagate across all thread boundaries and services</li>
+          <li>☐ Thread pool and connection pool metrics exposed to Prometheus</li>
+          <li>☐ Network health checks verify DNS resolution and TCP connectivity</li>
+          <li>☐ Client-side timeouts are set above p99.9 latency with proper retry logic</li>
+        </ul>
+        <h3>Interview Formula</h3>
+        <p>When answering this question in an interview, structure your response as:</p>
+        <ol>
+          <li>Acknowledge that "no exceptions in logs" is a signal, not a dead end</li>
+          <li>List the categories of invisible failures (infrastructure, JVM, concurrency, network)</li>
+          <li>Describe your systematic approach (metrics → traces → infrastructure → code)</li>
+          <li>Give a concrete example (DNS caching, thread starvation, or GC pauses)</li>
+          <li>Discuss proactive prevention (how to instrument systems so this can't happen again)</li>
+        </ol>
+      </details>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         CHAPTER NAVIGATION
+         ═══════════════════════════════════════════════════════════════════ -->
+    <nav class="chapter-nav" aria-label="Chapter navigation">
+      <a href="ch14-memory-leak-production.html" class="chapter-nav-prev">← Chapter 14: Memory Leak in Production</a>
+      <a href="../index.html" class="chapter-nav-next">Back to Index →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

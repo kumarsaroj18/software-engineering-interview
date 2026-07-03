@@ -1,0 +1,1244 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 3: REST API Fails Under 10,000 Concurrent Requests | Senior Backend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 3</span>
+      <span class="chapter-title">API Fails at Scale</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#capacity-model">Capacity Model</a></li>
+        <li><a href="#thread-pool-exhaustion">Thread Pool Exhaustion</a></li>
+        <li><a href="#connection-pool">Connection Pool Bottlenecks</a></li>
+        <li><a href="#database-bottlenecks">Database Bottlenecks</a></li>
+        <li><a href="#network-limits">Network & OS Limits</a></li>
+        <li><a href="#cpu-vs-io">CPU vs I/O Bound</a></li>
+        <li><a href="#diagnosing">Diagnosing with Tools</a></li>
+        <li><a href="#load-testing">Load Testing</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-i">Part I — Spring Boot Core Internals</a> &rsaquo;
+      <span>Chapter 3</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Thread Pools</span>
+        <span class="badge badge-topic">Load Testing</span>
+        <span class="badge badge-topic">Performance</span>
+      </div>
+      <h1>REST API Works with 100 Users but Fails Under 10,000 Concurrent Requests</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> At scale, every shared resource becomes a bottleneck. The investigation order matters: thread pools → connection pools → database → network/OS limits → application code. Most failures at 10K QPS come from resource exhaustion, not logic bugs.
+      </p>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter... (e.g., Tomcat threads, HikariCP, backpressure)" aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <div class="callout callout-info">
+        <p><strong>What they're really testing:</strong></p>
+        <ul>
+          <li>Can you systematically diagnose performance issues rather than guessing?</li>
+          <li>Do you understand the full request path — from Linux kernel to Spring to DB?</li>
+          <li>Do you know <em>where</em> bottlenecks occur at each order of magnitude (100 → 1K → 10K)?</li>
+          <li>Can you use profiling tools: thread dumps, flame graphs, Prometheus, Grafana?</li>
+          <li>Do you understand the difference between CPU-bound and I/O-bound workloads?</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Interview Answer</h2>
+      <div class="callout callout-tip">
+        <p><strong>Use this in the interview:</strong></p>
+        <blockquote>
+          "When a REST API breaks at 10K concurrent requests, I investigate in a specific order based on where exhaustion typically happens first:
+          <br><br>
+          <strong>1. Tomcat thread pool</strong> — default is 200 threads. At 10K concurrent requests with 100ms avg latency, you need 1000 threads in-flight simultaneously. The remaining 9000 queue up. Queue fills → 503.<br>
+          <strong>2. Connection pool (HikariCP)</strong> — default is 10 connections. Even with 200 Tomcat threads, only 10 can query the DB simultaneously. Others block on <code>getConnection()</code>.<br>
+          <strong>3. Database</strong> — 10K requests hitting a DB with 100 max connections creates lock contention, slow queries, and I/O saturation.<br>
+          <strong>4. OS limits</strong> — file descriptors (ulimit), ephemeral port exhaustion, TCP backlog queue, TIME_WAIT accumulation.<br>
+          <strong>5. Downstream services</strong> — if each request calls 3 downstream APIs, you're making 30K outbound HTTP calls.
+          <br><br>
+          My first action would be taking a thread dump during the failure — it immediately shows where threads are stuck. Then I'd check connection pool metrics and DB slow query logs."
+        </blockquote>
+      </div>
+    </section>
+
+    <!-- Section 3: Capacity Model -->
+    <section id="capacity-model">
+      <h2>Capacity Estimation Model</h2>
+
+      <details>
+        <summary>Little's Law — the math behind concurrency limits</summary>
+        <div class="callout callout-info">
+          <p><strong>Little's Law:</strong> <code>L = λ × W</code><br>
+          Where: L = concurrent requests in system, λ = arrival rate (req/s), W = avg response time (seconds)</p>
+        </div>
+        <pre class="diagram">
+  Example: Can our API handle 10,000 req/s?
+  ══════════════════════════════════════════
+
+  Given:
+  • Tomcat threads: 200 (default)
+  • Avg response time: 50ms (0.05s)
+  • HikariCP pool: 10 connections
+
+  Max throughput with Tomcat threads:
+  λ_max = L / W = 200 / 0.05 = 4,000 req/s  ← BOTTLENECK!
+  
+  But wait — with HikariCP pool of 10:
+  λ_max = 10 / 0.05 = 200 req/s  ← REAL BOTTLENECK!
+  
+  ╔═════════════════════════════════════════════════════════════╗
+  ║ Even with 200 Tomcat threads, if each request holds a DB   ║
+  ║ connection for 50ms, effective throughput = 200 req/s.     ║
+  ║ 190 threads are just WAITING for a connection.             ║
+  ╚═════════════════════════════════════════════════════════════╝
+
+  To handle 10,000 req/s at 50ms latency:
+  • Need L = 10000 × 0.05 = 500 concurrent requests in-flight
+  • Tomcat threads: ≥ 500 (or use async/reactive)
+  • DB connections: 500 / (% time holding conn)
+    If 30% of response time is DB: 500 × 0.3 = 150 connections needed
+        </pre>
+      </details>
+
+      <details>
+        <summary>Bottleneck progression as load increases</summary>
+        <pre class="diagram">
+  Load →   100 req/s    1,000 req/s    10,000 req/s    100,000 req/s
+           ─────────    ───────────    ────────────    ─────────────
+  
+  Thread   ✅ Fine       ⚠️ Pressure   ❌ Exhausted    ❌ Exhausted
+  Pool     (20 active)  (180 active)  (200 stuck)    (need reactive)
+  
+  Conn     ✅ Fine       ⚠️ Contention ❌ Exhausted    ❌ Exhausted
+  Pool     (3 active)   (10 active)   (10+190 wait)  (need sharding)
+  
+  Database ✅ Fine       ✅ Fine        ⚠️ Lock waits   ❌ Saturated
+           (low IOPS)   (some waits)  (CPU 80%)      (need replicas)
+  
+  Network  ✅ Fine       ✅ Fine        ⚠️ Ports fill   ❌ Exhausted
+           (few conns)  (200 conns)   (TIME_WAIT)    (ephem ports)
+  
+  GC       ✅ Fine       ✅ Fine        ⚠️ More allocs  ❌ STW pauses
+           (minor GC)   (minor GC)   (full GC 1/hr)  (full GC/min)
+  
+  CPU      ✅ Fine       ✅ Fine        ⚠️ 70-80%       ❌ Saturated
+           (5%)         (30%)        (context sw.)   (need scale-out)
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 4: Thread Pool Exhaustion -->
+    <section id="thread-pool-exhaustion">
+      <h2>Thread Pool Exhaustion — The First Wall</h2>
+
+      <details>
+        <summary>Tomcat thread pool internals</summary>
+        <pre><code class="language-yaml"># Default Spring Boot Tomcat settings
+server:
+  tomcat:
+    threads:
+      max: 200          # Max worker threads
+      min-spare: 10     # Threads kept alive when idle
+    accept-count: 100   # OS-level TCP backlog queue
+    max-connections: 8192 # Max concurrent connections (NIO)
+    connection-timeout: 20000 # 20s to complete request</code></pre>
+        <pre class="diagram">
+  Tomcat NIO Architecture (Spring Boot default):
+  ═══════════════════════════════════════════════
+
+  Incoming TCP connections
+        │
+        ▼
+  ┌─────────────────────────────────────────────────┐
+  │  Acceptor Thread (1)                             │
+  │  Accepts TCP connections from OS backlog         │
+  │  max-connections: 8192 (NIO selector limit)      │
+  └──────────────────────┬──────────────────────────┘
+                         │
+                         ▼
+  ┌─────────────────────────────────────────────────┐
+  │  Poller Thread (1-2)                             │
+  │  Monitors sockets for readable data (NIO)       │
+  │  Non-blocking — handles thousands of connections │
+  └──────────────────────┬──────────────────────────┘
+                         │ Socket has data ready
+                         ▼
+  ┌─────────────────────────────────────────────────┐
+  │  Worker Thread Pool (10-200)                     │
+  │  Executes your @Controller methods              │
+  │  BLOCKING — each thread handles ONE request     │
+  │                                                  │
+  │  Thread-1: GET /api/orders (querying DB...)     │
+  │  Thread-2: POST /api/payments (calling Stripe..)│
+  │  Thread-3: GET /api/users (waiting on Redis...) │
+  │  ...                                             │
+  │  Thread-200: PUT /api/cart (blocked on DB conn) │
+  │                                                  │
+  │  ❌ Thread-201: NO THREAD AVAILABLE!             │
+  │  → Request sits in accept-count queue (100 max) │
+  │  → Queue full → TCP connection refused (503)    │
+  └─────────────────────────────────────────────────┘
+        </pre>
+      </details>
+
+      <details>
+        <summary>What "thread pool exhaustion" looks like in thread dumps</summary>
+        <pre><code class="language-bash"># Take thread dump during high load
+jstack $(pgrep -f 'spring-boot') > thread_dump.txt
+
+# Count thread states
+grep "java.lang.Thread.State" thread_dump.txt | sort | uniq -c | sort -rn
+# Typical output during exhaustion:
+#   180 java.lang.Thread.State: TIMED_WAITING (parking)  ← waiting for connection
+#    15 java.lang.Thread.State: RUNNABLE                  ← actually working
+#     5 java.lang.Thread.State: WAITING (parking)        ← idle threads</code></pre>
+        <pre><code class="language-java">// What you'll see in the thread dump:
+"http-nio-8080-exec-187" #250 daemon prio=5
+   java.lang.Thread.State: TIMED_WAITING (parking)
+    at sun.misc.Unsafe.park(Native Method)
+    - parking to wait for &lt;0x000000076ab59e98&gt;
+    at java.util.concurrent.locks.LockSupport.parkNanos(LockSupport.java:215)
+    at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:186)
+    //                                      ↑ STUCK HERE — waiting for DB connection
+    at com.zaxxer.hikari.HikariDataSource.getConnection(HikariDataSource.java:128)
+    at org.springframework.jdbc.datasource.DataSourceUtils.fetchConnection(...)
+    at com.example.OrderRepository.findByUserId(OrderRepository.java:45)
+    at com.example.OrderController.getOrders(OrderController.java:32)</code></pre>
+        <div class="callout callout-tip">
+          <p><strong>Quick Diagnosis:</strong> If 180+ threads are in <code>TIMED_WAITING</code> on <code>HikariPool.getConnection()</code>, your bottleneck is the connection pool, not the thread pool. Increasing Tomcat threads would only create more threads waiting for connections.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Tuning Tomcat thread pool for high concurrency</summary>
+        <pre><code class="language-yaml"># application.yml — tuned for 10K req/s
+server:
+  tomcat:
+    threads:
+      max: 400              # Increase if I/O-bound (not CPU-bound)
+      min-spare: 50         # Faster ramp-up under load spikes
+    accept-count: 500       # Larger backlog for burst absorption
+    max-connections: 10000  # Match expected concurrent connections
+    connection-timeout: 5000 # Fail fast — don't hold connections forever
+
+# Monitor with Actuator
+management:
+  endpoints:
+    web:
+      exposure:
+        include: metrics,health,prometheus
+  metrics:
+    tags:
+      application: order-service</code></pre>
+        <pre><code class="language-java">// Prometheus metrics to monitor thread pool
+// Available via: /actuator/prometheus
+
+// tomcat_threads_current_threads — current active threads
+// tomcat_threads_busy_threads — threads processing requests
+// tomcat_threads_config_max_threads — max pool size
+// tomcat_connections_current_connections — open connections
+
+// Alert rule:
+// rate(tomcat_threads_busy_threads / tomcat_threads_config_max_threads) > 0.8
+// → Thread pool is 80% utilized — scale or optimize</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Connection Pool Bottlenecks -->
+    <section id="connection-pool">
+      <h2>Connection Pool Bottlenecks</h2>
+
+      <details>
+        <summary>HikariCP — why 10 connections is the default and when it's not enough</summary>
+        <pre class="diagram">
+  HikariCP Request Flow:
+  ═══════════════════════
+
+  200 Tomcat threads competing for 10 DB connections:
+
+  Thread-1 ──┐
+  Thread-2 ──┤
+  Thread-3 ──┤
+  ...        ├──▶ HikariPool (size=10) ──▶ PostgreSQL
+  Thread-198 ┤       │                      (max_connections=100)
+  Thread-199 ┤       │
+  Thread-200 ┘       │
+                     │
+              ┌──────┴──────┐
+              │ 10 active   │ ← Actually executing queries
+              │ 190 WAITING │ ← Blocked on getConnection()
+              │             │   (timeout: 30s default)
+              │ After 30s:  │
+              │ SQLException│ ← "Connection is not available"
+              └─────────────┘
+        </pre>
+        <pre><code class="language-java">// The exception you'll see in logs:
+// java.sql.SQLTransientConnectionException: HikariPool-1 - Connection is not available,
+// request timed out after 30000ms.
+// Active: 10, Idle: 0, Waiting: 190, Total: 10
+
+// HikariCP optimal pool size formula (from HikariCP wiki):
+// connections = ((core_count * 2) + effective_spindle_count)
+// For SSD with 4-core DB server: (4 * 2) + 1 = 9 ≈ 10 (the default!)
+
+// BUT: this assumes queries are fast (< 5ms average)
+// If avg query time = 50ms and you need 1000 req/s throughput:
+// connections_needed = throughput × query_time = 1000 × 0.05 = 50</code></pre>
+      </details>
+
+      <details>
+        <summary>Tuning HikariCP for high throughput</summary>
+        <pre><code class="language-yaml"># application.yml
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 50          # Match calculated need
+      minimum-idle: 10               # Keep warm connections
+      connection-timeout: 5000       # Fail fast (not 30s default!)
+      idle-timeout: 300000           # 5 min idle before close
+      max-lifetime: 1800000          # 30 min max connection age
+      leak-detection-threshold: 10000 # Alert if connection held > 10s
+      
+      # Critical: register MBeans for monitoring
+      register-mbeans: true
+      pool-name: OrderServicePool</code></pre>
+        <pre><code class="language-java">// Custom HikariCP metrics listener
+@Configuration
+public class DataSourceMetricsConfig {
+
+    @Bean
+    public HikariDataSource dataSource(DataSourceProperties properties, 
+                                        MeterRegistry registry) {
+        HikariDataSource ds = properties.initializeDataSourceBuilder()
+            .type(HikariDataSource.class).build();
+        ds.setMetricRegistry(registry);
+        return ds;
+    }
+}
+
+// Key metrics to monitor:
+// hikaricp_connections_active — currently executing queries
+// hikaricp_connections_idle — available in pool
+// hikaricp_connections_pending — threads waiting for connection
+// hikaricp_connections_timeout_total — failed to get connection (CRITICAL)
+//
+// Alert: hikaricp_connections_pending > 0 for > 5s</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 6: Database Bottlenecks -->
+    <section id="database-bottlenecks">
+      <h2>Database Bottlenecks</h2>
+
+      <details>
+        <summary>PostgreSQL under 10K req/s — what breaks first</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Bottleneck</th>
+              <th>Symptom</th>
+              <th>How to Detect</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Lock contention</strong></td>
+              <td>Queries slow, <code>lock_timeout</code> errors</td>
+              <td><code>pg_stat_activity</code> shows <code>wait_event = Lock</code></td>
+              <td>Reduce tx duration, use skip locked, partition hot tables</td>
+            </tr>
+            <tr>
+              <td><strong>Connection limit</strong></td>
+              <td><code>too many connections</code> error</td>
+              <td><code>SELECT count(*) FROM pg_stat_activity</code></td>
+              <td>PgBouncer, connection pooling at DB level</td>
+            </tr>
+            <tr>
+              <td><strong>Slow queries</strong></td>
+              <td>P99 latency spikes, CPU on DB</td>
+              <td><code>pg_stat_statements</code>, slow query log</td>
+              <td>Add indexes, rewrite queries, read replicas</td>
+            </tr>
+            <tr>
+              <td><strong>Sequential scans</strong></td>
+              <td>Disk I/O saturated, high read bytes</td>
+              <td><code>EXPLAIN ANALYZE</code> shows Seq Scan</td>
+              <td>Create appropriate B-tree/GIN indexes</td>
+            </tr>
+            <tr>
+              <td><strong>WAL write bottleneck</strong></td>
+              <td>INSERT/UPDATE slow, fsync delays</td>
+              <td><code>pg_stat_wal</code>, disk IOPS at limit</td>
+              <td>Faster disk (io2), batch writes, async commit</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Essential PostgreSQL diagnostic queries</summary>
+        <pre><code class="language-sql">-- 1. Active connections and what they're doing
+SELECT pid, state, wait_event_type, wait_event, 
+       now() - query_start as duration, query
+FROM pg_stat_activity
+WHERE state != 'idle'
+ORDER BY duration DESC
+LIMIT 20;
+
+-- 2. Lock contention — who's blocking whom
+SELECT blocked.pid AS blocked_pid,
+       blocked.query AS blocked_query,
+       blocking.pid AS blocking_pid,
+       blocking.query AS blocking_query,
+       now() - blocked.query_start AS blocked_duration
+FROM pg_stat_activity blocked
+JOIN pg_locks blocked_locks ON blocked.pid = blocked_locks.pid
+JOIN pg_locks blocking_locks ON blocked_locks.locktype = blocking_locks.locktype
+    AND blocked_locks.relation = blocking_locks.relation
+    AND blocked_locks.pid != blocking_locks.pid
+JOIN pg_stat_activity blocking ON blocking_locks.pid = blocking.pid
+WHERE NOT blocked_locks.granted;
+
+-- 3. Top slow queries (requires pg_stat_statements extension)
+SELECT query, calls, mean_exec_time, total_exec_time,
+       rows / calls as avg_rows
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 10;
+
+-- 4. Table bloat and dead tuples (need VACUUM)
+SELECT relname, n_dead_tup, n_live_tup,
+       round(n_dead_tup::numeric / NULLIF(n_live_tup, 0) * 100, 2) as dead_pct
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY n_dead_tup DESC;</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 7: Network & OS Limits -->
+    <section id="network-limits">
+      <h2>Network &amp; OS Limits</h2>
+
+      <details>
+        <summary>Linux kernel limits that bite at 10K connections</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Limit</th>
+              <th>Default</th>
+              <th>Impact at 10K</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>File descriptors</strong> (<code>ulimit -n</code>)</td>
+              <td>1024</td>
+              <td>Each connection = 1 fd. 1024 max = 1024 connections!</td>
+              <td><code>ulimit -n 65535</code> or <code>/etc/security/limits.conf</code></td>
+            </tr>
+            <tr>
+              <td><strong>Ephemeral ports</strong></td>
+              <td>28,232 ports (32768-60999)</td>
+              <td>Outbound connections use ephemeral ports. TIME_WAIT holds them for 60s</td>
+              <td><code>net.ipv4.ip_local_port_range</code>, connection reuse</td>
+            </tr>
+            <tr>
+              <td><strong>TCP backlog</strong> (<code>somaxconn</code>)</td>
+              <td>128</td>
+              <td>Queue for pending TCP connections. Overflow = dropped SYN</td>
+              <td><code>net.core.somaxconn = 65535</code></td>
+            </tr>
+            <tr>
+              <td><strong>TIME_WAIT sockets</strong></td>
+              <td>60s timeout</td>
+              <td>10K short connections/s = 600K TIME_WAIT sockets!</td>
+              <td><code>net.ipv4.tcp_tw_reuse = 1</code>, keep-alive connections</td>
+            </tr>
+            <tr>
+              <td><strong>Conntrack table</strong></td>
+              <td>65536 entries</td>
+              <td>NAT/firewall tracks connections. Table full = dropped packets</td>
+              <td><code>net.netfilter.nf_conntrack_max = 1000000</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Essential sysctl tuning for high-throughput services</summary>
+        <pre><code class="language-bash"># /etc/sysctl.conf — production tuning for 10K+ connections
+
+# File descriptors
+fs.file-max = 2097152
+
+# TCP connection queue
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# Ephemeral port range
+net.ipv4.ip_local_port_range = 1024 65535
+
+# TIME_WAIT handling
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+
+# TCP keepalive (detect dead connections faster)
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 3
+
+# Buffer sizes for high-bandwidth
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# Connection tracking (if behind NAT/firewall)
+net.netfilter.nf_conntrack_max = 1000000</code></pre>
+        <pre><code class="language-bash"># Verify current limits during investigation
+# File descriptors
+cat /proc/sys/fs/file-nr  # allocated / unused / max
+ulimit -n                  # per-process limit
+
+# Ephemeral port exhaustion
+ss -s                      # Summary: TCP states count
+ss -tan state time-wait | wc -l  # TIME_WAIT count
+
+# TCP backlog overflow
+netstat -s | grep -i "listen queue"  # Dropped connections
+cat /proc/net/netstat | grep -i overflow</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 8: CPU vs I/O Bound -->
+    <section id="cpu-vs-io">
+      <h2>CPU-Bound vs I/O-Bound — Different Solutions</h2>
+
+      <details>
+        <summary>Identifying whether you're CPU-bound or I/O-bound</summary>
+        <pre class="diagram">
+  CPU-Bound (compute limited):          I/O-Bound (waiting on external):
+  ══════════════════════════════          ═══════════════════════════════
+
+  Symptoms:                              Symptoms:
+  • CPU at 90-100%                       • CPU at 10-30%
+  • Threads in RUNNABLE state            • Threads in WAITING/TIMED_WAITING
+  • GC pressure (allocation rate)        • Connection pool exhaustion
+  • Slow JSON serialization              • Slow downstream responses
+  • Complex business logic               • DB query latency
+  
+  Solution:                              Solution:
+  • Scale OUT (more pods)                • Scale connection pools
+  • Optimize algorithms                  • Async I/O (WebFlux, Virtual Threads)
+  • Cache computed results               • Cache external call results
+  • Reduce object allocation             • Circuit breakers + timeouts
+  • Consider GraalVM native              • Read replicas for DB
+  
+  Thread pool sizing:                    Thread pool sizing:
+  • threads ≈ CPU cores                  • threads ≈ CPU cores × (1 + wait/compute)
+  • More threads = context switch waste  • More threads = better utilization while waiting
+        </pre>
+      </details>
+
+      <details>
+        <summary>The optimal thread pool formula</summary>
+        <pre><code class="language-java">// Brian Goetz's formula (Java Concurrency in Practice):
+// threads = N_cpu × U_cpu × (1 + W/C)
+// Where:
+//   N_cpu = number of CPU cores
+//   U_cpu = target CPU utilization (0.0 to 1.0)
+//   W/C   = ratio of wait time to compute time
+
+// Example: 4-core server, 80% target utilization, 
+//          avg request: 5ms compute + 45ms I/O wait
+// threads = 4 × 0.8 × (1 + 45/5) = 4 × 0.8 × 10 = 32
+
+// For a typical Spring Boot app (80% I/O wait):
+// W/C = 80/20 = 4
+// threads = 4 × 0.8 × (1 + 4) = 16 (per-core: 4)
+
+// For 10K req/s at 50ms avg response time:
+// Concurrent requests = 10000 × 0.05 = 500
+// Need at minimum 500 threads (or use non-blocking I/O)
+
+// ⚠️ With virtual threads (Java 21+): use unbounded pool
+// Virtual threads are cheap — no need to optimize pool size
+spring.threads.virtual.enabled=true  // Spring Boot 3.2+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 9: Diagnosing with Tools -->
+    <section id="diagnosing">
+      <h2>Diagnosing Performance Issues — Tooling</h2>
+
+      <details>
+        <summary>Flame graph analysis — finding the actual hotspot</summary>
+        <pre><code class="language-bash"># 1. Generate flame graph with async-profiler (best for JVM)
+# Download: https://github.com/async-profiler/async-profiler
+
+# CPU profiling — shows where time is spent executing
+./profiler.sh -d 30 -f cpu_flame.html -o flamegraph $(pgrep -f spring-boot)
+
+# Wall clock profiling — shows where time is spent WAITING
+./profiler.sh -d 30 -e wall -f wall_flame.html -o flamegraph $(pgrep -f spring-boot)
+
+# Allocation profiling — shows what's creating GC pressure
+./profiler.sh -d 30 -e alloc -f alloc_flame.html -o flamegraph $(pgrep -f spring-boot)
+
+# Lock profiling — shows contention points
+./profiler.sh -d 30 -e lock -f lock_flame.html -o flamegraph $(pgrep -f spring-boot)</code></pre>
+        <pre class="diagram">
+  Reading a flame graph:
+  ═══════════════════════
+
+  Width = time spent (wider = more time)
+  Stack grows upward (bottom = entry point, top = leaf function)
+
+  ┌─────────────────── HikariPool.getConnection() ──────────────────┐ 40%!
+  ├──────── OrderRepository.findById() ────────┤                     │
+  ├──── OrderService.getOrder() ───┤           │                     │
+  ├── OrderController.get() ──┤    │           │                     │
+  ├ DispatcherServlet ─┤      │    │           │                     │
+  └────────────────────────────────────────────────────────────────────┘
+
+  This tells you: 40% of request time is spent WAITING for a DB connection.
+  Fix: increase pool size, reduce query time, or reduce connection hold time.
+        </pre>
+      </details>
+
+      <details>
+        <summary>Key Prometheus metrics and Grafana dashboards</summary>
+        <pre><code class="language-java">// Essential metrics for high-traffic services
+@Configuration
+public class PerformanceMetrics {
+
+    @Bean
+    public MeterRegistryCustomizer&lt;MeterRegistry&gt; commonTags() {
+        return registry -> registry.config()
+            .commonTags("service", "order-service", "env", "prod");
+    }
+
+    // Custom request duration histogram with percentiles
+    @Bean
+    public TimedAspect timedAspect(MeterRegistry registry) {
+        return new TimedAspect(registry);
+    }
+}
+
+// Controller with @Timed annotation
+@RestController
+public class OrderController {
+
+    @Timed(value = "orders.get", percentiles = {0.5, 0.95, 0.99})
+    @GetMapping("/api/orders/{id}")
+    public Order getOrder(@PathVariable Long id) {
+        return orderService.findById(id);
+    }
+}</code></pre>
+        <pre><code class="language-bash"># Critical PromQL queries for performance investigation:
+
+# 1. Request rate
+rate(http_server_requests_seconds_count{uri="/api/orders"}[5m])
+
+# 2. P99 latency
+histogram_quantile(0.99, rate(http_server_requests_seconds_bucket[5m]))
+
+# 3. Error rate (5xx)
+rate(http_server_requests_seconds_count{status=~"5.."}[5m])
+  / rate(http_server_requests_seconds_count[5m])
+
+# 4. Thread pool saturation
+tomcat_threads_busy_threads / tomcat_threads_config_max_threads
+
+# 5. Connection pool pressure
+hikaricp_connections_pending / hikaricp_connections_max
+
+# 6. JVM memory pressure
+jvm_memory_used_bytes{area="heap"} / jvm_memory_max_bytes{area="heap"}</code></pre>
+      </details>
+
+      <details>
+        <summary>Thread dump analysis — systematic approach</summary>
+        <pre><code class="language-bash"># Take 3 thread dumps 10 seconds apart (pattern matching)
+for i in 1 2 3; do
+  jstack $(pgrep -f spring-boot) > /tmp/threaddump_$i.txt
+  sleep 10
+done
+
+# Quick analysis: what are threads doing?
+grep "java.lang.Thread.State" /tmp/threaddump_1.txt | sort | uniq -c | sort -rn
+
+# Find threads stuck in the same place across all 3 dumps (real bottleneck)
+grep -A 5 "TIMED_WAITING\|BLOCKED" /tmp/threaddump_1.txt | \
+  grep "at " | sort | uniq -c | sort -rn | head -10
+
+# Common patterns:
+# ├── HikariPool.getConnection    → Connection pool exhaustion
+# ├── SocketInputStream.read      → Waiting on downstream HTTP response
+# ├── Object.wait (in Tomcat)     → Thread pool waiting for work (ok)
+# ├── AbstractQueuedSynchronizer  → Lock contention
+# └── GC Thread                   → Stop-the-world GC pause</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 10: Load Testing -->
+    <section id="load-testing">
+      <h2>Load Testing — Reproducing the Failure</h2>
+
+      <details>
+        <summary>k6 load test script for 10K concurrent users</summary>
+        <pre><code class="language-javascript">// k6 load test — ramp to 10,000 concurrent users
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Rate, Trend } from 'k6/metrics';
+
+const errorRate = new Rate('errors');
+const responseTime = new Trend('response_time');
+
+export const options = {
+  stages: [
+    { duration: '1m', target: 100 },    // Warm up
+    { duration: '2m', target: 1000 },   // Ramp to 1K
+    { duration: '2m', target: 5000 },   // Ramp to 5K
+    { duration: '5m', target: 10000 },  // Sustain 10K
+    { duration: '2m', target: 0 },      // Cool down
+  ],
+  thresholds: {
+    http_req_duration: ['p(95)<500', 'p(99)<2000'],
+    errors: ['rate<0.01'],  // Less than 1% error rate
+  },
+};
+
+export default function () {
+  const res = http.get('http://api.example.com/api/orders?userId=123', {
+    headers: { 'Authorization': 'Bearer test-token' },
+    timeout: '5s',
+  });
+
+  check(res, {
+    'status is 200': (r) => r.status === 200,
+    'response time < 500ms': (r) => r.timings.duration < 500,
+  });
+
+  errorRate.add(res.status !== 200);
+  responseTime.add(res.timings.duration);
+
+  sleep(Math.random() * 0.5); // Simulate real user think time
+}</code></pre>
+        <pre><code class="language-bash"># Run the test
+k6 run --out json=results.json load_test.js
+
+# Key metrics to watch:
+# http_req_duration (p95, p99) — latency
+# http_reqs — throughput (req/s)
+# http_req_failed — error rate
+# vus — virtual users (concurrency)
+# iteration_duration — full scenario time</code></pre>
+      </details>
+
+      <details>
+        <summary>Gatling simulation (for JVM teams)</summary>
+        <pre><code class="language-java">// Gatling load test in Java
+public class OrderApiSimulation extends Simulation {
+
+    HttpProtocolBuilder httpProtocol = http
+        .baseUrl("http://api.example.com")
+        .acceptHeader("application/json")
+        .header("Authorization", "Bearer test-token");
+
+    ScenarioBuilder scenario = scenario("High Load Orders")
+        .exec(
+            http("Get Orders")
+                .get("/api/orders")
+                .queryParam("userId", "#{userId}")
+                .check(status().is(200))
+                .check(responseTimeInMillis().lt(500))
+        )
+        .pause(Duration.ofMillis(100), Duration.ofMillis(500));
+
+    {
+        setUp(
+            scenario.injectOpen(
+                rampUsersPerSec(10).to(100).during(Duration.ofMinutes(1)),
+                rampUsersPerSec(100).to(1000).during(Duration.ofMinutes(2)),
+                rampUsersPerSec(1000).to(5000).during(Duration.ofMinutes(2)),
+                constantUsersPerSec(10000).during(Duration.ofMinutes(5))
+            )
+        ).protocols(httpProtocol)
+         .assertions(
+            global().responseTime().percentile(95.0).lt(500),
+            global().failedRequests().percent().lt(1.0)
+         );
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 11: Production Incident -->
+    <section id="production-incident">
+      <h2>Real Production Incident</h2>
+
+      <details>
+        <summary>The cascade: how one slow query took down the entire API</summary>
+        <div class="callout callout-danger">
+          <p><strong>Severity:</strong> P1 — Complete API outage for 23 minutes during peak traffic</p>
+        </div>
+
+        <h4>Context</h4>
+        <p>E-commerce product catalog API. Normal load: 2,000 req/s. Flash sale started, traffic spiked to 12,000 req/s. API went from healthy to 100% error rate in 90 seconds.</p>
+
+        <h4>Timeline</h4>
+        <pre class="diagram">
+  14:00 — Flash sale starts, traffic: 2K → 8K req/s (expected)
+  14:01 — P95 latency creeps from 50ms → 200ms
+  14:02 — Traffic hits 12K req/s (20% above capacity plan)
+  14:03 — PostgreSQL: new slow query appears (missing index on sale_items)
+           Query time: 5ms → 2000ms (sequential scan on 10M rows)
+  14:04 — HikariCP connections held for 2s each (was 50ms)
+           Pool saturated: 50/50 connections busy, 150 threads waiting
+  14:05 — Tomcat threads exhausted: 200/200 busy, accept-queue filling
+  14:06 — Accept queue full (100 limit). New connections refused. 503 errors.
+  14:07 — Health check fails (can't get thread to respond)
+  14:08 — K8s marks pod unhealthy, stops routing traffic
+  14:09 — All 3 pods marked unhealthy → COMPLETE OUTAGE
+  14:12 — On-call engineer alerted, starts investigation
+  14:15 — Thread dump shows 200 threads on HikariPool.getConnection()
+  14:18 — Identifies slow query in pg_stat_statements
+  14:20 — Creates missing index: CREATE INDEX CONCURRENTLY idx_sale_items_sale_id...
+  14:23 — Query time drops from 2s → 3ms. Pool drains. Pods recover.
+        </pre>
+
+        <h4>Root Cause Chain</h4>
+        <pre class="diagram">
+  Missing index on sale_items table
+       │
+       ▼
+  Sequential scan on 10M rows (2s per query)
+       │
+       ▼
+  Each request holds DB connection for 2s (was 50ms)
+       │
+       ▼
+  HikariCP pool (50 conn) saturated: 50 ÷ 2s = 25 req/s throughput!
+       │
+       ▼
+  190 Tomcat threads blocked waiting for connection (30s timeout)
+       │
+       ▼
+  Tomcat thread pool exhausted (200/200)
+       │
+       ▼
+  TCP accept-queue overflow → 503 for all requests
+       │
+       ▼
+  Health checks fail → K8s kills pods → Complete outage
+        </pre>
+
+        <h4>Lessons Learned</h4>
+        <ul>
+          <li><strong>Connection pool timeout should be LOW</strong> — Changed from 30s → 3s. Fail fast, don't block all threads.</li>
+          <li><strong>Always load test with production data volumes</strong> — The missing index only mattered at 10M rows.</li>
+          <li><strong>Circuit breaker on the query layer</strong> — Added Resilience4j bulkhead limiting concurrent DB calls to 30 (leaving headroom).</li>
+          <li><strong>Separate read/write pools</strong> — Catalog reads shouldn't compete with order writes for connections.</li>
+          <li><strong>Index coverage checks in CI</strong> — Added a test: "no query should seq scan tables > 100K rows."</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 12: Code Examples -->
+    <section id="code-examples">
+      <h2>Production-Ready Solutions</h2>
+
+      <details>
+        <summary>Pattern: Async controller with CompletableFuture (pre-Virtual Threads)</summary>
+        <pre><code class="language-java">// Release Tomcat thread immediately — non-blocking response
+@RestController
+public class OrderController {
+
+    private final Executor asyncExecutor;
+    private final OrderService orderService;
+
+    public OrderController(@Qualifier("asyncPool") Executor asyncExecutor,
+                           OrderService orderService) {
+        this.asyncExecutor = asyncExecutor;
+        this.orderService = orderService;
+    }
+
+    // Tomcat thread freed immediately; response written when CompletableFuture completes
+    @GetMapping("/api/orders/{id}")
+    public CompletableFuture&lt;Order&gt; getOrder(@PathVariable Long id) {
+        return CompletableFuture.supplyAsync(
+            () -> orderService.findById(id), asyncExecutor);
+    }
+
+    // DeferredResult with timeout handling
+    @GetMapping("/api/orders")
+    public DeferredResult&lt;List&lt;Order&gt;&gt; listOrders(@RequestParam Long userId) {
+        DeferredResult&lt;List&lt;Order&gt;&gt; result = new DeferredResult&lt;&gt;(5000L);
+        result.onTimeout(() -> result.setErrorResult(
+            ResponseEntity.status(504).body("Gateway timeout")));
+        
+        asyncExecutor.execute(() -> {
+            try {
+                result.setResult(orderService.findByUserId(userId));
+            } catch (Exception e) {
+                result.setErrorResult(e);
+            }
+        });
+        return result;
+    }
+}
+
+@Configuration
+public class AsyncConfig {
+    @Bean("asyncPool")
+    public Executor asyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(50);
+        executor.setMaxPoolSize(200);
+        executor.setQueueCapacity(500);
+        executor.setRejectedExecutionHandler(new CallerRunsPolicy());
+        executor.setThreadNamePrefix("async-");
+        executor.initialize();
+        return executor;
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Pattern: Virtual Threads (Java 21+ / Spring Boot 3.2+)</summary>
+        <pre><code class="language-yaml"># application.yml — enable virtual threads
+spring:
+  threads:
+    virtual:
+      enabled: true  # Each request gets a virtual thread (millions possible)</code></pre>
+        <pre><code class="language-java">// With virtual threads enabled, Tomcat uses virtual threads per-request.
+// No thread pool sizing needed — virtual threads are cheap (~1KB stack).
+// Blocking calls (JDBC, HTTP) automatically yield the carrier thread.
+
+// Before virtual threads: 200 platform threads → 200 concurrent requests
+// After virtual threads: millions of virtual threads → limited only by connections
+
+// ⚠️ Gotcha: Virtual threads don't help if the bottleneck is DB connections!
+// You still need HikariCP tuning. The threads aren't the limit — connections are.
+
+// Pinning issue: synchronized blocks pin the virtual thread to carrier thread
+// BAD:
+synchronized (lock) {
+    jdbcTemplate.query(...);  // Carrier thread pinned during I/O!
+}
+
+// GOOD: Use ReentrantLock instead
+private final ReentrantLock lock = new ReentrantLock();
+lock.lock();
+try {
+    jdbcTemplate.query(...);  // Virtual thread can unmount
+} finally {
+    lock.unlock();
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Pattern: Caching to bypass the database entirely</summary>
+        <pre><code class="language-java">@Service
+public class ProductCatalogService {
+
+    private final Cache&lt;Long, Product&gt; localCache; // Caffeine (L1)
+    private final RedisTemplate&lt;String, Product&gt; redis; // Redis (L2)
+    private final ProductRepository repository; // PostgreSQL (L3)
+
+    public ProductCatalogService() {
+        this.localCache = Caffeine.newBuilder()
+            .maximumSize(10_000)
+            .expireAfterWrite(Duration.ofMinutes(5))
+            .recordStats()
+            .build();
+    }
+
+    public Product getProduct(Long id) {
+        // L1: In-memory (< 1ms, no network)
+        Product cached = localCache.getIfPresent(id);
+        if (cached != null) return cached;
+
+        // L2: Redis (1-3ms, network hop)
+        String redisKey = "product:" + id;
+        cached = redis.opsForValue().get(redisKey);
+        if (cached != null) {
+            localCache.put(id, cached);
+            return cached;
+        }
+
+        // L3: Database (5-50ms, connection required)
+        Product product = repository.findById(id)
+            .orElseThrow(() -> new NotFoundException("Product not found: " + id));
+        
+        redis.opsForValue().set(redisKey, product, Duration.ofMinutes(30));
+        localCache.put(id, product);
+        
+        return product;
+    }
+
+    // At 10K req/s with 95% L1 cache hit rate:
+    // Only 500 req/s hit Redis
+    // Only 25 req/s (5% of Redis misses) hit the database
+    // DB load reduced from 10,000 → 25 req/s!
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Pattern: Bulkhead — isolate critical paths</summary>
+        <pre><code class="language-java">// Resilience4j Bulkhead: limit concurrent calls to protect resources
+@Configuration
+public class BulkheadConfig {
+
+    @Bean
+    public BulkheadRegistry bulkheadRegistry() {
+        BulkheadConfig config = BulkheadConfig.custom()
+            .maxConcurrentCalls(30)     // Max 30 concurrent DB calls
+            .maxWaitDuration(Duration.ofMillis(500)) // Wait max 500ms for a slot
+            .build();
+        return BulkheadRegistry.of(config);
+    }
+}
+
+@Service
+public class OrderService {
+
+    @Bulkhead(name = "database", fallbackMethod = "getOrderFallback")
+    public Order getOrder(Long id) {
+        return orderRepository.findById(id).orElseThrow();
+    }
+
+    private Order getOrderFallback(Long id, BulkheadFullException e) {
+        // Return from cache or return a degraded response
+        return cacheService.getStaleOrder(id)
+            .orElseThrow(() -> new ServiceUnavailableException("High load - try again"));
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 13: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Anti-patterns that cause failures at scale</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Mistake</th>
+              <th>Why It Fails at 10K</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>Increasing Tomcat threads without increasing DB pool</td>
+              <td>More threads = more contention for same 10 connections</td>
+              <td>Tune pools together: thread pool / conn pool ratio</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>No connection timeout on HikariCP</td>
+              <td>Threads wait 30s for a connection, Tomcat pool fills up</td>
+              <td>Set <code>connection-timeout: 3000</code> — fail fast</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>N+1 queries in JPA</td>
+              <td>100 users = 100 queries. 10K users = 10K queries per request</td>
+              <td>Use <code>@EntityGraph</code>, JOIN FETCH, or batch fetching</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Synchronous calls to downstream services inside request</td>
+              <td>Each downstream call adds latency; timeout accumulates</td>
+              <td>Parallel async calls with CompletableFuture.allOf()</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>No caching layer</td>
+              <td>Every request hits DB — 10K req/s directly to PostgreSQL</td>
+              <td>Add L1 (Caffeine) + L2 (Redis) cache for read-heavy endpoints</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>Health check queries hitting the same pool</td>
+              <td>Health checks contend with real traffic for connections</td>
+              <td>Separate health check connection or simple socket check</td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td>Unbounded result sets (<code>SELECT * FROM orders WHERE user_id = ?</code>)</td>
+              <td>Power users with 50K orders = huge memory allocation per request</td>
+              <td>Always paginate: <code>LIMIT 50 OFFSET ?</code> or cursor-based</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 14: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs — Scaling Strategies</h2>
+
+      <details>
+        <summary>Horizontal vs vertical scaling decision matrix</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>When to Use</th>
+              <th>Pros</th>
+              <th>Cons</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Scale UP (vertical)</strong></td>
+              <td>CPU-bound, single-thread bottleneck</td>
+              <td>Simple, no code changes</td>
+              <td>Expensive, ceiling limit, single point of failure</td>
+            </tr>
+            <tr>
+              <td><strong>Scale OUT (horizontal)</strong></td>
+              <td>I/O-bound, stateless services</td>
+              <td>Linear scaling, HA, cost-effective</td>
+              <td>Need stateless design, more operational complexity</td>
+            </tr>
+            <tr>
+              <td><strong>Caching (L1+L2)</strong></td>
+              <td>Read-heavy, tolerance for staleness</td>
+              <td>10-100x throughput boost, reduces DB load</td>
+              <td>Invalidation complexity, memory cost, stale data risk</td>
+            </tr>
+            <tr>
+              <td><strong>Read replicas</strong></td>
+              <td>Read-heavy, need fresh data</td>
+              <td>Scales reads, isolates writes</td>
+              <td>Replication lag, connection management complexity</td>
+            </tr>
+            <tr>
+              <td><strong>Async/reactive (WebFlux)</strong></td>
+              <td>Many concurrent connections, I/O-heavy</td>
+              <td>10K+ connections per instance, low memory</td>
+              <td>Complex programming model, debugging harder, ecosystem gaps</td>
+            </tr>
+            <tr>
+              <td><strong>Virtual Threads (Java 21)</strong></td>
+              <td>I/O-bound, existing blocking code</td>
+              <td>Simple model, scales like reactive, keeps blocking code</td>
+              <td>JDK 21+ required, pinning issues, library support</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 15: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Likely follow-ups and how to answer</summary>
+        <dl>
+          <dt><strong>Q: "How would you handle a sudden traffic spike without pre-scaling?"</strong></dt>
+          <dd>Three layers of defense: (1) Rate limiting at the API gateway — shed excess load gracefully, (2) Circuit breakers — prevent cascade when downstream can't handle load, (3) Auto-scaling on latency/CPU metrics — scale pods before thread pools exhaust. Also: graceful degradation — serve cached/stale responses rather than 503.</dd>
+
+          <dt><strong>Q: "Your API has 50ms latency at P50 but 5 seconds at P99. What's happening?"</strong></dt>
+          <dd>Bimodal latency usually means: (1) GC pauses (check GC logs for STW > 1s), (2) Lock contention (1% of requests hit a hot row), (3) Connection pool wait (most get a connection instantly, few wait for full pool), (4) Slow query triggered by specific data patterns (e.g., users with 10K orders). I'd check the P99 requests specifically — are they a specific user/endpoint?</dd>
+
+          <dt><strong>Q: "Would you choose WebFlux or Virtual Threads for a new high-throughput service?"</strong></dt>
+          <dd>For a new Spring Boot service in 2024+: Virtual Threads. They give you reactive-level scalability with imperative code. WebFlux only if you need streaming/SSE or your entire stack is already reactive (R2DBC, reactive Redis). The debugging and testing story for virtual threads is much better.</dd>
+
+          <dt><strong>Q: "How do you prevent one slow endpoint from affecting all others?"</strong></dt>
+          <dd>Bulkhead pattern: separate thread pools per endpoint group. Critical endpoints (checkout) get a dedicated pool with guaranteed capacity. Non-critical endpoints (analytics) get a smaller pool and degrade gracefully. Alternatively: separate services for different SLA tiers.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- Section 16: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Interview Takeaways:</strong></p>
+        <ol>
+          <li>Investigate in order: <strong>thread pool → connection pool → database → OS limits → code</strong></li>
+          <li>Use <strong>Little's Law</strong> to calculate capacity: L = λ × W. Know your numbers.</li>
+          <li>Default Tomcat (200 threads) + HikariCP (10 connections) = <strong>~200 req/s effective throughput</strong></li>
+          <li>First action during failure: <strong>thread dump</strong> — it shows exactly where threads are stuck</li>
+          <li>Flame graphs distinguish <strong>CPU-bound</strong> (profile CPU) from <strong>I/O-bound</strong> (profile wall clock)</li>
+          <li><strong>Caching is the #1 throughput multiplier</strong> — 95% cache hit = 20x DB load reduction</li>
+          <li><strong>Virtual Threads</strong> (Java 21) solve thread-per-request scalability without reactive complexity</li>
+          <li>Connection pool timeout must be <strong>low</strong> (3-5s) — fail fast, not fill up thread pool</li>
+          <li><strong>Separate read/write paths</strong> — don't let catalog reads starve payment writes</li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch02-duplicate-records-retries.html" class="chapter-nav-prev">← Chapter 2: Duplicate Records &amp; Retries</a>
+      <a href="ch04-hikaricp-pool-exhaustion.html" class="chapter-nav-next">Chapter 4: HikariCP Pool Exhaustion →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

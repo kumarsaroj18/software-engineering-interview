@@ -1,0 +1,1991 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 14 — Investigating Memory Leaks in Production | Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="../assets/css/prism.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 14</span>
+      <span class="chapter-title">Memory Leak in Production</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#memory-model">JVM Memory Model</a></li>
+        <li><a href="#leak-types">Types of Memory Leaks</a></li>
+        <li><a href="#investigation-tools">Investigation Tools</a></li>
+        <li><a href="#heap-dump-analysis">Heap Dump Analysis</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo; <a href="../index.html#part-iii">Part III — Production Engineering &amp; Debugging</a> &rsaquo; <span>Chapter 14</span>
+    </nav>
+
+    <header>
+      <h1>How Would You Investigate a Memory Leak That Only Appears After Several Days in Production?</h1>
+      <span class="badge badge-hard">Hard</span>
+      <span class="badge badge-topic">Heap Dumps</span>
+      <span class="badge badge-topic">Profiling</span>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+
+    <!-- Section 1: Interviewer Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>What is the interviewer really evaluating?</summary>
+        <p>This question is designed to test several dimensions of senior engineering expertise simultaneously:</p>
+        <ul>
+          <li><strong>JVM memory model understanding</strong> — Do you know where objects live, how generational GC works, and the difference between heap and off-heap memory?</li>
+          <li><strong>Production debugging methodology</strong> — Can you investigate a live system without taking it down or losing evidence?</li>
+          <li><strong>Tool proficiency</strong> — Are you familiar with heap dump analysis, flight recorders, and native memory tracking?</li>
+          <li><strong>Pattern recognition</strong> — Can you identify which category of leak this is from symptoms alone?</li>
+          <li><strong>Risk management</strong> — Do you understand the operational risks of debugging in production (heap dumps freezing the JVM, etc.)?</li>
+          <li><strong>Communication under pressure</strong> — Can you explain your investigation plan clearly while an incident is happening?</li>
+        </ul>
+        <p>The "only appears after several days" aspect is critical — it rules out simple issues and points to slow accumulation patterns like growing collections, ThreadLocal leaks, or classloader leaks during hot redeployments.</p>
+        <p>At the FAANG level, interviewers expect you to discuss the full lifecycle: detection via monitoring, evidence collection, root cause analysis, fix, and prevention mechanisms.</p>
+      </details>
+    </section>
+
+    <!-- Section 2: Quick Answer -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <details>
+        <summary>30-second elevator pitch</summary>
+        <blockquote class="callout-tip">
+          <p><strong>TL;DR:</strong> I would approach this systematically: (1) Confirm the leak using heap metrics trending over days — look for monotonically increasing Old Gen usage that GC cannot reclaim. (2) Enable <code>-XX:+HeapDumpOnOutOfMemoryError</code> proactively and take comparative heap dumps at day 1 vs day 5. (3) Analyze with Eclipse MAT — inspect the dominator tree, find the largest retained-size objects, and trace GC roots to identify what's holding references. (4) Common culprits for multi-day leaks: ThreadLocals not cleaned in request filters, static Maps/Lists used as caches without eviction, listener registrations without deregistration, and connection/stream handles not closed in error paths. (5) Fix with proper lifecycle management (try-finally, @PreDestroy, WeakReferences for caches), then validate with a soak test reproducing production traffic patterns over 7+ days.</p>
+        </blockquote>
+      </details>
+    </section>
+
+
+    <!-- Section 3: JVM Memory Model -->
+    <section id="memory-model">
+      <h2>JVM Memory Model</h2>
+      <details>
+        <summary>Heap: Young Generation &amp; Old Generation</summary>
+        <p>The JVM heap is divided into generational spaces optimized for object lifetimes:</p>
+        <pre><code class="language-bash"># Typical production heap layout (G1GC, 8GB heap)
+# ┌─────────────────────────────────────────────────────────────────┐
+# │                        JVM Process Memory                        │
+# ├──────────────────────────────────┬──────────────────────────────┤
+# │            Heap (8GB)            │        Non-Heap              │
+# ├────────────┬─────────────────────┼──────────────────────────────┤
+# │ Young Gen  │    Old Generation   │  Metaspace │ Code Cache     │
+# │  (~2GB)    │      (~6GB)         │  (256MB)   │  (240MB)       │
+# ├────┬───────┤                     │            │                │
+# │Eden│ S0|S1 │                     │            │                │
+# └────┴───────┴─────────────────────┴────────────┴────────────────┘</code></pre>
+        <ul>
+          <li><strong>Young Generation (Eden + Survivor Spaces)</strong> — Short-lived objects. Minor GC collects here frequently (~100ms pauses). Objects surviving multiple minor GCs get promoted to Old Gen.</li>
+          <li><strong>Old Generation (Tenured)</strong> — Long-lived objects. Full GC is expensive (seconds of pause). In a memory leak, this is where leaked objects accumulate.</li>
+          <li><strong>Promotion rate</strong> — Objects surviving <code>-XX:MaxTenuringThreshold</code> (default 15 for G1) minor GCs get promoted. A leak causes higher-than-normal promotion rates.</li>
+        </ul>
+        <pre><code class="language-bash"># Key JVM flags for memory investigation
+java -Xms8g -Xmx8g \
+  -XX:+UseG1GC \
+  -XX:MaxGCPauseMillis=200 \
+  -XX:+HeapDumpOnOutOfMemoryError \
+  -XX:HeapDumpPath=/var/dumps/heap-$(date +%s).hprof \
+  -XX:+PrintGCDetails \
+  -XX:+PrintGCDateStamps \
+  -Xloggc:/var/log/gc/gc.log \
+  -XX:+UseGCLogFileRotation \
+  -XX:NumberOfGCLogFiles=10 \
+  -XX:GCLogFileSize=50M \
+  -jar application.jar</code></pre>
+      </details>
+
+      <details>
+        <summary>Metaspace</summary>
+        <p>Metaspace replaced PermGen in Java 8+. It stores class metadata, method bytecodes, and constant pools in native memory (not heap).</p>
+        <pre><code class="language-bash"># Monitor metaspace usage
+jcmd &lt;pid&gt; VM.metaspace
+
+# Typical output showing leak symptoms:
+# MaxMetaspaceSize: unlimited
+# CompressedClassSpaceSize: 1073741824
+# Used:  340MB    ← growing over time = classloader leak
+# Committed: 360MB
+# Reserved: 1GB</code></pre>
+        <p><strong>Leak pattern:</strong> Hot redeployments in application servers (Tomcat, Jetty) without proper cleanup cause classloader leaks. Each redeployment loads classes into a new classloader, but static references or ThreadLocals prevent the old classloader from being garbage collected.</p>
+        <pre><code class="language-java">// Classic classloader leak: static reference holding class from child classloader
+public class MemoryLeakFilter implements Filter {
+    // BAD: Static field holds reference to webapp classloader
+    private static final Map&lt;String, Object&gt; cache = new ConcurrentHashMap&lt;&gt;();
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
+        // Objects stored here pin the webapp classloader
+        cache.put(req.getRemoteAddr(), new RequestContext(req));
+        chain.doFilter(req, res);
+    }
+    // No cleanup on undeploy → classloader leak
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Native Memory &amp; Off-Heap</summary>
+        <p>Native memory is allocated outside the JVM heap and is NOT subject to garbage collection:</p>
+        <ul>
+          <li><strong>Direct ByteBuffers</strong> — Allocated via <code>ByteBuffer.allocateDirect()</code>. Used by NIO channels, Netty, and many I/O frameworks. Limited by <code>-XX:MaxDirectMemorySize</code>.</li>
+          <li><strong>JNI allocations</strong> — Memory allocated by native code via <code>malloc()</code>. Invisible to JVM monitoring unless NMT is enabled.</li>
+          <li><strong>Thread stacks</strong> — Each thread consumes <code>-Xss</code> (default 512KB–1MB). 1000 threads = ~1GB of native memory.</li>
+          <li><strong>Memory-mapped files</strong> — <code>MappedByteBuffer</code> maps files into process address space. Not freed until GC collects the buffer object.</li>
+          <li><strong>Compressed class space</strong> — Native memory for compressed class pointers (if enabled).</li>
+        </ul>
+        <pre><code class="language-bash"># Enable Native Memory Tracking (5-10% overhead)
+java -XX:NativeMemoryTracking=detail -jar app.jar
+
+# Baseline at startup
+jcmd &lt;pid&gt; VM.native_memory baseline
+
+# Compare after 5 days
+jcmd &lt;pid&gt; VM.native_memory detail diff
+
+# Sample output showing native leak:
+# Total: reserved=12GB, committed=10GB  (+2GB since baseline)
+#
+# -                  Internal (reserved=2500MB, committed=2500MB)
+#                             (malloc=2500MB #450000)  ← suspicious!
+#                             (+1800MB since baseline)  ← LEAK!</code></pre>
+        <pre><code class="language-java">// Direct ByteBuffer leak example
+public class DirectBufferLeak {
+    // BAD: Direct buffers never explicitly freed
+    public byte[] readFromChannel(SocketChannel channel) throws IOException {
+        // Allocates native memory — only freed when GC collects this object
+        ByteBuffer buffer = ByteBuffer.allocateDirect(64 * 1024);
+        channel.read(buffer);
+        buffer.flip();
+        byte[] data = new byte[buffer.remaining()];
+        buffer.get(data);
+        // buffer goes out of scope but native memory lingers
+        // until next Full GC (which may be days away!)
+        return data;
+    }
+
+    // GOOD: Reuse pooled direct buffers
+    private static final ThreadLocal&lt;ByteBuffer&gt; BUFFER_POOL =
+        ThreadLocal.withInitial(() -&gt; ByteBuffer.allocateDirect(64 * 1024));
+
+    public byte[] readFromChannelFixed(SocketChannel channel) throws IOException {
+        ByteBuffer buffer = BUFFER_POOL.get();
+        buffer.clear();
+        channel.read(buffer);
+        buffer.flip();
+        byte[] data = new byte[buffer.remaining()];
+        buffer.get(data);
+        return data;
+    }
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- Section 4: Types of Memory Leaks -->
+    <section id="leak-types">
+      <h2>Types of Memory Leaks in Java</h2>
+      <details>
+        <summary>Static Collections Growing Unbounded</summary>
+        <p>The most common leak pattern in production. A static collection accumulates entries without any eviction or size limit:</p>
+        <pre><code class="language-java">// LEAK: Static map grows forever
+public class AuditService {
+    // This map is never cleared, never evicted, and lives for the lifetime of the JVM
+    private static final Map&lt;String, AuditEntry&gt; auditLog = new ConcurrentHashMap&lt;&gt;();
+
+    public void recordAction(String userId, String action) {
+        // 10,000 requests/day × 365 days = 3.65 million entries
+        // Each AuditEntry ~2KB = 7.3 GB leaked
+        auditLog.put(userId + "_" + System.nanoTime(), new AuditEntry(userId, action, Instant.now()));
+    }
+
+    // No eviction, no size cap, no TTL
+}
+
+// FIX: Use bounded cache with eviction
+public class AuditServiceFixed {
+    private static final Cache&lt;String, AuditEntry&gt; auditCache = Caffeine.newBuilder()
+        .maximumSize(10_000)
+        .expireAfterWrite(Duration.ofHours(1))
+        .build();
+
+    public void recordAction(String userId, String action) {
+        auditCache.put(userId + "_" + System.nanoTime(), new AuditEntry(userId, action, Instant.now()));
+    }
+}</code></pre>
+        <p><strong>Why it takes days to manifest:</strong> At 1000 requests/hour, a map growing by 500 bytes/entry takes ~5 days to consume 60MB — enough to shift Old Gen baseline but not trigger OOM immediately.</p>
+      </details>
+
+      <details>
+        <summary>ThreadLocal Not Cleaned Up</summary>
+        <p>ThreadLocals are particularly dangerous in thread-pool environments (Tomcat, Jetty) because threads are reused across requests:</p>
+        <pre><code class="language-java">// LEAK: ThreadLocal set but never removed
+public class RequestContextFilter implements Filter {
+    private static final ThreadLocal&lt;RequestContext&gt; CONTEXT = new ThreadLocal&lt;&gt;();
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+        // Thread pool reuses threads — previous value NOT automatically cleared
+        CONTEXT.set(new RequestContext(
+            ((HttpServletRequest) req).getHeader("X-Request-Id"),
+            ((HttpServletRequest) req).getHeader("Authorization"),
+            new HashMap&lt;&gt;(),  // attributes map grows per request
+            new ArrayList&lt;&gt;()  // breadcrumbs list grows per request
+        ));
+
+        chain.doFilter(req, res);
+        // BUG: No finally block to remove!
+        // If chain.doFilter() throws, CONTEXT is never cleaned
+    }
+
+    public static RequestContext current() {
+        return CONTEXT.get();
+    }
+}
+
+// Why it leaks after days:
+// - Tomcat has 200 threads in its pool
+// - Each thread accumulates RequestContext objects
+// - RequestContext.attributes map grows if downstream code adds to it
+// - After 5 days: 200 threads × 50MB accumulated state = 10GB</code></pre>
+        <pre><code class="language-java">// FIX: Always clean up in finally block
+public class RequestContextFilterFixed implements Filter {
+    private static final ThreadLocal&lt;RequestContext&gt; CONTEXT = new ThreadLocal&lt;&gt;();
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+        try {
+            CONTEXT.set(new RequestContext(
+                ((HttpServletRequest) req).getHeader("X-Request-Id")
+            ));
+            chain.doFilter(req, res);
+        } finally {
+            CONTEXT.remove();  // CRITICAL: Always remove, even on exception
+        }
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Listener/Callback Not Deregistered</summary>
+        <p>Event-driven architectures leak when listeners outlive their intended scope:</p>
+        <pre><code class="language-java">// LEAK: Observer never deregistered
+@Component
+public class PriceUpdateWidget {
+    @Autowired
+    private EventBus eventBus;
+
+    @PostConstruct
+    public void init() {
+        // Registers a strong reference to 'this'
+        eventBus.register(this);
+    }
+
+    @Subscribe
+    public void onPriceUpdate(PriceUpdateEvent event) {
+        // handle event
+    }
+
+    // No @PreDestroy to unregister!
+    // If this bean is prototype-scoped or in a child context that gets refreshed,
+    // the old instance is never GC'd because eventBus holds a reference
+}
+
+// FIX: Proper lifecycle management
+@Component
+public class PriceUpdateWidgetFixed {
+    @Autowired
+    private EventBus eventBus;
+
+    @PostConstruct
+    public void init() {
+        eventBus.register(this);
+    }
+
+    @PreDestroy
+    public void cleanup() {
+        eventBus.unregister(this);  // Remove strong reference
+    }
+}</code></pre>
+        <p><strong>Spring-specific trap:</strong> <code>ApplicationListener</code> beans in a child <code>ApplicationContext</code> that register with the parent context. When the child context is refreshed (e.g., Spring Cloud Config refresh), listeners from the old context remain registered.</p>
+      </details>
+
+      <details>
+        <summary>ClassLoader Leaks (Redeployment)</summary>
+        <p>Each webapp classloader holds references to all classes it loaded. A single pinned reference prevents the entire classloader (and all its classes) from being collected:</p>
+        <pre><code class="language-java">// Common pinning patterns that cause classloader leaks:
+
+// 1. JDBC driver registered in webapp classloader
+//    DriverManager holds static reference → pins classloader
+Class.forName("com.mysql.cj.jdbc.Driver"); // Registers in DriverManager
+
+// 2. Logging framework with webapp classloader
+//    java.util.logging.Level instances hold classloader reference
+Logger.getLogger("com.myapp"); // Level class loaded by webapp classloader
+
+// 3. ThreadLocal referencing webapp class
+public class WebAppThreadLocal {
+    // Thread outlives webapp → pins classloader
+    private static final ThreadLocal&lt;MyWebAppClass&gt; TL = new ThreadLocal&lt;&gt;();
+}
+
+// 4. Shutdown hooks referencing webapp classes
+Runtime.getRuntime().addShutdownHook(new Thread(() -&gt; {
+    // Lambda captures webapp classloader
+    myService.cleanup();
+}));</code></pre>
+        <pre><code class="language-bash"># Detecting classloader leaks
+jcmd &lt;pid&gt; GC.class_stats
+
+# In Eclipse MAT: 
+# OQL query to find duplicate classes (loaded by multiple classloaders)
+SELECT * FROM INSTANCEOF java.lang.ClassLoader 
+WHERE retainedHeapSize &gt; 50000000</code></pre>
+      </details>
+
+      <details>
+        <summary>Connection/Stream Not Closed</summary>
+        <p>Resource leaks that bypass try-with-resources, especially in error paths:</p>
+        <pre><code class="language-java">// LEAK: Connection not closed on exception
+public class ReportService {
+    @Autowired
+    private DataSource dataSource;
+
+    public Report generateReport(String query) throws SQLException {
+        Connection conn = dataSource.getConnection();
+        PreparedStatement stmt = conn.prepareStatement(query);
+        ResultSet rs = stmt.executeQuery();
+
+        // If processResults() throws RuntimeException,
+        // connection is never returned to pool
+        Report report = processResults(rs);
+
+        rs.close();
+        stmt.close();
+        conn.close();  // Never reached on exception!
+        return report;
+    }
+
+    // After days: pool exhausted, new requests block, timeouts cascade
+}
+
+// FIX: try-with-resources guarantees cleanup
+public class ReportServiceFixed {
+    @Autowired
+    private DataSource dataSource;
+
+    public Report generateReport(String query) throws SQLException {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query);
+             ResultSet rs = stmt.executeQuery()) {
+            return processResults(rs);
+        }
+        // All resources closed even on exception
+    }
+}</code></pre>
+        <pre><code class="language-yaml"># HikariCP leak detection configuration
+spring:
+  datasource:
+    hikari:
+      leak-detection-threshold: 30000  # 30 seconds
+      maximum-pool-size: 20
+      connection-timeout: 5000
+      # Logs stack trace of code that checked out connection but didn't return it
+      # WARNING: com.zaxxer.hikari - Connection leak detection triggered for connection_id
+      #   java.lang.Exception: Apparent connection leak detected
+      #     at com.example.ReportService.generateReport(ReportService.java:42)</code></pre>
+      </details>
+
+      <details>
+        <summary>Cache Without Eviction Policy</summary>
+        <p>In-memory caches that grow indefinitely are a slow-burning leak:</p>
+        <pre><code class="language-java">// LEAK: HashMap used as cache without bounds
+@Service
+public class UserProfileCache {
+    // Grows forever — one entry per unique user who ever logged in
+    private final Map&lt;Long, UserProfile&gt; cache = new ConcurrentHashMap&lt;&gt;();
+
+    public UserProfile getProfile(Long userId) {
+        return cache.computeIfAbsent(userId, id -&gt; {
+            // Fetches from DB and caches permanently
+            return userRepository.findById(id).orElse(null);
+        });
+    }
+    // 1 million users × 5KB each = 5GB after months in production
+}
+
+// FIX: Bounded cache with TTL
+@Service
+public class UserProfileCacheFixed {
+    private final Cache&lt;Long, UserProfile&gt; cache = Caffeine.newBuilder()
+        .maximumSize(50_000)                    // Hard cap
+        .expireAfterAccess(Duration.ofMinutes(30)) // TTL on access
+        .expireAfterWrite(Duration.ofHours(2))     // TTL on write
+        .recordStats()                             // Enable monitoring
+        .removalListener((key, value, cause) -&gt;
+            log.debug("Evicted user {} due to {}", key, cause))
+        .build();
+
+    public UserProfile getProfile(Long userId) {
+        return cache.get(userId, id -&gt; userRepository.findById(id).orElse(null));
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Native Memory Leaks (JNI, Netty Direct Buffers)</summary>
+        <p>These are invisible to standard heap monitoring — the JVM heap looks fine but the process RSS keeps growing:</p>
+        <pre><code class="language-java">// LEAK: Netty ByteBuf not released
+public class NettyLeakHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        ByteBuf buf = (ByteBuf) msg;
+        // Process the buffer...
+        processData(buf);
+
+        // BUG: Forgot to release!
+        // buf.release(); // MISSING!
+
+        // In Netty, ByteBuf uses reference counting
+        // If not released, direct memory is never freed
+        // Process RSS grows while heap stays stable
+    }
+}
+
+// FIX: Always release in finally or use ReferenceCountUtil
+public class NettyFixedHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        ByteBuf buf = (ByteBuf) msg;
+        try {
+            processData(buf);
+        } finally {
+            ReferenceCountUtil.release(msg);  // Decrements refcount, frees if 0
+        }
+    }
+}</code></pre>
+        <pre><code class="language-bash"># Detect native memory growth
+# 1. Compare RSS vs heap
+ps -p &lt;pid&gt; -o rss=  # Total resident memory
+jcmd &lt;pid&gt; GC.heap_info  # Just heap
+
+# If RSS &gt;&gt; heap + metaspace + thread_stacks, you have a native leak
+
+# 2. Enable Netty leak detection
+-Dio.netty.leakDetection.level=PARANOID
+-Dio.netty.leakDetection.targetRecords=20
+
+# 3. Use jemalloc profiling for native allocations
+LD_PRELOAD=/usr/lib/libjemalloc.so MALLOC_CONF="prof:true,prof_prefix:/tmp/jeprof" java -jar app.jar
+jeprof --svg /path/to/java /tmp/jeprof.*.heap &gt; leak.svg</code></pre>
+      </details>
+    </section>
+
+
+    <!-- Section 5: Investigation Tools -->
+    <section id="investigation-tools">
+      <h2>Investigation Tools</h2>
+      <details>
+        <summary>jmap — Heap Dump &amp; Histogram</summary>
+        <p><code>jmap</code> provides heap snapshots and quick histograms. Use with caution in production — heap dumps pause the JVM.</p>
+        <pre><code class="language-bash"># Quick histogram (minimal pause, no full dump)
+jmap -histo:live &lt;pid&gt; | head -30
+
+# Output shows top objects by count and size:
+#  num     #instances    #bytes  class name
+# ─────────────────────────────────────────────
+#    1:      3456789   345678900  [B  (byte arrays)
+#    2:      2345678   234567800  java.lang.String
+#    3:      1234567   198765432  com.example.RequestContext  ← SUSPICIOUS
+#    4:       890123    89012300  java.util.HashMap$Node
+
+# Full heap dump (WARNING: pauses JVM for seconds to minutes)
+jmap -dump:format=b,file=/var/dumps/heap-$(date +%Y%m%d-%H%M%S).hprof &lt;pid&gt;
+
+# Live objects only (forces Full GC first)
+jmap -dump:live,format=b,file=/var/dumps/heap-live.hprof &lt;pid&gt;</code></pre>
+        <p><strong>Production considerations:</strong></p>
+        <ul>
+          <li>Heap dump pauses the JVM for the entire duration (8GB heap → 30-60s pause)</li>
+          <li>Needs disk space &gt;= heap size (8GB heap → 8GB+ hprof file)</li>
+          <li>Take dump from a node already removed from the load balancer</li>
+          <li>Consider <code>jcmd</code> as a safer alternative (more granular control)</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>jcmd — Modern JVM Diagnostic Commands</summary>
+        <p><code>jcmd</code> is the modern replacement for <code>jmap</code>, <code>jstack</code>, and <code>jinfo</code>. More flexible and safer:</p>
+        <pre><code class="language-bash"># List available commands
+jcmd &lt;pid&gt; help
+
+# Heap dump (same as jmap but with more options)
+jcmd &lt;pid&gt; GC.heap_dump /var/dumps/heap.hprof
+
+# Class histogram without full dump
+jcmd &lt;pid&gt; GC.class_histogram
+
+# VM flags (check current GC settings)
+jcmd &lt;pid&gt; VM.flags
+
+# Thread dump
+jcmd &lt;pid&gt; Thread.print
+
+# Force GC (to see what survives)
+jcmd &lt;pid&gt; GC.run
+
+# Native Memory Tracking (requires -XX:NativeMemoryTracking=detail at startup)
+jcmd &lt;pid&gt; VM.native_memory summary
+jcmd &lt;pid&gt; VM.native_memory detail
+jcmd &lt;pid&gt; VM.native_memory baseline
+jcmd &lt;pid&gt; VM.native_memory summary.diff  # Compare to baseline
+
+# Start/stop JFR recording
+jcmd &lt;pid&gt; JFR.start name=leak duration=60s filename=/tmp/recording.jfr
+jcmd &lt;pid&gt; JFR.dump name=leak filename=/tmp/recording.jfr
+jcmd &lt;pid&gt; JFR.stop name=leak</code></pre>
+      </details>
+
+      <details>
+        <summary>Eclipse MAT — Memory Analyzer Tool</summary>
+        <p>The gold standard for heap dump analysis. Key features for leak investigation:</p>
+        <pre><code class="language-bash"># Open heap dump in MAT (GUI or headless)
+# GUI: File → Open Heap Dump → select .hprof file
+
+# Headless analysis for production (generates HTML report)
+./ParseHeapDump.sh /var/dumps/heap.hprof \
+  org.eclipse.mat.api:suspects \
+  org.eclipse.mat.api:overview \
+  org.eclipse.mat.api:top_components</code></pre>
+        <p><strong>Key MAT concepts:</strong></p>
+        <ul>
+          <li><strong>Dominator Tree</strong> — Shows objects ranked by retained size. The dominator of an object X is the last GC root on all paths to X. If the dominator is freed, X becomes garbage.</li>
+          <li><strong>Retained Size vs Shallow Size</strong> — Shallow = object's own memory. Retained = memory freed if this object is GC'd (includes all dominated objects).</li>
+          <li><strong>GC Roots</strong> — Objects that cannot be garbage collected: thread stacks, static fields, JNI references, system classes.</li>
+          <li><strong>Leak Suspects Report</strong> — Automatic analysis identifying likely leak sources.</li>
+          <li><strong>OQL (Object Query Language)</strong> — SQL-like queries on the heap.</li>
+        </ul>
+        <pre><code class="language-bash"># Useful MAT OQL queries:
+
+# Find all ThreadLocal values
+SELECT tl.value FROM INSTANCEOF java.lang.ThreadLocal$ThreadLocalMap$Entry tl
+WHERE tl.value != null
+
+# Find large HashMaps (potential unbounded caches)
+SELECT m, m.size, m.@retainedHeapSize 
+FROM java.util.HashMap m 
+WHERE m.size &gt; 10000
+
+# Find objects holding references to specific class
+SELECT * FROM INSTANCEOF com.example.RequestContext
+
+# Classloader leak detection
+SELECT cl, cl.@retainedHeapSize 
+FROM INSTANCEOF java.lang.ClassLoader cl
+WHERE cl.@retainedHeapSize &gt; 50000000</code></pre>
+      </details>
+
+      <details>
+        <summary>JFR — Java Flight Recorder</summary>
+        <p>Low-overhead continuous profiling. Ideal for production because it's always-on with &lt;2% overhead:</p>
+        <pre><code class="language-bash"># Enable JFR at startup (always-on, circular buffer)
+java -XX:StartFlightRecording=\
+  disk=true,\
+  maxage=7d,\
+  maxsize=1g,\
+  dumponexit=true,\
+  filename=/var/jfr/app.jfr,\
+  settings=profile \
+  -jar application.jar
+
+# Dump current recording without stopping it
+jcmd &lt;pid&gt; JFR.dump name=1 filename=/tmp/leak-investigation.jfr
+
+# Start targeted recording for allocation profiling
+jcmd &lt;pid&gt; JFR.start \
+  name=alloc-profile \
+  duration=300s \
+  filename=/tmp/alloc.jfr \
+  settings=profile \
+  jdk.ObjectAllocationInNewTLAB#enabled=true \
+  jdk.ObjectAllocationOutsideTLAB#enabled=true</code></pre>
+        <p><strong>Key JFR events for leak investigation:</strong></p>
+        <ul>
+          <li><code>jdk.OldObjectSample</code> — Samples of objects that survived into Old Gen (shows allocation stack trace)</li>
+          <li><code>jdk.ObjectAllocationInNewTLAB</code> — Allocation site profiling</li>
+          <li><code>jdk.GCHeapSummary</code> — Heap usage before/after each GC</li>
+          <li><code>jdk.MetaspaceAllocationFailure</code> — Metaspace pressure</li>
+          <li><code>jdk.GarbageCollection</code> — GC pause times and types</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>async-profiler — Allocation Profiling</summary>
+        <p>async-profiler can profile allocations with near-zero overhead, producing flame graphs showing where memory is being allocated:</p>
+        <pre><code class="language-bash"># Attach to running JVM and profile allocations for 60 seconds
+./asprof -d 60 -e alloc -f /tmp/alloc-flamegraph.html &lt;pid&gt;
+
+# Profile only objects surviving to Old Gen (TLAB-based)
+./asprof -d 300 -e alloc --alloc 1m -f /tmp/old-gen-alloc.html &lt;pid&gt;
+
+# Profile with specific allocation size threshold (ignore small objects)
+./asprof -d 60 -e alloc --alloc 512k -f /tmp/large-alloc.html &lt;pid&gt;
+
+# Live heap profiling (shows objects currently alive, not just allocated)
+./asprof -d 60 -e live -f /tmp/live-heap.html &lt;pid&gt;</code></pre>
+        <p><strong>Reading the flame graph:</strong> Width represents bytes allocated. The stack traces show you exactly which code paths are allocating memory that survives into Old Gen. Look for wide bars in unexpected places.</p>
+      </details>
+
+      <details>
+        <summary>NMT — Native Memory Tracking</summary>
+        <p>Tracks all memory allocated by the JVM itself (not just heap). Essential for native memory leaks:</p>
+        <pre><code class="language-bash"># Must be enabled at startup (5-10% overhead)
+java -XX:NativeMemoryTracking=detail -jar app.jar
+
+# Take baseline
+jcmd &lt;pid&gt; VM.native_memory baseline
+
+# After several days, compare:
+jcmd &lt;pid&gt; VM.native_memory detail.diff
+
+# Example output showing a leak:
+#
+# Native Memory Tracking:
+# Total: reserved=14GB +2GB, committed=12GB +2GB
+#
+# -                    Java Heap (reserved=8GB, committed=8GB)
+#                               (mmap: reserved=8GB, committed=8GB)
+#
+# -                       Class (reserved=1100MB +200MB, committed=1050MB +200MB)
+#                               (classes #45000 +15000)  ← classloader leak!
+#                               (malloc=34MB +12MB #450000 +150000)
+#
+# -                      Thread (reserved=800MB +300MB, committed=800MB +300MB)
+#                               (thread #800 +300)  ← thread leak!
+#
+# -                    Internal (reserved=2500MB +1800MB, committed=2500MB +1800MB)
+#                               (malloc=2500MB +1800MB)  ← native alloc leak!</code></pre>
+        <p><strong>Categories to watch:</strong></p>
+        <ul>
+          <li><strong>Class</strong> — Growing = classloader leak (hot redeployment, dynamic proxies)</li>
+          <li><strong>Thread</strong> — Growing = threads created but not dying</li>
+          <li><strong>Internal</strong> — Growing = direct byte buffers or JNI malloc</li>
+          <li><strong>Code</strong> — Growing = JIT compiled code accumulating (rare)</li>
+        </ul>
+      </details>
+    </section>
+
+
+    <!-- Section 6: Heap Dump Analysis -->
+    <section id="heap-dump-analysis">
+      <h2>Taking and Analyzing Heap Dumps</h2>
+      <details>
+        <summary>Capturing Heap Dumps Safely in Production</summary>
+        <p>Taking a heap dump is an invasive operation. Follow this procedure to minimize impact:</p>
+        <pre><code class="language-bash"># Step 1: Remove node from load balancer (no new traffic)
+aws elbv2 deregister-targets \
+  --target-group-arn arn:aws:elasticloadbalancing:us-east-1:123456789:targetgroup/my-app/abc123 \
+  --targets Id=i-0abc123def456
+
+# Step 2: Wait for in-flight requests to drain (30-60s)
+sleep 60
+
+# Step 3: Take heap dump
+# Option A: jmap (simple)
+jmap -dump:live,format=b,file=/var/dumps/heap-$(hostname)-$(date +%Y%m%d-%H%M%S).hprof $(pgrep -f 'application.jar')
+
+# Option B: jcmd (preferred, more control)
+jcmd $(pgrep -f 'application.jar') GC.heap_dump /var/dumps/heap.hprof
+
+# Option C: Trigger via JMX (useful for remote debugging)
+# Connect via JConsole → MBeans → com.sun.management → HotSpotDiagnostic → dumpHeap
+
+# Step 4: Compress and copy off the instance
+gzip /var/dumps/heap.hprof
+aws s3 cp /var/dumps/heap.hprof.gz s3://my-debug-bucket/incidents/2024-01-15/
+
+# Step 5: Re-register node (or let it be replaced by ASG)
+aws elbv2 register-targets \
+  --target-group-arn arn:aws:elasticloadbalancing:us-east-1:123456789:targetgroup/my-app/abc123 \
+  --targets Id=i-0abc123def456</code></pre>
+        <p><strong>Automatic heap dump on OOM:</strong></p>
+        <pre><code class="language-bash"># Always have this in production JVM args
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/var/dumps/oom-heap.hprof
+-XX:OnOutOfMemoryError="kill -9 %p"  # Kill after dump to allow fast restart
+
+# For containerized environments (K8s), dump to a mounted volume:
+-XX:HeapDumpPath=/mnt/debug-volume/oom-$(hostname).hprof</code></pre>
+      </details>
+
+      <details>
+        <summary>Dominator Tree Analysis</summary>
+        <p>The dominator tree is the most powerful tool for finding leaks. It shows which objects "dominate" (keep alive) the most memory:</p>
+        <pre><code class="language-bash"># In Eclipse MAT:
+# 1. Open heap dump
+# 2. Click "Dominator Tree" icon (or Analyze → Dominator Tree)
+# 3. Sort by "Retained Heap" descending
+#
+# Typical output for ThreadLocal leak:
+#
+# Class Name                          | Shallow Heap | Retained Heap
+# ────────────────────────────────────┼──────────────┼──────────────
+# java.lang.Thread (http-nio-8080-1)  |         120  |  512,000,000  ← 512MB!
+#   └─ java.lang.ThreadLocal$Map      |          64  |  511,999,800
+#       └─ Entry[256]                 |       4,096  |  511,999,700
+#           └─ com.example.RequestCtx |         200  |  450,000,000
+#               └─ java.util.HashMap  |          56  |  449,000,000
+#                   └─ Node[65536]    |     524,288  |  448,999,000
+#
+# This tells us:
+# - Thread http-nio-8080-1 retains 512MB
+# - It's held via a ThreadLocal map
+# - The ThreadLocal value is a RequestContext
+# - Which contains a HashMap with 65536 entries (way too many!)</code></pre>
+        <p><strong>Key insight:</strong> If you see threads dominating disproportionate memory, it's almost certainly a ThreadLocal leak in a thread-pool environment.</p>
+      </details>
+
+      <details>
+        <summary>GC Roots &amp; Reference Chains</summary>
+        <p>Once you find the large retained objects, trace backwards to understand WHY they can't be collected:</p>
+        <pre><code class="language-bash"># In Eclipse MAT:
+# Right-click suspicious object → "Path to GC Roots" → "exclude weak/soft references"
+#
+# Example output:
+#
+# com.example.RequestContext @ 0x7f8a1234
+#   ↑ referent in java.lang.ThreadLocal$ThreadLocalMap$Entry @ 0x7f8a5678
+#     ↑ table[42] in java.lang.ThreadLocal$ThreadLocalMap @ 0x7f8a9abc
+#       ↑ threadLocals in java.lang.Thread @ 0x7f8adef0  [Thread: http-nio-8080-exec-1]
+#
+# Translation: 
+# The RequestContext is alive because:
+# 1. A Thread (GC root — thread stacks are always GC roots)
+# 2. Has a ThreadLocalMap
+# 3. Which has an Entry
+# 4. Whose value is our RequestContext
+#
+# ROOT CAUSE: The ThreadLocal was set but never removed!</code></pre>
+        <pre><code class="language-bash"># OQL queries to investigate GC roots:
+
+# Find all GC roots for a specific class
+SELECT * FROM OBJECTS (
+  SELECT referrer FROM OBJECTS (
+    inbound(obj)
+  )
+) WHERE @GCRootInfo != null
+
+# Find the shortest path from a leaked object to GC root
+# (Use MAT's "Shortest Paths to GC Roots" context menu)
+
+# Find all objects retained by a specific thread
+SELECT OBJECTS o FROM java.lang.Thread t, OBJECTS t.threadLocals.table[0:-1].value o
+WHERE t.name.toString().startsWith("http-nio")</code></pre>
+      </details>
+
+      <details>
+        <summary>Retained Size vs Shallow Size</summary>
+        <p>Understanding this distinction is crucial for interpreting heap dumps correctly:</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Concept</th>
+              <th>Definition</th>
+              <th>Example</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Shallow Size</strong></td>
+              <td>Memory consumed by the object itself (its fields)</td>
+              <td>A HashMap with 1M entries: shallow = 56 bytes (just the object header + fields)</td>
+            </tr>
+            <tr>
+              <td><strong>Retained Size</strong></td>
+              <td>Memory freed if this object is GC'd (includes all objects reachable only through it)</td>
+              <td>Same HashMap: retained = 200MB (includes all Entry nodes, keys, and values)</td>
+            </tr>
+            <tr>
+              <td><strong>Deep Size</strong></td>
+              <td>Total size of object graph reachable from this object (may overlap with other retainers)</td>
+              <td>If values are shared with another map, deep &gt; retained</td>
+            </tr>
+          </tbody>
+        </table>
+        <pre><code class="language-java">// Visualizing the difference:
+//
+// Object A (shallow: 32 bytes, retained: 1 GB)
+//   └─ Object B (shallow: 32 bytes, retained: 999 MB)
+//       └─ byte[999_000_000]  (shallow: 999 MB, retained: 999 MB)
+//
+// If only A references B, and only B references the byte array:
+//   - Freeing A frees A + B + byte[] = 1 GB (retained size of A)
+//   - The byte[] has high shallow AND retained size
+//   - A has low shallow but high retained size
+//
+// LESSON: Sort by RETAINED size to find leak roots.
+// Sort by SHALLOW size to find the actual memory consumers.</code></pre>
+      </details>
+
+      <details>
+        <summary>Comparing Heap Dumps Over Time</summary>
+        <p>The most reliable technique: take dumps at known-good (day 1) and known-bad (day 5) states, then diff:</p>
+        <pre><code class="language-bash"># In Eclipse MAT:
+# 1. Open both heap dumps
+# 2. Use "Compare Snapshots" feature
+# 3. Select "Dominator Tree" comparison
+#
+# Shows delta between dumps:
+#
+# Class Name                    | Objects (Day1) | Objects (Day5) | Delta
+# ─────────────────────────────┼────────────────┼────────────────┼──────
+# com.example.RequestContext    |          200   |      1,200,000 | +1,199,800 ⚠️
+# java.util.HashMap$Node       |       50,000   |     35,000,000 | +34,950,000 ⚠️
+# byte[]                        |      100,000   |     36,000,000 | +35,900,000 ⚠️
+# java.lang.String             |       80,000   |     12,000,000 | +11,920,000 ⚠️
+# com.example.AuditEntry       |            0   |      5,000,000 | +5,000,000 ⚠️
+
+# This immediately tells us:
+# - RequestContext objects are accumulating (ThreadLocal leak?)
+# - HashMap nodes are growing (unbounded cache?)
+# - AuditEntry objects are never evicted</code></pre>
+        <pre><code class="language-bash"># Automating comparison with MAT command line:
+./ParseHeapDump.sh heap-day1.hprof org.eclipse.mat.api:suspects
+./ParseHeapDump.sh heap-day5.hprof org.eclipse.mat.api:suspects
+
+# Compare class histograms directly:
+jmap -histo:live &lt;pid&gt; &gt; /tmp/histo-day1.txt  # Take on day 1
+jmap -histo:live &lt;pid&gt; &gt; /tmp/histo-day5.txt  # Take on day 5
+diff /tmp/histo-day1.txt /tmp/histo-day5.txt   # See what grew</code></pre>
+      </details>
+    </section>
+
+
+    <!-- Section 7: Real Production Incident -->
+    <section id="production-incident">
+      <h2>Real Incident: ThreadLocal Leak in Request Filter</h2>
+      <details>
+        <summary>Timeline: Detection to Resolution</summary>
+        <p>A real production incident at a high-traffic e-commerce platform (50K RPM, 12 nodes, 10GB heap each):</p>
+        <pre><code class="language-bash"># ═══════════════════════════════════════════════════════════════════
+# INCIDENT TIMELINE
+# ═══════════════════════════════════════════════════════════════════
+
+# Day 0 (Monday): Fresh deployment
+# - Heap: 3.2GB used (normal baseline)
+# - Old Gen: 1.8GB used after Full GC
+# - GC pauses: Minor GC every 8s (~15ms), Full GC every 6 hours (~200ms)
+# - p99 latency: 45ms
+
+# Day 2 (Wednesday): Monitoring shows slow upward trend
+# - Heap: 5.1GB used
+# - Old Gen: 3.8GB used after Full GC  ← growing!
+# - GC pauses: Minor GC every 5s (~20ms), Full GC every 2 hours (~400ms)
+# - p99 latency: 52ms  (within SLA, no alert)
+
+# Day 4 (Friday): On-call engineer notices GC dashboard
+# - Heap: 8.2GB used
+# - Old Gen: 7.1GB used after Full GC  ← critical!
+# - GC pauses: Minor GC every 2s (~50ms), Full GC every 30 minutes (~2s)
+# - p99 latency: 180ms  ← degraded but not alerting yet
+
+# Day 5 (Saturday 03:00): OOM Kill
+# - Heap: 10GB (maxed out)
+# - Full GC every 30 seconds, 8-second pauses
+# - GC overhead &gt; 90% — JVM spending more time in GC than serving requests
+# - p99 latency: 12,000ms → connection timeouts → cascade failure
+# - Kubernetes OOM killer terminates pod (RSS exceeds limit)
+# - 3 of 12 pods killed within 10 minutes
+# - PagerDuty: "SERVICE DEGRADED — Error rate &gt; 5%"</code></pre>
+      </details>
+
+      <details>
+        <summary>Root Cause Analysis</summary>
+        <p>The leak was caused by a request correlation filter deployed on Day 0:</p>
+        <pre><code class="language-java">/**
+ * BUGGY CODE: Deployed in release v2.34.0 on Monday
+ * Purpose: Track request metadata for distributed tracing
+ */
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class RequestCorrelationFilter extends OncePerRequestFilter {
+
+    private static final ThreadLocal&lt;CorrelationContext&gt; CONTEXT = new ThreadLocal&lt;&gt;();
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain filterChain) throws ServletException, IOException {
+
+        CorrelationContext ctx = new CorrelationContext();
+        ctx.setRequestId(UUID.randomUUID().toString());
+        ctx.setUserId(request.getHeader("X-User-Id"));
+        ctx.setTraceId(request.getHeader("X-Trace-Id"));
+        ctx.setStartTime(Instant.now());
+        ctx.setAttributes(new HashMap&lt;&gt;());  // ← THIS IS THE PROBLEM
+
+        CONTEXT.set(ctx);
+
+        try {
+            filterChain.doFilter(request, response);
+        } catch (Exception e) {
+            // On exception, we skip the finally block below
+            // because the developer put cleanup OUTSIDE the catch
+            ctx.getAttributes().put("error", e.getMessage());
+            ctx.getAttributes().put("stackTrace", ExceptionUtils.getStackTraceAsString(e));
+            throw e;
+        }
+
+        // BUG: This line is NEVER reached if an exception is thrown!
+        CONTEXT.remove();
+    }
+
+    public static CorrelationContext current() {
+        return CONTEXT.get();
+    }
+}
+
+/**
+ * The CorrelationContext object that grows over time
+ */
+public class CorrelationContext {
+    private String requestId;
+    private String userId;
+    private String traceId;
+    private Instant startTime;
+    private Map&lt;String, Object&gt; attributes;  // Grows unbounded!
+
+    // Various services add to attributes during request processing:
+    // - PaymentService adds payment details
+    // - InventoryService adds stock levels
+    // - RecommendationService adds ML model results (large byte arrays!)
+    // Each attribute is 5-50KB
+}</code></pre>
+        <pre><code class="language-java">/**
+ * Downstream service that adds data to the context
+ * This is why the leak grows: each request adds data that is never freed
+ */
+@Service
+public class RecommendationService {
+
+    public List&lt;Product&gt; getRecommendations(String userId) {
+        CorrelationContext ctx = RequestCorrelationFilter.current();
+
+        // Each call adds ~50KB of ML model output to the context
+        // On a reused thread, this accumulates across requests!
+        if (ctx != null) {
+            ctx.getAttributes().put("ml_scores_" + System.nanoTime(),
+                mlModel.score(userId));  // 50KB per call
+            ctx.getAttributes().put("feature_vector_" + System.nanoTime(),
+                featureStore.getVector(userId));  // 20KB per call
+        }
+
+        return recommendations;
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>How It Was Discovered</summary>
+        <pre><code class="language-bash"># Step 1: Check GC logs (already confirmed growing Old Gen)
+grep "Full GC" /var/log/gc/gc.log | tail -20
+# [2024-01-20T03:01:15] [GC pause (G1 Evacuation) 9.8G-&gt;9.6G(10G) 8.234s]
+# [2024-01-20T03:01:45] [GC pause (G1 Evacuation) 9.9G-&gt;9.7G(10G) 8.891s]
+# Only reclaiming 200MB per Full GC = almost everything is reachable!
+
+# Step 2: Take heap dump from a node removed from LB
+kubectl exec pod/app-node-7 -- jcmd 1 GC.heap_dump /tmp/heap.hprof
+kubectl cp pod/app-node-7:/tmp/heap.hprof ./heap-day5.hprof
+
+# Step 3: Quick histogram reveals the smoking gun
+kubectl exec pod/app-node-7 -- jmap -histo:live 1 | head -15
+#  num     #instances     #bytes  class name
+#    1:      8500000   680000000  [B  (byte arrays from ML scores)
+#    2:      4200000   336000000  java.util.HashMap$Node
+#    3:      4200000   201600000  java.lang.String
+#    4:      2100000   168000000  com.example.CorrelationContext ← BINGO!
+#    5:      2100000    67200000  java.util.HashMap
+
+# Step 4: MAT Analysis — Dominator tree confirms ThreadLocal retention
+# Thread "http-nio-8080-exec-42" retains 512MB
+#   └─ ThreadLocal$ThreadLocalMap
+#       └─ Entry (referent=RequestCorrelationFilter.CONTEXT)
+#           └─ CorrelationContext (attributes map with 45,000 entries!)
+
+# Step 5: Trace back to code — the filter never removes on exception path</code></pre>
+      </details>
+
+      <details>
+        <summary>The Fix &amp; Prevention</summary>
+        <pre><code class="language-java">/**
+ * FIXED CODE: v2.34.1 hotfix
+ */
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class RequestCorrelationFilter extends OncePerRequestFilter {
+
+    private static final ThreadLocal&lt;CorrelationContext&gt; CONTEXT = new ThreadLocal&lt;&gt;();
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain filterChain) throws ServletException, IOException {
+
+        CorrelationContext ctx = new CorrelationContext();
+        ctx.setRequestId(UUID.randomUUID().toString());
+        ctx.setUserId(request.getHeader("X-User-Id"));
+        ctx.setTraceId(request.getHeader("X-Trace-Id"));
+        ctx.setStartTime(Instant.now());
+        // FIX 1: Bounded attributes map
+        ctx.setAttributes(new LinkedHashMap&lt;&gt;(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry&lt;String, Object&gt; eldest) {
+                return size() &gt; 100;  // Hard cap at 100 attributes
+            }
+        });
+
+        CONTEXT.set(ctx);
+
+        try {
+            filterChain.doFilter(request, response);
+        } finally {
+            // FIX 2: ALWAYS clean up, no matter what
+            CONTEXT.remove();
+        }
+    }
+
+    public static CorrelationContext current() {
+        return CONTEXT.get();
+    }
+}</code></pre>
+        <pre><code class="language-yaml"># Prevention: Added monitoring and alerts
+# prometheus-alerts.yml
+groups:
+  - name: memory-leak-detection
+    rules:
+      - alert: OldGenGrowthAnomaly
+        expr: |
+          (
+            jvm_memory_used_bytes{area="heap", id="G1 Old Gen"}
+            - jvm_memory_used_bytes{area="heap", id="G1 Old Gen"} offset 24h
+          ) > 1073741824
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Old Gen grew by >1GB in 24 hours on {{ $labels.instance }}"
+          runbook: "https://wiki.internal/runbooks/memory-leak-investigation"
+
+      - alert: GCOverheadHigh
+        expr: |
+          rate(jvm_gc_pause_seconds_sum{action="end of major GC"}[5m])
+          / rate(jvm_gc_pause_seconds_count{action="end of major GC"}[5m]) > 2
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Full GC pauses averaging >2s on {{ $labels.instance }}"</code></pre>
+      </details>
+    </section>
+
+
+    <!-- Section 8: Systematic Debugging Workflow -->
+    <section id="debugging-workflow">
+      <h2>Systematic Investigation Workflow</h2>
+      <details>
+        <summary>Phase 1: Confirm the Leak (Hours 0–4)</summary>
+        <p>Before diving into heap dumps, confirm you actually have a leak and characterize it:</p>
+        <pre><code class="language-bash"># Step 1: Check heap usage trend over time (Grafana/Prometheus)
+# Query: jvm_memory_used_bytes{area="heap", id="G1 Old Gen"}
+# Look for: monotonically increasing post-GC baseline
+
+# Step 2: Check GC frequency and pause times
+# Query: rate(jvm_gc_pause_seconds_count{action="end of major GC"}[1h])
+# Look for: increasing Full GC frequency
+
+# Step 3: Determine if it's heap or native memory
+# Compare: container RSS vs JVM heap used
+# If RSS &gt;&gt; heap → native memory leak
+# If RSS ≈ heap + metaspace + thread_stacks → heap leak
+
+# Step 4: Check if it's specific to one instance or all
+# If all instances: code bug (introduced in recent deployment)
+# If one instance: workload-specific trigger or race condition
+
+# Step 5: Check deployment timeline
+# Did this start after a specific deployment?
+kubectl rollout history deployment/my-app
+git log --oneline --since="5 days ago" -- src/main/java/com/example/filter/</code></pre>
+        <p><strong>Key decision:</strong> Is this urgent (hours until OOM) or can you investigate over days?</p>
+        <ul>
+          <li><strong>Urgent:</strong> Take heap dump immediately, rolling-restart to buy time</li>
+          <li><strong>Non-urgent:</strong> Set up comparative dumps, enable JFR, profile allocations</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>Phase 2: Evidence Collection (Hours 4–24)</summary>
+        <p>Gather data for root cause analysis without losing the evidence:</p>
+        <pre><code class="language-bash"># Comparative heap dumps strategy:
+# Take dumps at different points to see GROWTH, not just state
+
+# Day 1 (baseline): immediately after deployment
+jcmd &lt;pid&gt; GC.heap_dump /var/dumps/heap-baseline.hprof
+jmap -histo:live &lt;pid&gt; &gt; /var/dumps/histo-baseline.txt
+
+# Day 3 (growing): system showing growth but not critical
+jcmd &lt;pid&gt; GC.heap_dump /var/dumps/heap-day3.hprof
+jmap -histo:live &lt;pid&gt; &gt; /var/dumps/histo-day3.txt
+
+# Day 5 (pre-OOM): system approaching OOM
+jcmd &lt;pid&gt; GC.heap_dump /var/dumps/heap-day5.hprof
+jmap -histo:live &lt;pid&gt; &gt; /var/dumps/histo-day5.txt
+
+# Quick comparison of histograms
+diff &lt;(awk '{print $4, $3}' /var/dumps/histo-baseline.txt | sort -k2 -rn | head -20) \
+     &lt;(awk '{print $4, $3}' /var/dumps/histo-day5.txt | sort -k2 -rn | head -20)
+
+# Enable continuous monitoring
+# JFR (low overhead, always-on)
+jcmd &lt;pid&gt; JFR.start name=leak-investigation duration=0 \
+  settings=profile maxage=7d maxsize=2g \
+  filename=/var/jfr/continuous.jfr
+
+# async-profiler allocation sampling
+./asprof start -e alloc --alloc 1m -f /var/profile/alloc-%t.jfr &lt;pid&gt;</code></pre>
+      </details>
+
+      <details>
+        <summary>Phase 3: Root Cause Analysis (Hours 24–48)</summary>
+        <p>With heap dumps in hand, systematically identify the leak source:</p>
+        <pre><code class="language-bash"># Analysis flowchart:
+#
+# 1. Open day-5 heap dump in Eclipse MAT
+#    └─ Run "Leak Suspects" report
+#       └─ Review top suspects (usually correct for simple leaks)
+#
+# 2. Open Dominator Tree
+#    └─ Sort by Retained Heap (descending)
+#    └─ Find the largest retained objects
+#       ├─ Thread objects → ThreadLocal leak
+#       ├─ Static fields → Unbounded collection
+#       ├─ ClassLoader → Redeployment leak
+#       └─ byte[] / char[] → Cached data growing
+#
+# 3. For top suspect: "Path to GC Roots" → "exclude weak/soft references"
+#    └─ This shows WHY the object can't be collected
+#    └─ Trace back to the responsible code
+#
+# 4. Compare with baseline dump
+#    └─ Which object counts/sizes grew disproportionately?
+#    └─ MAT: "Compare Snapshots" tool
+#
+# 5. Cross-reference with allocation profiler
+#    └─ JFR OldObjectSample events show WHERE leaked objects were allocated
+#    └─ async-profiler alloc flame graph shows HOT allocation sites</code></pre>
+        <pre><code class="language-java">// Common patterns you'll find in the dominator tree:
+
+// Pattern 1: ThreadLocal → large retained size on Thread objects
+// Fix: Add try-finally with ThreadLocal.remove()
+
+// Pattern 2: Static ConcurrentHashMap → millions of entries
+// Fix: Replace with Caffeine/Guava cache with maxSize + expireAfterWrite
+
+// Pattern 3: EventBus/ApplicationEventPublisher → growing listener list
+// Fix: Add @PreDestroy to unregister, use WeakReference listeners
+
+// Pattern 4: ScheduledExecutorService → queued tasks accumulating
+// Fix: Bounded queue, or ensure tasks complete (not just scheduled)
+
+// Pattern 5: StringBuilder/ByteArrayOutputStream growing in reused object
+// Fix: Reset or recreate per use, don't store in ThreadLocal without clearing</code></pre>
+      </details>
+
+      <details>
+        <summary>Phase 4: Validation &amp; Soak Testing</summary>
+        <p>After fixing, prove the leak is gone with extended testing:</p>
+        <pre><code class="language-bash"># Soak test configuration
+# Goal: Reproduce production traffic patterns over 7+ days (accelerated)
+
+# Gatling/k6 load test simulating 7 days of traffic in 24 hours
+k6 run --duration 24h --vus 200 \
+  --env TARGET=http://staging:8080 \
+  soak-test.js
+
+# Monitor during soak test:
+# 1. Heap usage after Full GC should be FLAT (not growing)
+# 2. Object counts should stabilize
+# 3. GC pause times should be consistent
+# 4. No increase in Full GC frequency</code></pre>
+        <pre><code class="language-java">// Automated leak detection in CI/CD pipeline
+@SpringBootTest
+@DirtiesContext
+public class MemoryLeakRegressionTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @Test
+    void shouldNotLeakMemoryOverManyRequests() throws Exception {
+        // Warm up
+        for (int i = 0; i &lt; 1000; i++) {
+            mockMvc.perform(get("/api/resource/" + i)).andExpect(status().isOk());
+        }
+
+        // Force GC and measure baseline
+        System.gc();
+        Thread.sleep(1000);
+        long baselineMemory = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+
+        // Simulate sustained load
+        for (int i = 0; i &lt; 100_000; i++) {
+            mockMvc.perform(get("/api/resource/" + (i % 1000)))
+                .andExpect(status().isOk());
+
+            // Periodically throw exceptions (to test error paths)
+            if (i % 100 == 0) {
+                mockMvc.perform(get("/api/resource/invalid-" + i))
+                    .andExpect(status().is4xxClientError());
+            }
+        }
+
+        // Force GC and measure final
+        System.gc();
+        Thread.sleep(1000);
+        long finalMemory = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+
+        // Allow 20% growth (normal variance) but not unbounded growth
+        long growth = finalMemory - baselineMemory;
+        assertThat(growth).isLessThan(baselineMemory / 5);  // &lt;20% growth
+    }
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- Section 9: Code Examples -->
+    <section id="code-examples">
+      <h2>Production-Ready Code Patterns</h2>
+      <details>
+        <summary>ThreadLocal with try-finally Cleanup</summary>
+        <pre><code class="language-java">/**
+ * Safe ThreadLocal pattern using AutoCloseable for guaranteed cleanup.
+ * Works with try-with-resources for scope-bounded ThreadLocal usage.
+ */
+public class SafeThreadLocalScope&lt;T&gt; implements AutoCloseable {
+
+    private final ThreadLocal&lt;T&gt; threadLocal;
+
+    private SafeThreadLocalScope(ThreadLocal&lt;T&gt; threadLocal, T value) {
+        this.threadLocal = threadLocal;
+        this.threadLocal.set(value);
+    }
+
+    public static &lt;T&gt; SafeThreadLocalScope&lt;T&gt; open(ThreadLocal&lt;T&gt; tl, T value) {
+        return new SafeThreadLocalScope&lt;&gt;(tl, value);
+    }
+
+    public T get() {
+        return threadLocal.get();
+    }
+
+    @Override
+    public void close() {
+        threadLocal.remove();
+    }
+}
+
+// Usage in a filter:
+@Component
+public class SafeRequestFilter extends OncePerRequestFilter {
+
+    private static final ThreadLocal&lt;RequestContext&gt; CONTEXT = new ThreadLocal&lt;&gt;();
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain chain) throws ServletException, IOException {
+        try (SafeThreadLocalScope&lt;RequestContext&gt; scope =
+                 SafeThreadLocalScope.open(CONTEXT, buildContext(request))) {
+            chain.doFilter(request, response);
+        }
+        // CONTEXT.remove() is GUARANTEED by AutoCloseable
+    }
+
+    public static RequestContext current() {
+        return CONTEXT.get();
+    }
+
+    private RequestContext buildContext(HttpServletRequest request) {
+        return new RequestContext(
+            request.getHeader("X-Request-Id"),
+            Instant.now()
+        );
+    }
+}
+
+/**
+ * Alternative: Spring's RequestContextHolder (already handles cleanup)
+ * Use this instead of custom ThreadLocals when possible.
+ */
+@Component
+public class SpringManagedContextFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain chain) throws ServletException, IOException {
+        // Spring's RequestAttributes is cleaned up by the framework
+        RequestContextHolder.currentRequestAttributes()
+            .setAttribute("correlationId",
+                request.getHeader("X-Correlation-Id"),
+                RequestAttributes.SCOPE_REQUEST);
+        chain.doFilter(request, response);
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>WeakReference Caches</summary>
+        <pre><code class="language-java">/**
+ * WeakHashMap-based cache: entries are eligible for GC when keys
+ * are no longer strongly referenced elsewhere.
+ *
+ * CAVEAT: Not thread-safe! Wrap with Collections.synchronizedMap or use Caffeine.
+ */
+public class WeakCache&lt;K, V&gt; {
+    private final Map&lt;K, V&gt; cache = Collections.synchronizedMap(new WeakHashMap&lt;&gt;());
+
+    public V get(K key) {
+        return cache.get(key);
+    }
+
+    public void put(K key, V value) {
+        cache.put(key, value);
+    }
+}
+
+/**
+ * Production-grade: Caffeine cache with weak values
+ * Entries are GC'd when the value is no longer strongly referenced.
+ */
+@Configuration
+public class CacheConfig {
+
+    @Bean
+    public Cache&lt;String, UserSession&gt; sessionCache() {
+        return Caffeine.newBuilder()
+            .weakValues()                              // GC-friendly
+            .maximumSize(100_000)                      // Hard upper bound
+            .expireAfterAccess(Duration.ofMinutes(30)) // Idle TTL
+            .expireAfterWrite(Duration.ofHours(4))     // Absolute TTL
+            .recordStats()                             // Metrics for Micrometer
+            .removalListener((key, value, cause) -&gt; {
+                if (cause.wasEvicted()) {
+                    log.debug("Session {} evicted: {}", key, cause);
+                }
+            })
+            .build();
+    }
+
+    /**
+     * SoftReference-based cache: JVM will clear these before throwing OOM.
+     * Good for optional caching where data can be re-fetched.
+     */
+    @Bean
+    public Cache&lt;Long, ExpensiveResult&gt; computationCache() {
+        return Caffeine.newBuilder()
+            .softValues()                              // Cleared under memory pressure
+            .maximumSize(10_000)
+            .expireAfterWrite(Duration.ofHours(1))
+            .build();
+    }
+}
+
+/**
+ * Spring Cache abstraction with Caffeine (declarative approach)
+ */
+@Configuration
+@EnableCaching
+public class SpringCacheConfig {
+
+    @Bean
+    public CacheManager cacheManager() {
+        CaffeineCacheManager manager = new CaffeineCacheManager();
+        manager.setCaffeine(Caffeine.newBuilder()
+            .maximumSize(10_000)
+            .expireAfterWrite(Duration.ofMinutes(10))
+            .recordStats());
+        return manager;
+    }
+}
+
+@Service
+public class ProductService {
+
+    @Cacheable(value = "products", key = "#productId")
+    public Product getProduct(String productId) {
+        // Only called on cache miss — result automatically cached with eviction
+        return productRepository.findById(productId).orElseThrow();
+    }
+
+    @CacheEvict(value = "products", key = "#productId")
+    public void updateProduct(String productId, ProductUpdate update) {
+        productRepository.save(update.toEntity());
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Connection Pool Leak Detection</summary>
+        <pre><code class="language-java">/**
+ * HikariCP configuration with leak detection and monitoring.
+ * Detects connections checked out but never returned.
+ */
+@Configuration
+public class DataSourceConfig {
+
+    @Bean
+    @ConfigurationProperties("spring.datasource.hikari")
+    public HikariConfig hikariConfig() {
+        HikariConfig config = new HikariConfig();
+        config.setMaximumPoolSize(20);
+        config.setMinimumIdle(5);
+        config.setConnectionTimeout(5000);   // 5s to get connection
+        config.setIdleTimeout(300000);       // 5min idle before close
+        config.setMaxLifetime(1800000);      // 30min max connection age
+
+        // LEAK DETECTION: Log stack trace if connection held > 30s
+        config.setLeakDetectionThreshold(30000);
+
+        // Connection validation
+        config.setConnectionTestQuery("SELECT 1");
+        config.setValidationTimeout(3000);
+
+        return config;
+    }
+
+    @Bean
+    public DataSource dataSource(HikariConfig config) {
+        return new HikariDataSource(config);
+    }
+}
+
+/**
+ * Custom leak-aware wrapper for critical code paths
+ */
+public class LeakAwareConnectionWrapper implements AutoCloseable {
+
+    private static final Logger log = LoggerFactory.getLogger(LeakAwareConnectionWrapper.class);
+    private static final AtomicInteger OPEN_CONNECTIONS = new AtomicInteger(0);
+
+    private final Connection delegate;
+    private final String allocationStackTrace;
+    private final Instant checkedOutAt;
+    private volatile boolean closed = false;
+
+    public LeakAwareConnectionWrapper(Connection delegate) {
+        this.delegate = delegate;
+        this.checkedOutAt = Instant.now();
+        this.allocationStackTrace = Arrays.stream(Thread.currentThread().getStackTrace())
+            .skip(2)
+            .limit(10)
+            .map(StackTraceElement::toString)
+            .collect(Collectors.joining("\n  at "));
+        int count = OPEN_CONNECTIONS.incrementAndGet();
+        if (count &gt; 15) {  // Warning threshold
+            log.warn("High open connection count: {}. Latest from:\n  at {}",
+                count, allocationStackTrace);
+        }
+    }
+
+    @Override
+    public void close() throws Exception {
+        if (!closed) {
+            closed = true;
+            OPEN_CONNECTIONS.decrementAndGet();
+            delegate.close();
+        }
+    }
+
+    // Called by a scheduled task to detect leaks
+    public void checkForLeak() {
+        if (!closed &amp;&amp; Duration.between(checkedOutAt, Instant.now()).toMinutes() &gt; 5) {
+            log.error("PROBABLE CONNECTION LEAK! Checked out {} ago from:\n  at {}",
+                Duration.between(checkedOutAt, Instant.now()), allocationStackTrace);
+        }
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>@PreDestroy Cleanup Pattern</summary>
+        <pre><code class="language-java">/**
+ * Proper lifecycle management for beans that register listeners,
+ * start threads, or hold external resources.
+ */
+@Component
+public class EventProcessingService implements DisposableBean {
+
+    private final EventBus eventBus;
+    private final ScheduledExecutorService scheduler;
+    private final Cache&lt;String, ProcessedEvent&gt; eventCache;
+    private final List&lt;Subscription&gt; subscriptions = new CopyOnWriteArrayList&lt;&gt;();
+
+    public EventProcessingService(EventBus eventBus) {
+        this.eventBus = eventBus;
+        this.scheduler = Executors.newScheduledThreadPool(2,
+            new ThreadFactoryBuilder().setNameFormat("event-processor-%d").setDaemon(true).build());
+        this.eventCache = Caffeine.newBuilder()
+            .maximumSize(10_000)
+            .expireAfterWrite(Duration.ofHours(1))
+            .build();
+    }
+
+    @PostConstruct
+    public void init() {
+        // Register with event bus
+        eventBus.register(this);
+
+        // Start background tasks
+        scheduler.scheduleAtFixedRate(this::processBacklog, 0, 30, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::reportMetrics, 0, 60, TimeUnit.SECONDS);
+
+        // Subscribe to external topics
+        subscriptions.add(messageBroker.subscribe("orders.*", this::onOrder));
+        subscriptions.add(messageBroker.subscribe("payments.*", this::onPayment));
+    }
+
+    @PreDestroy
+    @Override
+    public void destroy() {
+        // 1. Unregister from event bus
+        eventBus.unregister(this);
+
+        // 2. Cancel all subscriptions
+        subscriptions.forEach(Subscription::cancel);
+        subscriptions.clear();
+
+        // 3. Shut down executor gracefully
+        scheduler.shutdown();
+        try {
+            if (!scheduler.awaitTermination(30, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+                log.warn("Scheduler did not terminate within 30s, forced shutdown");
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+
+        // 4. Invalidate cache
+        eventCache.invalidateAll();
+        eventCache.cleanUp();
+
+        log.info("EventProcessingService destroyed cleanly");
+    }
+
+    @Subscribe
+    public void onEvent(DomainEvent event) {
+        eventCache.put(event.getId(), process(event));
+    }
+
+    private void processBacklog() { /* ... */ }
+    private void reportMetrics() { /* ... */ }
+    private void onOrder(Message msg) { /* ... */ }
+    private void onPayment(Message msg) { /* ... */ }
+    private ProcessedEvent process(DomainEvent event) { return null; /* ... */ }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Closeable Resources with Defensive Patterns</summary>
+        <pre><code class="language-java">/**
+ * Defensive resource management for complex workflows
+ * where multiple resources must be managed together.
+ */
+public class BatchExportService {
+
+    private static final Logger log = LoggerFactory.getLogger(BatchExportService.class);
+
+    /**
+     * Pattern 1: try-with-resources for simple cases
+     */
+    public void exportSimple(String query, Path outputFile) throws IOException, SQLException {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query);
+             ResultSet rs = stmt.executeQuery();
+             BufferedWriter writer = Files.newBufferedWriter(outputFile)) {
+
+            while (rs.next()) {
+                writer.write(formatRow(rs));
+                writer.newLine();
+            }
+        }
+        // ALL resources closed, even on exception
+    }
+
+    /**
+     * Pattern 2: Cleaner API for resources that outlive a method call
+     * (Java 9+ java.lang.ref.Cleaner)
+     */
+    private static final Cleaner CLEANER = Cleaner.create();
+
+    public class ManagedBuffer {
+        private ByteBuffer directBuffer;
+        private final Cleaner.Cleanable cleanable;
+
+        public ManagedBuffer(int size) {
+            this.directBuffer = ByteBuffer.allocateDirect(size);
+            // Safety net: if user forgets to close, Cleaner will free it
+            ByteBuffer bufferRef = this.directBuffer;
+            this.cleanable = CLEANER.register(this, () -&gt; {
+                // Release direct buffer's native memory
+                if (bufferRef instanceof sun.nio.ch.DirectBuffer db) {
+                    db.cleaner().clean();
+                }
+            });
+        }
+
+        public void close() {
+            cleanable.clean();  // Explicit cleanup (preferred)
+        }
+    }
+
+    /**
+     * Pattern 3: Resource tracking for debugging
+     */
+    public class TrackedInputStream extends FilterInputStream {
+
+        private static final Set&lt;TrackedInputStream&gt; OPEN_STREAMS =
+            Collections.newSetFromMap(new ConcurrentHashMap&lt;&gt;());
+
+        private final String allocationSite;
+        private final Instant openedAt;
+        private volatile boolean closed = false;
+
+        public TrackedInputStream(InputStream in) {
+            super(in);
+            this.openedAt = Instant.now();
+            this.allocationSite = Thread.currentThread().getStackTrace()[2].toString();
+            OPEN_STREAMS.add(this);
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (!closed) {
+                closed = true;
+                OPEN_STREAMS.remove(this);
+                super.close();
+            }
+        }
+
+        // Call periodically to detect leaks
+        public static void reportLeaks() {
+            OPEN_STREAMS.stream()
+                .filter(s -&gt; Duration.between(s.openedAt, Instant.now()).toMinutes() &gt; 5)
+                .forEach(s -&gt; log.warn("Stream leak! Opened {} ago at {}",
+                    Duration.between(s.openedAt, Instant.now()), s.allocationSite));
+        }
+    }
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- Section 10: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Mistakes candidates make when answering this question</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Mistake</th>
+              <th>Why It's Wrong</th>
+              <th>What to Say Instead</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>"Just increase the heap size"</td>
+              <td>Masks the leak, delays the inevitable, makes Full GC pauses worse</td>
+              <td>"Increasing heap buys time for investigation but doesn't fix the root cause. A 10GB leak in an 8GB heap becomes a 10GB leak in a 16GB heap — it just takes longer to OOM."</td>
+            </tr>
+            <tr>
+              <td>"Take a heap dump immediately"</td>
+              <td>A single dump shows state, not growth. You need comparison over time.</td>
+              <td>"I'd take comparative dumps — one at baseline and one when degraded — to see what objects accumulated."</td>
+            </tr>
+            <tr>
+              <td>"Use jstack to find the leak"</td>
+              <td>jstack shows thread state (deadlocks, blocked), not memory. Wrong tool.</td>
+              <td>"jstack is for threading issues. For memory leaks I'd use jmap histogram, Eclipse MAT for deep analysis, or JFR for allocation profiling."</td>
+            </tr>
+            <tr>
+              <td>Only mentioning heap leaks</td>
+              <td>Native memory leaks (Netty, JNI, direct buffers) are invisible to heap tools</td>
+              <td>"I'd first determine if it's a heap leak or native leak by comparing JVM heap metrics with process RSS. If RSS grows but heap is stable, it's a native memory issue requiring NMT or jemalloc profiling."</td>
+            </tr>
+            <tr>
+              <td>"Use finalize() to clean up"</td>
+              <td>finalize() is deprecated, unpredictable, creates GC pressure, and can resurrect objects</td>
+              <td>"I'd use try-with-resources, AutoCloseable, or java.lang.ref.Cleaner (Java 9+) as a safety net — never finalize()."</td>
+            </tr>
+            <tr>
+              <td>Not considering production constraints</td>
+              <td>Can't freely restart, can't attach debuggers, heap dumps cause pauses</td>
+              <td>"Before taking a heap dump in production, I'd drain the node from the load balancer, ensure sufficient disk space, and coordinate with the on-call team since it will pause the JVM for potentially minutes."</td>
+            </tr>
+            <tr>
+              <td>"Just restart the service periodically"</td>
+              <td>Acceptable as mitigation while investigating, but not a long-term solution</td>
+              <td>"Scheduled restarts can mitigate impact while we investigate, but the root cause must be found and fixed. Restarts during investigation can destroy evidence."</td>
+            </tr>
+            <tr>
+              <td>Forgetting to verify the fix</td>
+              <td>A fix without soak testing is an assumption, not a solution</td>
+              <td>"After the fix, I'd run a soak test simulating 7+ days of production traffic to confirm Old Gen usage stabilizes and doesn't grow monotonically."</td>
+            </tr>
+            <tr>
+              <td>Not mentioning monitoring/prevention</td>
+              <td>Senior engineers think about systemic improvements, not just point fixes</td>
+              <td>"Beyond the fix, I'd add Prometheus alerts for Old Gen growth rate, enable JFR always-on recording, and add a leak regression test to CI."</td>
+            </tr>
+            <tr>
+              <td>Confusing retained size with shallow size</td>
+              <td>Shallow size of a HashMap is 56 bytes, but retained size can be gigabytes</td>
+              <td>"In the dominator tree, I'd sort by retained heap size to find which objects, when freed, would release the most memory. The shallow size of a collection is trivial; what matters is everything it retains."</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 11: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Leak Prevention Strategies: Cost vs Benefit</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Pros</th>
+              <th>Cons</th>
+              <th>When to Use</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Bounded caches (Caffeine)</strong></td>
+              <td>Prevents unbounded growth; configurable eviction; built-in metrics</td>
+              <td>Cache misses on eviction; tuning maxSize requires load testing</td>
+              <td>Any in-memory caching — always prefer bounded over unbounded</td>
+            </tr>
+            <tr>
+              <td><strong>WeakReference/SoftReference</strong></td>
+              <td>GC-friendly; automatic cleanup under memory pressure</td>
+              <td>Unpredictable eviction; can't guarantee cache hits; SoftRef delays collection</td>
+              <td>Optional caching where data can be re-fetched cheaply</td>
+            </tr>
+            <tr>
+              <td><strong>Always-on JFR</strong></td>
+              <td>Retrospective debugging; &lt;2% overhead; shows allocation sites</td>
+              <td>Disk space for recordings; adds complexity to deployment; JFR file management</td>
+              <td>All production JVMs — the overhead is negligible vs the debugging value</td>
+            </tr>
+            <tr>
+              <td><strong>NMT (Native Memory Tracking)</strong></td>
+              <td>Finds native leaks invisible to heap tools; detailed category breakdown</td>
+              <td>5-10% overhead; must be enabled at startup; can't enable retroactively</td>
+              <td>Services using Netty, JNI, or heavy direct buffer usage</td>
+            </tr>
+            <tr>
+              <td><strong>Periodic restarts (mitigation)</strong></td>
+              <td>Immediate relief; buys investigation time; simple to implement</td>
+              <td>Disrupts users during restart; destroys leak evidence; doesn't fix root cause</td>
+              <td>Emergency mitigation while root cause is investigated — never as permanent fix</td>
+            </tr>
+            <tr>
+              <td><strong>Connection pool leak detection</strong></td>
+              <td>Early warning; logs allocation stack trace; prevents pool exhaustion</td>
+              <td>False positives on long transactions; slight overhead per connection</td>
+              <td>Always enable in production — HikariCP's leakDetectionThreshold is near zero cost</td>
+            </tr>
+            <tr>
+              <td><strong>Heap dumps on OOM</strong></td>
+              <td>Captures state at moment of failure; no proactive action needed</td>
+              <td>JVM already in degraded state; dump may be incomplete; requires disk space</td>
+              <td>Always configure — it's free until triggered and invaluable when it fires</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>GC Algorithm Trade-offs for Leak-Prone Systems</summary>
+        <pre><code class="language-bash"># G1GC (default since Java 9): Best general-purpose choice
+# + Handles large heaps well (8-64GB)
+# + Mixed GC reclaims Old Gen incrementally
+# - Full GC still possible under extreme pressure
+java -XX:+UseG1GC -XX:MaxGCPauseMillis=200
+
+# ZGC (Java 15+): Ultra-low pause regardless of heap size
+# + Pauses &lt; 10ms even with 16TB heap
+# + Concurrent compaction (no STW Full GC)
+# - Higher CPU overhead (~15%)
+# - Slightly higher memory footprint
+java -XX:+UseZGC -XX:+ZGenerational  # Java 21+
+
+# Shenandoah: Similar to ZGC, available on more platforms
+# + Sub-10ms pauses
+# + Concurrent evacuation
+# - Not available in Oracle JDK
+java -XX:+UseShenandoahGC
+
+# IMPORTANT: GC choice doesn't FIX leaks — it only affects HOW the system
+# degrades. G1 will Full GC more frequently. ZGC will use more CPU.
+# The leak must still be found and fixed.</code></pre>
+      </details>
+
+      <details>
+        <summary>Heap Size: Too Small vs Too Large</summary>
+        <ul>
+          <li><strong>Too small (e.g., 2GB for a leaky app)</strong> — OOM happens faster (hours instead of days), but easier to detect. Smaller heap dumps are faster to analyze. Full GC is faster.</li>
+          <li><strong>Too large (e.g., 32GB for the same app)</strong> — Masks the leak for weeks/months. Full GC when it happens is catastrophic (30+ second pauses). Heap dumps are enormous (30GB+ files). Analysis tools may not have enough RAM.</li>
+          <li><strong>Right-sized</strong> — Set heap to expected working set × 2-3x. Monitor post-GC Old Gen as the true usage metric. Alert when post-GC Old Gen exceeds 70% capacity.</li>
+        </ul>
+        <pre><code class="language-bash"># Golden rule: if post-Full-GC heap usage grows over time, you have a leak.
+# The heap size only determines how long before it becomes critical.
+#
+# Example monitoring query (PromQL):
+# Post-GC heap = heap used immediately after a Full GC event
+jvm_memory_used_bytes{area="heap"} and on() 
+  changes(jvm_gc_pause_seconds_count{action="end of major GC"}[1m]) &gt; 0</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 12: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Questions the interviewer might ask next</summary>
+        <ol>
+          <li>
+            <strong>"How would you reproduce this in a test environment?"</strong>
+            <p>Set up a soak test with production-like traffic patterns (including error scenarios). Use a smaller heap (-Xmx1g) to accelerate the timeline. Enable allocation profiling. Run for 48-72 hours while monitoring post-GC heap growth. Key: include the error paths that trigger the leak (e.g., requests that throw exceptions).</p>
+          </li>
+          <li>
+            <strong>"What if the leak only happens under specific traffic patterns?"</strong>
+            <p>Replay production access logs (with sanitized data) against the test environment. Use traffic shadowing/mirroring to replay real traffic. Correlate heap growth timing with specific API endpoints or user actions using JFR's OldObjectSample events.</p>
+          </li>
+          <li>
+            <strong>"How do you handle this in a containerized environment (Kubernetes)?"</strong>
+            <p>Set JVM heap to ~75% of container memory limit (leave room for metaspace, threads, native). Use init containers or sidecars to upload heap dumps. Mount debug volumes for JFR recordings. Use ephemeral containers for on-demand diagnostics. Configure OOM killer behavior via resource limits.</p>
+          </li>
+          <li>
+            <strong>"The heap looks fine but the container keeps getting OOM-killed. What's happening?"</strong>
+            <p>This is a native memory leak. The JVM heap is within bounds, but native memory (direct buffers, JNI, thread stacks, metaspace) is growing beyond the container's memory limit. Use NMT to track native allocations. Check thread count growth. Monitor direct buffer usage via JMX <code>java.nio:type=BufferPool</code>.</p>
+          </li>
+          <li>
+            <strong>"How would you prevent this class of bug from reaching production?"</strong>
+            <p>Static analysis (SpotBugs/PMD rules for unclosed resources, FindBugs ThreadLocal detector). Code review checklist for ThreadLocal usage. Mandatory soak tests in CI/CD for services with stateful components. Runtime leak detection in staging (smaller heaps, aggressive GC). Architecture review for any component that stores per-request state.</p>
+          </li>
+          <li>
+            <strong>"What's the difference between a memory leak in Java vs C/C++?"</strong>
+            <p>In C/C++, leaked memory is truly unreachable (malloc without free). In Java, leaked objects are still reachable — they're held by unintended references. Java leaks are "reference leaks" — the GC works correctly, but the programmer maintains references longer than intended. This makes Java leaks harder to detect (no "definitely lost" category like Valgrind) but easier to diagnose (heap dumps show the reference chain).</p>
+          </li>
+          <li>
+            <strong>"How would you investigate if the leak is in a third-party library?"</strong>
+            <p>Heap dump analysis doesn't care about code ownership — the dominator tree reveals the retaining path regardless. If the retained objects are from a library: check the library's issue tracker, upgrade to latest version, review the library's lifecycle requirements (e.g., Netty requires explicit release of ByteBuf). Worst case: wrap the library call with defensive cleanup or use a classloader-isolated module.</p>
+          </li>
+          <li>
+            <strong>"Can you have a memory leak with G1GC/ZGC?"</strong>
+            <p>Absolutely. GC algorithms determine how efficiently unreachable objects are collected and how long pauses are. They cannot collect reachable objects. A reference leak (object kept alive by unintended reference) is invisible to all GC algorithms. The GC works perfectly — it's the application that's broken.</p>
+          </li>
+        </ol>
+      </details>
+    </section>
+
+    <!-- Section 13: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Key Takeaways</summary>
+        <ul>
+          <li><strong>Memory leaks in Java are reference leaks</strong> — objects remain reachable through unintended reference chains. The GC is working correctly; the code is holding references too long.</li>
+          <li><strong>Multi-day leaks have specific patterns:</strong> ThreadLocals in pooled threads, static collections without eviction, listeners never deregistered, classloaders pinned by lingering references.</li>
+          <li><strong>Systematic investigation workflow:</strong> Confirm (metrics trending), characterize (heap vs native), collect evidence (comparative dumps), analyze (MAT dominator tree + GC roots), fix, validate (soak test).</li>
+          <li><strong>Production safety:</strong> Drain traffic before taking dumps. Always have <code>-XX:+HeapDumpOnOutOfMemoryError</code> configured. Use JFR always-on for retrospective analysis.</li>
+          <li><strong>Retained size is king:</strong> Sort by retained heap in the dominator tree to find leak roots. Follow the path to GC roots to understand WHY objects can't be collected.</li>
+          <li><strong>Don't forget native memory:</strong> If RSS grows but heap is stable, use NMT, check direct buffer pools, and count threads. Netty ByteBuf reference counting is a common source.</li>
+          <li><strong>Prevention beats detection:</strong> Bounded caches (Caffeine), try-with-resources for all Closeable objects, @PreDestroy for listener cleanup, leak detection thresholds on connection pools, and automated soak tests in CI/CD.</li>
+        </ul>
+
+        <pre><code class="language-java">// The golden rules of Java memory management:
+//
+// 1. ThreadLocal.remove() in finally — ALWAYS
+// 2. Caches need bounds AND TTL — ALWAYS
+// 3. Listeners need lifecycle (register + deregister) — ALWAYS
+// 4. try-with-resources for Closeable — ALWAYS
+// 5. Monitor post-GC Old Gen over time — ALWAYS
+// 6. HeapDumpOnOutOfMemoryError enabled — ALWAYS
+// 7. JFR always-on in production — ALWAYS (if Java 11+)
+// 8. Direct buffers need explicit management — ALWAYS
+// 9. Validate fixes with soak tests — ALWAYS
+// 10. Heap size is not a fix for leaks — NEVER</code></pre>
+      </details>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav" aria-label="Chapter navigation">
+      <a href="ch13-async-still-blocking.html" class="prev">&larr; Chapter 13: Async Still Blocking</a>
+      <a href="ch15-intermittent-failures-no-logs.html" class="next">Chapter 15: Intermittent Failures Without Logs &rarr;</a>
+    </nav>
+
+  </main>
+
+  <script src="../assets/js/prism.js" data-manual></script>
+  <script>
+    // Load Prism language components
+    Prism.languages.java = Prism.languages.java || {};
+    Prism.languages.yaml = Prism.languages.yaml || {};
+    Prism.languages.bash = Prism.languages.bash || {};
+  </script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

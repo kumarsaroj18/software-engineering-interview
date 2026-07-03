@@ -1,0 +1,2111 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 5: Kafka Exactly-Once Delivery | Senior Backend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 5</span>
+      <span class="chapter-title">Kafka Exactly-Once</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#delivery-semantics">Delivery Semantics</a></li>
+        <li><a href="#producer-side">Idempotent Producer</a></li>
+        <li><a href="#consumer-side">Consumer Offsets</a></li>
+        <li><a href="#kafka-transactions">Kafka Transactions</a></li>
+        <li><a href="#consumer-idempotency">Consumer Idempotency</a></li>
+        <li><a href="#outbox-pattern">Outbox Pattern</a></li>
+        <li><a href="#failure-scenarios">Failure Scenarios</a></li>
+        <li><a href="#spring-kafka">Spring Kafka</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-i">Part I — Spring Boot Core Internals</a> &rsaquo;
+      <span>Chapter 5</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Kafka</span>
+        <span class="badge badge-topic">Exactly-Once</span>
+      </div>
+      <h1>How Would You Ensure a Kafka Consumer Processes a Message Exactly Once?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> True exactly-once delivery in distributed systems is impossible (Two Generals' Problem). Kafka achieves <em>effectively exactly-once</em> through three complementary mechanisms: idempotent producers (prevent duplicate writes to topics), transactional consumers (atomic read-process-write), and consumer-side deduplication (idempotent business logic). In production, the pragmatic approach is at-least-once delivery + idempotent consumers — it's simpler, faster, and achieves the same end result.
+      </p>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter... (e.g., idempotent producer, transactional.id, dedup table, outbox)" aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <div class="callout callout-info">
+        <p><strong>What they're really testing:</strong></p>
+        <ul>
+          <li>Do you understand why true exactly-once is impossible in distributed systems (Two Generals' Problem, FLP impossibility)?</li>
+          <li>Can you articulate the difference between <strong>delivery guarantees</strong> (network-level) vs <strong>processing guarantees</strong> (application-level)?</li>
+          <li>Do you know how Kafka's idempotent producer and transactional API work at a protocol level?</li>
+          <li>Can you design consumer-side idempotency using deduplication tables and atomic offset commits?</li>
+          <li>Have you dealt with <strong>duplicate processing in production</strong> — rebalances, consumer crashes, zombie instances?</li>
+          <li>Do you understand the <strong>performance cost</strong> of exactly-once and when at-least-once + idempotency is the better trade-off?</li>
+          <li>Can you implement the Outbox pattern to avoid dual-write problems between DB and Kafka?</li>
+        </ul>
+      </div>
+      <div class="callout callout-warning">
+        <p><strong>Senior-level differentiator:</strong> Junior engineers say "set enable.idempotence=true." Mid-level engineers explain the transactional API. Senior engineers explain why exactly-once is an abstraction, describe the failure modes it doesn't cover (e.g., side effects like sending emails), and propose idempotent consumer designs that work regardless of delivery guarantees.</p>
+      </div>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+
+      <details>
+        <summary>Concise answer for time-pressured interviews</summary>
+        <div class="callout callout-tip">
+          <p><strong>Interview opener:</strong></p>
+          <blockquote>
+            "True exactly-once delivery is impossible in distributed systems — you can't distinguish a lost acknowledgment from a lost message. Kafka achieves <em>effectively exactly-once</em> through three layers:
+            <br><br>
+            <strong>1. Idempotent Producer:</strong> Each producer gets a PID and sequence number. The broker deduplicates retries, so a message is written to the topic partition exactly once even if the producer retries.
+            <br><br>
+            <strong>2. Transactional API:</strong> For read-process-write patterns (consume from topic A, process, produce to topic B), Kafka transactions atomically commit both the output messages and the consumer offsets. Either both succeed or both are rolled back.
+            <br><br>
+            <strong>3. Consumer-side idempotency:</strong> For consumers that write to external systems (databases, APIs), you store the Kafka offset or a unique event ID in the same database transaction as the business logic. On replay, the dedup check prevents re-processing.
+            <br><br>
+            In practice, I prefer at-least-once delivery with idempotent consumers — it's simpler, has lower latency, and handles the cases Kafka transactions can't (external side effects). The key insight is: make your consumer's business logic idempotent, and the delivery guarantee becomes irrelevant."
+          </blockquote>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 3: Delivery Semantics -->
+    <section id="delivery-semantics">
+      <h2>At-Most-Once vs At-Least-Once vs Exactly-Once</h2>
+
+      <details>
+        <summary>Theory, impossibility theorem, and how Kafka achieves effectively-exactly-once</summary>
+
+        <h3>The Three Delivery Guarantees</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Guarantee</th>
+              <th>Definition</th>
+              <th>Risk</th>
+              <th>Use Case</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>At-Most-Once</strong></td>
+              <td>Message delivered 0 or 1 times. Fire and forget.</td>
+              <td>Data loss</td>
+              <td>Metrics, logging (where occasional loss is acceptable)</td>
+            </tr>
+            <tr>
+              <td><strong>At-Least-Once</strong></td>
+              <td>Message delivered 1 or more times. Retry until ACK.</td>
+              <td>Duplicates</td>
+              <td>Most business events (with idempotent consumers)</td>
+            </tr>
+            <tr>
+              <td><strong>Exactly-Once</strong></td>
+              <td>Message delivered exactly 1 time. No loss, no duplicates.</td>
+              <td>Performance cost, complexity</td>
+              <td>Financial transactions, inventory (where correctness is critical)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Why True Exactly-Once Is Impossible</h3>
+        <div class="callout callout-danger">
+          <p><strong>The Two Generals' Problem:</strong> Two generals need to coordinate an attack. They communicate via messengers who can be captured. Neither general can ever be sure the other received their message. Even if a messenger arrives, the sender doesn't know until they receive an acknowledgment — and that acknowledgment can also be lost. There is no protocol with a finite number of messages that guarantees agreement.</p>
+        </div>
+
+        <pre class="diagram">
+  The Impossibility of Exactly-Once Delivery
+  ═══════════════════════════════════════════════════════════════
+
+  Scenario: Producer sends message M to Broker
+
+  Case 1: Message lost
+  ┌──────────┐     ✗ (lost)      ┌──────────┐
+  │ Producer │ ─────────────────→ │  Broker  │
+  │          │                    │ (no M)   │
+  └──────────┘                    └──────────┘
+  Producer doesn't know → retries → could cause duplicate
+
+  Case 2: ACK lost
+  ┌──────────┐     M (delivered)  ┌──────────┐
+  │ Producer │ ─────────────────→ │  Broker  │
+  │          │ ←─────── ✗ ─────── │ (has M)  │
+  │(no ACK)  │     ACK lost       └──────────┘
+  └──────────┘
+  Producer doesn't know if M arrived → retries → DUPLICATE!
+
+  The producer CANNOT distinguish Case 1 from Case 2.
+  This is why exactly-once requires additional mechanisms
+  beyond simple send-and-acknowledge.
+        </pre>
+
+        <h3>How Kafka Achieves "Effectively Exactly-Once"</h3>
+        <p>Kafka doesn't solve the Two Generals' Problem — nobody can. Instead, it provides mechanisms that make duplicates <strong>detectable and preventable</strong> at each layer:</p>
+
+        <pre class="diagram">
+  Kafka's Exactly-Once Stack
+  ═══════════════════════════════════════════════════════════════
+
+  Layer 1: Idempotent Producer (Broker-side dedup)
+  ┌──────────┐  PID=5, seq=42   ┌──────────────────────┐
+  │ Producer │ ────────────────→ │ Broker               │
+  │ PID=5    │  (retry)         │ Last seq for PID5=42 │
+  │ seq=42   │ ────────────────→ │ → DUPLICATE, reject  │
+  └──────────┘                   └──────────────────────┘
+
+  Layer 2: Transactional API (Atomic offset + output)
+  ┌──────────────────────────────────────────────────────┐
+  │                  TRANSACTION                          │
+  │  ┌─────────────┐   ┌─────────────┐   ┌───────────┐ │
+  │  │ Read from   │ → │ Process     │ → │ Write to  │ │
+  │  │ Topic A     │   │ (transform) │   │ Topic B + │ │
+  │  │             │   │             │   │ Commit    │ │
+  │  │             │   │             │   │ Offset A  │ │
+  │  └─────────────┘   └─────────────┘   └───────────┘ │
+  │  ALL or NOTHING — atomic commit                      │
+  └──────────────────────────────────────────────────────┘
+
+  Layer 3: Consumer-Side Idempotency (App-level dedup)
+  ┌──────────────────────────────────────────────────────┐
+  │                DATABASE TRANSACTION                    │
+  │  ┌─────────────┐   ┌─────────────┐   ┌───────────┐ │
+  │  │ Check dedup │ → │ Execute     │ → │ Record    │ │
+  │  │ table for   │   │ business    │   │ event_id  │ │
+  │  │ event_id    │   │ logic       │   │ in dedup  │ │
+  │  └─────────────┘   └─────────────┘   └───────────┘ │
+  │  If event_id exists → skip (already processed)       │
+  └──────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Key Distinction: Delivery vs Processing</h3>
+        <div class="callout callout-info">
+          <p><strong>Important:</strong> Kafka's exactly-once semantics (EOS) guarantees that within the Kafka ecosystem (topic-to-topic), messages are processed exactly once. But the moment your consumer has side effects outside Kafka (writing to a database, calling an API, sending an email), Kafka's EOS cannot help. You need <strong>consumer-side idempotency</strong> for end-to-end exactly-once processing.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: Idempotent Producer -->
+    <section id="producer-side">
+      <h2>Idempotent Producer</h2>
+
+      <details>
+        <summary>enable.idempotence, acks=all, producer sequence numbers, transactional producer</summary>
+
+        <h3>How Idempotent Producer Works</h3>
+        <p>When <code>enable.idempotence=true</code>, each producer instance gets a unique <strong>Producer ID (PID)</strong> from the broker. Every message sent includes the PID and a monotonically increasing <strong>sequence number</strong> per partition. The broker tracks the last sequence number for each PID+partition pair and rejects duplicates.</p>
+
+        <pre class="diagram">
+  Idempotent Producer Internals
+  ═══════════════════════════════════════════════════════════════
+
+  Producer (PID=7)                    Broker (Partition 0)
+  ─────────────────                   ────────────────────
+  Send(key=A, seq=0) ──────────────→  Store: offset=100, PID=7, seq=0 ✓
+  Send(key=B, seq=1) ──────────────→  Store: offset=101, PID=7, seq=1 ✓
+  Send(key=C, seq=2) ──────────────→  ACK lost! ←──── ✗
+  Retry(key=C, seq=2) ─────────────→  Broker sees: PID=7, last_seq=2
+                                       → DUPLICATE! Return success (no write)
+  Send(key=D, seq=3) ──────────────→  Store: offset=102, PID=7, seq=3 ✓
+
+  If seq arrives out of order (gap):
+  Send(key=E, seq=5) ──────────────→  Broker sees: last_seq=3, got seq=5
+                                       → OutOfOrderSequenceException!
+                                       (Indicates data loss — fatal error)
+        </pre>
+
+        <h3>Producer Configuration for Exactly-Once</h3>
+        <pre><code class="language-yaml"># application.yml - Spring Boot Kafka Producer
+spring:
+  kafka:
+    producer:
+      bootstrap-servers: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      # Idempotent producer settings
+      properties:
+        enable.idempotence: true          # Enables PID + sequence numbers
+        acks: all                          # Wait for all ISR replicas (forced by idempotence)
+        max.in.flight.requests.per.connection: 5  # Max 5 with idempotence (was 1 before KIP-185)
+        retries: 2147483647                # Infinite retries (forced by idempotence)
+        delivery.timeout.ms: 120000        # 2 min total delivery timeout
+      # Transactional producer (for read-process-write)
+      transaction-id-prefix: payment-processor  # Enables transactions
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer</code></pre>
+
+        <h3>What enable.idempotence=true Actually Does</h3>
+        <div class="callout callout-info">
+          <p><strong>Implicit settings when idempotence is enabled:</strong></p>
+          <ul>
+            <li><code>acks=all</code> — forced (must wait for all in-sync replicas)</li>
+            <li><code>retries=Integer.MAX_VALUE</code> — forced (must retry to ensure delivery)</li>
+            <li><code>max.in.flight.requests.per.connection ≤ 5</code> — enforced (broker can track up to 5 in-flight batches per PID+partition)</li>
+          </ul>
+          <p>Since Kafka 3.0, <code>enable.idempotence=true</code> is the <strong>default</strong>. You get it for free unless you explicitly disable it.</p>
+        </div>
+
+        <h3>Transactional Producer (for Kafka-to-Kafka)</h3>
+        <pre><code class="language-java">@Service
+@RequiredArgsConstructor
+public class TransactionalPaymentProcessor {
+    
+    private final KafkaTemplate&lt;String, Object&gt; kafkaTemplate;
+    
+    /**
+     * Atomically: consume from input topic, process, produce to output topic.
+     * The consumer offset commit and producer write happen in one transaction.
+     */
+    public void processPaymentEvent(ConsumerRecord&lt;String, PaymentEvent&gt; record) {
+        kafkaTemplate.executeInTransaction(ops -> {
+            PaymentEvent event = record.value();
+            
+            // Business logic
+            PaymentResult result = processPayment(event);
+            
+            // Produce to output topic (within transaction)
+            ops.send("payment-results", event.getPaymentId(), result);
+            
+            // If this method completes without exception,
+            // both the output message AND the consumer offset are committed atomically
+            return result;
+        });
+    }
+}
+
+@Configuration
+public class KafkaTransactionalConfig {
+    
+    @Bean
+    public ProducerFactory&lt;String, Object&gt; producerFactory() {
+        Map&lt;String, Object&gt; props = new HashMap&lt;&gt;();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "payment-processor-" + hostname());
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+        
+        DefaultKafkaProducerFactory&lt;String, Object&gt; factory = 
+            new DefaultKafkaProducerFactory&lt;&gt;(props);
+        factory.setTransactionIdPrefix("payment-tx-");
+        return factory;
+    }
+    
+    @Bean
+    public KafkaTemplate&lt;String, Object&gt; kafkaTemplate(
+            ProducerFactory&lt;String, Object&gt; producerFactory) {
+        return new KafkaTemplate&lt;&gt;(producerFactory);
+    }
+    
+    private String hostname() {
+        try { return InetAddress.getLocalHost().getHostName(); }
+        catch (Exception e) { return UUID.randomUUID().toString().substring(0, 8); }
+    }
+}</code></pre>
+
+        <h3>Producer Sequence Numbers — Deep Dive</h3>
+        <div class="callout callout-warning">
+          <p><strong>PID lifecycle:</strong> The PID is ephemeral — assigned when the producer initializes and lost when the producer restarts. This means idempotent producer alone does NOT deduplicate across producer restarts. For cross-restart deduplication, you need the <strong>transactional API</strong> with a stable <code>transactional.id</code>. The broker uses the transactional.id to fence old producer instances (zombie fencing).</p>
+        </div>
+
+        <pre><code class="language-java">// Demonstrating the difference: idempotent vs transactional
+// 
+// Idempotent only (no transactional.id):
+// - Deduplicates retries within a single producer session
+// - PID changes on restart → retries after restart can create duplicates
+// - Good for: simple produce-only workflows
+//
+// Transactional (with transactional.id):
+// - Stable identity across restarts
+// - Broker fences old instances with same transactional.id
+// - Enables atomic multi-partition writes + offset commits
+// - Good for: read-process-write (stream processing), financial events</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Consumer Offset Management -->
+    <section id="consumer-side">
+      <h2>Consumer Offset Management</h2>
+
+      <details>
+        <summary>Auto vs manual commit, commit strategies: sync/async, after-processing vs before-processing</summary>
+
+        <h3>How Consumer Offsets Work</h3>
+        <pre class="diagram">
+  Consumer Offset Lifecycle
+  ═══════════════════════════════════════════════════════════════
+
+  Topic: payments (Partition 0)
+  ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+  │ 0  │ 1  │ 2  │ 3  │ 4  │ 5  │ 6  │ 7  │ 8  │ 9  │  Messages
+  └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+                          ↑              ↑
+                   committed=4      position=7
+                   (stored in        (next poll
+                    __consumer_       starts here)
+                    offsets topic)
+
+  On rebalance/restart: consumer resumes from committed offset (4)
+  Messages 4, 5, 6 will be RE-DELIVERED → potential duplicates!
+        </pre>
+
+        <h3>Auto Commit vs Manual Commit</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Config</th>
+              <th>Guarantee</th>
+              <th>Risk</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Auto-commit (default)</strong></td>
+              <td><code>enable.auto.commit=true</code>, <code>auto.commit.interval.ms=5000</code></td>
+              <td>At-most-once (if commit before processing) or At-least-once (if commit after)</td>
+              <td>Commits on timer, not aligned with processing</td>
+            </tr>
+            <tr>
+              <td><strong>Manual sync commit</strong></td>
+              <td><code>enable.auto.commit=false</code> + <code>consumer.commitSync()</code></td>
+              <td>At-least-once</td>
+              <td>Blocks until commit confirmed; slower</td>
+            </tr>
+            <tr>
+              <td><strong>Manual async commit</strong></td>
+              <td><code>enable.auto.commit=false</code> + <code>consumer.commitAsync()</code></td>
+              <td>At-least-once (mostly)</td>
+              <td>Non-blocking but can lose commits on failure</td>
+            </tr>
+            <tr>
+              <td><strong>Transactional commit</strong></td>
+              <td><code>isolation.level=read_committed</code> + <code>sendOffsetsToTransaction()</code></td>
+              <td>Exactly-once (within Kafka)</td>
+              <td>Higher latency, more complex</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Commit Timing and Its Consequences</h3>
+        <pre><code class="language-java">// DANGEROUS: Commit BEFORE processing → At-Most-Once
+// If processing fails after commit, message is lost!
+consumer.commitSync(); // ← offset advanced
+processMessage(record); // ← if this throws, message is gone
+
+// SAFE: Commit AFTER processing → At-Least-Once
+// If crash after processing but before commit, message is redelivered
+processMessage(record); // ← process first
+consumer.commitSync();  // ← if crash here, message redelivered (duplicate)
+
+// SAFEST: Atomic commit with processing → Effectively Exactly-Once
+// Store offset in same DB transaction as business logic
+@Transactional
+public void process(ConsumerRecord&lt;String, PaymentEvent&gt; record) {
+    // Business logic
+    paymentRepository.save(toEntity(record.value()));
+    // Store offset in DB (same transaction!)
+    offsetRepository.save(new ProcessedOffset(
+        record.topic(), record.partition(), record.offset()));
+    // Both succeed or both rollback — no window for duplicates
+}</code></pre>
+
+        <h3>Spring Kafka AckMode Options</h3>
+        <pre><code class="language-java">// Spring Kafka provides multiple acknowledgment modes
+@Configuration
+public class ConsumerConfig {
+    
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory&lt;String, String&gt; kafkaListenerContainerFactory(
+            ConsumerFactory&lt;String, String&gt; consumerFactory) {
+        
+        var factory = new ConcurrentKafkaListenerContainerFactory&lt;String, String&gt;();
+        factory.setConsumerFactory(consumerFactory);
+        
+        // AckMode options:
+        // RECORD  — commit after each record processed
+        // BATCH   — commit after all records in poll() batch processed (default)
+        // TIME    — commit after ackTime milliseconds
+        // COUNT   — commit after ackCount records
+        // MANUAL  — listener calls Acknowledgment.acknowledge()
+        // MANUAL_IMMEDIATE — acknowledge() commits immediately (no batching)
+        
+        factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL);
+        factory.getContainerProperties().setSyncCommits(true);
+        
+        return factory;
+    }
+}
+
+// Using MANUAL ack mode in a listener
+@KafkaListener(topics = "payments", groupId = "payment-processor")
+public void handlePayment(
+        ConsumerRecord&lt;String, PaymentEvent&gt; record,
+        Acknowledgment acknowledgment) {
+    try {
+        paymentService.process(record.value());
+        acknowledgment.acknowledge(); // Commit only on success
+    } catch (RetryableException e) {
+        // Don't acknowledge — message will be redelivered on next poll
+        throw e;
+    } catch (PoisonPillException e) {
+        // Dead-letter or skip — acknowledge to avoid infinite loop
+        deadLetterPublisher.send(record);
+        acknowledgment.acknowledge();
+    }
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>The rebalance gap:</strong> Even with manual commits, there's a window between processing and committing where a rebalance can cause redelivery. If a rebalance occurs after you process message offset=5 but before you commit offset=6, the new consumer assigned to that partition will re-poll from offset=5. This is why consumer-side idempotency is essential.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 6: Kafka Transactions -->
+    <section id="kafka-transactions">
+      <h2>Kafka Transactions</h2>
+
+      <details>
+        <summary>Read-process-write pattern, isolation.level, transactional.id, fencing zombies</summary>
+
+        <h3>The Read-Process-Write Pattern</h3>
+        <p>Kafka transactions enable atomic read-process-write: consume messages from input topics, process them, and produce output messages + commit consumer offsets — all as a single atomic operation. If any step fails, everything is rolled back.</p>
+
+        <pre class="diagram">
+  Kafka Transaction Flow
+  ═══════════════════════════════════════════════════════════════
+
+  Consumer (txn.id = "processor-1")          Broker / Transaction Coordinator
+  ──────────────────────────────────          ────────────────────────────────
+  1. initTransactions()  ─────────────────→  Register txn.id, assign epoch=1
+                                              Fence any previous epoch (zombie kill)
+
+  2. beginTransaction()  ─────────────────→  Mark txn as ONGOING
+
+  3. poll() → records from input-topic       (normal consume)
+
+  4. send(output-topic, result) ──────────→  Write to output-topic (UNCOMMITTED)
+                                              Consumers with isolation=read_committed
+                                              will NOT see these yet
+
+  5. sendOffsetsToTransaction(             → Write offsets to __consumer_offsets
+       offsets, consumerGroupId)              (UNCOMMITTED)
+
+  6. commitTransaction() ─────────────────→  Write COMMIT marker to txn log
+                                              Offsets and output messages become
+                                              visible atomically
+
+  On failure at any step:
+  7. abortTransaction() ──────────────────→  Write ABORT marker
+                                              Output messages are discarded
+                                              Offsets are NOT committed
+                                              → Consumer re-reads from last committed
+        </pre>
+
+        <h3>Transaction Configuration</h3>
+        <pre><code class="language-yaml"># Producer config (transactional)
+spring:
+  kafka:
+    producer:
+      transaction-id-prefix: order-processor
+      properties:
+        enable.idempotence: true
+        transactional.id: order-processor-${HOSTNAME}
+        transaction.timeout.ms: 60000
+
+    # Consumer config (read committed)
+    consumer:
+      properties:
+        isolation.level: read_committed  # Only see committed messages
+        enable.auto.commit: false        # Offsets managed by transaction
+      group-id: order-processor-group</code></pre>
+
+        <h3>isolation.level Explained</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Setting</th>
+              <th>Behavior</th>
+              <th>Use Case</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>read_uncommitted</code> (default)</td>
+              <td>Consumer sees ALL messages, including those in open transactions</td>
+              <td>Maximum throughput, duplicates acceptable</td>
+            </tr>
+            <tr>
+              <td><code>read_committed</code></td>
+              <td>Consumer only sees messages from committed transactions</td>
+              <td>Required for exactly-once consumers</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-info">
+          <p><strong>How read_committed works internally:</strong> The broker maintains a <code>Last Stable Offset (LSO)</code> — the offset of the first message in an open transaction. Consumers with <code>read_committed</code> cannot read beyond the LSO. This means a long-running transaction blocks all downstream consumers on that partition, even for messages from other producers. Keep transactions short!</p>
+        </div>
+
+        <h3>Zombie Fencing with Epochs</h3>
+        <pre class="diagram">
+  Zombie Fencing
+  ═══════════════════════════════════════════════════════════════
+
+  Scenario: Pod A (txn.id="proc-1") crashes, Pod B takes over
+
+  Timeline:
+  t=0   Pod A starts:      initTransactions("proc-1") → epoch=1
+  t=10  Pod A begins txn:  beginTransaction()
+  t=11  Pod A sends msg:   send("output", data) [UNCOMMITTED, epoch=1]
+  t=12  Pod A CRASHES      (transaction left open — zombie!)
+
+  t=30  Pod B starts:      initTransactions("proc-1") → epoch=2
+                            Broker: "epoch 2 > epoch 1 for proc-1"
+                            → ABORT all pending txns from epoch 1
+                            → Pod A's uncommitted messages are discarded
+                            → Any future requests from epoch 1 are rejected
+                                (ProducerFencedException)
+
+  t=31  Pod B begins txn:  beginTransaction() [epoch=2, clean state]
+
+  Result: Even if Pod A "wakes up" later, it gets ProducerFencedException
+          on any send/commit attempt. The zombie is fenced.
+        </pre>
+
+        <h3>Complete Transactional Consumer-Producer</h3>
+        <pre><code class="language-java">@Component
+public class ExactlyOnceStreamProcessor {
+    
+    private final KafkaTemplate&lt;String, Object&gt; kafkaTemplate;
+    
+    // Spring Kafka handles transaction lifecycle when 
+    // transaction-id-prefix is set and container is configured properly
+    @KafkaListener(
+        topics = "order-events",
+        groupId = "order-processor",
+        containerFactory = "transactionalListenerFactory"
+    )
+    public void processOrderEvent(ConsumerRecord&lt;String, OrderEvent&gt; record) {
+        // This entire method executes within a Kafka transaction
+        // Spring Kafka wraps it: beginTransaction → execute → commitTransaction
+        
+        OrderEvent event = record.value();
+        
+        // Business logic
+        EnrichedOrder enriched = orderEnricher.enrich(event);
+        
+        // Produce to output topic (within same transaction)
+        kafkaTemplate.send("enriched-orders", event.getOrderId(), enriched);
+        
+        // When this method returns without exception:
+        // - Output message to "enriched-orders" is committed
+        // - Consumer offset for "order-events" is committed
+        // Both atomically. If exception → both rolled back.
+    }
+}
+
+@Configuration
+public class TransactionalListenerConfig {
+    
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory&lt;String, Object&gt; 
+            transactionalListenerFactory(
+                ConsumerFactory&lt;String, Object&gt; consumerFactory,
+                KafkaTransactionManager&lt;String, Object&gt; transactionManager) {
+        
+        var factory = new ConcurrentKafkaListenerContainerFactory&lt;String, Object&gt;();
+        factory.setConsumerFactory(consumerFactory);
+        factory.getContainerProperties().setTransactionManager(transactionManager);
+        factory.getContainerProperties().setEosMode(
+            ContainerProperties.EOSMode.V2); // KIP-447: simplified fencing
+        // isolation.level=read_committed is automatically set
+        return factory;
+    }
+    
+    @Bean
+    public KafkaTransactionManager&lt;String, Object&gt; kafkaTransactionManager(
+            ProducerFactory&lt;String, Object&gt; producerFactory) {
+        return new KafkaTransactionManager&lt;&gt;(producerFactory);
+    }
+}</code></pre>
+
+        <div class="callout callout-danger">
+          <p><strong>Transaction limitations:</strong></p>
+          <ul>
+            <li>Kafka transactions only guarantee exactly-once within the Kafka ecosystem (topic → topic)</li>
+            <li>They do NOT help with external side effects (DB writes, HTTP calls, emails)</li>
+            <li>Long transactions block downstream consumers (LSO issue)</li>
+            <li>Each <code>transactional.id</code> must be unique per producer instance — typically use hostname or pod name as suffix</li>
+            <li>Transaction timeout default is 60s — if processing takes longer, transaction is aborted</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 7: Consumer-Side Idempotency -->
+    <section id="consumer-idempotency">
+      <h2>Consumer-Side Idempotency</h2>
+
+      <details>
+        <summary>Store processed offsets/event IDs in same transaction as business logic, dedup table pattern</summary>
+
+        <h3>Why Consumer-Side Idempotency Is the Real Solution</h3>
+        <div class="callout callout-tip">
+          <p><strong>The pragmatic truth:</strong> In most production systems, the consumer writes to a database, not back to Kafka. Kafka transactions don't help here. The real exactly-once guarantee comes from making your consumer logic idempotent — processing the same message twice produces the same result as processing it once.</p>
+        </div>
+
+        <h3>Pattern 1: Deduplication Table</h3>
+        <pre><code class="language-sql">-- Deduplication table: stores processed event IDs
+CREATE TABLE processed_events (
+    event_id        VARCHAR(64) PRIMARY KEY,    -- Unique event identifier from Kafka message
+    topic           VARCHAR(128) NOT NULL,
+    partition_id    INT NOT NULL,
+    offset_id       BIGINT NOT NULL,
+    processed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    consumer_group  VARCHAR(128) NOT NULL,
+    
+    -- Index for cleanup of old entries
+    INDEX idx_processed_at (processed_at)
+);
+
+-- Alternative: track by topic-partition-offset (more space efficient)
+CREATE TABLE consumer_offsets_local (
+    consumer_group  VARCHAR(128) NOT NULL,
+    topic           VARCHAR(128) NOT NULL,
+    partition_id    INT NOT NULL,
+    last_offset     BIGINT NOT NULL,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    
+    PRIMARY KEY (consumer_group, topic, partition_id)
+);
+
+-- Cleanup old entries (run periodically)
+DELETE FROM processed_events 
+WHERE processed_at &lt; NOW() - INTERVAL 7 DAY;</code></pre>
+
+        <h3>Pattern 2: Atomic Business Logic + Dedup Check</h3>
+        <pre><code class="language-java">@Service
+@RequiredArgsConstructor
+public class IdempotentPaymentConsumer {
+    
+    private final PaymentRepository paymentRepository;
+    private final ProcessedEventRepository dedupRepository;
+    private final TransactionTemplate transactionTemplate;
+    
+    @KafkaListener(topics = "payment-events", groupId = "payment-processor")
+    public void handlePayment(
+            ConsumerRecord&lt;String, PaymentEvent&gt; record,
+            Acknowledgment ack) {
+        
+        String eventId = extractEventId(record);
+        
+        // Execute business logic + dedup check in ONE database transaction
+        boolean processed = transactionTemplate.execute(status -> {
+            // 1. Check if already processed (idempotency check)
+            if (dedupRepository.existsByEventId(eventId)) {
+                log.info("Duplicate event detected, skipping: {}", eventId);
+                return false; // Already processed
+            }
+            
+            // 2. Execute business logic
+            PaymentEvent event = record.value();
+            Payment payment = Payment.builder()
+                .paymentId(event.getPaymentId())
+                .amount(event.getAmount())
+                .status(PaymentStatus.COMPLETED)
+                .build();
+            paymentRepository.save(payment);
+            
+            // 3. Record that we processed this event (same transaction!)
+            dedupRepository.save(ProcessedEvent.builder()
+                .eventId(eventId)
+                .topic(record.topic())
+                .partitionId(record.partition())
+                .offsetId(record.offset())
+                .consumerGroup("payment-processor")
+                .build());
+            
+            return true;
+        });
+        
+        // 4. Acknowledge Kafka offset only after DB commit succeeds
+        ack.acknowledge();
+        
+        if (processed) {
+            log.info("Payment processed: {} (offset={})", 
+                record.value().getPaymentId(), record.offset());
+        }
+    }
+    
+    private String extractEventId(ConsumerRecord&lt;String, PaymentEvent&gt; record) {
+        // Prefer a business-level unique ID from the message headers or payload
+        Header eventIdHeader = record.headers().lastHeader("event-id");
+        if (eventIdHeader != null) {
+            return new String(eventIdHeader.value(), StandardCharsets.UTF_8);
+        }
+        // Fallback: topic-partition-offset (unique within Kafka)
+        return String.format("%s-%d-%d", 
+            record.topic(), record.partition(), record.offset());
+    }
+}</code></pre>
+
+        <h3>Pattern 3: Natural Idempotency (No Dedup Table Needed)</h3>
+        <pre><code class="language-java">// Some operations are NATURALLY idempotent — no dedup table needed!
+
+// Example 1: Upsert (INSERT ON CONFLICT UPDATE)
+// Processing the same "set account balance to $100" twice → same result
+@Repository
+public interface AccountRepository extends JpaRepository&lt;Account, String&gt; {
+    
+    @Modifying
+    @Query(value = """
+        INSERT INTO accounts (account_id, balance, updated_at) 
+        VALUES (:accountId, :balance, :updatedAt)
+        ON CONFLICT (account_id) 
+        DO UPDATE SET balance = :balance, updated_at = :updatedAt
+        WHERE accounts.updated_at &lt; :updatedAt
+        """, nativeQuery = true)
+    void upsertBalance(@Param("accountId") String accountId,
+                       @Param("balance") BigDecimal balance,
+                       @Param("updatedAt") Instant updatedAt);
+}
+
+// Example 2: Conditional update with version check
+// Only applies if current version matches — replay is a no-op
+@Modifying
+@Query("""
+    UPDATE Order o SET o.status = :newStatus, o.version = :newVersion
+    WHERE o.orderId = :orderId AND o.version = :expectedVersion
+    """)
+int updateOrderStatus(@Param("orderId") String orderId,
+                      @Param("newStatus") OrderStatus newStatus,
+                      @Param("expectedVersion") long expectedVersion,
+                      @Param("newVersion") long newVersion);
+
+// Example 3: Idempotent key (unique constraint prevents duplicate insert)
+// Second insert attempt → DataIntegrityViolationException → catch and skip
+@Transactional
+public void processTransfer(TransferEvent event) {
+    try {
+        transferRepository.save(Transfer.builder()
+            .transferId(event.getTransferId()) // UNIQUE constraint
+            .fromAccount(event.getFrom())
+            .toAccount(event.getTo())
+            .amount(event.getAmount())
+            .build());
+    } catch (DataIntegrityViolationException e) {
+        log.info("Transfer {} already exists, skipping", event.getTransferId());
+        // Idempotent! Same result whether processed once or twice.
+    }
+}</code></pre>
+
+        <h3>Choosing the Right Idempotency Strategy</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>When to Use</th>
+              <th>Pros</th>
+              <th>Cons</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Dedup table</strong></td>
+              <td>Generic, works for any operation</td>
+              <td>Universal, explicit, auditable</td>
+              <td>Extra storage, needs cleanup job</td>
+            </tr>
+            <tr>
+              <td><strong>Natural idempotency (upsert)</strong></td>
+              <td>State-setting operations (SET x = value)</td>
+              <td>No extra table, no cleanup</td>
+              <td>Not all operations are naturally idempotent</td>
+            </tr>
+            <tr>
+              <td><strong>Unique constraint</strong></td>
+              <td>Create operations with business ID</td>
+              <td>Simple, leverages existing schema</td>
+              <td>Requires unique business key in message</td>
+            </tr>
+            <tr>
+              <td><strong>Version/timestamp guard</strong></td>
+              <td>Ordered updates with causality</td>
+              <td>Handles out-of-order delivery too</td>
+              <td>Needs version or timestamp in every message</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-danger">
+          <p><strong>Critical:</strong> The dedup check and the business logic MUST be in the same database transaction. If they're separate, there's a window where the business logic commits but the dedup record doesn't (crash between the two) — resulting in duplicate processing on retry.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 8: Outbox Pattern -->
+    <section id="outbox-pattern">
+      <h2>Outbox Pattern with Kafka</h2>
+
+      <details>
+        <summary>CDC, Debezium, avoiding dual-write problems</summary>
+
+        <h3>The Dual-Write Problem</h3>
+        <pre class="diagram">
+  The Dual-Write Problem
+  ═══════════════════════════════════════════════════════════════
+
+  WRONG: Write to DB AND Kafka separately (dual-write)
+  
+  @Transactional
+  public void createOrder(Order order) {
+      orderRepository.save(order);     // 1. Write to DB ✓
+      kafkaTemplate.send("orders", order); // 2. Write to Kafka ???
+  }
+
+  Failure modes:
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Scenario A: DB succeeds, Kafka fails                        │
+  │ → Order in DB, no event published. Downstream never knows.  │
+  │                                                             │
+  │ Scenario B: Kafka succeeds, DB fails (rollback)             │
+  │ → Event published for an order that doesn't exist!          │
+  │                                                             │
+  │ Scenario C: App crashes between the two writes              │
+  │ → Inconsistent state. Which write happened?                 │
+  └─────────────────────────────────────────────────────────────┘
+
+  You CANNOT make DB + Kafka atomic without distributed transactions
+  (2PC), which is impractical. The Outbox Pattern solves this.
+        </pre>
+
+        <h3>The Outbox Pattern Solution</h3>
+        <pre class="diagram">
+  Outbox Pattern Architecture
+  ═══════════════════════════════════════════════════════════════
+
+  Step 1: Write business data + outbox event in ONE DB transaction
+  ┌──────────────────────────────────────────────────────────┐
+  │              SINGLE DATABASE TRANSACTION                   │
+  │                                                          │
+  │  ┌─────────────────┐     ┌──────────────────────────┐   │
+  │  │ orders table    │     │ outbox_events table       │   │
+  │  │ INSERT order    │     │ INSERT event (payload,    │   │
+  │  │                 │     │   topic, status=PENDING)  │   │
+  │  └─────────────────┘     └──────────────────────────┘   │
+  │                                                          │
+  │  COMMIT — both or neither                                │
+  └──────────────────────────────────────────────────────────┘
+
+  Step 2: CDC (Debezium) captures changes from outbox table
+  ┌─────────────┐         ┌────────────┐         ┌─────────┐
+  │  PostgreSQL │  WAL →  │  Debezium  │  ─────→ │  Kafka  │
+  │  outbox     │  CDC    │ Connector  │  publish │  Topic  │
+  │  table      │         │            │         │         │
+  └─────────────┘         └────────────┘         └─────────┘
+                                                      │
+                                              Guaranteed delivery
+                                              (Debezium tracks LSN)
+        </pre>
+
+        <h3>Outbox Table Schema</h3>
+        <pre><code class="language-sql">CREATE TABLE outbox_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_type  VARCHAR(128) NOT NULL,    -- e.g., 'Order', 'Payment'
+    aggregate_id    VARCHAR(128) NOT NULL,    -- e.g., order ID
+    event_type      VARCHAR(128) NOT NULL,    -- e.g., 'OrderCreated'
+    topic           VARCHAR(256) NOT NULL,    -- Target Kafka topic
+    partition_key   VARCHAR(256),             -- Kafka message key
+    payload         JSONB NOT NULL,           -- Event payload
+    headers         JSONB,                    -- Optional Kafka headers
+    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    
+    -- For polling-based publisher (alternative to CDC)
+    status          VARCHAR(20) DEFAULT 'PENDING',  -- PENDING, PUBLISHED
+    published_at    TIMESTAMP,
+    
+    INDEX idx_outbox_status_created (status, created_at)
+);
+
+-- Debezium outbox connector uses "outbox.event.router" SMT
+-- which reads from this table and routes to the correct topic
+-- After capture, rows can be deleted (Debezium tracks WAL position)</code></pre>
+
+        <h3>Implementation with Spring Boot</h3>
+        <pre><code class="language-java">@Service
+@RequiredArgsConstructor
+public class OrderService {
+    
+    private final OrderRepository orderRepository;
+    private final OutboxEventRepository outboxRepository;
+    
+    @Transactional  // Single DB transaction — atomic!
+    public Order createOrder(CreateOrderRequest request) {
+        // 1. Business logic
+        Order order = Order.builder()
+            .orderId(UUID.randomUUID().toString())
+            .customerId(request.getCustomerId())
+            .items(request.getItems())
+            .totalAmount(calculateTotal(request.getItems()))
+            .status(OrderStatus.CREATED)
+            .build();
+        orderRepository.save(order);
+        
+        // 2. Write to outbox (same transaction!)
+        OutboxEvent event = OutboxEvent.builder()
+            .aggregateType("Order")
+            .aggregateId(order.getOrderId())
+            .eventType("OrderCreated")
+            .topic("order-events")
+            .partitionKey(order.getOrderId())
+            .payload(objectMapper.valueToTree(OrderCreatedEvent.from(order)))
+            .build();
+        outboxRepository.save(event);
+        
+        // No Kafka send here! Debezium (or poller) will publish it.
+        return order;
+    }
+}
+
+// Alternative: Polling-based outbox publisher (simpler than CDC)
+@Component
+@RequiredArgsConstructor
+public class OutboxPublisher {
+    
+    private final OutboxEventRepository outboxRepository;
+    private final KafkaTemplate&lt;String, String&gt; kafkaTemplate;
+    
+    @Scheduled(fixedDelay = 100) // Poll every 100ms
+    @Transactional
+    public void publishPendingEvents() {
+        List&lt;OutboxEvent&gt; pending = outboxRepository
+            .findTop100ByStatusOrderByCreatedAtAsc("PENDING");
+        
+        for (OutboxEvent event : pending) {
+            try {
+                kafkaTemplate.send(
+                    event.getTopic(),
+                    event.getPartitionKey(),
+                    event.getPayload().toString()
+                ).get(5, TimeUnit.SECONDS); // Synchronous send
+                
+                event.setStatus("PUBLISHED");
+                event.setPublishedAt(Instant.now());
+                outboxRepository.save(event);
+            } catch (Exception e) {
+                log.error("Failed to publish outbox event: {}", event.getId(), e);
+                break; // Stop processing to maintain ordering
+            }
+        }
+    }
+}</code></pre>
+
+        <h3>Debezium Outbox Connector Configuration</h3>
+        <pre><code class="language-json">{
+  "name": "outbox-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "${secrets:db-password}",
+    "database.dbname": "orders_db",
+    "database.server.name": "orders",
+    "table.include.list": "public.outbox_events",
+    "tombstones.on.delete": "false",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.table.field.event.id": "id",
+    "transforms.outbox.table.field.event.key": "partition_key",
+    "transforms.outbox.table.field.event.payload": "payload",
+    "transforms.outbox.table.field.event.topic": "topic",
+    "transforms.outbox.table.field.event.type": "event_type",
+    "transforms.outbox.route.topic.replacement": "${routedByValue}",
+    "transforms.outbox.table.expand.json.payload": "true"
+  }
+}</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>CDC vs Polling:</strong></p>
+          <ul>
+            <li><strong>CDC (Debezium)</strong>: Near real-time, no polling overhead, captures from WAL. More infrastructure (Kafka Connect, Debezium). Best for high-throughput systems.</li>
+            <li><strong>Polling</strong>: Simpler, no extra infrastructure. Higher latency (polling interval), DB load from repeated queries. Fine for low-to-medium throughput.</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 9: Failure Scenarios -->
+    <section id="failure-scenarios">
+      <h2>Failure Scenarios</h2>
+
+      <details>
+        <summary>Consumer crash, rebalance, producer timeout, broker failure</summary>
+
+        <h3>Scenario 1: Consumer Crash Before Offset Commit</h3>
+        <pre class="diagram">
+  Consumer Crash Before Commit
+  ═══════════════════════════════════════════════════════════════
+
+  Timeline:
+  t=0  Consumer polls: receives messages [offset 10, 11, 12]
+  t=1  Processes offset 10 ✓ (payment of $500 debited)
+  t=2  Processes offset 11 ✓ (payment of $200 debited)
+  t=3  💥 CRASH before commitSync()
+  
+  After restart (or rebalance to new consumer):
+  t=10 Consumer polls from last committed offset = 10
+  t=11 Re-processes offset 10 → $500 debited AGAIN! 💸
+  t=12 Re-processes offset 11 → $200 debited AGAIN! 💸
+
+  Without idempotency: customer charged $1400 instead of $700
+
+  With dedup table:
+  t=11 Check dedup: offset 10 exists → SKIP ✓
+  t=12 Check dedup: offset 11 exists → SKIP ✓
+  t=13 Process offset 12 → $300 debited (first time) ✓
+        </pre>
+
+        <h3>Scenario 2: Rebalance During Processing</h3>
+        <pre class="diagram">
+  Rebalance During Processing
+  ═══════════════════════════════════════════════════════════════
+
+  Consumer A (owns partition 0)        Consumer B (new instance)
+  ───────────────────────────          ──────────────────────────
+  t=0  poll() → offset 50
+  t=1  processing offset 50...
+  t=2  (takes too long - exceeds       
+       max.poll.interval.ms)           
+  t=3  REBALANCE triggered!            
+       Partition 0 revoked from A      Partition 0 assigned to B
+  t=4  A still processing (zombie!)    B polls from committed=49
+  t=5  A finishes, tries commit →      B processes offset 50 ✓
+       CommitFailedException!           B commits offset 51
+       (no longer owns partition)
+  
+  Result: offset 50 processed TWICE (by A and B)
+
+  Mitigation:
+  - Increase max.poll.interval.ms if processing is legitimately slow
+  - Use cooperative rebalancing (CooperativeStickyAssignor)
+  - Implement ConsumerRebalanceListener to detect revocation mid-processing
+  - Consumer-side idempotency catches the duplicate regardless
+        </pre>
+
+        <h3>Scenario 3: Producer Timeout (ACK Lost)</h3>
+        <pre><code class="language-java">// Producer sends payment event, ACK is lost
+// Producer retries → potential duplicate in topic
+
+// Without idempotent producer:
+// Message written to partition TWICE (offsets 100 and 101, same data)
+
+// With idempotent producer (enable.idempotence=true):
+// Broker detects: PID=7, seq=42 already received → rejects duplicate
+// Only one copy in partition (offset 100)
+
+// But what if producer RESTARTS between retries?
+// New PID assigned → broker can't detect duplicate!
+// Solution: transactional.id provides stable identity across restarts
+
+@Component
+public class ReliablePaymentPublisher {
+    
+    private final KafkaTemplate&lt;String, PaymentEvent&gt; kafkaTemplate;
+    
+    public void publishPayment(PaymentEvent event) {
+        try {
+            // Synchronous send with timeout — know for certain if it succeeded
+            SendResult&lt;String, PaymentEvent&gt; result = kafkaTemplate
+                .send("payments", event.getPaymentId(), event)
+                .get(10, TimeUnit.SECONDS);
+            
+            log.info("Published to partition={}, offset={}", 
+                result.getRecordMetadata().partition(),
+                result.getRecordMetadata().offset());
+                
+        } catch (TimeoutException e) {
+            // AMBIGUOUS: message may or may not have been written
+            // With idempotent producer: safe to retry
+            // Without: potential duplicate
+            log.warn("Publish timeout for payment {}, will retry", 
+                event.getPaymentId());
+            throw new RetryableException("Kafka publish timeout", e);
+        }
+    }
+}</code></pre>
+
+        <h3>Scenario 4: Broker Failure During Transaction</h3>
+        <pre class="diagram">
+  Broker Failure Mid-Transaction
+  ═══════════════════════════════════════════════════════════════
+
+  Producer                     Transaction Coordinator (Broker 1)
+  ─────────                    ─────────────────────────────────
+  beginTransaction() ────────→ ONGOING
+  send(topic-A, msg1) ───────→ Written (uncommitted)
+  send(topic-B, msg2) ───────→ Written (uncommitted)
+  commitTransaction() ────────→ 💥 BROKER CRASHES
+
+  What happens:
+  1. Transaction coordinator fails over to new leader (Broker 2)
+  2. New coordinator reads transaction log from __transaction_state
+  3. Sees ONGOING transaction past timeout → ABORTS it
+  4. Uncommitted messages on topic-A and topic-B are invisible
+     to read_committed consumers (filtered by LSO)
+  5. Producer gets DisconnectException → must abort and retry
+  6. On retry: new beginTransaction() starts clean
+
+  Key guarantee: Partial writes are NEVER visible to read_committed consumers
+        </pre>
+
+        <h3>Scenario 5: Split-Brain / Network Partition</h3>
+        <pre><code class="language-java">// Scenario: Consumer A thinks it still owns a partition after network heal
+// but the broker reassigned it to Consumer B during the partition
+
+// Spring Kafka's ConsumerRebalanceListener helps detect this:
+@Component
+public class RebalanceAwareListener implements ConsumerRebalanceListener {
+    
+    private final Set&lt;TopicPartition&gt; activePartitions = ConcurrentHashMap.newKeySet();
+    
+    @Override
+    public void onPartitionsRevoked(Collection&lt;TopicPartition&gt; partitions) {
+        log.warn("Partitions REVOKED: {}. Stopping in-flight processing.", partitions);
+        activePartitions.removeAll(partitions);
+        
+        // Flush any pending work, commit what's done
+        // Any in-progress work for these partitions should be abandoned
+    }
+    
+    @Override
+    public void onPartitionsAssigned(Collection&lt;TopicPartition&gt; partitions) {
+        log.info("Partitions ASSIGNED: {}", partitions);
+        activePartitions.addAll(partitions);
+    }
+    
+    public boolean isPartitionStillOwned(TopicPartition tp) {
+        return activePartitions.contains(tp);
+    }
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Bottom line:</strong> Every failure scenario leads to the same conclusion — you WILL get duplicates at some point (crash, rebalance, timeout, split-brain). Design your consumers to be idempotent. It's not a question of IF duplicates will happen, but WHEN.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: Spring Kafka Implementation -->
+    <section id="spring-kafka">
+      <h2>Spring Kafka Implementation</h2>
+
+      <details>
+        <summary>KafkaListener, error handlers, ContainerProperties, AckMode</summary>
+
+        <h3>Complete Production Configuration</h3>
+        <pre><code class="language-yaml"># application.yml — Production Spring Kafka configuration
+spring:
+  kafka:
+    bootstrap-servers: kafka-1:9092,kafka-2:9092,kafka-3:9092
+    
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        enable.idempotence: true
+        acks: all
+        max.in.flight.requests.per.connection: 5
+        retries: 2147483647
+        delivery.timeout.ms: 120000
+        linger.ms: 5                  # Batch for 5ms for throughput
+        batch.size: 65536             # 64KB batches
+        compression.type: lz4         # Compress batches
+      transaction-id-prefix: payment-processor-${HOSTNAME:localhost}
+    
+    consumer:
+      group-id: payment-processor-group
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      auto-offset-reset: earliest     # Start from beginning if no committed offset
+      enable-auto-commit: false       # Manual offset management
+      properties:
+        isolation.level: read_committed
+        max.poll.records: 100         # Process 100 records per poll
+        max.poll.interval.ms: 300000  # 5 min processing time before rebalance
+        session.timeout.ms: 45000     # 45s heartbeat timeout
+        heartbeat.interval.ms: 15000  # Heartbeat every 15s
+        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+        spring.json.trusted.packages: "com.company.payments.events"
+    
+    listener:
+      type: batch                     # Batch processing for throughput
+      concurrency: 3                  # 3 consumer threads (match partition count)
+      ack-mode: manual                # Manual acknowledgment</code></pre>
+
+        <h3>Error Handling with DefaultErrorHandler</h3>
+        <pre><code class="language-java">@Configuration
+public class KafkaErrorHandlingConfig {
+    
+    @Bean
+    public DefaultErrorHandler errorHandler(
+            KafkaTemplate&lt;String, Object&gt; kafkaTemplate) {
+        
+        // Dead Letter Topic publisher
+        DeadLetterPublishingRecoverer recoverer = 
+            new DeadLetterPublishingRecoverer(kafkaTemplate,
+                (record, ex) -> new TopicPartition(
+                    record.topic() + ".DLT", record.partition()));
+        
+        // Retry with exponential backoff, then send to DLT
+        ExponentialBackOff backOff = new ExponentialBackOff(1000L, 2.0);
+        backOff.setMaxElapsedTime(60000L); // Max 60s total retry time
+        
+        DefaultErrorHandler handler = new DefaultErrorHandler(recoverer, backOff);
+        
+        // Don't retry these — they'll never succeed
+        handler.addNotRetryableExceptions(
+            DeserializationException.class,
+            JsonParseException.class,
+            NullPointerException.class,
+            ClassCastException.class
+        );
+        
+        // Retry these — transient failures
+        handler.addRetryableExceptions(
+            DataAccessException.class,
+            TimeoutException.class,
+            TransientDataAccessException.class
+        );
+        
+        return handler;
+    }
+    
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory&lt;String, String&gt;
+            kafkaListenerContainerFactory(
+                ConsumerFactory&lt;String, String&gt; consumerFactory,
+                DefaultErrorHandler errorHandler) {
+        
+        var factory = new ConcurrentKafkaListenerContainerFactory&lt;String, String&gt;();
+        factory.setConsumerFactory(consumerFactory);
+        factory.setCommonErrorHandler(errorHandler);
+        factory.setConcurrency(3);
+        factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL);
+        factory.getContainerProperties().setSyncCommits(true);
+        // Cooperative rebalancing
+        factory.getContainerProperties().setAssignmentCommitOption(
+            ContainerProperties.AssignmentCommitOption.LATEST_ONLY_NO_TX);
+        
+        return factory;
+    }
+}</code></pre>
+
+        <h3>Production Consumer with Full Error Handling</h3>
+        <pre><code class="language-java">@Component
+@Slf4j
+@RequiredArgsConstructor
+public class PaymentEventConsumer {
+    
+    private final PaymentService paymentService;
+    private final MeterRegistry meterRegistry;
+    
+    @KafkaListener(
+        topics = "${app.kafka.topics.payments}",
+        groupId = "${spring.kafka.consumer.group-id}",
+        containerFactory = "kafkaListenerContainerFactory",
+        properties = {
+            "max.poll.records=50",
+            "fetch.min.bytes=1024"
+        }
+    )
+    public void handlePaymentEvents(
+            List&lt;ConsumerRecord&lt;String, PaymentEvent&gt;&gt; records,
+            Acknowledgment acknowledgment,
+            Consumer&lt;String, PaymentEvent&gt; consumer) {
+        
+        Timer.Sample timer = Timer.start(meterRegistry);
+        int successCount = 0;
+        int skipCount = 0;
+        
+        try {
+            for (ConsumerRecord&lt;String, PaymentEvent&gt; record : records) {
+                String eventId = getEventId(record);
+                
+                try {
+                    boolean processed = paymentService.processIdempotent(
+                        record.value(), eventId);
+                    
+                    if (processed) {
+                        successCount++;
+                    } else {
+                        skipCount++;  // Duplicate, already processed
+                    }
+                } catch (RetryableException e) {
+                    // Re-throw to trigger error handler retry
+                    throw e;
+                } catch (Exception e) {
+                    // Non-retryable: log, metric, continue with next record
+                    log.error("Failed to process payment event: {} (offset={})", 
+                        eventId, record.offset(), e);
+                    meterRegistry.counter("kafka.consumer.errors",
+                        "topic", record.topic(),
+                        "error_type", e.getClass().getSimpleName()).increment();
+                }
+            }
+            
+            // Acknowledge entire batch
+            acknowledgment.acknowledge();
+            
+        } finally {
+            timer.stop(meterRegistry.timer("kafka.consumer.batch.duration",
+                "topic", records.get(0).topic()));
+            meterRegistry.counter("kafka.consumer.processed", 
+                "outcome", "success").increment(successCount);
+            meterRegistry.counter("kafka.consumer.processed",
+                "outcome", "duplicate").increment(skipCount);
+        }
+        
+        log.debug("Batch processed: {} success, {} duplicates skipped", 
+            successCount, skipCount);
+    }
+    
+    private String getEventId(ConsumerRecord&lt;String, PaymentEvent&gt; record) {
+        Header header = record.headers().lastHeader("event-id");
+        if (header != null) {
+            return new String(header.value(), StandardCharsets.UTF_8);
+        }
+        return record.topic() + "-" + record.partition() + "-" + record.offset();
+    }
+}</code></pre>
+
+        <h3>ContainerProperties Deep Dive</h3>
+        <pre><code class="language-java">// Key ContainerProperties settings for exactly-once patterns
+
+ContainerProperties props = factory.getContainerProperties();
+
+// AckMode — when offsets are committed
+props.setAckMode(AckMode.MANUAL);           // You control via Acknowledgment
+// Alternatives:
+// AckMode.RECORD       — after each record (safest, slowest)
+// AckMode.BATCH        — after all records in poll() batch (default, good balance)
+// AckMode.MANUAL       — you call ack.acknowledge() (most control)
+// AckMode.MANUAL_IMMEDIATE — ack commits immediately, not batched
+
+// Sync vs Async commits
+props.setSyncCommits(true);  // Block until offset commit confirmed
+// false = async (faster but commit can be lost)
+
+// Transaction manager for exactly-once (Kafka-to-Kafka)
+props.setTransactionManager(kafkaTransactionManager);
+
+// EOS Mode (Exactly Once Semantics)
+props.setEosMode(EOSMode.V2);  // KIP-447: one producer per consumer group
+// V1 (deprecated): one producer per partition (more overhead)
+
+// Idle event publishing (detect stalled consumers)
+props.setIdleEventInterval(60000L); // Publish event if no records for 60s
+
+// Poll timeout
+props.setPollTimeout(5000L); // Wait up to 5s for records in poll()</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Spring Kafka 3.x changes:</strong> <code>SeekToCurrentErrorHandler</code> is deprecated in favor of <code>DefaultErrorHandler</code>. The <code>setCommonErrorHandler()</code> method replaces both <code>setErrorHandler()</code> and <code>setBatchErrorHandler()</code>. Use <code>DefaultErrorHandler</code> for all new code.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 11: Production Incident -->
+    <section id="production-incident">
+      <h2>Production Incident — Duplicate Payment Processing</h2>
+
+      <details>
+        <summary>Black Friday consumer group rebalance causes duplicate charges</summary>
+
+        <h3>Incident Timeline</h3>
+        <div class="callout callout-danger">
+          <p><strong>Severity:</strong> P1 — 2,847 customers double-charged during Black Friday peak traffic</p>
+          <p><strong>Duration:</strong> 47 minutes (11:23 AM — 12:10 PM EST)</p>
+          <p><strong>Root cause:</strong> Consumer group rebalance during peak processing, combined with missing idempotency in the payment consumer</p>
+        </div>
+
+        <pre class="diagram">
+  Incident Timeline
+  ═══════════════════════════════════════════════════════════════
+
+  11:00  Black Friday traffic ramps up. Payment topic partition lag growing.
+         Auto-scaler adds 2 new consumer pods (Pod C, Pod D) to handle load.
+  
+  11:15  New pods join consumer group → REBALANCE triggered (stop-the-world)
+         All consumers pause for ~30 seconds during Eager protocol rebalance
+         max.poll.interval.ms = 300000 (5 min) — not the issue
+  
+  11:23  Rebalance completes. Partition reassignment:
+         Pod A: partitions [0,1] → [0]        (lost partition 1)
+         Pod B: partitions [2,3] → [2]        (lost partition 3)  
+         Pod C: partitions []    → [1,3]      (new, gets partitions 1 and 3)
+         Pod D: partitions []    → [4,5]      (new)
+  
+  11:23  PROBLEM: Pod A had PROCESSED but NOT COMMITTED offsets for partition 1
+         Last committed offset for partition 1: 50,234
+         Pod A had processed up to: 50,891 (657 messages processed but uncommitted)
+  
+  11:23  Pod C starts consuming partition 1 from committed offset 50,234
+         → 657 payment messages RE-PROCESSED
+         → 657 customers charged AGAIN (no idempotency check!)
+  
+  11:35  First customer support ticket: "charged twice for my order"
+  11:42  Alert fires: payment_success_rate anomaly detected
+  11:45  On-call identifies duplicate payment IDs in the ledger
+  11:50  Root cause identified: rebalance + no dedup
+  12:00  Hotfix: disable consumer, stop processing
+  12:10  Deploy emergency idempotency check, resume processing
+  
+  12:10 - 14:00  Process refunds for 2,847 affected transactions
+        </pre>
+
+        <h3>Root Cause Analysis</h3>
+        <pre><code class="language-java">// THE BROKEN CODE (before fix)
+@KafkaListener(topics = "payment-commands", groupId = "payment-processor")
+public void processPayment(ConsumerRecord&lt;String, PaymentCommand&gt; record) {
+    PaymentCommand command = record.value();
+    
+    // NO IDEMPOTENCY CHECK! Just process blindly.
+    paymentGateway.charge(command.getCustomerId(), command.getAmount());
+    ledgerService.recordDebit(command.getPaymentId(), command.getAmount());
+    
+    // Offset committed by Spring Kafka AFTER this method returns (BATCH mode)
+    // If rebalance happens before batch commit → messages replayed → double charge
+}
+
+// The configuration that made it worse:
+spring:
+  kafka:
+    listener:
+      ack-mode: batch              # Commits after entire batch, not per record
+    consumer:
+      max-poll-records: 500        # Large batches = larger window for duplicates
+      # enable.auto.commit: false  # Manual commit, but batch-level only</code></pre>
+
+        <h3>The Fix</h3>
+        <pre><code class="language-java">// THE FIXED CODE (after incident)
+@KafkaListener(topics = "payment-commands", groupId = "payment-processor")
+public void processPayment(
+        ConsumerRecord&lt;String, PaymentCommand&gt; record,
+        Acknowledgment ack) {
+    
+    PaymentCommand command = record.value();
+    String idempotencyKey = command.getPaymentId(); // Business-level unique ID
+    
+    // Atomic: check dedup + process + record dedup — all in one DB transaction
+    boolean processed = paymentTransactionTemplate.execute(status -> {
+        // 1. Idempotency gate
+        if (paymentLedger.existsByPaymentId(idempotencyKey)) {
+            log.warn("Duplicate payment detected: {} (offset={}). Skipping.",
+                idempotencyKey, record.offset());
+            metrics.counter("payments.duplicate.skipped").increment();
+            return false;
+        }
+        
+        // 2. Charge customer (external call — must be idempotent at gateway too!)
+        ChargeResult result = paymentGateway.chargeIdempotent(
+            command.getCustomerId(), 
+            command.getAmount(),
+            idempotencyKey  // Pass to payment gateway for their dedup
+        );
+        
+        // 3. Record in ledger (serves as dedup record too)
+        paymentLedger.save(PaymentLedgerEntry.builder()
+            .paymentId(idempotencyKey)
+            .customerId(command.getCustomerId())
+            .amount(command.getAmount())
+            .gatewayTransactionId(result.getTransactionId())
+            .kafkaOffset(record.offset())
+            .kafkaPartition(record.partition())
+            .processedAt(Instant.now())
+            .build());
+        
+        return true;
+    });
+    
+    // 4. Commit offset only after successful DB transaction
+    ack.acknowledge();
+}
+
+// Additional safeguard: payment gateway idempotency key
+// Stripe, PayPal, etc. all support idempotency keys:
+// POST /v1/charges { "idempotency_key": "pay_abc123", ... }
+// If the same key is sent twice, they return the first result without charging again</code></pre>
+
+        <h3>Preventive Measures Implemented</h3>
+        <pre><code class="language-yaml"># Changes deployed after incident:
+
+# 1. Switched to Cooperative Sticky rebalancing (no stop-the-world)
+spring.kafka.consumer.properties.partition.assignment.strategy: \
+  org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+
+# 2. Reduced batch size to minimize rebalance window
+spring.kafka.consumer.max-poll-records: 50   # Was 500
+
+# 3. Added static group membership (fewer rebalances during scaling)
+spring.kafka.consumer.properties.group.instance.id: ${HOSTNAME}
+spring.kafka.consumer.properties.session.timeout.ms: 60000
+
+# 4. Monitoring alert on consumer lag spike during rebalance
+# Alert if: kafka_consumergroup_lag > 10000 for > 2 minutes</code></pre>
+
+        <h3>Post-Mortem Action Items</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Action</th>
+              <th>Priority</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>Add idempotency check to ALL payment consumers</td>
+              <td>P0</td>
+              <td>✅ Done (hotfix)</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>Switch to CooperativeStickyAssignor</td>
+              <td>P1</td>
+              <td>✅ Done</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>Add static group membership for consumer pods</td>
+              <td>P1</td>
+              <td>✅ Done</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Alert on duplicate payment IDs in ledger</td>
+              <td>P1</td>
+              <td>✅ Done</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>Load test with rebalance scenarios in staging</td>
+              <td>P2</td>
+              <td>✅ Done</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>Document idempotency patterns in engineering handbook</td>
+              <td>P2</td>
+              <td>✅ Done</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 12: Debugging Workflow -->
+    <section id="debugging-workflow">
+      <h2>Debugging — Consumer Lag, Offset Monitoring, Duplicate Detection</h2>
+
+      <details>
+        <summary>Tools and techniques for diagnosing exactly-once failures</summary>
+
+        <h3>Step 1: Check Consumer Group Lag</h3>
+        <pre><code class="language-bash"># Check consumer group lag (most important metric)
+kafka-consumer-groups.sh --bootstrap-server kafka:9092 \
+  --group payment-processor-group --describe
+
+# Output:
+# GROUP                  TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+# payment-processor-grp  payment-events  0          50234           50891           657
+# payment-processor-grp  payment-events  1          38100           38100           0
+# payment-processor-grp  payment-events  2          42567           42890           323
+#
+# LAG > 0 means consumer is behind. Large lag = potential redelivery window.
+
+# Check for "EMPTY" or "DEAD" members (zombie consumers)
+kafka-consumer-groups.sh --bootstrap-server kafka:9092 \
+  --group payment-processor-group --describe --members
+
+# Reset offsets (DANGEROUS — use in emergency only):
+kafka-consumer-groups.sh --bootstrap-server kafka:9092 \
+  --group payment-processor-group \
+  --topic payment-events \
+  --reset-offsets --to-offset 50234 \
+  --execute</code></pre>
+
+        <h3>Step 2: Monitor for Rebalances</h3>
+        <pre><code class="language-java">// Spring Kafka rebalance listener for monitoring
+@Component
+@Slf4j
+public class RebalanceMonitor implements ConsumerAwareRebalanceListener {
+    
+    private final MeterRegistry meterRegistry;
+    private Instant lastRebalanceTime;
+    
+    @Override
+    public void onPartitionsRevoked(Consumer&lt;?, ?&gt; consumer,
+            Collection&lt;TopicPartition&gt; partitions) {
+        log.warn("🔄 REBALANCE: Partitions REVOKED: {} (consumer={})",
+            partitions, consumer.groupMetadata().memberId());
+        meterRegistry.counter("kafka.rebalance", "type", "revoked").increment();
+        lastRebalanceTime = Instant.now();
+        
+        // Commit any pending offsets before revocation
+        consumer.commitSync(Duration.ofSeconds(5));
+    }
+    
+    @Override
+    public void onPartitionsAssigned(Consumer&lt;?, ?&gt; consumer,
+            Collection&lt;TopicPartition&gt; partitions) {
+        long rebalanceDuration = lastRebalanceTime != null ? 
+            Duration.between(lastRebalanceTime, Instant.now()).toMillis() : 0;
+        
+        log.info("🔄 REBALANCE: Partitions ASSIGNED: {} (took {}ms)",
+            partitions, rebalanceDuration);
+        meterRegistry.counter("kafka.rebalance", "type", "assigned").increment();
+        meterRegistry.timer("kafka.rebalance.duration")
+            .record(rebalanceDuration, TimeUnit.MILLISECONDS);
+    }
+}</code></pre>
+
+        <h3>Step 3: Detect Duplicates in the Database</h3>
+        <pre><code class="language-sql">-- Find duplicate payments (same payment_id processed multiple times)
+SELECT payment_id, COUNT(*) as times_processed, 
+       MIN(processed_at) as first_processed,
+       MAX(processed_at) as last_processed,
+       MAX(processed_at) - MIN(processed_at) as gap
+FROM payment_ledger
+GROUP BY payment_id
+HAVING COUNT(*) > 1
+ORDER BY last_processed DESC
+LIMIT 50;
+
+-- Check for offset gaps (potential missed messages)
+SELECT topic, partition_id, 
+       kafka_offset,
+       LEAD(kafka_offset) OVER (PARTITION BY topic, partition_id ORDER BY kafka_offset) as next_offset,
+       LEAD(kafka_offset) OVER (PARTITION BY topic, partition_id ORDER BY kafka_offset) - kafka_offset as gap
+FROM processed_events
+WHERE topic = 'payment-events'
+  AND processed_at > NOW() - INTERVAL '1 hour'
+HAVING gap > 1
+ORDER BY processed_at DESC;
+
+-- Monitor dedup hit rate (high rate = frequent redelivery)
+SELECT DATE_TRUNC('minute', attempted_at) as minute,
+       COUNT(*) as total_attempts,
+       SUM(CASE WHEN was_duplicate THEN 1 ELSE 0 END) as duplicates,
+       ROUND(100.0 * SUM(CASE WHEN was_duplicate THEN 1 ELSE 0 END) / COUNT(*), 2) as dup_pct
+FROM consumer_processing_log
+WHERE attempted_at > NOW() - INTERVAL '1 hour'
+GROUP BY 1
+ORDER BY 1 DESC;</code></pre>
+
+        <h3>Step 4: Kafka Internals Inspection</h3>
+        <pre><code class="language-bash"># Read the __consumer_offsets topic (internal topic storing committed offsets)
+kafka-console-consumer.sh --bootstrap-server kafka:9092 \
+  --topic __consumer_offsets \
+  --formatter "kafka.coordinator.group.GroupMetadataManager\$OffsetsMessageFormatter" \
+  --from-beginning | grep "payment-processor-group"
+
+# Check transaction state
+kafka-console-consumer.sh --bootstrap-server kafka:9092 \
+  --topic __transaction_state \
+  --formatter "kafka.coordinator.transaction.TransactionLog\$TransactionLogMessageFormatter" \
+  --from-beginning | grep "payment-processor"
+
+# Dump specific partition to check for duplicate messages
+kafka-console-consumer.sh --bootstrap-server kafka:9092 \
+  --topic payment-events \
+  --partition 0 \
+  --offset 50230 \
+  --max-messages 20 \
+  --property print.offset=true \
+  --property print.headers=true \
+  --property print.key=true</code></pre>
+
+        <h3>Step 5: Grafana Dashboard Queries (Prometheus)</h3>
+        <pre><code class="language-bash"># Key metrics to monitor:
+
+# 1. Consumer lag per partition
+kafka_consumergroup_lag{group="payment-processor-group"}
+
+# 2. Rebalance rate (should be near zero in steady state)
+rate(kafka_consumer_coordinator_rebalance_total[5m])
+
+# 3. Commit latency (high = potential for larger redelivery window)
+kafka_consumer_commit_latency_avg{group="payment-processor-group"}
+
+# 4. Duplicate detection rate (application metric)
+rate(payments_duplicate_skipped_total[5m])
+
+# 5. Records processed per second
+rate(spring_kafka_listener_seconds_count[1m])
+
+# Alert rules:
+# - Consumer lag > 10000 for > 5 minutes → P2 alert
+# - Rebalance count > 3 in 10 minutes → P3 alert  
+# - Duplicate rate > 5% → P2 alert (indicates rebalance storm)
+# - Consumer lag growing monotonically for > 15 min → P1 alert</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Debugging checklist when duplicates are detected:</strong></p>
+          <ol>
+            <li>Check consumer group lag — was there a lag spike? (indicates rebalance)</li>
+            <li>Check rebalance logs — was a partition reassigned?</li>
+            <li>Check consumer instance count — did auto-scaling trigger?</li>
+            <li>Check committed offsets vs processed offsets — gap = uncommitted window</li>
+            <li>Check if idempotency check is in same DB transaction as business logic</li>
+            <li>Check if external systems (payment gateway) received duplicates</li>
+          </ol>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 13: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Table of mistakes, symptoms, and fixes</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Mistake</th>
+              <th>Symptom</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td><strong>Relying solely on enable.idempotence=true</strong></td>
+              <td>Duplicates after producer restart (PID changes)</td>
+              <td>Use transactional.id for cross-restart dedup, or implement consumer-side idempotency</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td><strong>Dedup check in separate transaction from business logic</strong></td>
+              <td>Rare duplicates when crash occurs between dedup record and business write</td>
+              <td>Always execute dedup check + business logic + dedup record in ONE transaction</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td><strong>Using auto-commit with long processing</strong></td>
+              <td>At-most-once delivery — commits before processing completes</td>
+              <td>Disable auto-commit, use manual ack after successful processing</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td><strong>Large max.poll.records with batch ack</strong></td>
+              <td>Large redelivery window on rebalance (hundreds of duplicates)</td>
+              <td>Reduce batch size, or commit per-record for critical payments</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td><strong>Not handling ProducerFencedException</strong></td>
+              <td>Zombie producer continues processing after being fenced</td>
+              <td>Catch ProducerFencedException, stop processing, shutdown gracefully</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td><strong>External side effects in Kafka transactions</strong></td>
+              <td>Email sent twice, HTTP call made twice, even though Kafka transaction is atomic</td>
+              <td>Kafka EOS only covers Kafka. Side effects need their own idempotency (idempotency keys)</td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td><strong>Using topic-partition-offset as dedup key for compacted topics</strong></td>
+              <td>After compaction, offsets are reused — dedup table has stale entries</td>
+              <td>Use business-level event ID (UUID, payment_id) as dedup key, not Kafka offset</td>
+            </tr>
+            <tr>
+              <td>8</td>
+              <td><strong>Forgetting isolation.level=read_committed on consumer</strong></td>
+              <td>Consumer sees uncommitted transactional messages (phantom reads)</td>
+              <td>Set isolation.level=read_committed for all consumers downstream of transactional producers</td>
+            </tr>
+            <tr>
+              <td>9</td>
+              <td><strong>Same transactional.id across multiple instances</strong></td>
+              <td>Instances fence each other — only one can produce at a time</td>
+              <td>Append hostname/pod-name to transactional.id: "processor-${HOSTNAME}"</td>
+            </tr>
+            <tr>
+              <td>10</td>
+              <td><strong>Dual-write: DB + Kafka send in same method</strong></td>
+              <td>Inconsistency — one succeeds, other fails</td>
+              <td>Use Outbox pattern: write to DB only, let CDC/poller publish to Kafka</td>
+            </tr>
+            <tr>
+              <td>11</td>
+              <td><strong>No dedup table cleanup</strong></td>
+              <td>Table grows unbounded, query performance degrades</td>
+              <td>Add TTL/scheduled cleanup: DELETE WHERE processed_at < NOW() - 7 DAYS</td>
+            </tr>
+            <tr>
+              <td>12</td>
+              <td><strong>Assuming exactly-once means "process once"</strong></td>
+              <td>Design doesn't account for the fact that code WILL execute multiple times</td>
+              <td>"Exactly-once" means exactly-once <em>effect</em>. Code may run multiple times — ensure each run is idempotent</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 14: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs — Exactly-Once Cost vs At-Least-Once + Idempotency</h2>
+
+      <details>
+        <summary>When to use Kafka EOS vs pragmatic idempotency</summary>
+
+        <h3>Performance Comparison</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>At-Least-Once + Idempotent Consumer</th>
+              <th>Kafka Exactly-Once (EOS)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Throughput</strong></td>
+              <td>~100K msg/s per partition</td>
+              <td>~50-70K msg/s per partition (30-50% overhead)</td>
+            </tr>
+            <tr>
+              <td><strong>Latency (P99)</strong></td>
+              <td>5-15ms</td>
+              <td>20-50ms (transaction commit overhead)</td>
+            </tr>
+            <tr>
+              <td><strong>Broker overhead</strong></td>
+              <td>Minimal</td>
+              <td>Transaction coordinator, PID tracking, LSO maintenance</td>
+            </tr>
+            <tr>
+              <td><strong>Consumer visibility delay</strong></td>
+              <td>Immediate</td>
+              <td>Blocked until transaction commits (LSO lag)</td>
+            </tr>
+            <tr>
+              <td><strong>Complexity</strong></td>
+              <td>Dedup table + unique constraints</td>
+              <td>Transactional config + isolation levels + fencing</td>
+            </tr>
+            <tr>
+              <td><strong>External side effects</strong></td>
+              <td>✓ Handled by idempotency keys</td>
+              <td>✗ Not covered — still need idempotency for non-Kafka sinks</td>
+            </tr>
+            <tr>
+              <td><strong>Failure recovery</strong></td>
+              <td>Replay from last offset, dedup handles duplicates</td>
+              <td>Transaction abort + replay, stricter error handling needed</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Decision Matrix: When to Use What</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Scenario</th>
+              <th>Recommended Approach</th>
+              <th>Why</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Kafka Streams (topic → topic)</td>
+              <td><strong>Kafka EOS</strong></td>
+              <td>Native support, minimal code changes, no external state needed</td>
+            </tr>
+            <tr>
+              <td>Consumer → Database writes</td>
+              <td><strong>At-least-once + dedup table</strong></td>
+              <td>Kafka EOS can't span DB + Kafka atomically</td>
+            </tr>
+            <tr>
+              <td>Consumer → External API call</td>
+              <td><strong>At-least-once + idempotency key</strong></td>
+              <td>No transaction can span Kafka + HTTP. Use provider's idempotency key</td>
+            </tr>
+            <tr>
+              <td>Financial: consume → process → produce + DB</td>
+              <td><strong>Both: EOS for Kafka + dedup for DB</strong></td>
+              <td>Belt and suspenders for critical financial data</td>
+            </tr>
+            <tr>
+              <td>Analytics / metrics pipeline</td>
+              <td><strong>At-least-once (no dedup)</strong></td>
+              <td>Occasional duplicates acceptable; dedup cost not worth it</td>
+            </tr>
+            <tr>
+              <td>Event sourcing with replay</td>
+              <td><strong>Idempotent event handlers</strong></td>
+              <td>Events are replayed by design; handlers must be naturally idempotent</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>The Pragmatic Senior Answer</h3>
+        <div class="callout callout-tip">
+          <p><strong>What senior engineers say in interviews:</strong></p>
+          <blockquote>
+            "In my experience, at-least-once delivery with idempotent consumers is the sweet spot for 95% of use cases. Here's why:
+            <br><br>
+            1. <strong>It's simpler</strong> — one dedup table vs transactional producer config + isolation levels + fencing + EOS mode.
+            <br><br>
+            2. <strong>It's faster</strong> — 30-50% better throughput without transaction overhead.
+            <br><br>
+            3. <strong>It's universal</strong> — works for DB writes, API calls, email — anything. Kafka EOS only works within Kafka.
+            <br><br>
+            4. <strong>You need it anyway</strong> — even with Kafka EOS, the moment you have a non-Kafka sink, you need consumer-side idempotency. So build it from the start.
+            <br><br>
+            I use Kafka EOS specifically for Kafka Streams applications doing stateful aggregations where the state store and output topic must be consistent. For everything else, at-least-once + idempotency."
+          </blockquote>
+        </div>
+
+        <h3>Cost of Exactly-Once in Numbers</h3>
+        <pre class="diagram">
+  Performance Impact of EOS
+  ═══════════════════════════════════════════════════════════════
+
+  Benchmark: 3-broker cluster, 6 partitions, 1KB messages
+
+  ┌───────────────────────────────────────────────────────────┐
+  │ Mode                    │ Throughput  │ P99 Latency │ CPU │
+  ├───────────────────────────────────────────────────────────┤
+  │ acks=1, no idempotence  │ 150K msg/s  │    3ms      │ 40% │
+  │ acks=all, idempotent    │ 120K msg/s  │    8ms      │ 55% │
+  │ acks=all, transactional │  80K msg/s  │   25ms      │ 70% │
+  └───────────────────────────────────────────────────────────┘
+
+  Overhead breakdown:
+  - Idempotent producer:    ~20% throughput reduction (PID/seq tracking)
+  - Transactional commit:   ~35% throughput reduction (2PC with coordinator)
+  - read_committed consumer: +5-10ms latency (waits for LSO advance)
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 15: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Likely follow-ups and how to answer</summary>
+        <dl>
+          <dt><strong>Q: "Can you have exactly-once when your consumer calls an external HTTP API?"</strong></dt>
+          <dd>No — Kafka transactions only span Kafka-internal operations. For HTTP calls, you need the external service to support <strong>idempotency keys</strong> (Stripe does this with <code>Idempotency-Key</code> header). If the service doesn't support it, you can only achieve at-most-once (don't retry) or at-least-once (retry with dedup on your side), and you rely on the external service being naturally idempotent or having its own dedup.</dd>
+
+          <dt><strong>Q: "What happens if your dedup table query is slow under load?"</strong></dt>
+          <dd>The dedup table is a hot path — every message hits it. Optimize: (1) Use a unique index on event_id (single-row lookup), (2) Partition the table by date for faster cleanup, (3) Consider a Redis/Memcached layer for recent events (check cache first, fallback to DB), (4) Use a Bloom filter for a fast "definitely not processed" check before hitting the DB. In our payment system, we use a 2-tier approach: Redis SET for last 24h of event IDs (O(1) lookup), falling back to PostgreSQL dedup table for older events.</dd>
+
+          <dt><strong>Q: "How does Kafka Streams handle exactly-once internally?"</strong></dt>
+          <dd>Kafka Streams uses the transactional API under the hood. When you set <code>processing.guarantee=exactly_once_v2</code>, each StreamThread gets a transactional producer. The framework atomically commits: (1) output records to output topics, (2) changelog records to state store topics, (3) consumer offsets for input partitions. This is why Kafka Streams can guarantee exactly-once for stateful operations — the state store changelog and output are committed atomically. KIP-447 (v2) simplified this to use one producer per StreamThread instead of one per task.</dd>
+
+          <dt><strong>Q: "What is the Outbox pattern and when would you use it over Kafka transactions?"</strong></dt>
+          <dd>The Outbox pattern solves the dual-write problem (DB + Kafka). You write your business data and an outbox event to the same database in one transaction, then a separate process (CDC/Debezium or a poller) publishes the outbox events to Kafka. Use it when: your primary write is to a database (not Kafka), you need the DB and Kafka to be consistent, and you can tolerate slight publish delay (typically &lt;1s with CDC). Kafka transactions are for Kafka-to-Kafka flows only.</dd>
+
+          <dt><strong>Q: "How do you handle ordering with exactly-once? Can messages be processed out of order?"</strong></dt>
+          <dd>Within a single partition, Kafka guarantees order. With transactions, committed messages maintain their offset order. However: (1) If a transaction is aborted and retried, the retry gets a HIGHER offset — so consumers see the "gap" where the abort was. (2) Across partitions, there's no ordering guarantee. (3) With at-least-once + retry, redelivered messages may interleave with new messages. Solution: include a logical timestamp or version in messages, and use conditional updates (UPDATE WHERE version &lt; newVersion) to handle out-of-order delivery.</dd>
+
+          <dt><strong>Q: "What's the difference between consumer group static membership and cooperative rebalancing?"</strong></dt>
+          <dd>They solve different parts of the rebalance problem. <strong>Static membership</strong> (<code>group.instance.id</code>) prevents rebalance during transient failures — if a consumer disconnects and reconnects within session.timeout, it gets the same partitions back without triggering a rebalance. <strong>Cooperative rebalancing</strong> (CooperativeStickyAssignor) makes rebalances incremental — only affected partitions are revoked, not all partitions. Together, they minimize rebalance frequency and impact. Use both for payment/financial consumers.</dd>
+
+          <dt><strong>Q: "How would you test exactly-once processing in integration tests?"</strong></dt>
+          <dd>Use Testcontainers with a real Kafka broker. Test scenarios: (1) Send same message twice, verify only one DB record, (2) Kill consumer mid-batch (Thread.interrupt), verify no duplicates after restart, (3) Simulate rebalance by adding a consumer mid-processing, verify no duplicates, (4) Send a message, verify it's in both the output topic AND the dedup table atomically. We use a custom test harness that counts DB writes — if count > expected, the test fails. Also verify with <code>@EmbeddedKafka</code> for unit-level tests.</dd>
+
+          <dt><strong>Q: "What happens if the dedup table and the business table are in different databases?"</strong></dt>
+          <dd>Then you can't have a single transaction spanning both — you've recreated the dual-write problem. Solutions: (1) Move the dedup check into the same database as the business logic (preferred), (2) Use distributed transactions (XA/2PC — not recommended, fragile), (3) Use the business table itself as the dedup mechanism via unique constraints on the business key (e.g., <code>INSERT ... ON CONFLICT DO NOTHING</code>). Option 3 is simplest if your business entity has a natural unique key from the message.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- Section 16: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Key Takeaways:</strong></p>
+        <ol>
+          <li><strong>True exactly-once delivery is impossible</strong> in distributed systems (Two Generals' Problem). Kafka provides "effectively exactly-once" — an abstraction built on idempotent producers + transactions + consumer dedup.</li>
+          <li><strong>Idempotent producer</strong> (enable.idempotence=true) prevents duplicate writes to topics during producer retries. It's free (default since Kafka 3.0) but only works within a single producer session.</li>
+          <li><strong>Kafka transactions</strong> enable atomic read-process-write for topic-to-topic flows. They atomically commit output messages + consumer offsets. Limited to Kafka-internal operations.</li>
+          <li><strong>Consumer-side idempotency is the universal solution.</strong> Store the event ID or offset in the same database transaction as your business logic. Dedup table pattern works for any downstream system.</li>
+          <li><strong>The Outbox pattern</strong> solves dual-write (DB + Kafka). Write business data + outbox event in one DB transaction; CDC/Debezium publishes to Kafka asynchronously.</li>
+          <li><strong>At-least-once + idempotent consumers</strong> is the pragmatic choice for 95% of systems. Simpler, faster (30-50% better throughput), and works for ALL downstream systems (DB, HTTP, email).</li>
+          <li><strong>Rebalances are the #1 cause of duplicates.</strong> Mitigate with: CooperativeStickyAssignor, static group membership, smaller poll batches, and — most importantly — idempotent consumers.</li>
+          <li><strong>Make your business logic naturally idempotent</strong> where possible: upserts, conditional updates with version checks, unique constraints. When not possible, use an explicit dedup table.</li>
+          <li><strong>Monitor consumer lag and rebalance frequency.</strong> A lag spike after rebalance = messages being redelivered. Combine with duplicate detection alerts on the business side.</li>
+          <li><strong>External side effects</strong> (payment charges, emails, HTTP calls) are NEVER covered by Kafka EOS. Use idempotency keys provided by the external service, or accept at-most-once for those operations.</li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch04-hikaricp-pool-exhaustion.html" class="chapter-nav-prev">← Chapter 4: HikariCP Pool Exhaustion</a>
+      <a href="ch06-health-checks-503.html" class="chapter-nav-next">Chapter 6: Health Checks & 503s →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

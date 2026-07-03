@@ -1,0 +1,1349 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 8: Optimistic Locking Failures in High Concurrency | Senior Backend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 8</span>
+      <span class="chapter-title">Optimistic Locking Failures</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#optimistic-vs-pessimistic">Optimistic vs Pessimistic</a></li>
+        <li><a href="#why-it-fails">Why It Fails</a></li>
+        <li><a href="#retry-storms">Retry Storms</a></li>
+        <li><a href="#solutions">Solutions</a></li>
+        <li><a href="#jpa-implementation">JPA Implementation</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-Offs</a></li>
+        <li><a href="#follow-up-questions">Follow-Up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-ii">Part II — Distributed Systems &amp; Infrastructure</a> &rsaquo;
+      <span>Chapter 8</span>
+    </nav>
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Concurrency</span>
+        <span class="badge badge-topic">Locking</span>
+      </div>
+      <h1>Why Might Optimistic Locking Still Fail in a High-Concurrency Environment?</h1>
+      <p class="chapter-takeaway"><strong>Key Takeaway:</strong> Optimistic locking assumes low contention. When many threads compete for the same rows, version-check failures cascade into retry storms that amplify latency and can collapse throughput entirely — making pessimistic locking or queue-based serialization the better choice for true hot-spot resources.</p>
+    </header>
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search..." aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>What the interviewer is really asking</summary>
+        <div class="callout callout-info">
+          <p>This question tests whether you understand the <strong>limits</strong> of optimistic concurrency control — not just how it works, but when it breaks down. Senior engineers must demonstrate:</p>
+        </div>
+        <ul>
+          <li><strong>Deep understanding of CAS semantics</strong> — Compare-And-Swap at the database level via version columns or conditional updates.</li>
+          <li><strong>Failure-mode reasoning</strong> — Knowing that "no locks" doesn't mean "no contention."</li>
+          <li><strong>Quantitative thinking</strong> — Can you estimate retry rates given N concurrent writers on M hot rows?</li>
+          <li><strong>Solution repertoire</strong> — Ability to pivot to pessimistic locking, partitioning, event sourcing, or queue serialization when optimistic locking becomes a liability.</li>
+          <li><strong>Production experience</strong> — Real war stories of optimistic locking meltdowns (flash sales, counter increments, inventory deductions).</li>
+          <li><strong>Trade-off articulation</strong> — Explaining why you'd choose one strategy over another for a given workload profile.</li>
+        </ul>
+        <p>The interviewer wants to see that you don't blindly apply optimistic locking as a "best practice" but can reason about when it becomes an anti-pattern.</p>
+      </details>
+    </section>
+
+    <!-- Section 2: Quick Answer -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <details>
+        <summary>30-second elevator pitch</summary>
+        <div class="callout callout-tip">
+          <blockquote>
+            <p>Optimistic locking uses a version column (or CAS operation) to detect concurrent modifications at commit time. It works well under <strong>low contention</strong> because most transactions succeed on the first attempt. However, in high-concurrency environments — especially with hot rows like inventory counters or wallet balances — the failure rate grows proportionally to the number of concurrent writers. Each failed transaction must retry, creating a <strong>retry storm</strong> that amplifies load exponentially. The result: higher latency, wasted work, potential livelock, and in extreme cases, system collapse. Solutions include pessimistic locking for known hot rows, partitioned counters, <code>SELECT FOR UPDATE SKIP LOCKED</code> for queue-like workloads, or moving to event sourcing where conflicts are resolved at the domain level.</p>
+          </blockquote>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 3: Optimistic vs Pessimistic -->
+    <section id="optimistic-vs-pessimistic">
+      <h2>Optimistic vs Pessimistic Locking</h2>
+      <details>
+        <summary>How optimistic locking works — JPA @Version, CAS, and the lost update problem</summary>
+
+        <h3>The Optimistic Locking Model</h3>
+        <p>Optimistic locking is a concurrency control strategy that assumes conflicts are <strong>rare</strong>. Instead of acquiring a lock before reading, it allows all readers to proceed and checks for conflicts only at write time.</p>
+
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│                   OPTIMISTIC LOCKING FLOW                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Thread A                          Thread B                      │
+│  ────────                          ────────                      │
+│  1. SELECT item WHERE id=42        1. SELECT item WHERE id=42    │
+│     → version = 5, qty = 100         → version = 5, qty = 100   │
+│                                                                  │
+│  2. Business logic: qty - 1        2. Business logic: qty - 1    │
+│     → new qty = 99                    → new qty = 99             │
+│                                                                  │
+│  3. UPDATE item                    3. UPDATE item                │
+│     SET qty=99, version=6             SET qty=99, version=6      │
+│     WHERE id=42 AND version=5         WHERE id=42 AND version=5  │
+│     → rows affected = 1 ✓            → rows affected = 0 ✗      │
+│                                       → OptimisticLockException  │
+│                                                                  │
+│  Result: qty=99, version=6         Must RETRY from step 1        │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>JPA @Version Annotation</h3>
+        <p>In JPA/Hibernate, optimistic locking is implemented via the <code>@Version</code> annotation:</p>
+
+        <pre><code class="language-java">@Entity
+@Table(name = "inventory_item")
+public class InventoryItem {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Version
+    private Long version;
+
+    private String sku;
+    private int quantity;
+    private BigDecimal price;
+
+    // When Hibernate flushes, it generates:
+    // UPDATE inventory_item
+    //   SET quantity = ?, version = version + 1
+    //   WHERE id = ? AND version = ?
+    // If 0 rows updated → throws OptimisticLockException
+}</code></pre>
+
+        <h3>Compare-And-Swap (CAS) Semantics</h3>
+        <p>At its core, optimistic locking is a <strong>CAS operation</strong> at the database level:</p>
+
+        <pre><code class="language-sql">-- CAS pattern: update only if current state matches expected state
+UPDATE account
+SET balance = balance - 100.00,
+    version = version + 1
+WHERE id = :accountId
+  AND version = :expectedVersion;
+
+-- Check rows affected
+-- If 0 → someone else modified the row → retry or abort</code></pre>
+
+        <h3>The Lost Update Problem (Without Locking)</h3>
+        <p>Without any locking, you get the classic <strong>lost update</strong>:</p>
+
+        <pre class="diagram">
+┌────────────────────────────────────────────────────────┐
+│              LOST UPDATE (NO LOCKING)                   │
+├────────────────────────────────────────────────────────┤
+│                                                         │
+│  Initial: balance = $1000                               │
+│                                                         │
+│  Thread A: withdraw $200       Thread B: withdraw $300  │
+│  READ  balance → $1000        READ  balance → $1000    │
+│  CALC  $1000 - $200 = $800    CALC  $1000 - $300 = $700│
+│  WRITE balance = $800         WRITE balance = $700      │
+│                                                         │
+│  Final: balance = $700 (lost $200 withdrawal!)          │
+│  Expected: balance = $500                               │
+└────────────────────────────────────────────────────────┘
+        </pre>
+
+        <p>Optimistic locking <strong>detects</strong> this conflict. Pessimistic locking <strong>prevents</strong> it. The choice between them depends on contention levels.</p>
+
+        <h3>When Optimistic Locking Shines</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Characteristic</th>
+              <th>Optimistic</th>
+              <th>Pessimistic</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Lock acquisition cost</td>
+              <td>None (check at commit)</td>
+              <td>Lock overhead per read</td>
+            </tr>
+            <tr>
+              <td>Throughput under low contention</td>
+              <td>High</td>
+              <td>Lower (lock waits)</td>
+            </tr>
+            <tr>
+              <td>Deadlock risk</td>
+              <td>None</td>
+              <td>Possible</td>
+            </tr>
+            <tr>
+              <td>Scalability</td>
+              <td>Excellent when conflicts rare</td>
+              <td>Limited by lock granularity</td>
+            </tr>
+            <tr>
+              <td>Failure mode</td>
+              <td>Retry storm under contention</td>
+              <td>Timeout/deadlock detection</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 4: Why It Fails -->
+    <section id="why-it-fails">
+      <h2>Why Optimistic Locking Fails Under High Concurrency</h2>
+      <details>
+        <summary>All failure scenarios — retry storms, hot rows, long transactions, ABA problem</summary>
+
+        <div class="callout callout-danger">
+          <p><strong>Core insight:</strong> Optimistic locking's failure rate is proportional to the number of concurrent writers on the same row. With N concurrent writers, at most 1 succeeds per round — giving a failure rate of (N-1)/N per attempt.</p>
+        </div>
+
+        <h3>Failure Scenario 1: Hot Rows</h3>
+        <p>When many transactions target the same row (inventory counter, account balance, global sequence), the version number becomes a <strong>serialization bottleneck</strong> — except without the fairness guarantees of actual serialization.</p>
+
+        <pre><code class="language-java">// Example: 1000 concurrent requests all decrementing the same inventory row
+// Round 1: 1000 attempt, 1 succeeds, 999 fail → retry
+// Round 2: 999 attempt, 1 succeeds, 998 fail → retry
+// Round 3: 998 attempt, 1 succeeds, 997 fail → retry
+// ...
+// Total attempts: 1000 + 999 + 998 + ... + 1 = 500,500 attempts for 1000 updates
+// Wasted work: 499,500 failed attempts (99.8% waste)</code></pre>
+
+        <h3>Failure Scenario 2: Long Transactions</h3>
+        <p>The longer a transaction holds its read version, the higher the probability that another transaction will commit first:</p>
+
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────────────┐
+│           LONG TRANSACTION FAILURE PROBABILITY                │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  P(conflict) = 1 - (1 - λ·Δt)^N                             │
+│                                                               │
+│  Where:                                                       │
+│    λ   = write rate per second to the target row              │
+│    Δt  = transaction duration (read-to-commit time)           │
+│    N   = number of concurrent writers                         │
+│                                                               │
+│  Example: λ=10/s, Δt=500ms, N=50                            │
+│  P(conflict) ≈ 1 - e^(-λ·Δt·N) ≈ 1 - e^(-250) ≈ 100%      │
+│                                                               │
+│  Even with λ=1/s, Δt=100ms, N=5:                            │
+│  P(conflict) ≈ 1 - (1 - 0.1)^5 ≈ 41%                       │
+└──────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Failure Scenario 3: The ABA Problem</h3>
+        <p>With simple version counters, the ABA problem doesn't typically occur (version always increments). However, with <strong>timestamp-based</strong> or <strong>hash-based</strong> optimistic locking, ABA becomes real:</p>
+
+        <pre><code class="language-java">// ABA with hash-based optimistic locking:
+// 1. Thread A reads row: {balance: 100, hash: "abc123"}
+// 2. Thread B changes balance to 200, hash → "def456"
+// 3. Thread C changes balance back to 100, hash → "abc123" (same hash!)
+// 4. Thread A commits with WHERE hash = "abc123" → SUCCEEDS incorrectly
+//    Thread A doesn't know the row was modified twice
+
+// Solution: Always use monotonically increasing version numbers
+// or include a UUID/timestamp that never repeats</code></pre>
+
+        <h3>Failure Scenario 4: Version Field Not Checked in All Paths</h3>
+        <p>A common bug: some code paths update the row <strong>without</strong> checking the version, bypassing optimistic locking entirely.</p>
+
+        <pre><code class="language-java">// DANGEROUS: Native query bypasses @Version check
+@Modifying
+@Query("UPDATE InventoryItem SET quantity = :qty WHERE id = :id")
+void unsafeUpdate(@Param("id") Long id, @Param("qty") int qty);
+// This DOES NOT check version! Lost updates guaranteed.
+
+// SAFE: Let JPA manage the version
+@Transactional
+public void safeUpdate(Long id, int newQty) {
+    InventoryItem item = repository.findById(id)
+        .orElseThrow();
+    item.setQuantity(newQty);
+    // JPA flush will include: WHERE version = :readVersion
+}</code></pre>
+
+        <h3>Failure Scenario 5: Read-Your-Writes Violations in Replicated Databases</h3>
+        <p>With read replicas, you might read a <strong>stale version</strong> from a replica and then write to the primary:</p>
+
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────────────┐
+│        REPLICA LAG + OPTIMISTIC LOCKING = CONFUSION          │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Primary (version=7)     Replica (version=5, lagging)        │
+│  ──────────────────      ────────────────────────────        │
+│                                                               │
+│  Thread A:                                                    │
+│  1. READ from replica → version=5                            │
+│  2. UPDATE on primary WHERE version=5 → FAILS (actual is 7)  │
+│                                                               │
+│  Thread A sees a "conflict" that isn't a real conflict —     │
+│  it's just stale reads. This causes unnecessary retries.      │
+│                                                               │
+│  Fix: Read from primary for rows you intend to update,       │
+│       or use session-sticky routing.                          │
+└──────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Failure Scenario 6: Phantom Conflicts from Unrelated Field Updates</h3>
+        <p>A single <code>@Version</code> per entity means <strong>any</strong> field change bumps the version — even unrelated fields:</p>
+
+        <pre><code class="language-java">// Thread A: updates item.description (cosmetic change)
+// Thread B: updates item.quantity (critical business logic)
+// Both read version=5 → one will fail, even though they touched different fields
+
+// Solution: Use field-level optimistic locking (Hibernate @OptimisticLock)
+@Entity
+public class InventoryItem {
+    @Version
+    private Long version;
+
+    @OptimisticLock(excluded = true) // Changes to this field won't bump version
+    private String description;
+
+    @OptimisticLock(excluded = true)
+    private LocalDateTime lastViewedAt;
+
+    // Only quantity and price changes trigger version increment
+    private int quantity;
+    private BigDecimal price;
+}</code></pre>
+
+        <h3>Summary of Failure Modes</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Failure Mode</th>
+              <th>Root Cause</th>
+              <th>Impact</th>
+              <th>Detection</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Hot rows</td>
+              <td>Many writers, same row</td>
+              <td>Exponential retry growth</td>
+              <td>High OptimisticLockException rate</td>
+            </tr>
+            <tr>
+              <td>Long transactions</td>
+              <td>Large read-to-commit window</td>
+              <td>High conflict probability</td>
+              <td>Transaction duration metrics</td>
+            </tr>
+            <tr>
+              <td>ABA problem</td>
+              <td>Non-monotonic version scheme</td>
+              <td>Silent data corruption</td>
+              <td>Audit log discrepancies</td>
+            </tr>
+            <tr>
+              <td>Bypassed version checks</td>
+              <td>Native queries, bulk updates</td>
+              <td>Lost updates</td>
+              <td>Code review, static analysis</td>
+            </tr>
+            <tr>
+              <td>Replica lag</td>
+              <td>Stale reads from replicas</td>
+              <td>Unnecessary retries</td>
+              <td>Replica lag monitoring</td>
+            </tr>
+            <tr>
+              <td>Phantom conflicts</td>
+              <td>Entity-level versioning</td>
+              <td>False conflicts on unrelated fields</td>
+              <td>Conflict analysis by field</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 5: Retry Storms -->
+    <section id="retry-storms">
+      <h2>Retry Storms and Thundering Herd</h2>
+      <details>
+        <summary>How retry amplification turns optimistic locking into a denial-of-service on your own database</summary>
+
+        <div class="callout callout-danger">
+          <p><strong>The fundamental problem:</strong> When an optimistic lock fails, the standard advice is "just retry." But under high contention, retries create <em>more</em> contention, which creates <em>more</em> failures, which creates <em>more</em> retries — a positive feedback loop.</p>
+        </div>
+
+        <h3>Mathematical Model of Retry Amplification</h3>
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────────────┐
+│              RETRY AMPLIFICATION MODEL                         │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Given: N concurrent writers on 1 row, unlimited retries      │
+│                                                               │
+│  Round 1: N attempts → 1 success, (N-1) retries              │
+│  Round 2: (N-1) attempts → 1 success, (N-2) retries          │
+│  Round 3: (N-2) attempts → 1 success, (N-3) retries          │
+│  ...                                                          │
+│  Round k: (N-k+1) attempts → 1 success                       │
+│                                                               │
+│  Total attempts = N + (N-1) + (N-2) + ... + 1 = N(N+1)/2    │
+│  Total wasted = N(N+1)/2 - N = N(N-1)/2                     │
+│                                                               │
+│  For N=100:  Total attempts = 5,050 (50x amplification)      │
+│  For N=1000: Total attempts = 500,500 (500x amplification)   │
+│  For N=10000: Total attempts = 50,005,000 (5000x!)           │
+│                                                               │
+│  Worst-case latency for last writer: N rounds × tx_time      │
+│  With tx_time=50ms, N=1000: last writer waits ~50 seconds    │
+└──────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Thundering Herd Effect</h3>
+        <p>When a retry fires, it doesn't fire alone. If 999 transactions failed simultaneously, they all retry at roughly the same time (especially with fixed-delay retries):</p>
+
+        <pre><code class="language-java">// ANTI-PATTERN: Fixed-delay retry causes thundering herd
+@Retryable(value = OptimisticLockException.class, maxAttempts = 5,
+           backoff = @Backoff(delay = 100)) // All 999 retry at t+100ms!
+public void decrementInventory(Long itemId) {
+    InventoryItem item = repo.findById(itemId).orElseThrow();
+    item.setQuantity(item.getQuantity() - 1);
+    repo.save(item); // flush triggers version check
+}
+
+// The thundering herd timeline:
+// t=0ms:    1000 concurrent requests arrive
+// t=50ms:   1 succeeds, 999 get OptimisticLockException
+// t=150ms:  999 retry simultaneously → 1 succeeds, 998 fail
+// t=250ms:  998 retry simultaneously → 1 succeeds, 997 fail
+// ... system under sustained maximum load for 50+ seconds</code></pre>
+
+        <h3>CPU and I/O Waste</h3>
+        <p>Each failed-and-retried transaction wastes:</p>
+        <ul>
+          <li><strong>Database I/O:</strong> SELECT (read), UPDATE attempt (write), rollback</li>
+          <li><strong>Network round-trips:</strong> 2-3 per failed attempt</li>
+          <li><strong>Connection pool slots:</strong> Held during the entire retry cycle</li>
+          <li><strong>Application CPU:</strong> Business logic re-computation, serialization/deserialization</li>
+          <li><strong>GC pressure:</strong> Short-lived objects from failed transactions</li>
+        </ul>
+
+        <h3>Connection Pool Exhaustion</h3>
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────────────┐
+│            CONNECTION POOL DEATH SPIRAL                        │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Pool size: 20 connections                                    │
+│  Retry delay: 100ms                                           │
+│  Concurrent requests: 100                                     │
+│                                                               │
+│  1. 20 connections in use for first batch                     │
+│  2. 19 fail, need to retry → hold connection or re-acquire   │
+│  3. 80 requests waiting for connection                        │
+│  4. Retry requests + waiting requests fight for 20 slots     │
+│  5. Connection wait timeout → HTTP 503                        │
+│  6. Client retries HTTP 503 → MORE load arrives              │
+│                                                               │
+│  Result: Cascading failure from a single hot row              │
+└──────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Livelock vs Deadlock</h3>
+        <p>Pessimistic locking risks <strong>deadlock</strong> (two transactions wait for each other forever). Optimistic locking risks <strong>livelock</strong> (transactions keep retrying but never succeed due to constant interference). Livelock is harder to detect because the system appears "busy" — threads are running, queries are executing — but no useful work completes.</p>
+
+        <pre><code class="language-java">// Livelock scenario: Two threads repeatedly conflict
+// Thread A and Thread B both update rows X and Y
+// Round 1: A updates X (v1→v2), B updates Y (v1→v2)
+//          A tries Y (expects v1, actual v2) → FAIL
+//          B tries X (expects v1, actual v2) → FAIL
+// Round 2: A reads X(v2),Y(v2), B reads X(v2),Y(v2)
+//          A updates X (v2→v3), B updates X (v2→v3) → one fails
+//          ... cycle continues indefinitely without jitter</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 6: Solutions -->
+    <section id="solutions">
+      <h2>Solutions for High-Contention Scenarios</h2>
+      <details>
+        <summary>Pessimistic locking, partitioning, event sourcing, queue serialization, SKIP LOCKED</summary>
+
+        <h3>Solution 1: Pessimistic Locking for Known Hot Rows</h3>
+        <p>When you <em>know</em> a row is hot, acquire the lock upfront to serialize access and eliminate wasted retries:</p>
+
+        <pre><code class="language-java">@Repository
+public interface InventoryRepository extends JpaRepository&lt;InventoryItem, Long&gt; {
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT i FROM InventoryItem i WHERE i.id = :id")
+    Optional&lt;InventoryItem&gt; findByIdForUpdate(@Param("id") Long id);
+}
+
+@Service
+@Transactional
+public class InventoryService {
+
+    public boolean decrementStock(Long itemId) {
+        // Acquires SELECT ... FOR UPDATE — serializes writers
+        InventoryItem item = inventoryRepo.findByIdForUpdate(itemId)
+            .orElseThrow(() -&gt; new ItemNotFoundException(itemId));
+
+        if (item.getQuantity() &lt;= 0) {
+            return false; // Out of stock
+        }
+
+        item.setQuantity(item.getQuantity() - 1);
+        return true;
+        // Lock released at transaction commit
+    }
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Trade-off:</strong> Pessimistic locking serializes access (lower throughput under low contention) but guarantees exactly one attempt per success — no wasted work. For a hot row with 1000 concurrent writers, it's N attempts for N successes vs N(N+1)/2 with optimistic.</p>
+        </div>
+
+        <h3>Solution 2: SELECT FOR UPDATE SKIP LOCKED</h3>
+        <p>For queue-like workloads where any available row will do, <code>SKIP LOCKED</code> avoids blocking on locked rows:</p>
+
+        <pre><code class="language-sql">-- Worker pattern: grab the next available task
+-- Each worker gets a different unlocked row — no contention!
+SELECT id, payload, status
+FROM task_queue
+WHERE status = 'PENDING'
+ORDER BY created_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+
+-- If all pending rows are locked by other workers, returns empty set
+-- Worker can sleep and retry later — no blocking, no exceptions</code></pre>
+
+        <pre><code class="language-java">@Repository
+public interface TaskQueueRepository extends JpaRepository&lt;Task, Long&gt; {
+
+    @Query(value = """
+        SELECT * FROM task_queue
+        WHERE status = 'PENDING'
+        ORDER BY created_at
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+        """, nativeQuery = true)
+    Optional&lt;Task&gt; findNextAvailableTask();
+}
+
+@Service
+public class TaskWorker {
+
+    @Transactional
+    public Optional&lt;Task&gt; processNext() {
+        return taskRepo.findNextAvailableTask()
+            .map(task -&gt; {
+                task.setStatus(TaskStatus.PROCESSING);
+                task.setWorkerNode(nodeId);
+                task.setStartedAt(Instant.now());
+                return taskRepo.save(task);
+            });
+    }
+}</code></pre>
+
+        <h3>Solution 3: Partitioned Counters</h3>
+        <p>Split one hot counter into N shards to reduce per-shard contention by a factor of N:</p>
+
+        <pre><code class="language-java">@Entity
+@Table(name = "inventory_shard")
+public class InventoryShard {
+    @Id
+    private Long id;
+    private Long itemId;
+    private int shardIndex;  // 0..N-1
+    private int quantity;    // This shard's allocation
+
+    @Version
+    private Long version;
+}
+
+@Service
+public class ShardedInventoryService {
+
+    private static final int SHARD_COUNT = 16;
+
+    @Transactional
+    public boolean decrementStock(Long itemId) {
+        // Pick a random shard to reduce collision probability
+        int shard = ThreadLocalRandom.current().nextInt(SHARD_COUNT);
+
+        Optional&lt;InventoryShard&gt; shardOpt = shardRepo
+            .findByItemIdAndShardIndex(itemId, shard);
+
+        if (shardOpt.isPresent() &amp;&amp; shardOpt.get().getQuantity() &gt; 0) {
+            shardOpt.get().setQuantity(shardOpt.get().getQuantity() - 1);
+            return true;
+        }
+
+        // This shard is empty — try others
+        for (int i = 0; i &lt; SHARD_COUNT; i++) {
+            if (i == shard) continue;
+            Optional&lt;InventoryShard&gt; alt = shardRepo
+                .findByItemIdAndShardIndex(itemId, i);
+            if (alt.isPresent() &amp;&amp; alt.get().getQuantity() &gt; 0) {
+                alt.get().setQuantity(alt.get().getQuantity() - 1);
+                return true;
+            }
+        }
+        return false; // Truly out of stock
+    }
+
+    public int getTotalStock(Long itemId) {
+        return shardRepo.sumQuantityByItemId(itemId); // SELECT SUM(quantity)
+    }
+}</code></pre>
+
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────────────┐
+│              PARTITIONED COUNTER STRATEGY                      │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Before: 1 row, 1000 writers → 999 conflicts per round       │
+│                                                               │
+│  After: 16 shards, ~62 writers per shard → ~61 conflicts     │
+│                                                               │
+│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐     ┌──────┐             │
+│  │ S0  │ │ S1  │ │ S2  │ │ S3  │ ... │ S15  │             │
+│  │qty=6│ │qty=7│ │qty=6│ │qty=6│     │qty=7 │             │
+│  └─────┘ └─────┘ └─────┘ └─────┘     └──────┘             │
+│     ↑        ↑        ↑        ↑           ↑                │
+│   ~62      ~63      ~62      ~63         ~63 writers         │
+│                                                               │
+│  Total stock = SUM(all shards) = 100                         │
+│  Contention reduced 16x per shard                            │
+└──────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Solution 4: Event Sourcing</h3>
+        <p>Instead of updating a mutable row, append immutable events. Conflicts are resolved at the domain level during projection:</p>
+
+        <pre><code class="language-java">// Events are append-only — no version conflicts on writes!
+@Entity
+@Table(name = "inventory_event")
+public class InventoryEvent {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long eventId;      // Monotonically increasing
+
+    private Long itemId;
+    private String eventType;  // STOCK_ADDED, STOCK_RESERVED, STOCK_RELEASED
+    private int quantityDelta; // +10, -1, +1
+    private Instant occurredAt;
+    private String correlationId;
+}
+
+@Service
+public class EventSourcedInventoryService {
+
+    @Transactional
+    public boolean reserveStock(Long itemId, String orderId) {
+        // Calculate current stock from events (or use materialized view)
+        int currentStock = eventRepo.sumDeltaByItemId(itemId);
+
+        if (currentStock &lt;= 0) {
+            return false;
+        }
+
+        // Append event — INSERT, never UPDATE, so no version conflict
+        InventoryEvent event = new InventoryEvent();
+        event.setItemId(itemId);
+        event.setEventType("STOCK_RESERVED");
+        event.setQuantityDelta(-1);
+        event.setOccurredAt(Instant.now());
+        event.setCorrelationId(orderId);
+        eventRepo.save(event);
+        return true;
+    }
+    // Note: You still need a constraint to prevent overselling!
+    // Use a CHECK constraint or serializable isolation on the projection table.
+}</code></pre>
+
+        <h3>Solution 5: Queue-Based Serialization</h3>
+        <p>Funnel all writes through a single-threaded consumer to eliminate contention entirely:</p>
+
+        <pre><code class="language-java">// Producer: publish intent to a queue (fast, non-blocking)
+@Service
+public class InventoryRequestPublisher {
+
+    private final KafkaTemplate&lt;String, InventoryCommand&gt; kafka;
+
+    public CompletableFuture&lt;Boolean&gt; requestDecrement(Long itemId, String orderId) {
+        InventoryCommand cmd = new InventoryCommand(itemId, -1, orderId);
+        // Partition by itemId → all writes for same item go to same partition
+        // → single consumer thread processes them sequentially
+        kafka.send("inventory-commands", String.valueOf(itemId), cmd);
+        return pendingResults.register(orderId); // Await async result
+    }
+}
+
+// Consumer: single-threaded per partition → no contention
+@KafkaListener(topics = "inventory-commands", concurrency = "1")
+public void handleCommand(InventoryCommand cmd) {
+    // Only one thread ever updates this item → no lock needed
+    InventoryItem item = repo.findById(cmd.getItemId()).orElseThrow();
+    if (item.getQuantity() + cmd.getDelta() &gt;= 0) {
+        item.setQuantity(item.getQuantity() + cmd.getDelta());
+        repo.save(item);
+        resultPublisher.publish(cmd.getOrderId(), true);
+    } else {
+        resultPublisher.publish(cmd.getOrderId(), false);
+    }
+}</code></pre>
+
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────────────┐
+│            QUEUE-BASED SERIALIZATION                           │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌──────┐  ┌──────┐  ┌──────┐                               │
+│  │Req 1 │  │Req 2 │  │Req 3 │  ... (1000 concurrent)        │
+│  └──┬───┘  └──┬───┘  └──┬───┘                               │
+│     │         │         │                                     │
+│     ▼         ▼         ▼                                     │
+│  ┌────────────────────────────┐                               │
+│  │   Kafka Partition (item=42) │  ← ordered, durable          │
+│  │   [cmd1, cmd2, cmd3, ...]   │                              │
+│  └─────────────┬───────────────┘                              │
+│                │                                               │
+│                ▼                                               │
+│  ┌──────────────────────┐                                     │
+│  │  Single Consumer      │  ← sequential processing           │
+│  │  No locks needed      │                                    │
+│  │  No retries needed    │                                    │
+│  │  100% success rate    │                                    │
+│  └──────────────────────┘                                     │
+│                                                               │
+│  Trade-off: Async (latency for result) vs sync (immediate)   │
+└──────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Solution Comparison Matrix</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Solution</th>
+              <th>Contention Handling</th>
+              <th>Throughput</th>
+              <th>Latency</th>
+              <th>Complexity</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Pessimistic lock</td>
+              <td>Serializes at DB</td>
+              <td>Limited by lock hold time</td>
+              <td>P99 = lock wait + tx</td>
+              <td>Low</td>
+            </tr>
+            <tr>
+              <td>SKIP LOCKED</td>
+              <td>Skips contended rows</td>
+              <td>High (for queue workloads)</td>
+              <td>Low (no blocking)</td>
+              <td>Low</td>
+            </tr>
+            <tr>
+              <td>Partitioned counters</td>
+              <td>Splits hot row into N</td>
+              <td>N× improvement</td>
+              <td>Same as optimistic</td>
+              <td>Medium</td>
+            </tr>
+            <tr>
+              <td>Event sourcing</td>
+              <td>Append-only, no conflicts</td>
+              <td>Very high writes</td>
+              <td>Read cost higher</td>
+              <td>High</td>
+            </tr>
+            <tr>
+              <td>Queue serialization</td>
+              <td>Single writer per key</td>
+              <td>Bounded by consumer</td>
+              <td>Async (higher)</td>
+              <td>High</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 7: JPA Implementation -->
+    <section id="jpa-implementation">
+      <h2>JPA Implementation Deep Dive</h2>
+      <details>
+        <summary>@Version mechanics, OptimisticLockException handling, retry with backoff</summary>
+
+        <h3>How Hibernate Implements @Version</h3>
+        <p>When you annotate a field with <code>@Version</code>, Hibernate automatically:</p>
+        <ol>
+          <li>Includes <code>WHERE version = :readVersion</code> in every UPDATE/DELETE</li>
+          <li>Increments the version on successful flush</li>
+          <li>Throws <code>OptimisticLockException</code> if 0 rows were affected</li>
+        </ol>
+
+        <pre><code class="language-java">@Entity
+@Table(name = "orders")
+public class Order {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Version
+    private Integer version; // Supports int, Integer, long, Long, short, Short, Timestamp
+
+    @Enumerated(EnumType.STRING)
+    private OrderStatus status;
+
+    private BigDecimal totalAmount;
+
+    @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List&lt;OrderLine&gt; lines = new ArrayList&lt;&gt;();
+}
+
+// Generated SQL on flush:
+// UPDATE orders
+// SET status='CONFIRMED', total_amount=99.99, version=4
+// WHERE id=123 AND version=3
+//
+// If rows_affected == 0:
+//   throw new StaleObjectStateException(entityName, id)
+//   which wraps as javax.persistence.OptimisticLockException</code></pre>
+
+        <h3>Version Field Types</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Type</th>
+              <th>Increment Strategy</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>int</code> / <code>Integer</code></td>
+              <td>+1 per flush</td>
+              <td>Most common, wraps at Integer.MAX_VALUE</td>
+            </tr>
+            <tr>
+              <td><code>long</code> / <code>Long</code></td>
+              <td>+1 per flush</td>
+              <td>Recommended for high-write entities</td>
+            </tr>
+            <tr>
+              <td><code>short</code> / <code>Short</code></td>
+              <td>+1 per flush</td>
+              <td>Wraps at 32767 — avoid for production</td>
+            </tr>
+            <tr>
+              <td><code>Timestamp</code></td>
+              <td>Current time per flush</td>
+              <td>Clock skew issues, millisecond granularity</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-warning">
+          <p><strong>Avoid Timestamp versions</strong> — two transactions within the same millisecond can both "succeed" because they read and write the same timestamp. Use numeric versions exclusively.</p>
+        </div>
+
+        <h3>Proper Exception Handling</h3>
+        <pre><code class="language-java">@Service
+@Slf4j
+public class OrderService {
+
+    private final OrderRepository orderRepo;
+    private final MeterRegistry metrics;
+
+    /**
+     * Confirms an order with optimistic locking and retry.
+     * Catches the specific exception hierarchy correctly.
+     */
+    @Transactional
+    public Order confirmOrder(Long orderId) {
+        try {
+            Order order = orderRepo.findById(orderId)
+                .orElseThrow(() -&gt; new OrderNotFoundException(orderId));
+
+            order.setStatus(OrderStatus.CONFIRMED);
+            order.setConfirmedAt(Instant.now());
+            return orderRepo.saveAndFlush(order); // Force immediate flush
+
+        } catch (OptimisticLockException e) {
+            // JPA standard exception
+            metrics.counter("order.optimistic_lock.failure").increment();
+            throw new ConcurrentModificationException(
+                "Order " + orderId + " was modified concurrently", e);
+
+        } catch (StaleObjectStateException e) {
+            // Hibernate-specific (caught before wrapping in some configurations)
+            metrics.counter("order.optimistic_lock.failure").increment();
+            throw new ConcurrentModificationException(
+                "Order " + orderId + " version mismatch", e);
+        }
+    }
+}</code></pre>
+
+        <h3>Retry with Exponential Backoff and Jitter</h3>
+        <pre><code class="language-java">@Service
+@Slf4j
+public class ResilientInventoryService {
+
+    private static final int MAX_RETRIES = 5;
+    private static final long BASE_DELAY_MS = 50;
+    private static final long MAX_DELAY_MS = 2000;
+
+    private final InventoryRepository inventoryRepo;
+    private final MeterRegistry metrics;
+    private final TransactionTemplate txTemplate;
+
+    /**
+     * Decrements stock with retry + exponential backoff + jitter.
+     * Each retry starts a NEW transaction (critical!).
+     */
+    public boolean decrementWithRetry(Long itemId) {
+        for (int attempt = 1; attempt &lt;= MAX_RETRIES; attempt++) {
+            try {
+                Boolean result = txTemplate.execute(status -&gt; {
+                    InventoryItem item = inventoryRepo.findById(itemId)
+                        .orElseThrow();
+                    if (item.getQuantity() &lt;= 0) return false;
+                    item.setQuantity(item.getQuantity() - 1);
+                    inventoryRepo.saveAndFlush(item);
+                    return true;
+                });
+                metrics.counter("inventory.decrement.success",
+                    "attempt", String.valueOf(attempt)).increment();
+                return Boolean.TRUE.equals(result);
+
+            } catch (OptimisticLockException | CannotAcquireLockException e) {
+                metrics.counter("inventory.decrement.retry",
+                    "attempt", String.valueOf(attempt)).increment();
+
+                if (attempt == MAX_RETRIES) {
+                    log.error("Failed to decrement item {} after {} attempts",
+                        itemId, MAX_RETRIES);
+                    throw new StockDecrementFailedException(itemId, e);
+                }
+
+                long delay = calculateBackoff(attempt);
+                log.warn("Optimistic lock conflict on item {}, attempt {}/{}, "
+                    + "retrying in {}ms", itemId, attempt, MAX_RETRIES, delay);
+                sleep(delay);
+            }
+        }
+        return false; // Unreachable
+    }
+
+    /**
+     * Exponential backoff with full jitter (AWS-recommended approach).
+     * delay = random_between(0, min(cap, base * 2^attempt))
+     */
+    private long calculateBackoff(int attempt) {
+        long exponentialDelay = Math.min(MAX_DELAY_MS,
+            BASE_DELAY_MS * (1L &lt;&lt; attempt));
+        // Full jitter: random between 0 and the exponential delay
+        return ThreadLocalRandom.current().nextLong(0, exponentialDelay + 1);
+    }
+
+    private void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted during retry backoff", e);
+        }
+    }
+}</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Critical:</strong> Each retry must execute in a <strong>new transaction</strong>. If you retry within the same transaction, the EntityManager is already in a dirty state and will throw on flush. Use <code>TransactionTemplate</code> or <code>@Transactional(propagation = REQUIRES_NEW)</code> on the inner method.</p>
+        </div>
+
+        <h3>Spring Retry Integration</h3>
+        <pre><code class="language-java">@Configuration
+@EnableRetry
+public class RetryConfig {
+
+    @Bean
+    public RetryTemplate optimisticLockRetryTemplate() {
+        return RetryTemplate.builder()
+            .maxAttempts(5)
+            .exponentialBackoff(50, 2.0, 2000, true) // initialInterval, multiplier, max, withJitter
+            .retryOn(OptimisticLockException.class)
+            .retryOn(StaleObjectStateException.class)
+            .retryOn(CannotAcquireLockException.class)
+            .build();
+    }
+}
+
+@Service
+public class RetryableInventoryService {
+
+    @Retryable(
+        retryFor = {OptimisticLockException.class, StaleObjectStateException.class},
+        maxAttempts = 5,
+        backoff = @Backoff(delay = 50, multiplier = 2.0, maxDelay = 2000, random = true)
+    )
+    @Transactional(propagation = Propagation.REQUIRES_NEW) // New tx per attempt!
+    public boolean decrementStock(Long itemId) {
+        InventoryItem item = inventoryRepo.findById(itemId).orElseThrow();
+        if (item.getQuantity() &lt;= 0) return false;
+        item.setQuantity(item.getQuantity() - 1);
+        inventoryRepo.saveAndFlush(item);
+        return true;
+    }
+
+    @Recover
+    public boolean recoverDecrement(OptimisticLockException e, Long itemId) {
+        log.error("All retries exhausted for item {}", itemId, e);
+        alertService.fireAlert("INVENTORY_LOCK_FAILURE", itemId);
+        throw new StockDecrementFailedException(itemId, e);
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 8: Production Incident -->
+    <section id="production-incident">
+      <h2>Production Incident: Flash Sale Meltdown</h2>
+      <details>
+        <summary>10,000 users competing for 100 items — 99% OptimisticLockException rate</summary>
+
+        <div class="callout callout-danger">
+          <p><strong>Incident summary:</strong> During a flash sale event, 10,000 concurrent users attempted to purchase 100 limited-edition items. The optimistic locking strategy caused a 99% failure rate, exhausted the connection pool, and cascaded into a full site outage lasting 23 minutes.</p>
+        </div>
+
+        <h3>Timeline</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Event</th>
+              <th>Impact</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>T+0s</td>
+              <td>Flash sale starts, 10K requests hit /checkout</td>
+              <td>Normal</td>
+            </tr>
+            <tr>
+              <td>T+2s</td>
+              <td>OptimisticLockException rate spikes to 99.5%</td>
+              <td>Retry loops begin</td>
+            </tr>
+            <tr>
+              <td>T+5s</td>
+              <td>Connection pool saturated (200/200 connections)</td>
+              <td>New requests queue</td>
+            </tr>
+            <tr>
+              <td>T+8s</td>
+              <td>Request queue overflows, HTTP 503 responses begin</td>
+              <td>Users see errors</td>
+            </tr>
+            <tr>
+              <td>T+12s</td>
+              <td>Users refresh aggressively → 3x traffic spike</td>
+              <td>Load balancer overloaded</td>
+            </tr>
+            <tr>
+              <td>T+20s</td>
+              <td>Database CPU at 100%, read replicas lag 30s+</td>
+              <td>All services degraded</td>
+            </tr>
+            <tr>
+              <td>T+45s</td>
+              <td>Circuit breakers open across all services</td>
+              <td>Full site outage</td>
+            </tr>
+            <tr>
+              <td>T+5min</td>
+              <td>On-call engineer identified the hot row</td>
+              <td>Diagnosis</td>
+            </tr>
+            <tr>
+              <td>T+15min</td>
+              <td>Feature flag disabled flash sale endpoint</td>
+              <td>Bleeding stopped</td>
+            </tr>
+            <tr>
+              <td>T+23min</td>
+              <td>Connection pools drained, services recovered</td>
+              <td>Site restored</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Root Cause Analysis</h3>
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────────────┐
+│                ROOT CAUSE CHAIN                                │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  10,000 users → 1 inventory row (hot row)                    │
+│       │                                                       │
+│       ▼                                                       │
+│  Round 1: 10,000 → 1 success + 9,999 OptimisticLockException│
+│       │                                                       │
+│       ▼                                                       │
+│  9,999 retries → all retry with 100ms fixed delay            │
+│       │                                                       │
+│       ▼                                                       │
+│  Round 2 (t+100ms): 9,999 → 1 success + 9,998 fail          │
+│       │                                                       │
+│       ▼                                                       │
+│  Retry amplification: 10K + 9.9K + 9.8K + ... attempts       │
+│       │                                                       │
+│       ▼                                                       │
+│  Connection pool: 200 connections × 5 retries = 1000 slots   │
+│  But 10,000 requests need slots → queue grows unbounded       │
+│       │                                                       │
+│       ▼                                                       │
+│  Connection timeout → HTTP 503 → user refresh → more load     │
+│       │                                                       │
+│       ▼                                                       │
+│  CASCADING FAILURE: DB CPU 100% → replica lag → all reads fail│
+└──────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>The Fix: Multi-Layered Approach</h3>
+        <pre><code class="language-java">/**
+ * Post-incident architecture for flash sales:
+ * 1. Pre-allocated tokens (Redis) — rate limit at the edge
+ * 2. Pessimistic locking with timeout — serialize the critical path
+ * 3. Queue-based ordering — decouple request from processing
+ */
+@Service
+public class FlashSaleService {
+
+    private final RedisTemplate&lt;String, String&gt; redis;
+    private final InventoryRepository inventoryRepo;
+
+    /**
+     * Layer 1: Redis atomic decrement as a fast pre-check.
+     * Only allows up to N requests through to the database.
+     */
+    public boolean tryAcquireToken(String saleId) {
+        String key = "flash-sale:" + saleId + ":remaining";
+        Long remaining = redis.opsForValue().decrement(key);
+        if (remaining != null &amp;&amp; remaining &gt;= 0) {
+            return true; // Token acquired
+        }
+        // Restore the count if we went negative
+        redis.opsForValue().increment(key);
+        return false; // Sold out at Redis layer
+    }
+
+    /**
+     * Layer 2: Only token holders reach the database.
+     * Use pessimistic lock since we KNOW this is a hot row.
+     */
+    @Transactional(timeout = 5) // 5-second timeout to prevent indefinite blocking
+    public PurchaseResult completePurchase(Long itemId, Long userId) {
+        InventoryItem item = inventoryRepo.findByIdForUpdate(itemId)
+            .orElseThrow();
+
+        if (item.getQuantity() &lt;= 0) {
+            return PurchaseResult.SOLD_OUT;
+        }
+
+        item.setQuantity(item.getQuantity() - 1);
+        inventoryRepo.save(item);
+
+        // Create order record
+        orderService.createOrder(userId, itemId);
+        return PurchaseResult.SUCCESS;
+    }
+}
+
+// Redis pre-population before sale starts:
+// SET flash-sale:summer2024:remaining 100
+// This ensures at most 100 requests ever hit the database</code></pre>
+
+        <h3>Metrics That Would Have Caught This Earlier</h3>
+        <ul>
+          <li><code>optimistic_lock_exception_total</code> — Counter, alert if &gt; 100/min</li>
+          <li><code>retry_attempts_histogram</code> — Distribution of retry counts per operation</li>
+          <li><code>connection_pool_active_ratio</code> — Alert if &gt; 80% for &gt; 30s</li>
+          <li><code>transaction_duration_p99</code> — Alert if &gt; 500ms</li>
+          <li><code>db_row_lock_wait_seconds</code> — MySQL <code>innodb_row_lock_waits</code></li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 9: Debugging Workflow -->
+    <section id="debugging-workflow">
+      <h2>Debugging Workflow</h2>
+      <details>
+        <summary>Step-by-step diagnosis when you suspect optimistic locking failures in production</summary>
+
+        <h3>Step 1: Confirm the Symptom</h3>
+        <pre><code class="language-bash"># Check for OptimisticLockException in logs
+grep -c "OptimisticLockException\|StaleObjectStateException\|StaleStateException" \
+  /var/log/app/application.log | tail -20
+
+# Grafana query for exception rate
+rate(exceptions_total{exception="OptimisticLockException"}[5m])
+
+# Check MySQL row lock waits
+mysql -e "SHOW STATUS LIKE 'Innodb_row_lock%';"
+# Key metrics:
+#   Innodb_row_lock_waits — number of times a row lock had to wait
+#   Innodb_row_lock_time_avg — average wait time in ms</code></pre>
+
+        <h3>Step 2: Identify the Hot Row</h3>
+        <pre><code class="language-sql">-- PostgreSQL: Find most-updated rows
+SELECT relname, n_tup_upd, n_tup_hot_upd
+FROM pg_stat_user_tables
+ORDER BY n_tup_upd DESC
+LIMIT 10;
+
+-- MySQL: Check InnoDB lock waits (real-time)
+SELECT * FROM information_schema.INNODB_LOCK_WAITS;
+
+-- Application-level: Log the entity ID on OptimisticLockException
+-- Pattern: "OptimisticLockException on InventoryItem#42"</code></pre>
+
+        <h3>Step 3: Measure Contention Level</h3>
+        <pre><code class="language-sql">-- Count concurrent writers per row in a time window
+SELECT entity_id, COUNT(*) as concurrent_writers
+FROM audit_log
+WHERE event_type = 'UPDATE'
+  AND table_name = 'inventory_item'
+  AND created_at &gt; NOW() - INTERVAL '1 minute'
+GROUP BY entity_id
+ORDER BY concurrent_writers DESC
+LIMIT 10;
+
+-- If top row has 1000+ writers/minute → it's a hot row
+-- Anything above 10 concurrent writers will show significant OLE rate</code></pre>
+
+        <h3>Step 4: Analyze Retry Behavior</h3>
+        <pre><code class="language-bash"># Check retry distribution
+# How many operations needed 1 retry? 2? 3? 5?
+grep "retrying.*attempt" /var/log/app/application.log \
+  | awk -F'attempt ' '{print $2}' | cut -d'/' -f1 \
+  | sort | uniq -c | sort -rn
+
+# Expected healthy distribution:
+#   8000  attempt 1 (no retry needed — 80%)
+#   1500  attempt 2 (15%)
+#    400  attempt 3 (4%)
+#     80  attempt 4 (0.8%)
+#     20  attempt 5 (0.2%) — max retries, some fail
+
+# Unhealthy distribution (hot row):
+#    50   attempt 1
+#   200   attempt 2
+#   800   attempt 3
+#  2000   attempt 4
+#  6950   attempt 5 (exhausted!) — most requests failing</code></pre>
+
+        <h3>Step 5: Evaluate Connection Pool Impact</h3>
+        <pre><code class="language-bash"># HikariCP metrics (if using Spring Boot Actuator)
+curl -s localhost:8080/actuator/metrics/hikaricp.connections.active | jq .
+curl -s localhost:8080/actuator/metrics/hikaricp.connections.pending | jq .
+
+# Key indicators:
+# active/max &gt; 80% → approaching saturation
+# pending &gt; 0 for sustained period → requests are queuing</code></pre>
+
+        <h3>Step 6: Decision Matrix</h3>
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────────────┐
+│              DEBUGGING DECISION TREE                           │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  OLE rate &gt; 10%?                                             │
+│  ├── YES → Is it concentrated on specific rows?              │
+│  │         ├── YES → How many concurrent writers?            │
+│  │         │         ├── &lt;10 → Add jitter + increase retries │
+│  │         │         ├── 10-100 → Switch to pessimistic lock │
+│  │         │         └── &gt;100 → Partition or queue-serialize │
+│  │         └── NO → Transactions too long?                   │
+│  │                   ├── YES → Shorten tx, move work outside │
+│  │                   └── NO → Check replica lag, phantom conf│
+│  └── NO → Healthy; monitor and alert if it increases         │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Step 7: Validate the Fix</h3>
+        <pre><code class="language-bash"># Load test the fix with k6 or JMeter
+# Simulate the contention level that caused the incident
+
+# k6 script for concurrent inventory decrements
+k6 run --vus 1000 --duration 30s inventory-load-test.js
+
+# Compare metrics before/after:
+# - OptimisticLockException rate (should drop to near-zero)
+# - P99 latency (should be bounded)
+# - Connection pool utilization (should stay below 80%)
+# - Successful purchases per second (should match arrival rate)</code></pre>
+      </details>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch07-duplicate-scheduled-jobs.html" class="chapter-nav-prev">← Chapter 7: Duplicate Scheduled Jobs</a>
+      <a href="ch09-zero-downtime-schema-changes.html" class="chapter-nav-next">Chapter 9: Zero-Downtime Schema Changes →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

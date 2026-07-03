@@ -1,0 +1,1571 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 7: Preventing Duplicate Scheduled Job Execution | Senior Backend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 7</span>
+      <span class="chapter-title">Duplicate Scheduled Jobs</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#intent">Interviewer's Intent</a></li>
+        <li><a href="#sixty-second-answer">60-Second Answer</a></li>
+        <li><a href="#why-scheduled-runs-everywhere">Why @Scheduled Runs on Every Pod</a></li>
+        <li><a href="#leader-election-patterns">Leader Election Patterns</a></li>
+        <li><a href="#shedlock-deep-dive">ShedLock Deep Dive</a></li>
+        <li><a href="#quartz-clustering">Quartz Scheduler Clustering</a></li>
+        <li><a href="#kubernetes-native">Kubernetes-native Solutions</a></li>
+        <li><a href="#redis-distributed-locks">Redis Distributed Locks</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-ii">Part II — Distributed Systems &amp; Infrastructure</a> &rsaquo;
+      <span>Chapter 7</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">Leader Election</span>
+        <span class="badge badge-topic">Distributed Locks</span>
+        <span class="badge badge-topic">Scheduled Tasks</span>
+      </div>
+      <h1>Preventing Duplicate Scheduled Job Execution</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Spring's <code>@Scheduled</code> has no built-in cluster awareness — every pod runs the same cron independently. Use distributed locks (ShedLock), leader election (K8s Lease API), or externalize scheduling (Kubernetes CronJob) to guarantee exactly-once execution.
+      </p>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="intent">
+      <h2>Interviewer's Intent</h2>
+      <details>
+        <summary>What the interviewer is really evaluating</summary>
+        <div class="callout callout-info">
+          <p><strong>Why this question?</strong> Duplicate job execution is one of the most common production incidents after horizontal scaling. Interviewers use this question to probe whether candidates understand:</p>
+        </div>
+        <ul>
+          <li><strong>Distributed systems awareness</strong> — Do you recognize that in-process scheduling is node-local?</li>
+          <li><strong>Coordination primitives</strong> — Can you compare leader election vs. distributed locks vs. external orchestration?</li>
+          <li><strong>Production readiness</strong> — Do you consider clock skew, lock expiry, failover, and idempotency?</li>
+          <li><strong>Technology selection</strong> — Can you choose the right tool based on infrastructure constraints?</li>
+          <li><strong>Failure modes</strong> — What happens when the lock holder crashes mid-execution?</li>
+        </ul>
+        <p>A strong answer demonstrates knowledge of at least two distinct approaches, explains trade-offs, and mentions idempotency as a safety net regardless of the coordination strategy chosen.</p>
+      </details>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="sixty-second-answer">
+      <h2>60-Second Answer</h2>
+      <details>
+        <summary>Concise interview response</summary>
+        <div class="callout callout-tip">
+          <blockquote>
+            <p>"When you scale a Spring Boot app horizontally, <code>@Scheduled</code> fires on every pod because it's JVM-local — there's no cluster coordination. I'd fix this with one of three strategies depending on the stack:</p>
+            <p><strong>1. ShedLock</strong> — A lightweight library that uses a shared store (PostgreSQL, Redis, MongoDB) to acquire a lock before each scheduled execution. Only the pod that gets the lock runs the task. Minimal code change: add one annotation.</p>
+            <p><strong>2. Kubernetes CronJob</strong> — Move the schedule out of the app entirely. K8s ensures only one Job pod is spawned per cron tick. Best when you can decouple the task from the main deployment.</p>
+            <p><strong>3. Leader Election</strong> — One pod is elected leader (via K8s Lease API or a Redis lock) and only the leader's scheduler is active. Good for multiple scheduled tasks where you want a single 'scheduler' pod.</p>
+            <p>Regardless of approach, I'd also make the job idempotent — use a deduplication key or upsert logic — so that even if coordination fails, running twice doesn't produce duplicate side effects."</p>
+          </blockquote>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 3: Why @Scheduled Runs on Every Pod -->
+    <section id="why-scheduled-runs-everywhere">
+      <h2>Why @Scheduled Runs on Every Pod</h2>
+      <details>
+        <summary>Understanding the root cause</summary>
+        <p>Spring's <code>@Scheduled</code> annotation is processed by <code>ScheduledAnnotationBeanPostProcessor</code>, which registers tasks in a local <code>ThreadPoolTaskScheduler</code>. There is no network communication, no shared state, and no concept of "other instances."</p>
+
+        <div class="callout callout-warning">
+          <p><strong>Critical insight:</strong> Spring Framework deliberately does not include distributed scheduling. Each ApplicationContext is independent. When you deploy 5 replicas, you get 5 independent schedulers — all firing at the same cron expression.</p>
+        </div>
+
+        <h3>Architecture Diagram</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────┐
+│                    Kubernetes Cluster                     │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │   Pod 1      │  │   Pod 2      │  │   Pod 3      │  │
+│  │              │  │              │  │              │  │
+│  │ @Scheduled   │  │ @Scheduled   │  │ @Scheduled   │  │
+│  │ cron="0 * *" │  │ cron="0 * *" │  │ cron="0 * *" │  │
+│  │      │       │  │      │       │  │      │       │  │
+│  │      ▼       │  │      ▼       │  │      ▼       │  │
+│  │  sendReport()│  │  sendReport()│  │  sendReport()│  │
+│  │      │       │  │      │       │  │      │       │  │
+│  └──────┼───────┘  └──────┼───────┘  └──────┼───────┘  │
+│         │                  │                  │          │
+│         ▼                  ▼                  ▼          │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │          Email Service (3 duplicate sends!)      │    │
+│  └─────────────────────────────────────────────────┘    │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>The Code That Causes Problems</h3>
+<pre><code class="language-java">@Component
+public class ReportScheduler {
+
+    @Scheduled(cron = "0 0 9 * * MON-FRI")  // 9 AM weekdays
+    public void generateDailyReport() {
+        // This runs on EVERY pod in the deployment
+        List&lt;User&gt; users = userRepository.findAllActive();
+        for (User user : users) {
+            emailService.sendDailyReport(user);  // Duplicate emails!
+        }
+    }
+}</code></pre>
+
+        <h3>Why This Is Not a Bug</h3>
+        <p>Spring's design philosophy treats each application context as self-contained. Distributed coordination requires infrastructure dependencies (databases, Redis, ZooKeeper) that Spring doesn't want to mandate. The framework provides the building blocks; you choose the coordination strategy.</p>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Framework</th>
+              <th>Built-in Cluster Awareness</th>
+              <th>Coordination Mechanism</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Spring @Scheduled</td>
+              <td>❌ None</td>
+              <td>Manual (ShedLock, etc.)</td>
+            </tr>
+            <tr>
+              <td>Quartz (clustered)</td>
+              <td>✅ Yes</td>
+              <td>JDBC row-level locking</td>
+            </tr>
+            <tr>
+              <td>Micronaut @Scheduled</td>
+              <td>❌ None</td>
+              <td>Manual</td>
+            </tr>
+            <tr>
+              <td>Temporal.io</td>
+              <td>✅ Yes</td>
+              <td>Server-side orchestration</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 4: Leader Election Patterns -->
+    <section id="leader-election-patterns">
+      <h2>Leader Election Patterns</h2>
+      <details>
+        <summary>Choosing one pod to own scheduling responsibility</summary>
+        <p>Leader election ensures that exactly one instance in a cluster is designated as the "leader" and is responsible for executing scheduled tasks. If the leader fails, another instance takes over.</p>
+
+        <div class="callout callout-info">
+          <p><strong>Leader Election vs. Distributed Lock:</strong> Leader election is a long-lived assignment (one pod is leader until it fails). Distributed locks are short-lived and acquired per-task-execution. Both prevent duplicates, but leader election is better when you have many scheduled tasks on the same service.</p>
+        </div>
+
+        <h3>Pattern 1: Database-based Leader Election</h3>
+        <p>Use a database row as a lease. The leader periodically renews its lease; if it expires, another pod claims leadership.</p>
+
+<pre><code class="language-sql">-- Leader election table
+CREATE TABLE scheduler_leader (
+    id VARCHAR(64) PRIMARY KEY,
+    leader_id VARCHAR(255) NOT NULL,
+    last_heartbeat TIMESTAMP NOT NULL,
+    lease_duration_ms BIGINT NOT NULL DEFAULT 30000
+);
+
+-- Claim leadership (atomic upsert)
+INSERT INTO scheduler_leader (id, leader_id, last_heartbeat, lease_duration_ms)
+VALUES ('MAIN_SCHEDULER', 'pod-abc-123', NOW(), 30000)
+ON CONFLICT (id) DO UPDATE
+SET leader_id = 'pod-abc-123',
+    last_heartbeat = NOW()
+WHERE scheduler_leader.last_heartbeat &lt; NOW() - INTERVAL '30 seconds'
+   OR scheduler_leader.leader_id = 'pod-abc-123';</code></pre>
+
+<pre><code class="language-java">@Component
+public class DatabaseLeaderElection {
+
+    private final JdbcTemplate jdbc;
+    private final String podId = System.getenv("HOSTNAME");
+    private volatile boolean isLeader = false;
+
+    @Scheduled(fixedRate = 10_000) // Heartbeat every 10s
+    public void tryAcquireLeadership() {
+        int updated = jdbc.update("""
+            INSERT INTO scheduler_leader (id, leader_id, last_heartbeat)
+            VALUES ('MAIN', ?, NOW())
+            ON CONFLICT (id) DO UPDATE
+            SET leader_id = ?, last_heartbeat = NOW()
+            WHERE scheduler_leader.last_heartbeat &lt; NOW() - INTERVAL '30 seconds'
+               OR scheduler_leader.leader_id = ?
+            """, podId, podId, podId);
+
+        isLeader = (updated > 0);
+        log.info("Leadership status: {} for pod {}", isLeader, podId);
+    }
+
+    public boolean isLeader() {
+        return isLeader;
+    }
+}</code></pre>
+
+        <h3>Pattern 2: Redis-based Leader Election</h3>
+        <p>Use Redis SET with NX and EX to acquire a lease with automatic expiry.</p>
+
+<pre><code class="language-java">@Component
+public class RedisLeaderElection {
+
+    private final StringRedisTemplate redis;
+    private final String podId = System.getenv("HOSTNAME");
+    private static final String LEADER_KEY = "scheduler:leader";
+    private static final Duration LEASE_DURATION = Duration.ofSeconds(30);
+    private volatile boolean isLeader = false;
+
+    @Scheduled(fixedRate = 10_000)
+    public void tryAcquireLeadership() {
+        // Try to set leader key (only succeeds if not exists or we already own it)
+        Boolean acquired = redis.opsForValue()
+            .setIfAbsent(LEADER_KEY, podId, LEASE_DURATION);
+
+        if (Boolean.TRUE.equals(acquired)) {
+            isLeader = true;
+        } else {
+            // Check if we're the current leader and renew
+            String currentLeader = redis.opsForValue().get(LEADER_KEY);
+            if (podId.equals(currentLeader)) {
+                redis.expire(LEADER_KEY, LEASE_DURATION);
+                isLeader = true;
+            } else {
+                isLeader = false;
+            }
+        }
+    }
+
+    public boolean isLeader() {
+        return isLeader;
+    }
+}</code></pre>
+
+        <h3>Pattern 3: ZooKeeper Leader Election</h3>
+        <p>Apache Curator provides a robust <code>LeaderLatch</code> recipe built on ZooKeeper's ephemeral sequential nodes.</p>
+
+<pre><code class="language-java">@Component
+public class ZookeeperLeaderElection implements SmartLifecycle {
+
+    private final CuratorFramework curator;
+    private LeaderLatch leaderLatch;
+
+    @PostConstruct
+    public void init() throws Exception {
+        leaderLatch = new LeaderLatch(curator, "/scheduler/leader",
+            System.getenv("HOSTNAME"));
+        leaderLatch.start();
+    }
+
+    public boolean isLeader() {
+        return leaderLatch.hasLeadership();
+    }
+
+    @PreDestroy
+    public void shutdown() throws Exception {
+        leaderLatch.close(); // Graceful release
+    }
+
+    @Override
+    public void stop() {
+        try { shutdown(); } catch (Exception e) { /* log */ }
+    }
+
+    @Override
+    public boolean isRunning() {
+        return leaderLatch.getState() == LeaderLatch.State.STARTED;
+    }
+}</code></pre>
+
+        <h3>Pattern 4: Kubernetes Lease API</h3>
+        <p>Kubernetes has a native Lease resource in the <code>coordination.k8s.io/v1</code> API group, designed exactly for leader election. Spring Cloud Kubernetes integrates with it.</p>
+
+<pre><code class="language-yaml"># Kubernetes Lease resource (auto-managed by Spring Cloud K8s)
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: my-app-scheduler-leader
+  namespace: production
+spec:
+  holderIdentity: pod-abc-123
+  leaseDurationSeconds: 15
+  acquireTime: "2024-01-15T09:00:00Z"
+  renewTime: "2024-01-15T09:00:10Z"
+  leaseTransitions: 3</code></pre>
+
+<pre><code class="language-java">// Spring Cloud Kubernetes Leader Election
+@Configuration
+@EnableLeaderElection
+public class LeaderConfig {
+
+    @Bean
+    public LeaderElectionConfiguration leaderElectionConfig() {
+        return new LeaderElectionConfiguration("my-app-scheduler-leader");
+    }
+}
+
+@Component
+public class SchedulerLeaderHandler {
+
+    private volatile boolean isLeader = false;
+
+    @EventListener
+    public void onGranted(OnGrantedEvent event) {
+        log.info("Leadership GRANTED: {}", event.getRole());
+        isLeader = true;
+    }
+
+    @EventListener
+    public void onRevoked(OnRevokedEvent event) {
+        log.info("Leadership REVOKED: {}", event.getRole());
+        isLeader = false;
+    }
+
+    public boolean isLeader() {
+        return isLeader;
+    }
+}</code></pre>
+
+        <h3>Using Leader Election with @Scheduled</h3>
+<pre><code class="language-java">@Component
+@RequiredArgsConstructor
+public class ConditionalScheduler {
+
+    private final LeaderElection leaderElection;
+    private final ReportService reportService;
+
+    @Scheduled(cron = "0 0 9 * * MON-FRI")
+    public void generateDailyReport() {
+        if (!leaderElection.isLeader()) {
+            log.debug("Not leader, skipping scheduled task");
+            return;
+        }
+        log.info("Leader executing daily report generation");
+        reportService.generateAndSend();
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 5: ShedLock Deep Dive -->
+    <section id="shedlock-deep-dive">
+      <h2>ShedLock Deep Dive</h2>
+      <details>
+        <summary>The most popular solution for Spring scheduled task coordination</summary>
+        <p><a href="https://github.com/lukas-krecan/ShedLock">ShedLock</a> is a lightweight library that ensures scheduled tasks run at most once across a cluster. It does NOT provide distributed job scheduling — it only prevents multiple executions of the same task.</p>
+
+        <div class="callout callout-info">
+          <p><strong>How it works:</strong> Before a task executes, ShedLock tries to acquire a lock in a shared store. If the lock is already held (and hasn't expired), the task is skipped on that instance. The lock is released after execution or after <code>lockAtMostFor</code> expires.</p>
+        </div>
+
+        <h3>Architecture</h3>
+        <pre class="diagram">
+┌───────────────────────────────────────────────────────────────┐
+│                    Application Cluster                         │
+├───────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐       │
+│  │   Pod 1     │   │   Pod 2     │   │   Pod 3     │       │
+│  │             │   │             │   │             │       │
+│  │ @Scheduled  │   │ @Scheduled  │   │ @Scheduled  │       │
+│  │      │      │   │      │      │   │      │      │       │
+│  │      ▼      │   │      ▼      │   │      ▼      │       │
+│  │ ShedLock    │   │ ShedLock    │   │ ShedLock    │       │
+│  │ tryLock()   │   │ tryLock()   │   │ tryLock()   │       │
+│  │   ✅ GOT IT │   │   ❌ SKIP   │   │   ❌ SKIP   │       │
+│  │      │      │   │             │   │             │       │
+│  │      ▼      │   │             │   │             │       │
+│  │ execute()   │   │             │   │             │       │
+│  │      │      │   │             │   │             │       │
+│  │      ▼      │   │             │   │             │       │
+│  │ unlock()    │   │             │   │             │       │
+│  └──────┼──────┘   └─────────────┘   └─────────────┘       │
+│         │                                                     │
+│         ▼                                                     │
+│  ┌─────────────────────────────────────────────────────┐     │
+│  │         Lock Store (PostgreSQL / Redis / Mongo)      │     │
+│  │                                                      │     │
+│  │  name          | lock_until          | locked_by     │     │
+│  │  ─────────────────────────────────────────────────── │     │
+│  │  dailyReport   | 2024-01-15 09:05:00 | pod-1         │     │
+│  │  cleanupJob    | 2024-01-15 02:00:30 | pod-1         │     │
+│  └─────────────────────────────────────────────────────┘     │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Database Schema (PostgreSQL)</h3>
+<pre><code class="language-sql">-- ShedLock table
+CREATE TABLE shedlock (
+    name VARCHAR(64) NOT NULL,
+    lock_until TIMESTAMP NOT NULL,
+    locked_at TIMESTAMP NOT NULL,
+    locked_by VARCHAR(255) NOT NULL,
+    PRIMARY KEY (name)
+);
+
+-- Index for cleanup queries
+CREATE INDEX idx_shedlock_lock_until ON shedlock(lock_until);</code></pre>
+
+        <h3>Maven Dependencies</h3>
+<pre><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;net.javacrumbs.shedlock&lt;/groupId&gt;
+    &lt;artifactId&gt;shedlock-spring&lt;/artifactId&gt;
+    &lt;version&gt;5.10.0&lt;/version&gt;
+&lt;/dependency&gt;
+
+&lt;!-- Choose ONE lock provider --&gt;
+&lt;!-- Option A: JDBC (PostgreSQL, MySQL, etc.) --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;net.javacrumbs.shedlock&lt;/groupId&gt;
+    &lt;artifactId&gt;shedlock-provider-jdbc-template&lt;/artifactId&gt;
+    &lt;version&gt;5.10.0&lt;/version&gt;
+&lt;/dependency&gt;
+
+&lt;!-- Option B: Redis --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;net.javacrumbs.shedlock&lt;/groupId&gt;
+    &lt;artifactId&gt;shedlock-provider-redis-spring&lt;/artifactId&gt;
+    &lt;version&gt;5.10.0&lt;/version&gt;
+&lt;/dependency&gt;
+
+&lt;!-- Option C: MongoDB --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;net.javacrumbs.shedlock&lt;/groupId&gt;
+    &lt;artifactId&gt;shedlock-provider-mongo&lt;/artifactId&gt;
+    &lt;version&gt;5.10.0&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+
+        <h3>Configuration</h3>
+<pre><code class="language-java">@Configuration
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = "5m")
+public class SchedulerConfig {
+
+    @Bean
+    public LockProvider lockProvider(DataSource dataSource) {
+        return new JdbcTemplateLockProvider(
+            JdbcTemplateLockProvider.Configuration.builder()
+                .withJdbcTemplate(new JdbcTemplate(dataSource))
+                .usingDbTime()  // Use DB server time, not app time
+                .build()
+        );
+    }
+}</code></pre>
+
+        <h3>Usage with Annotations</h3>
+<pre><code class="language-java">@Component
+public class ScheduledTasks {
+
+    @Scheduled(cron = "0 0 9 * * MON-FRI")
+    @SchedulerLock(
+        name = "dailyReportGeneration",
+        lockAtMostFor = "5m",   // Max lock hold time (safety net)
+        lockAtLeastFor = "2m"   // Min lock hold time (prevent rapid re-execution)
+    )
+    public void generateDailyReport() {
+        // Guaranteed to run on only ONE pod
+        reportService.generateAndSendToAllUsers();
+    }
+
+    @Scheduled(fixedRate = 60_000)
+    @SchedulerLock(
+        name = "staleSessionCleanup",
+        lockAtMostFor = "10m",
+        lockAtLeastFor = "30s"
+    )
+    public void cleanupStaleSessions() {
+        sessionRepository.deleteExpired();
+    }
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>lockAtMostFor vs lockAtLeastFor:</strong></p>
+          <ul>
+            <li><code>lockAtMostFor</code> — Safety net. If the task crashes without releasing the lock, it expires after this duration. Set this to be longer than the task's worst-case execution time.</li>
+            <li><code>lockAtLeastFor</code> — Prevents rapid re-execution. Even if the task finishes in 1 second, the lock is held for at least this duration. Prevents other pods from running the same task within the same cron window due to slight clock differences.</li>
+          </ul>
+        </div>
+
+        <h3>Lock Providers Comparison</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Provider</th>
+              <th>Consistency</th>
+              <th>Performance</th>
+              <th>Infrastructure</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>JDBC (PostgreSQL)</td>
+              <td>Strong (ACID)</td>
+              <td>Good</td>
+              <td>Already have DB</td>
+              <td>Most applications</td>
+            </tr>
+            <tr>
+              <td>Redis</td>
+              <td>Eventual (single instance)</td>
+              <td>Excellent</td>
+              <td>Redis cluster</td>
+              <td>High-frequency tasks</td>
+            </tr>
+            <tr>
+              <td>MongoDB</td>
+              <td>Strong (with WriteConcern.MAJORITY)</td>
+              <td>Good</td>
+              <td>Mongo replica set</td>
+              <td>Already using Mongo</td>
+            </tr>
+            <tr>
+              <td>ZooKeeper</td>
+              <td>Strong (linearizable)</td>
+              <td>Good</td>
+              <td>ZK ensemble</td>
+              <td>Mission-critical tasks</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Redis Lock Provider Configuration</h3>
+<pre><code class="language-java">@Configuration
+@EnableSchedulerLock(defaultLockAtMostFor = "5m")
+public class RedisSchedulerConfig {
+
+    @Bean
+    public LockProvider lockProvider(RedisConnectionFactory connectionFactory) {
+        return new RedisLockProvider.Builder(connectionFactory)
+            .environment("production")  // Namespace prefix
+            .keyPrefix("shedlock:")
+            .build();
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 6: Quartz Scheduler Clustering -->
+    <section id="quartz-clustering">
+      <h2>Quartz Scheduler Clustering</h2>
+      <details>
+        <summary>Enterprise-grade clustered scheduling with JDBC JobStore</summary>
+        <p>Quartz Scheduler has built-in clustering support using a shared database (JDBC JobStore). Unlike ShedLock, which only prevents duplicate execution, Quartz provides full job scheduling, triggering, misfire handling, and failover.</p>
+
+        <h3>How Quartz Clustering Works</h3>
+        <pre class="diagram">
+┌────────────────────────────────────────────────────────────────┐
+│                     Quartz Cluster                              │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
+│  │   Node 1     │  │   Node 2     │  │   Node 3     │        │
+│  │   Quartz     │  │   Quartz     │  │   Quartz     │        │
+│  │   Scheduler  │  │   Scheduler  │  │   Scheduler  │        │
+│  │              │  │              │  │              │        │
+│  │  Polls DB    │  │  Polls DB    │  │  Polls DB    │        │
+│  │  for triggers│  │  for triggers│  │  for triggers│        │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘        │
+│         │                  │                  │                │
+│         └──────────────────┼──────────────────┘                │
+│                            ▼                                   │
+│  ┌──────────────────────────────────────────────────────┐     │
+│  │              Shared Database (JDBC JobStore)           │     │
+│  │                                                       │     │
+│  │  QRTZ_TRIGGERS    — trigger definitions & next fire   │     │
+│  │  QRTZ_JOB_DETAILS — job class and data               │     │
+│  │  QRTZ_LOCKS       — row-level locks for coordination  │     │
+│  │  QRTZ_FIRED_TRIGGERS — currently executing triggers   │     │
+│  │                                                       │     │
+│  │  Only ONE node acquires the row lock per trigger      │     │
+│  └──────────────────────────────────────────────────────┘     │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Spring Boot Configuration</h3>
+<pre><code class="language-yaml"># application.yml
+spring:
+  quartz:
+    job-store-type: jdbc
+    jdbc:
+      initialize-schema: always  # Creates Quartz tables on startup
+    properties:
+      org.quartz.scheduler.instanceName: MyClusteredScheduler
+      org.quartz.scheduler.instanceId: AUTO
+      org.quartz.jobStore.isClustered: true
+      org.quartz.jobStore.clusterCheckinInterval: 15000
+      org.quartz.jobStore.class: org.quartz.impl.jdbcjobstore.JobStoreTX
+      org.quartz.jobStore.driverDelegateClass: org.quartz.impl.jdbcjobstore.PostgreSQLDelegate
+      org.quartz.jobStore.tablePrefix: QRTZ_
+      org.quartz.jobStore.misfireThreshold: 60000
+      org.quartz.threadPool.threadCount: 5
+      org.quartz.jobStore.acquireTriggersWithinLock: true</code></pre>
+
+        <h3>Job Definition</h3>
+<pre><code class="language-java">@Component
+public class DailyReportJob implements Job {
+
+    @Autowired
+    private ReportService reportService;
+
+    @Override
+    public void execute(JobExecutionContext context) throws JobExecutionException {
+        log.info("Executing daily report on instance: {}",
+            context.getScheduler().getSchedulerInstanceId());
+        reportService.generateAndSend();
+    }
+}
+
+@Configuration
+public class QuartzConfig {
+
+    @Bean
+    public JobDetail dailyReportJobDetail() {
+        return JobBuilder.newJob(DailyReportJob.class)
+            .withIdentity("dailyReport", "reports")
+            .storeDurably()
+            .requestRecovery(true)  // Re-execute on failover
+            .build();
+    }
+
+    @Bean
+    public Trigger dailyReportTrigger() {
+        return TriggerBuilder.newTrigger()
+            .forJob(dailyReportJobDetail())
+            .withIdentity("dailyReportTrigger", "reports")
+            .withSchedule(CronScheduleBuilder
+                .cronSchedule("0 0 9 ? * MON-FRI")
+                .withMisfireHandlingInstructionFireAndProceed())
+            .build();
+    }
+}</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>When to use Quartz over ShedLock:</strong></p>
+          <ul>
+            <li>You need complex trigger types (cron, interval, calendar exclusions)</li>
+            <li>You need misfire handling (what happens if no pods were up during the scheduled time)</li>
+            <li>You need job persistence and recovery after crashes</li>
+            <li>You need to manage jobs dynamically (add/remove/pause at runtime)</li>
+          </ul>
+          <p>If you just want to prevent duplicates on simple <code>@Scheduled</code> methods, ShedLock is much simpler.</p>
+        </div>
+
+        <h3>Quartz Tables (Auto-created)</h3>
+<pre><code class="language-sql">-- Key Quartz tables for clustering
+-- QRTZ_LOCKS provides row-level locking
+SELECT * FROM qrtz_locks;
+-- LOCK_NAME
+-- --------------------
+-- TRIGGER_ACCESS
+-- STATE_ACCESS
+
+-- Check which node is running what
+SELECT trigger_name, instance_name, fired_time
+FROM qrtz_fired_triggers
+WHERE sched_name = 'MyClusteredScheduler';</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 7: Kubernetes-native Solutions -->
+    <section id="kubernetes-native">
+      <h2>Kubernetes-native Solutions</h2>
+      <details>
+        <summary>Leveraging the platform to solve scheduling</summary>
+        <p>If you're running on Kubernetes, you can move scheduling responsibility out of the application and into the platform. This eliminates the coordination problem entirely.</p>
+
+        <h3>Option 1: Kubernetes CronJob</h3>
+        <p>Kubernetes CronJob creates a new Pod on the defined schedule. Only one Pod is created per cron tick, so there's no duplication by design.</p>
+
+<pre><code class="language-yaml">apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-report-generator
+  namespace: production
+spec:
+  schedule: "0 9 * * 1-5"  # 9 AM weekdays (UTC)
+  concurrencyPolicy: Forbid  # Don't start new if previous still running
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 300  # If missed by 5min, skip this cycle
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 600  # Kill if runs longer than 10 min
+      template:
+        metadata:
+          labels:
+            app: report-generator
+            type: cronjob
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: report-generator-sa
+          containers:
+          - name: report-generator
+            image: myapp:1.2.3
+            command: ["java", "-jar", "app.jar", "--spring.profiles.active=cronjob"]
+            env:
+            - name: TASK_NAME
+              value: "dailyReport"
+            resources:
+              requests:
+                memory: "512Mi"
+                cpu: "250m"
+              limits:
+                memory: "1Gi"
+                cpu: "500m"</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>concurrencyPolicy options:</strong></p>
+          <ul>
+            <li><code>Forbid</code> — Skip the new run if the previous one hasn't finished (safest for reports)</li>
+            <li><code>Replace</code> — Kill the old run and start a new one</li>
+            <li><code>Allow</code> — Let multiple runs overlap (rarely appropriate)</li>
+          </ul>
+        </div>
+
+        <h3>Spring Boot CronJob Runner</h3>
+<pre><code class="language-java">@SpringBootApplication
+public class CronJobApplication implements CommandLineRunner {
+
+    @Autowired
+    private ReportService reportService;
+
+    @Value("${TASK_NAME:dailyReport}")
+    private String taskName;
+
+    public static void main(String[] args) {
+        // Run once and exit — K8s handles the schedule
+        System.exit(SpringApplication.exit(
+            SpringApplication.run(CronJobApplication.class, args)));
+    }
+
+    @Override
+    public void run(String... args) {
+        switch (taskName) {
+            case "dailyReport" -> reportService.generateAndSend();
+            case "cleanup" -> cleanupService.run();
+            default -> throw new IllegalArgumentException("Unknown task: " + taskName);
+        }
+    }
+}</code></pre>
+
+        <h3>Option 2: Single-Replica Scheduler Deployment</h3>
+        <p>Deploy the scheduler as a separate Deployment with <code>replicas: 1</code>. Only one pod runs the scheduled tasks.</p>
+
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler
+  namespace: production
+spec:
+  replicas: 1  # Exactly one scheduler pod
+  strategy:
+    type: Recreate  # Don't run two during rolling update
+  selector:
+    matchLabels:
+      app: myapp
+      role: scheduler
+  template:
+    metadata:
+      labels:
+        app: myapp
+        role: scheduler
+    spec:
+      containers:
+      - name: scheduler
+        image: myapp:1.2.3
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "scheduler"
+        - name: SCHEDULER_ENABLED
+          value: "true"</code></pre>
+
+<pre><code class="language-java">@Configuration
+@Profile("scheduler")
+@EnableScheduling
+public class SchedulerProfile {
+    // @Scheduled beans only active with scheduler profile
+}
+
+@Configuration
+@Profile("!scheduler")
+public class WorkerProfile {
+    // No @EnableScheduling — workers don't run cron tasks
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Limitations of single-replica:</strong> During a deployment rollout, there's a window where zero schedulers are running (Recreate strategy) or you must accept missed executions. This approach trades simplicity for reduced availability of the scheduler.</p>
+        </div>
+
+        <h3>Option 3: Leader Election Sidecar</h3>
+        <p>Use the Kubernetes leader election sidecar pattern. A sidecar container runs leader election and exposes an HTTP endpoint. Your main container checks it before executing tasks.</p>
+
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: app
+        image: myapp:1.2.3
+        env:
+        - name: LEADER_ELECTION_URL
+          value: "http://localhost:4040/leader"
+      - name: leader-elector
+        image: k8s.gcr.io/leader-elector:0.5
+        args:
+        - "--election=my-app-election"
+        - "--http=0.0.0.0:4040"
+        ports:
+        - containerPort: 4040</code></pre>
+
+<pre><code class="language-java">@Component
+public class K8sLeaderCheck {
+
+    private final RestTemplate restTemplate = new RestTemplate();
+
+    @Value("${LEADER_ELECTION_URL:http://localhost:4040/leader}")
+    private String leaderUrl;
+
+    public boolean isLeader() {
+        try {
+            String response = restTemplate.getForObject(leaderUrl, String.class);
+            String myPodName = System.getenv("HOSTNAME");
+            return response != null && response.contains(myPodName);
+        } catch (Exception e) {
+            log.warn("Leader check failed, assuming not leader", e);
+            return false;
+        }
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 8: Redis Distributed Locks -->
+    <section id="redis-distributed-locks">
+      <h2>Redis Distributed Locks</h2>
+      <details>
+        <summary>SET NX EX, Redisson, Redlock, and fencing tokens</summary>
+        <p>Redis provides fast, in-memory distributed locking. While simpler than ZooKeeper, Redis locks have subtle pitfalls around failover and split-brain scenarios that you must understand for production use.</p>
+
+        <h3>Basic Redis Lock: SET NX EX</h3>
+<pre><code class="language-bash"># Acquire lock (atomic: set-if-not-exists with expiry)
+SET scheduler:daily-report $RANDOM_TOKEN NX EX 300
+
+# Release lock (only if we still own it — use Lua script)
+EVAL "if redis.call('get', KEYS[1]) == ARGV[1] then \
+        return redis.call('del', KEYS[1]) \
+      else \
+        return 0 \
+      end" 1 scheduler:daily-report $RANDOM_TOKEN</code></pre>
+
+        <div class="callout callout-danger">
+          <p><strong>Never use DEL without checking ownership!</strong> If your lock expires while you're still processing (GC pause, slow I/O), another pod acquires it. A blind <code>DEL</code> would release the other pod's lock. Always use the Lua script pattern above.</p>
+        </div>
+
+        <h3>Java Implementation with Spring Data Redis</h3>
+<pre><code class="language-java">@Component
+public class RedisDistributedLock {
+
+    private final StringRedisTemplate redis;
+    private static final String UNLOCK_SCRIPT = """
+        if redis.call('get', KEYS[1]) == ARGV[1] then
+            return redis.call('del', KEYS[1])
+        else
+            return 0
+        end
+        """;
+
+    public Optional&lt;String&gt; tryAcquire(String lockKey, Duration ttl) {
+        String token = UUID.randomUUID().toString();
+        Boolean acquired = redis.opsForValue()
+            .setIfAbsent(lockKey, token, ttl);
+        return Boolean.TRUE.equals(acquired) ? Optional.of(token) : Optional.empty();
+    }
+
+    public boolean release(String lockKey, String token) {
+        RedisScript&lt;Long&gt; script = RedisScript.of(UNLOCK_SCRIPT, Long.class);
+        Long result = redis.execute(script,
+            Collections.singletonList(lockKey),
+            token);
+        return result != null && result == 1L;
+    }
+}
+
+// Usage in scheduler
+@Component
+@RequiredArgsConstructor
+public class LockProtectedScheduler {
+
+    private final RedisDistributedLock lock;
+    private final ReportService reportService;
+
+    @Scheduled(cron = "0 0 9 * * MON-FRI")
+    public void generateReport() {
+        Optional&lt;String&gt; token = lock.tryAcquire(
+            "lock:daily-report", Duration.ofMinutes(10));
+
+        if (token.isEmpty()) {
+            log.debug("Another pod holds the lock, skipping");
+            return;
+        }
+
+        try {
+            reportService.generateAndSend();
+        } finally {
+            lock.release("lock:daily-report", token.get());
+        }
+    }
+}</code></pre>
+
+        <h3>Redisson: Production-grade Redis Locks</h3>
+        <p>Redisson provides a battle-tested distributed lock implementation with automatic renewal (watchdog), reentrancy, and fairness options.</p>
+
+<pre><code class="language-java">@Configuration
+public class RedissonConfig {
+
+    @Bean
+    public RedissonClient redisson() {
+        Config config = new Config();
+        config.useSingleServer()
+            .setAddress("redis://redis-master:6379")
+            .setPassword("secret")
+            .setConnectionPoolSize(10);
+        return Redisson.create(config);
+    }
+}
+
+@Component
+@RequiredArgsConstructor
+public class RedissonScheduler {
+
+    private final RedissonClient redisson;
+    private final ReportService reportService;
+
+    @Scheduled(cron = "0 0 9 * * MON-FRI")
+    public void generateReport() {
+        RLock lock = redisson.getLock("scheduler:daily-report");
+
+        // tryLock: wait 0s, lease 5 minutes
+        boolean acquired = false;
+        try {
+            acquired = lock.tryLock(0, 5, TimeUnit.MINUTES);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+
+        if (!acquired) {
+            log.debug("Lock not acquired, another instance is processing");
+            return;
+        }
+
+        try {
+            reportService.generateAndSend();
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+}</code></pre>
+
+        <h3>The Redlock Algorithm</h3>
+        <p>For Redis deployments without strong consistency (no Sentinel/Cluster failover guarantees), Redlock uses N independent Redis masters (typically 5) and requires a majority (N/2+1) to agree on the lock.</p>
+
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│                    Redlock Algorithm                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Client attempts SET NX on all 5 independent Redis nodes:    │
+│                                                              │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────┐ │
+│  │Redis 1  │ │Redis 2  │ │Redis 3  │ │Redis 4  │ │  5  │ │
+│  │  ✅     │ │  ✅     │ │  ✅     │ │  ❌     │ │ ❌  │ │
+│  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────┘ │
+│                                                              │
+│  3 out of 5 succeeded (majority) → Lock acquired ✅         │
+│  Must complete within: TTL - time_to_acquire                 │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+        </pre>
+
+<pre><code class="language-java">// Redisson Redlock (multi-master)
+@Component
+public class RedlockScheduler {
+
+    @Autowired
+    private RedissonClient redisson1, redisson2, redisson3;
+
+    @Scheduled(cron = "0 0 9 * * MON-FRI")
+    public void generateReport() {
+        RLock lock1 = redisson1.getLock("scheduler:report");
+        RLock lock2 = redisson2.getLock("scheduler:report");
+        RLock lock3 = redisson3.getLock("scheduler:report");
+
+        RedissonRedLock redLock = new RedissonRedLock(lock1, lock2, lock3);
+
+        try {
+            if (redLock.tryLock(0, 5, TimeUnit.MINUTES)) {
+                try {
+                    reportService.generateAndSend();
+                } finally {
+                    redLock.unlock();
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}</code></pre>
+
+        <h3>Fencing Tokens</h3>
+        <p>Fencing tokens protect against a scenario where a client holds a lock, gets paused (GC, network), the lock expires, another client acquires it, and then both clients try to write.</p>
+
+        <div class="callout callout-info">
+          <p><strong>How fencing works:</strong> Each lock acquisition returns a monotonically increasing token. The downstream resource (database, API) rejects operations with a token lower than the highest it has seen.</p>
+        </div>
+
+<pre><code class="language-java">public class FencedLock {
+    private final StringRedisTemplate redis;
+
+    public OptionalLong tryAcquireWithFence(String lockKey, Duration ttl) {
+        // Atomically increment and set lock
+        String script = """
+            if redis.call('set', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then
+                return redis.call('incr', KEYS[2])
+            else
+                return nil
+            end
+            """;
+
+        Long fenceToken = redis.execute(
+            RedisScript.of(script, Long.class),
+            List.of(lockKey, lockKey + ":fence"),
+            UUID.randomUUID().toString(),
+            String.valueOf(ttl.getSeconds())
+        );
+
+        return fenceToken != null ? OptionalLong.of(fenceToken) : OptionalLong.empty();
+    }
+}
+
+// Usage: pass fence token to downstream writes
+public void processWithFence(long fenceToken) {
+    int updated = jdbc.update("""
+        UPDATE reports SET status = 'SENT', fence_token = ?
+        WHERE id = ? AND fence_token &lt; ?
+        """, fenceToken, reportId, fenceToken);
+
+    if (updated == 0) {
+        log.warn("Stale fence token {}, another instance already processed", fenceToken);
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 9: Production Incident -->
+    <section id="production-incident">
+      <h2>Production Incident: Duplicate Report Emails</h2>
+      <details>
+        <summary>50,000 users received 3× duplicate emails after autoscaling</summary>
+        <div class="callout callout-danger">
+          <p><strong>Incident Severity:</strong> P2 — Customer-facing duplicate communications</p>
+        </div>
+
+        <h3>Timeline</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Event</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>08:45 UTC</td>
+              <td>HPA (Horizontal Pod Autoscaler) scales deployment from 2 → 5 pods due to morning traffic spike</td>
+            </tr>
+            <tr>
+              <td>09:00 UTC</td>
+              <td><code>@Scheduled(cron = "0 0 9 * * *")</code> fires on all 5 pods simultaneously</td>
+            </tr>
+            <tr>
+              <td>09:00:02</td>
+              <td>All 5 pods query <code>SELECT * FROM users WHERE report_enabled = true</code></td>
+            </tr>
+            <tr>
+              <td>09:00:05</td>
+              <td>All 5 pods start sending emails concurrently</td>
+            </tr>
+            <tr>
+              <td>09:01:30</td>
+              <td>Email service rate limiter kicks in for 3 pods (429 errors)</td>
+            </tr>
+            <tr>
+              <td>09:02:00</td>
+              <td>2 pods complete full send. ~50K users receive 2 emails. Retry logic on failed pods sends partial third copies.</td>
+            </tr>
+            <tr>
+              <td>09:15:00</td>
+              <td>Customer support tickets start flooding in</td>
+            </tr>
+            <tr>
+              <td>09:30:00</td>
+              <td>Engineering alerted. Scheduled task disabled via feature flag.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Root Cause Analysis</h3>
+<pre><code class="language-java">// THE PROBLEMATIC CODE
+@Component
+public class DailyReportScheduler {
+
+    @Scheduled(cron = "0 0 9 * * *")
+    public void sendDailyReports() {
+        // NO coordination — runs on every pod
+        List&lt;User&gt; users = userRepo.findByReportEnabled(true);
+        for (User user : users) {
+            emailService.send(user.getEmail(), buildReport(user));
+        }
+    }
+}</code></pre>
+
+        <h3>Why It Wasn't Caught Earlier</h3>
+        <ul>
+          <li>Development: single instance → no duplication</li>
+          <li>Staging: 2 replicas, but manually deployed at different times → cron schedules rarely overlapped exactly</li>
+          <li>Production: initially 2 replicas with sticky timing. HPA scaling to 5 pods caused all to align on the same cron second.</li>
+        </ul>
+
+        <h3>The Fix (Applied in 30 minutes)</h3>
+<pre><code class="language-java">// IMMEDIATE FIX: Add ShedLock
+@Scheduled(cron = "0 0 9 * * *")
+@SchedulerLock(
+    name = "sendDailyReports",
+    lockAtMostFor = "30m",
+    lockAtLeastFor = "5m"
+)
+public void sendDailyReports() {
+    List&lt;User&gt; users = userRepo.findByReportEnabled(true);
+    for (User user : users) {
+        emailService.send(user.getEmail(), buildReport(user));
+    }
+}</code></pre>
+
+        <h3>Long-term Improvements</h3>
+<pre><code class="language-java">// LONG-TERM: Idempotent email sending with deduplication
+@Scheduled(cron = "0 0 9 * * *")
+@SchedulerLock(name = "sendDailyReports", lockAtMostFor = "30m")
+public void sendDailyReports() {
+    String batchId = "daily-report-" + LocalDate.now();
+
+    // Check if already processed today
+    if (reportBatchRepo.existsByBatchId(batchId)) {
+        log.info("Batch {} already processed, skipping", batchId);
+        return;
+    }
+
+    List&lt;User&gt; users = userRepo.findByReportEnabled(true);
+    for (User user : users) {
+        String dedupeKey = batchId + ":" + user.getId();
+
+        // Idempotent send — email service deduplicates by key
+        emailService.sendIdempotent(dedupeKey, user.getEmail(), buildReport(user));
+    }
+
+    // Mark batch as complete
+    reportBatchRepo.save(new ReportBatch(batchId, Instant.now(), users.size()));
+}</code></pre>
+
+        <h3>Lessons Learned</h3>
+        <div class="callout callout-tip">
+          <ol>
+            <li><strong>Defense in depth:</strong> Use both coordination (ShedLock) AND idempotency (deduplication keys)</li>
+            <li><strong>Test with realistic replica counts:</strong> CI/CD should run scheduled task tests with multiple instances</li>
+            <li><strong>Feature flags for scheduled tasks:</strong> Ability to disable any scheduled task without a deployment</li>
+            <li><strong>Audit trail:</strong> Log which pod executed which batch with a correlation ID</li>
+            <li><strong>Alerting:</strong> Monitor for duplicate sends using the deduplication key collision rate</li>
+          </ol>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: Code Examples -->
+    <section id="code-examples">
+      <h2>Complete Code Examples</h2>
+      <details>
+        <summary>Production-ready implementations</summary>
+
+        <h3>Example 1: Complete ShedLock Setup (Spring Boot)</h3>
+<pre><code class="language-java">// build.gradle.kts
+dependencies {
+    implementation("net.javacrumbs.shedlock:shedlock-spring:5.10.0")
+    implementation("net.javacrumbs.shedlock:shedlock-provider-jdbc-template:5.10.0")
+    implementation("org.springframework.boot:spring-boot-starter-jdbc")
+    runtimeOnly("org.postgresql:postgresql")
+}
+
+// --- SchedulerLockConfig.java ---
+@Configuration
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = "10m")
+public class SchedulerLockConfig {
+
+    @Bean
+    public LockProvider lockProvider(DataSource dataSource) {
+        return new JdbcTemplateLockProvider(
+            JdbcTemplateLockProvider.Configuration.builder()
+                .withJdbcTemplate(new JdbcTemplate(dataSource))
+                .usingDbTime()
+                .build()
+        );
+    }
+
+    @Bean
+    public TaskScheduler taskScheduler() {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(4);
+        scheduler.setThreadNamePrefix("sched-");
+        scheduler.setErrorHandler(t ->
+            log.error("Scheduled task failed", t));
+        return scheduler;
+    }
+}
+
+// --- ScheduledJobs.java ---
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class ScheduledJobs {
+
+    private final ReportService reportService;
+    private final CacheService cacheService;
+    private final MetricsService metrics;
+
+    @Scheduled(cron = "0 0 9 * * MON-FRI")
+    @SchedulerLock(name = "dailyReport", lockAtMostFor = "30m", lockAtLeastFor = "5m")
+    public void dailyReport() {
+        Instant start = Instant.now();
+        log.info("Starting daily report generation");
+
+        try {
+            int count = reportService.generateAndSend();
+            metrics.recordScheduledTask("dailyReport", "success", start);
+            log.info("Daily report sent to {} users", count);
+        } catch (Exception e) {
+            metrics.recordScheduledTask("dailyReport", "failure", start);
+            throw e;  // ShedLock still releases lock
+        }
+    }
+
+    @Scheduled(fixedRate = 300_000)  // Every 5 minutes
+    @SchedulerLock(name = "cacheWarmup", lockAtMostFor = "4m", lockAtLeastFor = "1m")
+    public void warmCache() {
+        cacheService.warmProductCache();
+    }
+
+    @Scheduled(cron = "0 0 2 * * *")  // 2 AM daily
+    @SchedulerLock(name = "dataCleanup", lockAtMostFor = "2h", lockAtLeastFor = "30m")
+    public void cleanupOldData() {
+        int deleted = dataService.deleteOlderThan(Period.ofDays(90));
+        log.info("Cleaned up {} old records", deleted);
+    }
+}
+
+// --- Flyway migration: V5__create_shedlock_table.sql ---
+// (see SQL below)</code></pre>
+
+<pre><code class="language-sql">-- V5__create_shedlock_table.sql
+CREATE TABLE IF NOT EXISTS shedlock (
+    name VARCHAR(64) NOT NULL,
+    lock_until TIMESTAMP NOT NULL,
+    locked_at TIMESTAMP NOT NULL,
+    locked_by VARCHAR(255) NOT NULL,
+    CONSTRAINT pk_shedlock PRIMARY KEY (name)
+);
+
+-- Optional: monitoring query
+-- Find stuck locks (held longer than expected)
+SELECT name, locked_by, locked_at,
+       lock_until - NOW() AS time_remaining
+FROM shedlock
+WHERE lock_until > NOW()
+ORDER BY locked_at;</code></pre>
+
+        <h3>Example 2: Redis Leader Election with Spring Boot</h3>
+<pre><code class="language-java">// --- RedisLeaderElectionService.java ---
+@Service
+@Slf4j
+public class RedisLeaderElectionService implements DisposableBean {
+
+    private final StringRedisTemplate redis;
+    private final String instanceId;
+    private final AtomicBoolean leader = new AtomicBoolean(false);
+
+    private static final String LEADER_KEY = "app:scheduler:leader";
+    private static final Duration LEASE_TTL = Duration.ofSeconds(30);
+    private static final Duration HEARTBEAT_INTERVAL = Duration.ofSeconds(10);
+
+    private final ScheduledExecutorService executor =
+        Executors.newSingleThreadScheduledExecutor();
+
+    public RedisLeaderElectionService(StringRedisTemplate redis) {
+        this.redis = redis;
+        this.instanceId = System.getenv().getOrDefault("HOSTNAME",
+            InetAddress.getLocalHost().getHostName());
+
+        // Start heartbeat
+        executor.scheduleAtFixedRate(this::heartbeat,
+            0, HEARTBEAT_INTERVAL.getSeconds(), TimeUnit.SECONDS);
+    }
+
+    private void heartbeat() {
+        try {
+            Boolean acquired = redis.opsForValue()
+                .setIfAbsent(LEADER_KEY, instanceId, LEASE_TTL);
+
+            if (Boolean.TRUE.equals(acquired)) {
+                leader.set(true);
+                log.debug("Acquired leadership: {}", instanceId);
+                return;
+            }
+
+            // Check if we already own it → renew
+            String currentLeader = redis.opsForValue().get(LEADER_KEY);
+            if (instanceId.equals(currentLeader)) {
+                redis.expire(LEADER_KEY, LEASE_TTL);
+                leader.set(true);
+            } else {
+                if (leader.getAndSet(false)) {
+                    log.info("Lost leadership to: {}", currentLeader);
+                }
+            }
+        } catch (Exception e) {
+            log.error("Leader election heartbeat failed", e);
+            leader.set(false);
+        }
+    }
+
+    public boolean isLeader() {
+        return leader.get();
+    }
+
+    @Override
+    public void destroy() {
+        executor.shutdown();
+        // Release leadership gracefully
+        if (leader.get()) {
+            String script = """
+                if redis.call('get', KEYS[1]) == ARGV[1] then
+                    return redis.call('del', KEYS[1])
+                end
+                return 0
+                """;
+            redis.execute(RedisScript.of(script, Long.class),
+                List.of(LEADER_KEY), instanceId);
+        }
+    }
+}
+
+// --- LeaderAwareScheduler.java ---
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class LeaderAwareScheduler {
+
+    private final RedisLeaderElectionService leaderElection;
+    private final ReportService reportService;
+    private final NotificationService notificationService;
+
+    @Scheduled(cron = "0 0 9 * * MON-FRI")
+    public void dailyReport() {
+        if (!leaderElection.isLeader()) return;
+        log.info("Leader executing daily report");
+        reportService.generateAndSend();
+    }
+
+    @Scheduled(fixedRate = 60_000)
+    public void processNotificationQueue() {
+        if (!leaderElection.isLeader()) return;
+        notificationService.processQueue();
+    }
+
+    @Scheduled(cron = "0 30 1 * * *")
+    public void nightlyAggregation() {
+        if (!leaderElection.isLeader()) return;
+        analyticsService.runNightlyAggregation();
+    }
+}</code></pre>
+
+        <h3>Example 3: Kubernetes CronJob with Monitoring</h3>
+<pre><code class="language-yaml">---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-report
+  namespace: production
+  labels:
+    app: myapp
+    component: scheduled-tasks
+spec:
+  schedule: "0 9 * * 1-5"
+  timeZone: "America/New_York"  # K8s 1.27+
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app: myapp
+            component: cronjob-report
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "8080"
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: cronjob-runner
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+          containers:
+          - name: report-job
+            image: registry.example.com/myapp:1.2.3
+            command:
+            - java
+            - -jar
+            - /app/app.jar
+            - --spring.profiles.active=cronjob
+            - --task.name=dailyReport
+            env:
+            - name: DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password
+            resources:
+              requests:
+                memory: "512Mi"
+                cpu: "500m"
+              limits:
+                memory: "1Gi"
+                cpu: "1000m"
+          volumes:
+          - name: tmp
+            emptyDir: {}
+
+---
+# RBAC for CronJob ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cronjob-runner
+  namespace: production
+
+---
+# PrometheusRule for alerting on failed CronJobs
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cronjob-alerts
+  namespace: production
+spec:
+  groups:
+  - name: cronjob.rules
+    rules:
+    - alert: CronJobFailed
+      expr: |
+        kube_job_status_failed{namespace="production",job_name=~"daily-report.*"} > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "CronJob {{ $labels.job_name }} failed"
+        description: "CronJob has been in failed state for 5 minutes."</code></pre>
+      </details>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch06-health-checks-503.html" class="chapter-nav-prev">← Chapter 6: Health Checks &amp; 503</a>
+      <a href="ch08-optimistic-locking-failures.html" class="chapter-nav-next">Chapter 8: Optimistic Locking →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

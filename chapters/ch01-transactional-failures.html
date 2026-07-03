@@ -1,0 +1,1387 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 1: Why can @Transactional fail even when no exception is thrown? | Senior Backend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <!-- Sidebar Navigation -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 1</span>
+      <span class="chapter-title">@Transactional Failures</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#how-spring-transactions-work">How Spring Creates Transactions</a></li>
+        <li><a href="#proxy-mechanism">AOP Proxy Mechanism</a></li>
+        <li><a href="#transaction-lifecycle">Transaction Lifecycle</a></li>
+        <li><a href="#failure-reasons">Why Transactions Fail Silently</a></li>
+        <li><a href="#rollback-rules">Rollback Rules</a></li>
+        <li><a href="#isolation-levels">Isolation Levels</a></li>
+        <li><a href="#nested-transactions">Nested Transactions</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-checklist">Debugging Checklist</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-i">Part I — Spring Boot Core Internals</a> &rsaquo;
+      <span>Chapter 1</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Spring AOP</span>
+        <span class="badge badge-topic">Proxy</span>
+        <span class="badge badge-topic">Transactions</span>
+      </div>
+      <h1>Why can <code>@Transactional</code> fail even when no exception is thrown?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> <code>@Transactional</code> works through AOP proxies. If the proxy is bypassed (self-invocation, private methods, final classes), Spring never sees the call — and the transaction never begins.
+      </p>
+    </header>
+
+    <!-- Search -->
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter... (e.g., self-invocation, CGLIB, propagation)" aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <div class="callout callout-info">
+        <p><strong>What they're really testing:</strong></p>
+        <ul>
+          <li>Do you understand Spring's proxy-based AOP model, not just the annotation?</li>
+          <li>Can you explain <em>why</em> something fails, not just <em>that</em> it fails?</li>
+          <li>Have you debugged transaction issues in production?</li>
+          <li>Do you understand the difference between framework magic and actual behavior?</li>
+        </ul>
+      </div>
+      <p>This question separates engineers who've memorized the <code>@Transactional</code> annotation from those who understand how Spring's transaction infrastructure actually works at the bytecode level. Interviewers want to see that you can reason about proxy boundaries, AOP interceptors, and the subtle ways declarative transactions can silently fail.</p>
+    </section>
+
+    <!-- Section 2: 60-Second Interview Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Interview Answer</h2>
+      <div class="callout callout-tip">
+        <p><strong>Use this in the interview:</strong></p>
+        <blockquote>
+          "<code>@Transactional</code> relies on Spring AOP proxies. The transaction only activates when the method is called <em>through the proxy</em>. There are several scenarios where the proxy is bypassed or misconfigured:
+          <br><br>
+          <strong>1. Self-invocation</strong> — calling a <code>@Transactional</code> method from within the same class bypasses the proxy entirely.<br>
+          <strong>2. Private/final methods</strong> — CGLIB can't override them, so the advice is never applied.<br>
+          <strong>3. Checked exceptions</strong> — by default, Spring only rolls back on unchecked exceptions (<code>RuntimeException</code>). A checked exception commits the transaction.<br>
+          <strong>4. Wrong propagation</strong> — <code>SUPPORTS</code> or <code>NOT_SUPPORTED</code> won't start a new transaction if none exists.<br>
+          <strong>5. Async boundaries</strong> — <code>@Async</code> methods run on a different thread, outside the caller's transaction context.
+          <br><br>
+          I've hit most of these in production. The self-invocation one is particularly insidious because everything <em>appears</em> to work until you check the database under load."
+        </blockquote>
+      </div>
+    </section>
+
+    <!-- Section 3: How Spring Creates Transactions Internally -->
+    <section id="how-spring-transactions-work">
+      <h2>How Spring Creates Transactions Internally</h2>
+
+      <details>
+        <summary>The Big Picture — What happens when you add <code>@Transactional</code></summary>
+        <p>When Spring Boot starts, it performs the following at bean initialization time:</p>
+        <ol>
+          <li><strong>Component Scanning</strong> — finds your <code>@Service</code> class</li>
+          <li><strong>BeanPostProcessor</strong> — <code>InfrastructureAdvisorAutoProxyCreator</code> detects <code>@Transactional</code></li>
+          <li><strong>Proxy Creation</strong> — wraps your bean in a CGLIB (or JDK dynamic) proxy</li>
+          <li><strong>Advice Registration</strong> — attaches <code>TransactionInterceptor</code> as around-advice</li>
+        </ol>
+        <p>At runtime, every call to a <code>@Transactional</code> method goes through this proxy, which:</p>
+        <ol>
+          <li>Looks up the <code>PlatformTransactionManager</code></li>
+          <li>Calls <code>getTransaction()</code> with the appropriate <code>TransactionDefinition</code></li>
+          <li>Executes your method</li>
+          <li>On success → <code>commit()</code></li>
+          <li>On <code>RuntimeException</code> → <code>rollback()</code></li>
+        </ol>
+      </details>
+
+      <details>
+        <summary>Spring's Internal Transaction Flow — Component Diagram</summary>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Spring Container                               │
+│                                                                       │
+│  ┌──────────────┐     ┌────────────────────────┐                    │
+│  │  Caller Bean │────▶│   CGLIB Proxy           │                    │
+│  └──────────────┘     │  (generated subclass)   │                    │
+│                        │                          │                    │
+│                        │  ┌────────────────────┐ │                    │
+│                        │  │TransactionInterceptor│ │                    │
+│                        │  │                    │ │                    │
+│                        │  │ 1. getTransaction()│ │                    │
+│                        │  │ 2. invoke target   │ │                    │
+│                        │  │ 3. commit/rollback │ │                    │
+│                        │  └────────┬───────────┘ │                    │
+│                        └───────────┼─────────────┘                    │
+│                                    │                                  │
+│                                    ▼                                  │
+│                        ┌────────────────────────┐                    │
+│                        │  Your @Service class    │                    │
+│                        │  (actual target bean)   │                    │
+│                        └────────────────────────┘                    │
+│                                    │                                  │
+│                                    ▼                                  │
+│                        ┌────────────────────────┐                    │
+│                        │ PlatformTransactionMgr  │                    │
+│                        │ (DataSourceTxManager)   │                    │
+│                        └────────────┬───────────┘                    │
+│                                    │                                  │
+└────────────────────────────────────┼─────────────────────────────────┘
+                                     ▼
+                          ┌─────────────────────┐
+                          │   DataSource         │
+                          │   (HikariCP)         │
+                          └─────────────────────┘
+        </pre>
+      </details>
+
+      <details>
+        <summary>TransactionSynchronizationManager — The Thread-Local Magic</summary>
+        <p>Spring stores all transaction state in <code>ThreadLocal</code> variables via <code>TransactionSynchronizationManager</code>:</p>
+        <pre><code class="language-java">public abstract class TransactionSynchronizationManager {
+    // Each thread gets its own transaction resources
+    private static final ThreadLocal&lt;Map&lt;Object, Object&gt;&gt; resources =
+        new NamedThreadLocal&lt;&gt;("Transactional resources");
+
+    private static final ThreadLocal&lt;Set&lt;TransactionSynchronization&gt;&gt; synchronizations =
+        new NamedThreadLocal&lt;&gt;("Transaction synchronizations");
+
+    private static final ThreadLocal&lt;String&gt; currentTransactionName =
+        new NamedThreadLocal&lt;&gt;("Current transaction name");
+
+    private static final ThreadLocal&lt;Boolean&gt; currentTransactionReadOnly =
+        new NamedThreadLocal&lt;&gt;("Current transaction read-only status");
+
+    private static final ThreadLocal&lt;Integer&gt; currentTransactionIsolationLevel =
+        new NamedThreadLocal&lt;&gt;("Current transaction isolation level");
+
+    private static final ThreadLocal&lt;Boolean&gt; actualTransactionActive =
+        new NamedThreadLocal&lt;&gt;("Actual transaction active");
+}</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Critical Implication:</strong> Because transaction state is thread-local, any code that runs on a <em>different thread</em> (thread pools, <code>@Async</code>, <code>CompletableFuture</code>, reactive streams) operates <strong>outside</strong> the current transaction. The transaction context does NOT propagate across threads.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: AOP Proxy Mechanism -->
+    <section id="proxy-mechanism">
+      <h2>Spring AOP Proxy Mechanism</h2>
+
+      <details>
+        <summary>JDK Dynamic Proxy vs CGLIB — When does Spring use which?</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>JDK Dynamic Proxy</th>
+              <th>CGLIB Proxy</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Mechanism</strong></td>
+              <td>Implements the same interfaces</td>
+              <td>Generates a subclass at runtime</td>
+            </tr>
+            <tr>
+              <td><strong>Requirement</strong></td>
+              <td>Target must implement an interface</td>
+              <td>No interface needed (default in Spring Boot)</td>
+            </tr>
+            <tr>
+              <td><strong>Final methods</strong></td>
+              <td>N/A (interface methods)</td>
+              <td>❌ Cannot proxy final methods</td>
+            </tr>
+            <tr>
+              <td><strong>Private methods</strong></td>
+              <td>❌ Not in interface</td>
+              <td>❌ Not visible to subclass</td>
+            </tr>
+            <tr>
+              <td><strong>Performance</strong></td>
+              <td>Slightly slower (reflection)</td>
+              <td>Faster (direct bytecode)</td>
+            </tr>
+            <tr>
+              <td><strong>Spring Boot default</strong></td>
+              <td>No (since Spring Boot 2.0)</td>
+              <td>✅ Yes (<code>proxyTargetClass=true</code>)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>How CGLIB proxy generation works — bytecode level</summary>
+        <p>When Spring creates a CGLIB proxy for your service, it essentially generates something like this at runtime:</p>
+        <pre><code class="language-java">// This is what Spring generates (simplified)
+public class OrderService$$EnhancerBySpringCGLIB extends OrderService {
+
+    private MethodInterceptor interceptor; // TransactionInterceptor
+
+    @Override
+    public void placeOrder(Order order) {
+        // The interceptor wraps the call with transaction logic
+        interceptor.intercept(this, 
+            OrderService.class.getMethod("placeOrder", Order.class),
+            new Object[]{order},
+            methodProxy);
+    }
+}
+
+// Inside TransactionInterceptor.invoke():
+public Object invoke(MethodInvocation invocation) {
+    TransactionInfo txInfo = createTransactionIfNecessary(tm, txAttr, methodId);
+    Object retVal;
+    try {
+        retVal = invocation.proceed(); // calls YOUR actual method
+    } catch (Throwable ex) {
+        completeTransactionAfterThrowing(txInfo, ex);
+        throw ex;
+    }
+    commitTransactionAfterReturning(txInfo);
+    return retVal;
+}</code></pre>
+        <div class="callout callout-info">
+          <p><strong>Key Insight:</strong> The proxy is a <em>subclass</em>. This means <code>final</code> methods can't be overridden, and <code>private</code> methods aren't visible to the subclass. The interceptor advice is simply never applied to these methods.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>The self-invocation trap — visualized</summary>
+        <pre class="diagram">
+  ✅ External call (through proxy):
+  ─────────────────────────────────
+
+  CallerBean ──────▶ Proxy(OrderService) ──────▶ OrderService.placeOrder()
+                         │                              │
+                         │ BEGIN TRANSACTION             │
+                         │◄─────────────────────────────│
+                         │ COMMIT                        │
+                         ▼                              ▼
+
+
+  ❌ Self-invocation (bypasses proxy):
+  ─────────────────────────────────────
+
+  CallerBean ──────▶ Proxy(OrderService) ──────▶ OrderService.processAll()
+                         │                              │
+                         │ (no @Transactional            │
+                         │  on processAll)               │
+                         │                              │
+                         │                    this.placeOrder(order)  ← DIRECT CALL!
+                         │                              │
+                         │                    ❌ No proxy involved
+                         │                    ❌ No transaction started
+                         ▼                              ▼
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Transaction Lifecycle -->
+    <section id="transaction-lifecycle">
+      <h2>Transaction Lifecycle — Sequence Diagram</h2>
+
+      <details>
+        <summary>Full lifecycle: from method call to commit/rollback</summary>
+        <pre class="diagram">
+  Caller          Proxy            TransactionInterceptor       DataSource        Your Method
+    │                │                      │                       │                  │
+    │ placeOrder()   │                      │                       │                  │
+    │───────────────▶│                      │                       │                  │
+    │                │  invoke()            │                       │                  │
+    │                │─────────────────────▶│                       │                  │
+    │                │                      │                       │                  │
+    │                │                      │ getConnection()        │                  │
+    │                │                      │──────────────────────▶│                  │
+    │                │                      │       Connection       │                  │
+    │                │                      │◀──────────────────────│                  │
+    │                │                      │                       │                  │
+    │                │                      │ setAutoCommit(false)   │                  │
+    │                │                      │──────────────────────▶│                  │
+    │                │                      │                       │                  │
+    │                │                      │ bind to ThreadLocal    │                  │
+    │                │                      │─────┐                 │                  │
+    │                │                      │◀────┘                 │                  │
+    │                │                      │                       │                  │
+    │                │                      │ proceed()             │                  │
+    │                │                      │─────────────────────────────────────────▶│
+    │                │                      │                       │                  │
+    │                │                      │                       │  ┌────────────┐  │
+    │                │                      │                       │  │ Business   │  │
+    │                │                      │                       │  │ Logic      │  │
+    │                │                      │                       │  │ (JPA ops)  │  │
+    │                │                      │                       │  └────────────┘  │
+    │                │                      │                       │                  │
+    │                │                      │       return value    │                  │
+    │                │                      │◀─────────────────────────────────────────│
+    │                │                      │                       │                  │
+    │                │                      │──── SUCCESS PATH ────▶│                  │
+    │                │                      │    connection.commit() │                  │
+    │                │                      │                       │                  │
+    │                │                      │──── FAILURE PATH ────▶│                  │
+    │                │                      │  connection.rollback() │                  │
+    │                │                      │                       │                  │
+    │                │                      │ unbind from ThreadLocal│                  │
+    │                │                      │ release connection     │                  │
+    │                │  return result        │                       │                  │
+    │◀──────────────│◀─────────────────────│                       │                  │
+    │                │                      │                       │                  │
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 6: Why Transactions Fail Silently -->
+    <section id="failure-reasons">
+      <h2>Why Transactions Fail Silently — All Scenarios</h2>
+
+      <details>
+        <summary>1. Self-Invocation (The #1 trap in interviews)</summary>
+        <p>When a method in the same class calls another <code>@Transactional</code> method, it uses <code>this</code> reference — bypassing the proxy entirely.</p>
+        <pre><code class="language-java">@Service
+public class OrderService {
+
+    // ❌ This does NOT run in a transaction!
+    public void processAllOrders(List&lt;Order&gt; orders) {
+        for (Order order : orders) {
+            this.placeOrder(order); // Direct call — proxy bypassed!
+        }
+    }
+
+    @Transactional
+    public void placeOrder(Order order) {
+        orderRepository.save(order);
+        paymentService.charge(order); // If this fails, save is NOT rolled back!
+    }
+}</code></pre>
+
+        <p><strong>Fix Options:</strong></p>
+        <pre><code class="language-java">// Fix 1: Inject self (proxy-aware)
+@Service
+public class OrderService {
+    @Autowired
+    private OrderService self; // Spring injects the PROXY, not 'this'
+
+    public void processAllOrders(List&lt;Order&gt; orders) {
+        for (Order order : orders) {
+            self.placeOrder(order); // ✅ Goes through proxy
+        }
+    }
+
+    @Transactional
+    public void placeOrder(Order order) {
+        orderRepository.save(order);
+        paymentService.charge(order);
+    }
+}
+
+// Fix 2: Extract to a separate service
+@Service
+public class OrderProcessingService {
+    @Autowired
+    private OrderService orderService;
+
+    public void processAllOrders(List&lt;Order&gt; orders) {
+        for (Order order : orders) {
+            orderService.placeOrder(order); // ✅ External call through proxy
+        }
+    }
+}
+
+// Fix 3: Use ApplicationContext (less clean)
+@Service
+public class OrderService implements ApplicationContextAware {
+    private ApplicationContext ctx;
+
+    public void processAllOrders(List&lt;Order&gt; orders) {
+        OrderService proxy = ctx.getBean(OrderService.class);
+        for (Order order : orders) {
+            proxy.placeOrder(order); // ✅ Gets proxy from container
+        }
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>2. Checked Exceptions — Silent commit on failure</summary>
+        <p>By default, Spring only rolls back on <strong>unchecked exceptions</strong> (<code>RuntimeException</code> and its subclasses). Checked exceptions cause a <strong>commit</strong>.</p>
+        <pre><code class="language-java">@Transactional
+public void transferMoney(Account from, Account to, BigDecimal amount) 
+        throws InsufficientFundsException {  // ← Checked exception
+    
+    from.debit(amount);
+    accountRepository.save(from);
+    
+    to.credit(amount);
+    accountRepository.save(to);
+    
+    if (from.getBalance().compareTo(BigDecimal.ZERO) &lt; 0) {
+        // ❌ This COMMITS the debit! Transaction is NOT rolled back.
+        throw new InsufficientFundsException("Not enough funds");
+    }
+}</code></pre>
+
+        <p><strong>Fix:</strong></p>
+        <pre><code class="language-java">// Option 1: Declare rollbackFor explicitly
+@Transactional(rollbackFor = Exception.class)
+public void transferMoney(Account from, Account to, BigDecimal amount) 
+        throws InsufficientFundsException {
+    // Now rolls back on ALL exceptions, checked and unchecked
+}
+
+// Option 2: Wrap checked exceptions as unchecked
+@Transactional
+public void transferMoney(Account from, Account to, BigDecimal amount) {
+    try {
+        externalBankService.validate(from, amount);
+    } catch (BankValidationException e) {
+        throw new TransferFailedException("Validation failed", e); // RuntimeException
+    }
+}
+
+// Option 3: Use noRollbackFor for specific unchecked exceptions
+@Transactional(noRollbackFor = {OptimisticLockException.class})
+public void updateWithRetry(Entity entity) {
+    // OptimisticLockException won't trigger rollback
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>3. Wrong Propagation Level</summary>
+        <pre><code class="language-java">// ❌ SUPPORTS — no transaction created if caller doesn't have one
+@Transactional(propagation = Propagation.SUPPORTS)
+public void auditLog(String message) {
+    // If called without an existing transaction, this runs WITHOUT a transaction
+    auditRepository.save(new AuditEntry(message));
+}
+
+// ❌ NOT_SUPPORTED — suspends existing transaction!
+@Transactional(propagation = Propagation.NOT_SUPPORTED)
+public void sendNotification(User user) {
+    // This deliberately runs OUTSIDE any transaction
+    // But if you forget this is non-transactional, updates here won't roll back
+    notificationRepository.markAsSent(user.getId());
+}</code></pre>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Propagation</th>
+              <th>Existing Tx?</th>
+              <th>Behavior</th>
+              <th>Risk</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>REQUIRED</code></td>
+              <td>Yes → join / No → create</td>
+              <td>Default, safest</td>
+              <td>Low</td>
+            </tr>
+            <tr>
+              <td><code>REQUIRES_NEW</code></td>
+              <td>Always creates new, suspends existing</td>
+              <td>Independent commit</td>
+              <td>Medium (suspended tx holds connection)</td>
+            </tr>
+            <tr>
+              <td><code>SUPPORTS</code></td>
+              <td>Yes → join / No → none</td>
+              <td>Optional</td>
+              <td><strong>High — may run without tx</strong></td>
+            </tr>
+            <tr>
+              <td><code>NOT_SUPPORTED</code></td>
+              <td>Always non-transactional</td>
+              <td>Suspends existing</td>
+              <td><strong>High — no rollback</strong></td>
+            </tr>
+            <tr>
+              <td><code>MANDATORY</code></td>
+              <td>Must exist → join / No → exception</td>
+              <td>Fails fast</td>
+              <td>Low (safe guard)</td>
+            </tr>
+            <tr>
+              <td><code>NEVER</code></td>
+              <td>Must NOT exist → exception if exists</td>
+              <td>Fails fast</td>
+              <td>Low</td>
+            </tr>
+            <tr>
+              <td><code>NESTED</code></td>
+              <td>Yes → savepoint / No → create</td>
+              <td>Partial rollback</td>
+              <td>Medium (not all DBs support savepoints)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>4. Final Methods (CGLIB cannot override)</summary>
+        <pre><code class="language-java">@Service
+public class PaymentService {
+
+    // ❌ CGLIB cannot generate subclass override for final method
+    @Transactional
+    public final void processPayment(Payment payment) {
+        paymentRepository.save(payment);
+        ledgerService.recordEntry(payment);
+        // Transaction advice is NEVER applied — this runs without a transaction
+    }
+}</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>No compile-time warning!</strong> Spring will silently skip the transactional advice on final methods. There's no error at startup — the method simply executes without transaction boundaries. Some static analysis tools (like IntelliJ's inspections) can catch this.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>5. Private Methods</summary>
+        <pre><code class="language-java">@Service
+public class InventoryService {
+
+    public void restockAll(List&lt;Item&gt; items) {
+        items.forEach(this::restockItem);
+    }
+
+    // ❌ Private method — invisible to CGLIB subclass proxy
+    @Transactional
+    private void restockItem(Item item) {
+        item.setQuantity(item.getQuantity() + item.getReorderAmount());
+        itemRepository.save(item);
+    }
+}</code></pre>
+        <p>Spring's <code>TransactionAttributeSource</code> actually <em>ignores</em> <code>@Transactional</code> on non-public methods by design. See <code>AbstractFallbackTransactionAttributeSource.computeTransactionAttribute()</code>:</p>
+        <pre><code class="language-java">// Spring Framework source (simplified)
+protected TransactionAttribute computeTransactionAttribute(Method method, Class&lt;?&gt; targetClass) {
+    // Don't allow non-public methods, as configured.
+    if (allowPublicMethodsOnly() &amp;&amp; !Modifier.isPublic(method.getModifiers())) {
+        return null; // ← silently returns null, no transaction advice applied
+    }
+    // ...
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>6. @Async Methods — Thread Boundary</summary>
+        <pre><code class="language-java">@Service
+public class OrderService {
+
+    @Transactional
+    public void placeOrder(Order order) {
+        orderRepository.save(order);
+        sendConfirmation(order); // ← Runs on async thread pool
+        // Transaction commits here on THIS thread
+    }
+
+    @Async
+    @Transactional // ❌ This is a NEW transaction on a DIFFERENT thread
+    public void sendConfirmation(Order order) {
+        // This runs OUTSIDE the placeOrder transaction
+        // Also: self-invocation problem! @Async won't work either.
+        emailService.send(order.getEmail(), "Confirmed");
+        order.setConfirmationSent(true);
+        orderRepository.save(order); // This is a separate transaction
+    }
+}</code></pre>
+        <div class="callout callout-danger">
+          <p><strong>Double problem here:</strong> (1) <code>@Async</code> requires external invocation (same proxy issue). (2) Even if called externally, the async method runs on a different thread — the caller's transaction context is NOT propagated.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>7. Bean not managed by Spring</summary>
+        <pre><code class="language-java">// ❌ Created with 'new' — Spring has no proxy around this
+OrderService orderService = new OrderService();
+orderService.placeOrder(order); // @Transactional does nothing
+
+// ❌ Also fails: inner classes, prototype beans obtained manually
+public class OrderController {
+    public void handle() {
+        // If OrderProcessor is not a Spring bean...
+        OrderProcessor processor = new OrderProcessor();
+        processor.process(); // No transaction!
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>8. Transaction Manager Mismatch</summary>
+        <pre><code class="language-java">@Configuration
+public class DataSourceConfig {
+    @Bean
+    public PlatformTransactionManager primaryTxManager(DataSource primaryDs) {
+        return new DataSourceTransactionManager(primaryDs);
+    }
+
+    @Bean
+    public PlatformTransactionManager secondaryTxManager(DataSource secondaryDs) {
+        return new DataSourceTransactionManager(secondaryDs);
+    }
+}
+
+@Service
+public class ReportService {
+    // ❌ Uses default (primary) tx manager, but queries secondary datasource
+    @Transactional
+    public Report generate() {
+        // This hits the secondary database but the transaction
+        // is bound to the primary DataSource — no actual transaction protection
+        return secondaryJdbcTemplate.query(...);
+    }
+
+    // ✅ Fix: specify the correct transaction manager
+    @Transactional("secondaryTxManager")
+    public Report generateFixed() {
+        return secondaryJdbcTemplate.query(...);
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 7: Rollback Rules -->
+    <section id="rollback-rules">
+      <h2>Rollback Rules — Deep Dive</h2>
+
+      <details>
+        <summary>Default rollback behavior matrix</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Exception Type</th>
+              <th>Default Behavior</th>
+              <th>Why?</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>RuntimeException</code></td>
+              <td>✅ Rollback</td>
+              <td>Considered unrecoverable programming errors</td>
+            </tr>
+            <tr>
+              <td><code>Error</code></td>
+              <td>✅ Rollback</td>
+              <td>JVM-level failures (OOM, StackOverflow)</td>
+            </tr>
+            <tr>
+              <td><code>Checked Exception</code></td>
+              <td>❌ Commit</td>
+              <td>Considered recoverable business conditions (legacy EJB convention)</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout-tip">
+          <p><strong>Best Practice:</strong> Always use <code>@Transactional(rollbackFor = Exception.class)</code> for critical operations. The default behavior is a holdover from the EJB era and causes real production bugs.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>How Spring decides to rollback — source code walkthrough</summary>
+        <pre><code class="language-java">// TransactionAspectSupport.java (simplified)
+protected void completeTransactionAfterThrowing(TransactionInfo txInfo, Throwable ex) {
+    if (txInfo.transactionAttribute != null) {
+        // This is where the rollback decision happens
+        if (txInfo.transactionAttribute.rollbackOn(ex)) {
+            txInfo.getTransactionManager().rollback(txInfo.getTransactionStatus());
+        } else {
+            // Checked exception → COMMIT (surprising behavior!)
+            txInfo.getTransactionManager().commit(txInfo.getTransactionStatus());
+        }
+    }
+}
+
+// DefaultTransactionAttribute.rollbackOn()
+@Override
+public boolean rollbackOn(Throwable ex) {
+    return (ex instanceof RuntimeException || ex instanceof Error);
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Custom rollback rules — advanced patterns</summary>
+        <pre><code class="language-java">// Rollback on specific checked exceptions
+@Transactional(rollbackFor = {PaymentException.class, InventoryException.class})
+public void checkout(Cart cart) { ... }
+
+// Rollback on all except specific exceptions
+@Transactional(
+    rollbackFor = Exception.class,
+    noRollbackFor = {DuplicateNotificationException.class}
+)
+public void processEvent(Event event) { ... }
+
+// Programmatic rollback (when you can't use exceptions)
+@Transactional
+public OrderResult placeOrder(Order order) {
+    orderRepository.save(order);
+    
+    PaymentResult result = paymentGateway.charge(order);
+    if (!result.isSuccessful()) {
+        // Force rollback without throwing an exception
+        TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+        return OrderResult.failed(result.getReason());
+    }
+    return OrderResult.success(order.getId());
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 8: Isolation Levels -->
+    <section id="isolation-levels">
+      <h2>Isolation Levels</h2>
+
+      <details>
+        <summary>Isolation level comparison with real-world implications</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Level</th>
+              <th>Dirty Read</th>
+              <th>Non-Repeatable Read</th>
+              <th>Phantom Read</th>
+              <th>Use Case</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>READ_UNCOMMITTED</code></td>
+              <td>⚠️ Yes</td>
+              <td>⚠️ Yes</td>
+              <td>⚠️ Yes</td>
+              <td>Analytics on stale data (rare)</td>
+            </tr>
+            <tr>
+              <td><code>READ_COMMITTED</code></td>
+              <td>✅ No</td>
+              <td>⚠️ Yes</td>
+              <td>⚠️ Yes</td>
+              <td><strong>Default in PostgreSQL, Oracle</strong> — most OLTP apps</td>
+            </tr>
+            <tr>
+              <td><code>REPEATABLE_READ</code></td>
+              <td>✅ No</td>
+              <td>✅ No</td>
+              <td>⚠️ Yes</td>
+              <td><strong>Default in MySQL/InnoDB</strong> — financial calculations</td>
+            </tr>
+            <tr>
+              <td><code>SERIALIZABLE</code></td>
+              <td>✅ No</td>
+              <td>✅ No</td>
+              <td>✅ No</td>
+              <td>Critical sections (rare, high lock contention)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Setting isolation in Spring — and when it silently does nothing</summary>
+        <pre><code class="language-java">@Transactional(isolation = Isolation.SERIALIZABLE)
+public BigDecimal calculateAccountBalance(Long accountId) {
+    // Works: new transaction gets SERIALIZABLE isolation
+    return transactionRepository.sumByAccountId(accountId);
+}
+
+// ⚠️ TRAP: Isolation is IGNORED when joining an existing transaction!
+@Transactional(isolation = Isolation.SERIALIZABLE) // ← IGNORED!
+public void innerMethod() {
+    // If called within an existing REQUIRED transaction,
+    // this joins the OUTER transaction's isolation level.
+    // Spring logs a warning but does NOT fail.
+}</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Gotcha:</strong> Isolation level only takes effect when a <em>new</em> transaction is created. With <code>Propagation.REQUIRED</code> (default), if a transaction already exists, the isolation parameter is <strong>silently ignored</strong>. Use <code>REQUIRES_NEW</code> if you need a specific isolation level guaranteed.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 9: Nested Transactions -->
+    <section id="nested-transactions">
+      <h2>Nested Transactions &amp; Savepoints</h2>
+
+      <details>
+        <summary>REQUIRES_NEW vs NESTED — critical difference</summary>
+        <pre class="diagram">
+  REQUIRES_NEW:                              NESTED (Savepoint):
+  ─────────────                              ──────────────────
+
+  Outer Tx ──┐                               Outer Tx ──────────────────┐
+             │ SUSPEND                                    │              │
+             │                                           SAVEPOINT       │
+  New Tx  ───┼──── independent ────┐                     │              │
+             │                     │         Inner work   │              │
+             │      COMMIT/ROLLBACK│                     │              │
+             │◀────────────────────┘         ROLLBACK ──▶│ (to savepoint)│
+             │ RESUME                                    │              │
+  Outer Tx ──┘                               Outer Tx ──┘ (continues)   │
+                                                                         │
+  • Inner rollback does NOT                  • Inner rollback goes to     │
+    affect outer                               savepoint only            │
+  • 2 physical transactions                  • 1 physical transaction    │
+  • 2 connections from pool!                 • 1 connection              │
+        </pre>
+      </details>
+
+      <details>
+        <summary>When to use REQUIRES_NEW (and the connection pool risk)</summary>
+        <pre><code class="language-java">@Service
+public class PaymentService {
+
+    @Transactional
+    public void processOrder(Order order) {
+        orderRepository.save(order);
+        
+        // This gets its own transaction — commits even if outer fails
+        auditService.logPaymentAttempt(order); // REQUIRES_NEW
+        
+        paymentGateway.charge(order.getTotal()); // might throw
+    }
+}
+
+@Service
+public class AuditService {
+    
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logPaymentAttempt(Order order) {
+        // This commits independently — audit trail preserved
+        // even if the payment fails and outer tx rolls back
+        auditRepository.save(new AuditEntry("PAYMENT_ATTEMPT", order.getId()));
+    }
+}</code></pre>
+        <div class="callout callout-danger">
+          <p><strong>Connection Pool Risk:</strong> <code>REQUIRES_NEW</code> suspends the outer transaction but <em>holds its connection</em>. The inner transaction acquires a <em>second</em> connection. Under load, nested <code>REQUIRES_NEW</code> calls can exhaust HikariCP pools (see Chapter 4). With a pool size of 10 and 10 concurrent requests each doing <code>REQUIRES_NEW</code>, you need 20 connections — instant deadlock.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: Production Incident -->
+    <section id="production-incident">
+      <h2>Real Production Incident</h2>
+
+      <details>
+        <summary>The case of the "phantom order" — orders created but never charged</summary>
+        <div class="callout callout-danger">
+          <p><strong>Severity:</strong> P1 — Revenue loss detected after 3 days in production</p>
+        </div>
+
+        <h4>Symptoms</h4>
+        <ul>
+          <li>Orders appearing in the database with status <code>CREATED</code></li>
+          <li>No corresponding payment records</li>
+          <li>No exceptions in logs</li>
+          <li>Happened intermittently — ~2% of orders</li>
+        </ul>
+
+        <h4>Investigation</h4>
+        <pre><code class="language-sql">-- Found 847 orders with no payments over 3 days
+SELECT o.id, o.created_at, o.status, p.id as payment_id
+FROM orders o
+LEFT JOIN payments p ON o.id = p.order_id
+WHERE o.status = 'CREATED'
+  AND p.id IS NULL
+  AND o.created_at > NOW() - INTERVAL '3 days';</code></pre>
+
+        <h4>Root Cause</h4>
+        <pre><code class="language-java">@Service
+public class CheckoutService {
+
+    @Transactional
+    public OrderResult checkout(Cart cart) {
+        Order order = orderRepository.save(createOrder(cart)); // ← Saved
+
+        try {
+            PaymentResult result = paymentClient.charge(order); // ← HTTP call
+            if (result.isDeclined()) {
+                throw new PaymentDeclinedException(result.getReason());
+                // ✅ RuntimeException → rollback → order removed
+            }
+        } catch (PaymentGatewayTimeoutException e) {
+            // ❌ BUG: This is a CHECKED exception!
+            // Transaction COMMITS — order saved without payment
+            log.warn("Payment gateway timeout for order {}", order.getId());
+            throw e; // Propagates, but damage is done — transaction already committed
+        }
+        
+        order.setStatus("PAID");
+        return OrderResult.success(order);
+    }
+}</code></pre>
+
+        <h4>The Subtle Bug</h4>
+        <p><code>PaymentGatewayTimeoutException</code> extended <code>IOException</code> (checked). When the payment gateway was slow (2% of the time under load), the timeout exception was thrown, but Spring <em>committed</em> the transaction because it's a checked exception. The order was persisted without payment.</p>
+
+        <h4>Resolution</h4>
+        <pre><code class="language-java">// Fix 1: Add rollbackFor
+@Transactional(rollbackFor = Exception.class)
+public OrderResult checkout(Cart cart) { ... }
+
+// Fix 2: Team adopted a project-wide rule
+@Target({ElementType.METHOD, ElementType.TYPE})
+@Retention(RetentionPolicy.RUNTIME)
+@Transactional(rollbackFor = Exception.class)
+public @interface SafeTransaction {
+    // All new code uses this instead of @Transactional
+}</code></pre>
+
+        <h4>Lessons Learned</h4>
+        <ul>
+          <li>Added an ArchUnit test: <em>"No method should use bare @Transactional without rollbackFor"</em></li>
+          <li>Added a reconciliation job to detect orders without payments</li>
+          <li>Payment gateway timeout was 30s — reduced to 5s with circuit breaker</li>
+        </ul>
+        <pre><code class="language-java">// ArchUnit rule added to CI pipeline
+@ArchTest
+static final ArchRule transactional_must_specify_rollback =
+    methods()
+        .that().areAnnotatedWith(Transactional.class)
+        .should(new ArchCondition&lt;JavaMethod&gt;("specify rollbackFor") {
+            @Override
+            public void check(JavaMethod method, ConditionEvents events) {
+                Transactional tx = method.getAnnotationOfType(Transactional.class);
+                if (tx.rollbackFor().length == 0) {
+                    events.add(SimpleConditionEvent.violated(method,
+                        method.getFullName() + " uses @Transactional without rollbackFor"));
+                }
+            }
+        });</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 11: Debugging Checklist -->
+    <section id="debugging-checklist">
+      <h2>Debugging Checklist</h2>
+
+      <details>
+        <summary>Step-by-step: how to diagnose @Transactional failures</summary>
+        <ol>
+          <li>
+            <strong>Enable transaction logging:</strong>
+            <pre><code class="language-yaml"># application.yml
+logging:
+  level:
+    org.springframework.transaction: TRACE
+    org.springframework.orm.jpa: DEBUG
+    org.hibernate.engine.transaction.internal.TransactionImpl: DEBUG</code></pre>
+            <p>Look for: <code>"Creating new transaction"</code>, <code>"Participating in existing transaction"</code>, <code>"Initiating transaction commit"</code>, <code>"Initiating transaction rollback"</code></p>
+          </li>
+          <li>
+            <strong>Verify proxy is in play:</strong>
+            <pre><code class="language-java">@Autowired
+private OrderService orderService;
+
+@PostConstruct
+public void checkProxy() {
+    log.info("OrderService class: {}", orderService.getClass().getName());
+    // Should show: OrderService$$EnhancerBySpringCGLIB$$xxxxx
+    // If it shows just OrderService — no proxy!
+}</code></pre>
+          </li>
+          <li>
+            <strong>Check if method is public and non-final:</strong>
+            <pre><code class="language-bash"># Quick grep to find potential issues
+grep -rn "@Transactional" --include="*.java" | \
+  xargs -I{} grep -l "private\|final\|static" {} | sort -u</code></pre>
+          </li>
+          <li>
+            <strong>Check for self-invocation:</strong>
+            <p>Search for <code>this.methodName()</code> or unqualified method calls within the same class where the called method has <code>@Transactional</code>.</p>
+          </li>
+          <li>
+            <strong>Verify transaction manager binding:</strong>
+            <pre><code class="language-java">// Add a TransactionSynchronization to verify transaction is active
+@Transactional
+public void suspiciousMethod() {
+    boolean isActive = TransactionSynchronizationManager.isActualTransactionActive();
+    String txName = TransactionSynchronizationManager.getCurrentTransactionName();
+    log.info("Tx active: {}, name: {}", isActive, txName);
+    // If isActive is false — transaction was never started!
+}</code></pre>
+          </li>
+          <li>
+            <strong>Check exception hierarchy:</strong>
+            <pre><code class="language-java">// Is your exception checked or unchecked?
+log.info("Exception superclass chain:");
+Class&lt;?&gt; clazz = yourException.getClass();
+while (clazz != null) {
+    log.info("  → {}", clazz.getName());
+    clazz = clazz.getSuperclass();
+}
+// If you see Exception (not RuntimeException) in the chain — it won't rollback!</code></pre>
+          </li>
+        </ol>
+      </details>
+    </section>
+
+    <!-- Section 12: Code Examples -->
+    <section id="code-examples">
+      <h2>Production-Ready Code Examples</h2>
+
+      <details>
+        <summary>Pattern: TransactionTemplate for programmatic control</summary>
+        <pre><code class="language-java">@Service
+public class OrderService {
+
+    private final TransactionTemplate txTemplate;
+    private final TransactionTemplate txReadOnly;
+
+    public OrderService(PlatformTransactionManager txManager) {
+        this.txTemplate = new TransactionTemplate(txManager);
+        this.txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+        
+        this.txReadOnly = new TransactionTemplate(txManager);
+        this.txReadOnly.setReadOnly(true);
+    }
+
+    // No proxy needed — transaction is explicit
+    public OrderResult placeOrder(Order order) {
+        return txTemplate.execute(status -> {
+            try {
+                Order saved = orderRepository.save(order);
+                paymentService.charge(saved);
+                return OrderResult.success(saved.getId());
+            } catch (Exception e) {
+                status.setRollbackOnly(); // Explicit rollback
+                return OrderResult.failed(e.getMessage());
+            }
+        });
+    }
+
+    // Read-only transaction for queries
+    public List&lt;Order&gt; findRecentOrders(Long userId) {
+        return txReadOnly.execute(status ->
+            orderRepository.findByUserIdAndCreatedAfter(userId, Instant.now().minus(Duration.ofDays(30)))
+        );
+    }
+}</code></pre>
+        <div class="callout callout-tip">
+          <p><strong>When to use TransactionTemplate:</strong> When you need fine-grained control, when dealing with self-invocation scenarios, or in non-Spring-managed classes. It's also useful in tests and batch processing where declarative transactions become unwieldy.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Pattern: Transaction event listeners (post-commit actions)</summary>
+        <pre><code class="language-java">@Service
+public class OrderService {
+
+    @Autowired private ApplicationEventPublisher eventPublisher;
+
+    @Transactional
+    public Order placeOrder(OrderRequest request) {
+        Order order = orderRepository.save(new Order(request));
+        
+        // Publish event — but listener runs AFTER commit
+        eventPublisher.publishEvent(new OrderCreatedEvent(order.getId()));
+        
+        return order;
+    }
+}
+
+@Component
+public class OrderEventListener {
+
+    // ✅ Runs ONLY after the transaction successfully commits
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onOrderCreated(OrderCreatedEvent event) {
+        // Safe to send emails, notifications, trigger async workflows
+        // If the transaction rolled back, this never executes
+        emailService.sendOrderConfirmation(event.getOrderId());
+        analyticsService.trackConversion(event.getOrderId());
+    }
+
+    // Runs after rollback — for compensating actions
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_ROLLBACK)
+    public void onOrderFailed(OrderCreatedEvent event) {
+        metricsService.incrementCounter("orders.failed");
+    }
+}</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Pitfall:</strong> <code>@TransactionalEventListener(AFTER_COMMIT)</code> runs after the transaction commits but <em>without a transaction</em>. If the listener itself needs a transaction, it must start its own (or use <code>@Transactional(propagation = REQUIRES_NEW)</code>).</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Pattern: Read-only transactions — performance implications</summary>
+        <pre><code class="language-java">@Transactional(readOnly = true)
+public List&lt;OrderSummary&gt; getOrderHistory(Long userId) {
+    // What readOnly = true actually does:
+    // 1. Hibernate: sets FlushMode to MANUAL (no dirty checking)
+    // 2. JDBC: connection.setReadOnly(true) — hint to DB
+    // 3. PostgreSQL: routes to read replica (if configured)
+    // 4. MySQL: allows InnoDB to skip gap locks
+    return orderRepository.findByUserId(userId);
+}
+
+// ⚠️ Common mistake: modifying entities in a read-only transaction
+@Transactional(readOnly = true)
+public void updateLastAccess(Long userId) {
+    User user = userRepository.findById(userId).orElseThrow();
+    user.setLastAccessTime(Instant.now());
+    // ❌ This change is SILENTLY IGNORED — flush is disabled
+    // No exception, no error — just lost data
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Pattern: Testing transactions with @Transactional in tests</summary>
+        <pre><code class="language-java">// ⚠️ @Transactional on test methods auto-rolls-back after each test
+// This can HIDE transaction boundary bugs!
+@SpringBootTest
+@Transactional // ← rolls back after each test
+class OrderServiceTest {
+
+    @Test
+    void placeOrder_shouldPersist() {
+        // This test passes even if @Transactional on the service is broken!
+        // Because the TEST's transaction wraps everything.
+        orderService.placeOrder(testOrder);
+        
+        // This assertion works inside the test's transaction
+        assertThat(orderRepository.findById(testOrder.getId())).isPresent();
+    }
+}
+
+// ✅ Better: test without test-level @Transactional to catch real issues
+@SpringBootTest
+class OrderServiceIntegrationTest {
+
+    @Autowired private OrderService orderService;
+    @Autowired private OrderRepository orderRepository;
+
+    @Test
+    void placeOrder_shouldCommitInRealTransaction() {
+        Order order = orderService.placeOrder(testOrder);
+        
+        // Verify in a new transaction (simulates real usage)
+        Order found = orderRepository.findById(order.getId()).orElseThrow();
+        assertThat(found.getStatus()).isEqualTo("CREATED");
+    }
+
+    @AfterEach
+    void cleanup() {
+        orderRepository.deleteAll(); // Manual cleanup
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 13: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Mistakes that experienced engineers still make</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Mistake</th>
+              <th>Why It's Dangerous</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>Catching exceptions inside <code>@Transactional</code></td>
+              <td>Swallows the signal — Spring sees success and commits</td>
+              <td>Re-throw or use <code>setRollbackOnly()</code></td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>Long-running HTTP calls inside a transaction</td>
+              <td>Holds DB connection for the duration of the HTTP call</td>
+              <td>Move HTTP calls outside tx boundary or use <code>REQUIRES_NEW</code></td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td><code>@Transactional</code> on interface methods (with CGLIB)</td>
+              <td>CGLIB proxies the class, not the interface — annotation may be missed</td>
+              <td>Always put <code>@Transactional</code> on the implementation</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Mixing JPA and JDBC in same transaction</td>
+              <td>JPA may flush at unexpected times, JDBC sees stale data</td>
+              <td>Call <code>entityManager.flush()</code> before JDBC operations</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>Using <code>@Transactional</code> on <code>@Configuration</code> classes</td>
+              <td>CGLIB already proxies <code>@Configuration</code> — double proxy issues</td>
+              <td>Use on <code>@Service</code> classes only</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>Lazy loading outside transaction</td>
+              <td><code>LazyInitializationException</code> in controller/view layer</td>
+              <td>Use <code>@EntityGraph</code>, DTOs, or keep session open</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 14: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs &amp; Alternatives</h2>
+
+      <details>
+        <summary>Declarative vs Programmatic transactions</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Pros</th>
+              <th>Cons</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>@Transactional</code> (declarative)</td>
+              <td>Clean, convention-based, less boilerplate</td>
+              <td>Proxy pitfalls, hidden behavior, hard to debug</td>
+              <td>Standard CRUD services</td>
+            </tr>
+            <tr>
+              <td><code>TransactionTemplate</code> (programmatic)</td>
+              <td>Explicit, no proxy issues, fine control</td>
+              <td>More verbose, clutters business logic</td>
+              <td>Complex workflows, batch processing</td>
+            </tr>
+            <tr>
+              <td>AspectJ weaving (compile-time)</td>
+              <td>No proxy — works on private, final, self-calls</td>
+              <td>Build complexity, harder to debug, slow compilation</td>
+              <td>Legacy codebases with severe proxy issues</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Transaction scope — narrow vs wide</summary>
+        <pre class="diagram">
+  Narrow Transaction (recommended):        Wide Transaction (risky):
+  ─────────────────────────────────        ──────────────────────────────
+
+  validate(input)                          ┌─ BEGIN TX ──────────────────┐
+  enrichData(input)                        │ validate(input)             │
+  ┌─ BEGIN TX ──────┐                      │ enrichData(input)           │
+  │ save(entity)    │                      │ save(entity)                │
+  │ updateRelated() │                      │ updateRelated()             │
+  └─ COMMIT ────────┘                      │ sendEmail()    ← 3s wait!  │
+  sendEmail(entity)                        │ callExternalAPI() ← 5s!    │
+  callExternalAPI()                        └─ COMMIT ────────────────────┘
+                                              (held connection for 8s!)
+  Connection held: ~50ms                    Connection held: ~8000ms
+        </pre>
+        <div class="callout callout-tip">
+          <p><strong>Rule of thumb:</strong> A transaction should hold a DB connection for the minimum time necessary. Move I/O operations (HTTP calls, file ops, message publishing) <em>outside</em> the transaction boundary wherever possible.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 15: Follow-up Interview Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Likely follow-ups and how to answer them</summary>
+        <dl>
+          <dt><strong>Q: "How would you detect @Transactional issues at compile time?"</strong></dt>
+          <dd>Use ArchUnit rules in CI to enforce: no private @Transactional methods, rollbackFor always specified, no self-invocation patterns. Also IntelliJ Spring inspections catch many issues.</dd>
+
+          <dt><strong>Q: "What happens if a @Transactional method calls another @Transactional method in a different bean?"</strong></dt>
+          <dd>With default propagation (REQUIRED), the inner method joins the outer transaction. They share the same physical connection. If the inner method throws, the entire transaction is marked for rollback — even if the outer method catches the exception.</dd>
+
+          <dt><strong>Q: "How do distributed transactions work across microservices?"</strong></dt>
+          <dd>@Transactional only works for local transactions (single datasource). For distributed transactions: use the Saga pattern (choreography or orchestration), the Outbox pattern with CDC, or in rare cases, XA/2PC with JTA. I strongly prefer Sagas for microservices.</dd>
+
+          <dt><strong>Q: "Can you use @Transactional with Kotlin coroutines or reactive streams?"</strong></dt>
+          <dd>No — @Transactional relies on thread-local state. For reactive (WebFlux), use ReactiveTransactionManager with TransactionalOperator. For Kotlin coroutines, use @Transactional with spring-tx's coroutine support (Spring 6.1+) or transactionalOperator.executeAndAwait {}.</dd>
+
+          <dt><strong>Q: "How does @Transactional interact with Spring's retry mechanism?"</strong></dt>
+          <dd>@Retryable should wrap @Transactional (retry at a higher level). If @Transactional wraps @Retryable, the retry happens inside the same transaction — which is already marked for rollback. The correct ordering: Caller → @Retryable → @Transactional → business logic. See Chapter 2 for deep dive on retry + idempotency.</dd>
+
+          <dt><strong>Q: "What's the performance impact of @Transactional?"</strong></dt>
+          <dd>Minimal per-call overhead (~0.1ms for proxy dispatch + connection acquisition). The real cost is holding connections: a transaction that takes 100ms holds a HikariCP connection for 100ms. With pool size 10 and 100 concurrent requests, that's the bottleneck — not the proxy overhead.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- Section 16: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Interview Takeaways:</strong></p>
+        <ol>
+          <li><code>@Transactional</code> = AOP proxy. No proxy → no transaction.</li>
+          <li><strong>Self-invocation</strong> is the #1 production trap — fix with self-injection or extract to another bean.</li>
+          <li>Default rollback is <strong>only on RuntimeException</strong> — always use <code>rollbackFor = Exception.class</code> for critical paths.</li>
+          <li><strong>Final/private methods</strong> silently skip transactional advice — no compile error, no runtime error.</li>
+          <li>Transaction context is <strong>thread-local</strong> — @Async, CompletableFuture, reactive break it.</li>
+          <li><strong>Isolation level is ignored</strong> when joining an existing transaction.</li>
+          <li>Keep transactions <strong>short</strong> — never put HTTP calls or message publishing inside a tx boundary.</li>
+          <li>Use <strong>TransactionTemplate</strong> when you need explicit control or face proxy limitations.</li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="../index.html" class="chapter-nav-prev">← Back to Index</a>
+      <a href="ch02-duplicate-records-retries.html" class="chapter-nav-next">Chapter 2: Duplicate Records &amp; Retries →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

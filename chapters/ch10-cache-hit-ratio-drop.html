@@ -1,0 +1,1821 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 10: Cache Hit Ratio Drop | Senior Backend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 10</span>
+      <span class="chapter-title">Cache Hit Ratio Drop</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#cache-architecture">Cache Architecture</a></li>
+        <li><a href="#why-ratio-drops">Why Ratio Drops</a></li>
+        <li><a href="#cache-stampede">Cache Stampede</a></li>
+        <li><a href="#eviction-policies">Eviction Policies</a></li>
+        <li><a href="#redis-monitoring">Redis Monitoring</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-ii">Part II — Distributed Systems &amp; Infrastructure</a> &rsaquo;
+      <span>Chapter 10</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">Redis</span>
+        <span class="badge badge-topic">Caching</span>
+      </div>
+      <h1>Cache Hit Ratio Drops from 95% to 30% — What Would You Check?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> A sudden cache hit ratio drop is a production emergency requiring systematic diagnosis — check TTL expiry patterns, recent deployments, memory pressure, eviction policies, and serialization compatibility before assuming the cache itself is broken.
+      </p>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>What the interviewer is really assessing</summary>
+        <p>This question tests whether a senior engineer can systematically diagnose a production caching issue under pressure. The interviewer evaluates:</p>
+        <ul>
+          <li><strong>Systematic thinking:</strong> Do you jump to conclusions or follow a structured investigation?</li>
+          <li><strong>Production awareness:</strong> Have you actually operated cache infrastructure at scale?</li>
+          <li><strong>Depth of knowledge:</strong> Do you understand cache internals (eviction, memory management, replication)?</li>
+          <li><strong>Incident response:</strong> Can you triage, mitigate, then root-cause — in that order?</li>
+          <li><strong>Architecture understanding:</strong> Do you know how caching fits into the broader system?</li>
+        </ul>
+        <div class="callout callout-info">
+          <p><strong>💡 Interview Tip:</strong> Start with immediate mitigation (can we scale the DB? circuit-break?), then move to diagnosis. This shows you prioritize user impact over root-cause curiosity.</p>
+        </div>
+      </details>
+      <details>
+        <summary>Expected seniority signals</summary>
+        <ul>
+          <li>Mentions checking recent deployments first (most common cause)</li>
+          <li>Distinguishes between gradual degradation vs. cliff-drop</li>
+          <li>Knows Redis-specific monitoring commands</li>
+          <li>Understands multi-tier caching and where the break might be</li>
+          <li>Discusses mitigation before deep debugging</li>
+          <li>References real incidents or war stories</li>
+        </ul>
+      </details>
+    </section>
+
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <details>
+        <summary>30-second structured response</summary>
+        <div class="callout callout-tip">
+          <blockquote>
+            <p>"A cache hit ratio dropping from 95% to 30% is a P1 incident. My immediate response:</p>
+            <ol>
+              <li><strong>Correlate with timeline:</strong> Check deployment history, config changes, and traffic patterns in the last hour</li>
+              <li><strong>Check Redis health:</strong> Run INFO stats for keyspace_hits/misses, check memory usage and eviction count</li>
+              <li><strong>Verify key patterns:</strong> Confirm the cache key format hasn't changed (common with serialization updates)</li>
+              <li><strong>Check TTL distribution:</strong> Mass TTL expiry causes thundering herd on the database</li>
+              <li><strong>Mitigate immediately:</strong> Scale read replicas on DB, enable circuit breaker, consider cache warming</li>
+            </ol>
+            <p>The most frequent root cause I've seen: a deployment changed the serialization format or cache key structure, making all existing entries effectively invisible."</p>
+          </blockquote>
+        </div>
+      </details>
+    </section>
+
+    <section id="cache-architecture">
+      <h2>Multi-Tier Cache Architecture</h2>
+      <details>
+        <summary>L1 / L2 / L3 caching layers</summary>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│                        Request Flow                               │
+└─────────────────────────────────────────────────────────────────┘
+
+  Client Request
+       │
+       ▼
+┌─────────────┐    HIT     ┌──────────────────────────────────┐
+│  L1 Cache   │───────────▶│  Return immediately (~1ms)       │
+│  (Caffeine) │            │  In-process, per-JVM             │
+│  ~10K keys  │            │  No serialization overhead       │
+└─────┬───────┘            └──────────────────────────────────┘
+      │ MISS
+      ▼
+┌─────────────┐    HIT     ┌──────────────────────────────────┐
+│  L2 Cache   │───────────▶│  Return with network hop (~2ms)  │
+│   (Redis)   │            │  Shared across all JVMs          │
+│  ~1M keys   │            │  Serialization cost              │
+└─────┬───────┘            └──────────────────────────────────┘
+      │ MISS
+      ▼
+┌─────────────┐    HIT     ┌──────────────────────────────────┐
+│  L3 Source  │───────────▶│  Return with query (~20-200ms)   │
+│ (Database)  │            │  Populate L1 + L2 on return      │
+│  Full data  │            │  Most expensive path             │
+└─────────────┘            └──────────────────────────────────┘
+        </pre>
+        <div class="callout callout-info">
+          <p><strong>Why multi-tier?</strong> L1 eliminates serialization and network overhead for hot keys. L2 provides shared state across a cluster. The ratio drop could be at any layer — isolate which one first.</p>
+        </div>
+      </details>
+      <details>
+        <summary>Spring Boot multi-tier cache configuration</summary>
+        <pre><code class="language-java">@Configuration
+@EnableCaching
+public class MultiTierCacheConfig {
+
+    @Bean
+    public CacheManager cacheManager(RedisConnectionFactory redisConnectionFactory) {
+        // L1: Caffeine (in-process, per JVM)
+        CaffeineCacheManager l1CacheManager = new CaffeineCacheManager();
+        l1CacheManager.setCaffeine(Caffeine.newBuilder()
+            .maximumSize(10_000)
+            .expireAfterWrite(Duration.ofMinutes(5))
+            .recordStats());  // Critical for monitoring
+
+        // L2: Redis (distributed, shared)
+        RedisCacheConfiguration redisConfig = RedisCacheConfiguration
+            .defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(30))
+            .serializeKeysWith(
+                RedisSerializationContext.SerializationPair
+                    .fromSerializer(new StringRedisSerializer()))
+            .serializeValuesWith(
+                RedisSerializationContext.SerializationPair
+                    .fromSerializer(new GenericJackson2JsonRedisSerializer()));
+
+        RedisCacheManager l2CacheManager = RedisCacheManager.builder(redisConnectionFactory)
+            .cacheDefaults(redisConfig)
+            .build();
+
+        // Composite: L1 checked first, then L2
+        return new MultiTierCacheManager(l1CacheManager, l2CacheManager);
+    }
+}</code></pre>
+        <pre><code class="language-java">public class MultiTierCacheManager implements CacheManager {
+
+    private final CaffeineCacheManager l1;
+    private final RedisCacheManager l2;
+
+    public MultiTierCacheManager(CaffeineCacheManager l1, RedisCacheManager l2) {
+        this.l1 = l1;
+        this.l2 = l2;
+    }
+
+    @Override
+    public Cache getCache(String name) {
+        Cache l1Cache = l1.getCache(name);
+        Cache l2Cache = l2.getCache(name);
+        return new MultiTierCache(name, l1Cache, l2Cache);
+    }
+
+    @Override
+    public Collection&lt;String&gt; getCacheNames() {
+        Set&lt;String&gt; names = new LinkedHashSet&lt;&gt;();
+        names.addAll(l1.getCacheNames());
+        names.addAll(l2.getCacheNames());
+        return names;
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Cache key design principles</summary>
+        <p>Cache key design directly impacts hit ratio. Poor keys cause namespace collisions or unnecessary fragmentation:</p>
+        <pre><code class="language-java">// ❌ Bad: version not included — stale data after schema changes
+String key = "user:" + userId;
+
+// ❌ Bad: too granular — low reuse
+String key = "user:" + userId + ":ts:" + System.currentTimeMillis();
+
+// ✅ Good: versioned, hierarchical, bounded
+String key = "v2:user:" + userId;
+
+// ✅ Good: includes relevant context for correct invalidation
+String key = "v2:user:" + userId + ":profile";
+String key = "v2:user:" + userId + ":preferences";</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>⚠️ Key format changes are the #1 cause of sudden hit ratio drops.</strong> If a deployment changes <code>user:{id}</code> to <code>v2:user:{id}</code>, all existing keys become orphaned misses until they naturally expire.</p>
+        </div>
+      </details>
+    </section>
+
+    <section id="why-ratio-drops">
+      <h2>Why Cache Hit Ratio Drops</h2>
+      <details>
+        <summary>Root causes taxonomy</summary>
+        <p>A drop from 95% to 30% is catastrophic — it means ~65% of requests now hit the database that previously didn't. Here's a comprehensive taxonomy:</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Category</th>
+              <th>Cause</th>
+              <th>Pattern</th>
+              <th>Severity</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Deployment</td>
+              <td>Cache key format changed</td>
+              <td>Cliff drop at deploy time</td>
+              <td>🔴 Critical</td>
+            </tr>
+            <tr>
+              <td>Deployment</td>
+              <td>Serialization format changed</td>
+              <td>Cliff drop, deserialization errors in logs</td>
+              <td>🔴 Critical</td>
+            </tr>
+            <tr>
+              <td>Deployment</td>
+              <td>FLUSHALL in migration script</td>
+              <td>Instant 0% hit ratio</td>
+              <td>🔴 Critical</td>
+            </tr>
+            <tr>
+              <td>TTL</td>
+              <td>Mass TTL expiry (synchronized TTLs)</td>
+              <td>Periodic drops at fixed intervals</td>
+              <td>🟠 High</td>
+            </tr>
+            <tr>
+              <td>Memory</td>
+              <td>maxmemory reached, eviction triggered</td>
+              <td>Gradual decline as memory fills</td>
+              <td>🟠 High</td>
+            </tr>
+            <tr>
+              <td>Memory</td>
+              <td>Hot key eviction under LRU</td>
+              <td>Specific queries slow down</td>
+              <td>🟡 Medium</td>
+            </tr>
+            <tr>
+              <td>Traffic</td>
+              <td>New traffic pattern (bot, scraper)</td>
+              <td>Cache pollution with low-reuse keys</td>
+              <td>🟡 Medium</td>
+            </tr>
+            <tr>
+              <td>Infrastructure</td>
+              <td>Redis cluster rebalancing/resharding</td>
+              <td>Temporary misses during slot migration</td>
+              <td>🟠 High</td>
+            </tr>
+            <tr>
+              <td>Infrastructure</td>
+              <td>Network partition to Redis</td>
+              <td>All requests bypass cache</td>
+              <td>🔴 Critical</td>
+            </tr>
+            <tr>
+              <td>Application</td>
+              <td>Cache stampede / thundering herd</td>
+              <td>Spike in DB load at key expiry</td>
+              <td>🟠 High</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>TTL mass expiry</summary>
+        <p>When all keys are set with the same TTL at roughly the same time (e.g., after a cache warm-up or deployment), they all expire simultaneously:</p>
+        <pre class="diagram">
+Timeline:
+  T=0 (deploy)        T=30min (mass expiry)       T=31min (stampede)
+     │                        │                         │
+     ▼                        ▼                         ▼
+  ┌────────┐            ┌────────┐               ┌────────┐
+  │ Warm   │            │ All    │               │ All    │
+  │ cache  │            │ keys   │               │ reqs   │
+  │ 95%    │            │ expire │               │ hit DB │
+  │ hit    │            │ at     │               │ 30%    │
+  │ rate   │            │ once   │               │ hit    │
+  └────────┘            └────────┘               └────────┘
+        </pre>
+        <p><strong>Fix: TTL jitter</strong></p>
+        <pre><code class="language-java">// ❌ Bad: all keys expire at exactly 30 minutes
+cache.put(key, value, Duration.ofMinutes(30));
+
+// ✅ Good: add random jitter to spread expiry
+private static final ThreadLocalRandom RANDOM = ThreadLocalRandom.current();
+
+public Duration jitteredTtl(Duration baseTtl) {
+    // Add ±20% jitter
+    long baseSeconds = baseTtl.getSeconds();
+    long jitter = (long) (baseSeconds * 0.2 * (RANDOM.nextDouble() - 0.5));
+    return Duration.ofSeconds(baseSeconds + jitter);
+}
+
+cache.put(key, value, jitteredTtl(Duration.ofMinutes(30)));</code></pre>
+      </details>
+      <details>
+        <summary>Deployment flushed cache</summary>
+        <p>Common anti-patterns that flush cache on deployment:</p>
+        <pre><code class="language-java">// ❌ In a @PostConstruct or Flyway migration
+@PostConstruct
+public void init() {
+    // Someone thought "fresh start" was a good idea
+    redisTemplate.getConnectionFactory()
+        .getConnection().flushAll();
+}
+
+// ❌ In application.yml
+spring:
+  cache:
+    redis:
+      # This causes FLUSHALL on startup
+      flush-on-connect: true</code></pre>
+        <div class="callout callout-danger">
+          <p><strong>🚨 Never FLUSHALL in production.</strong> If you need to invalidate specific keys after a schema change, use targeted key deletion with a pattern scan: <code>SCAN 0 MATCH "user:*" COUNT 100</code> with batched DEL.</p>
+        </div>
+      </details>
+      <details>
+        <summary>Key pattern change</summary>
+        <p>A subtle but devastating change — the cache key format changes between versions:</p>
+        <pre><code class="language-java">// Version 1 (before deploy)
+@Cacheable(value = "users", key = "#userId")
+public User getUser(Long userId) { ... }
+// Generates: "users::42"
+
+// Version 2 (after deploy) — someone "improved" the key
+@Cacheable(value = "users", key = "'v2:' + #userId")
+public User getUser(Long userId) { ... }
+// Generates: "users::v2:42"
+// All existing "users::42" keys are now orphaned!</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>⚠️ Mitigation:</strong> Use a versioned cache name prefix in configuration, not in annotations. When you bump the version, implement a migration that warms the new key space before removing the old one.</p>
+        </div>
+      </details>
+      <details>
+        <summary>Memory pressure and eviction</summary>
+        <p>When Redis hits <code>maxmemory</code>, it begins evicting keys based on the configured policy:</p>
+        <pre><code class="language-bash"># Check memory status
+redis-cli INFO memory
+# used_memory: 8589934592  (8GB)
+# maxmemory: 8589934592    (8GB — full!)
+# evicted_keys: 2847561    (keys forcibly removed)
+
+# Check eviction policy
+redis-cli CONFIG GET maxmemory-policy
+# "allkeys-lru"</code></pre>
+        <p>When eviction rate exceeds insertion rate, your effective cache size shrinks and hit ratio drops. Common triggers:</p>
+        <ul>
+          <li>Large objects being cached (unbounded lists, full entity graphs)</li>
+          <li>Key cardinality explosion (new feature caching per-request data)</li>
+          <li>Memory fragmentation (high fragmentation ratio &gt; 1.5)</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Redis cluster rebalancing</summary>
+        <p>During resharding, hash slots migrate between nodes. Keys in migrating slots experience temporary misses:</p>
+        <pre class="diagram">
+Before Resharding:
+  Node A [slots 0-5460]      Node B [slots 5461-10922]    Node C [slots 10923-16383]
+  ████████████████            ████████████████             ████████████████
+
+During Resharding (adding Node D):
+  Node A [slots 0-4095]      Node B [slots 5461-10922]    Node C [slots 10923-16383]
+  ████████████                ████████████████             ████████████████
+       │
+       │ migrating slots 4096-5460
+       ▼
+  Node D [slots 4096-5460]   ← Keys in transit → MISS during migration
+  ██████
+        </pre>
+        <div class="callout callout-info">
+          <p><strong>Redis handles ASK/MOVED redirects</strong>, but client libraries may not follow them instantly. Lettuce and Jedis handle this, but connection pool refresh can cause brief miss spikes.</p>
+        </div>
+      </details>
+    </section>
+
+    <section id="cache-stampede">
+      <h2>Cache Stampede (Thundering Herd)</h2>
+      <details>
+        <summary>How stampedes cause ratio drops</summary>
+        <p>A cache stampede occurs when a popular key expires and hundreds of concurrent requests all miss simultaneously, all query the database, and all try to repopulate the cache:</p>
+        <pre class="diagram">
+Normal Operation:                    Stampede:
+                                     
+  Req1 ──▶ Cache HIT ──▶ Return     Req1 ──▶ Cache MISS ──▶ DB Query ──▶ Write Cache
+  Req2 ──▶ Cache HIT ──▶ Return     Req2 ──▶ Cache MISS ──▶ DB Query ──▶ Write Cache
+  Req3 ──▶ Cache HIT ──▶ Return     Req3 ──▶ Cache MISS ──▶ DB Query ──▶ Write Cache
+  Req4 ──▶ Cache HIT ──▶ Return     Req4 ──▶ Cache MISS ──▶ DB Query ──▶ Write Cache
+                                     ...
+  1 DB query per TTL cycle           500 DB queries in 100ms!
+                                     
+  DB Load: ░░░░░ (minimal)           DB Load: █████████████████ (overwhelmed)
+        </pre>
+        <div class="callout callout-danger">
+          <p><strong>🚨 Stampede cascades:</strong> DB overload → slower responses → more requests queue up → connection pool exhaustion → timeout errors → even more cache misses (because writes fail) → death spiral.</p>
+        </div>
+      </details>
+      <details>
+        <summary>Prevention strategies</summary>
+        <h3>1. Distributed Lock (Mutex)</h3>
+        <p>Only one thread recomputes the value; others wait or get stale data:</p>
+        <pre><code class="language-java">@Component
+public class StampedeProtectedCache {
+
+    private final StringRedisTemplate redis;
+    private final RedissonClient redisson;
+
+    public &lt;T&gt; T getWithLock(String key, Class&lt;T&gt; type,
+                              Supplier&lt;T&gt; loader, Duration ttl) {
+        // Try cache first
+        String cached = redis.opsForValue().get(key);
+        if (cached != null) {
+            return deserialize(cached, type);
+        }
+
+        // Acquire distributed lock
+        RLock lock = redisson.getLock("lock:" + key);
+        try {
+            // Wait up to 5s for lock, hold for max 10s
+            if (lock.tryLock(5, 10, TimeUnit.SECONDS)) {
+                try {
+                    // Double-check after acquiring lock
+                    cached = redis.opsForValue().get(key);
+                    if (cached != null) {
+                        return deserialize(cached, type);
+                    }
+
+                    // Only one thread reaches here
+                    T value = loader.get();
+                    redis.opsForValue().set(key, serialize(value), ttl);
+                    return value;
+                } finally {
+                    lock.unlock();
+                }
+            } else {
+                // Lock timeout — return stale or throw
+                throw new CacheLoadTimeoutException(key);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new CacheException("Interrupted while waiting for lock", e);
+        }
+    }
+}</code></pre>
+
+        <h3>2. Probabilistic Early Expiration (XFetch)</h3>
+        <p>Keys recompute before they actually expire, based on a probability that increases as TTL approaches zero:</p>
+        <pre><code class="language-java">public &lt;T&gt; T getWithEarlyExpiry(String key, Class&lt;T&gt; type,
+                                  Supplier&lt;T&gt; loader, Duration ttl) {
+    CacheEntry&lt;T&gt; entry = getCacheEntry(key, type);
+
+    if (entry != null) {
+        double remainingTtl = entry.getExpiresAt() - System.currentTimeMillis();
+        double delta = entry.getComputeTime(); // How long the value took to compute
+        double beta = 1.0; // Tuning parameter
+
+        // XFetch algorithm: probabilistic early recomputation
+        boolean shouldRecompute = remainingTtl &lt;=
+            delta * beta * Math.log(Math.random());
+
+        if (!shouldRecompute) {
+            return entry.getValue(); // Cache HIT
+        }
+        // Fall through to recompute (early refresh)
+    }
+
+    long start = System.currentTimeMillis();
+    T value = loader.get();
+    long computeTime = System.currentTimeMillis() - start;
+
+    CacheEntry&lt;T&gt; newEntry = new CacheEntry&lt;&gt;(value, computeTime,
+        System.currentTimeMillis() + ttl.toMillis());
+    putCacheEntry(key, newEntry, ttl);
+    return value;
+}</code></pre>
+
+        <h3>3. Stale-While-Revalidate</h3>
+        <p>Return stale data immediately while refreshing in the background:</p>
+        <pre><code class="language-java">@Component
+public class StaleWhileRevalidateCache {
+
+    private final StringRedisTemplate redis;
+    private final TaskExecutor asyncExecutor;
+
+    public &lt;T&gt; T getStaleWhileRevalidate(String key, Class&lt;T&gt; type,
+                                           Supplier&lt;T&gt; loader,
+                                           Duration hardTtl,
+                                           Duration softTtl) {
+        String raw = redis.opsForValue().get(key);
+        if (raw == null) {
+            // Hard miss — must compute synchronously
+            T value = loader.get();
+            putWithSoftTtl(key, value, hardTtl, softTtl);
+            return value;
+        }
+
+        CacheEntry&lt;T&gt; entry = deserialize(raw, type);
+        if (entry.isSoftExpired()) {
+            // Soft expired — return stale, refresh async
+            asyncExecutor.execute(() -&gt; {
+                T fresh = loader.get();
+                putWithSoftTtl(key, fresh, hardTtl, softTtl);
+            });
+        }
+
+        return entry.getValue(); // Always returns immediately
+    }
+
+    private &lt;T&gt; void putWithSoftTtl(String key, T value,
+                                      Duration hardTtl, Duration softTtl) {
+        CacheEntry&lt;T&gt; entry = new CacheEntry&lt;&gt;(value,
+            Instant.now().plus(softTtl));
+        redis.opsForValue().set(key, serialize(entry), hardTtl);
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Comparing stampede prevention approaches</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Latency Impact</th>
+              <th>Consistency</th>
+              <th>Complexity</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Distributed Lock</td>
+              <td>Waiters blocked (P99 spike)</td>
+              <td>Strong</td>
+              <td>Medium</td>
+              <td>Expensive computations</td>
+            </tr>
+            <tr>
+              <td>XFetch (Probabilistic)</td>
+              <td>Minimal (early refresh)</td>
+              <td>Eventual</td>
+              <td>Low</td>
+              <td>High-traffic keys</td>
+            </tr>
+            <tr>
+              <td>Stale-While-Revalidate</td>
+              <td>None (always returns stale)</td>
+              <td>Eventual</td>
+              <td>Medium</td>
+              <td>Latency-sensitive UIs</td>
+            </tr>
+            <tr>
+              <td>Lease/Singleflight</td>
+              <td>Waiters get same result</td>
+              <td>Strong</td>
+              <td>High</td>
+              <td>Read-heavy with few keys</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <section id="eviction-policies">
+      <h2>Eviction Policies Deep Dive</h2>
+      <details>
+        <summary>Redis eviction policies explained</summary>
+        <p>Redis supports 8 eviction policies, configured via <code>maxmemory-policy</code>:</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Policy</th>
+              <th>Scope</th>
+              <th>Algorithm</th>
+              <th>Use Case</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>noeviction</code></td>
+              <td>—</td>
+              <td>Return errors on write when full</td>
+              <td>Data you cannot afford to lose</td>
+            </tr>
+            <tr>
+              <td><code>allkeys-lru</code></td>
+              <td>All keys</td>
+              <td>Approximate LRU</td>
+              <td>General-purpose caching (recommended)</td>
+            </tr>
+            <tr>
+              <td><code>allkeys-lfu</code></td>
+              <td>All keys</td>
+              <td>Approximate LFU</td>
+              <td>Frequency-based workloads</td>
+            </tr>
+            <tr>
+              <td><code>allkeys-random</code></td>
+              <td>All keys</td>
+              <td>Random eviction</td>
+              <td>Uniform access patterns</td>
+            </tr>
+            <tr>
+              <td><code>volatile-lru</code></td>
+              <td>Keys with TTL</td>
+              <td>Approximate LRU</td>
+              <td>Mix of persistent + cache keys</td>
+            </tr>
+            <tr>
+              <td><code>volatile-lfu</code></td>
+              <td>Keys with TTL</td>
+              <td>Approximate LFU</td>
+              <td>Frequency + TTL workloads</td>
+            </tr>
+            <tr>
+              <td><code>volatile-random</code></td>
+              <td>Keys with TTL</td>
+              <td>Random eviction</td>
+              <td>Uniform access with TTL</td>
+            </tr>
+            <tr>
+              <td><code>volatile-ttl</code></td>
+              <td>Keys with TTL</td>
+              <td>Shortest TTL first</td>
+              <td>Time-sensitive data</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout-warning">
+          <p><strong>⚠️ Common misconfiguration:</strong> Using <code>volatile-lru</code> when most keys don't have TTL set. Redis can't evict keys without TTL under volatile policies → OOM errors → all writes fail → catastrophic miss ratio.</p>
+        </div>
+      </details>
+      <details>
+        <summary>LRU vs LFU: when wrong policy kills hit ratio</summary>
+        <p>Redis uses <strong>approximated LRU</strong> (samples N keys, evicts the least recently used among them). The sample size is configurable:</p>
+        <pre><code class="language-bash"># Default samples 5 keys — increase for better accuracy at slight CPU cost
+CONFIG SET maxmemory-samples 10</code></pre>
+        <pre class="diagram">
+LRU Problem — "Scan pollution":
+
+  Time ──▶  Hot Keys (accessed every second):  A B C D E
+            Cold scan (one-time batch job):     X₁ X₂ X₃ ... X₁₀₀₀₀
+
+  With LRU: Scan keys are "recently used" → evict hot keys A-E
+  Result:   Hot key misses → hit ratio drops
+
+LFU Solution:
+
+  Key A: frequency counter = 2,847 (high)
+  Key X₁: frequency counter = 1 (just accessed once)
+
+  LFU correctly keeps A, evicts X₁
+  Result:   Hit ratio preserved despite scan
+        </pre>
+        <pre><code class="language-bash"># Switch to LFU for scan-resistant caching
+CONFIG SET maxmemory-policy allkeys-lfu
+
+# Tune LFU parameters
+# lfu-log-factor: higher = slower counter growth (default 10)
+# lfu-decay-time: minutes before counter is halved (default 1)
+CONFIG SET lfu-log-factor 10
+CONFIG SET lfu-decay-time 1</code></pre>
+        <div class="callout callout-tip">
+          <p><strong>💡 When to switch to LFU:</strong> If you have batch jobs, scrapers, or admin scans that pollute the cache with one-time access keys, LFU preserves your hot working set. Check with <code>OBJECT FREQ key</code> to see access frequency counters.</p>
+        </div>
+      </details>
+      <details>
+        <summary>TTL strategies for optimal hit ratio</summary>
+        <pre><code class="language-java">@Configuration
+public class TtlStrategyConfig {
+
+    // Different TTLs based on data volatility and cost
+    public enum CacheTier {
+        // Rarely changes, expensive to compute
+        REFERENCE_DATA(Duration.ofHours(24), Duration.ofHours(4)),
+        // Changes occasionally, moderate cost
+        USER_PROFILE(Duration.ofMinutes(30), Duration.ofMinutes(5)),
+        // Changes frequently, cheap to compute
+        SESSION_DATA(Duration.ofMinutes(5), Duration.ofSeconds(30)),
+        // Real-time data, very short cache
+        STOCK_PRICE(Duration.ofSeconds(10), Duration.ofSeconds(2));
+
+        private final Duration hardTtl;  // Max time in cache
+        private final Duration softTtl;  // Time before background refresh
+
+        CacheTier(Duration hardTtl, Duration softTtl) {
+            this.hardTtl = hardTtl;
+            this.softTtl = softTtl;
+        }
+
+        public Duration getJitteredHardTtl() {
+            long base = hardTtl.toSeconds();
+            long jitter = ThreadLocalRandom.current()
+                .nextLong(-base / 5, base / 5);
+            return Duration.ofSeconds(base + jitter);
+        }
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <section id="redis-monitoring">
+      <h2>Redis Monitoring Commands</h2>
+      <details>
+        <summary>INFO command — your first diagnostic stop</summary>
+        <pre><code class="language-bash"># Key stats for cache hit ratio investigation
+redis-cli INFO stats | grep -E "keyspace_hits|keyspace_misses|evicted_keys|expired_keys"
+
+# Output:
+keyspace_hits:892347561        # Total hits since restart
+keyspace_misses:584729134      # Total misses since restart
+evicted_keys:2847561           # Keys removed due to maxmemory
+expired_keys:15234891          # Keys expired by TTL
+
+# Calculate hit ratio:
+# hit_ratio = keyspace_hits / (keyspace_hits + keyspace_misses)
+# 892347561 / (892347561 + 584729134) = 60.4%
+
+# But we need RATE not cumulative — use redis-cli --stat
+redis-cli --stat -i 1
+# Shows per-second stats including hit rate changes</code></pre>
+        <pre><code class="language-bash"># Memory diagnostics
+redis-cli INFO memory
+
+# Key fields:
+# used_memory_human: 7.84G
+# used_memory_peak_human: 8.00G    ← Hit the ceiling!
+# maxmemory_human: 8.00G
+# mem_fragmentation_ratio: 1.42    ← Above 1.5 is problematic
+# mem_allocator: jemalloc-5.2.1
+
+# Keyspace info — number of keys and expiry stats
+redis-cli INFO keyspace
+# db0:keys=1847234,expires=1523891,avg_ttl=1423567</code></pre>
+      </details>
+      <details>
+        <summary>MEMORY USAGE and big key detection</summary>
+        <pre><code class="language-bash"># Check memory for specific key
+redis-cli MEMORY USAGE "user:12345:profile"
+# (integer) 2048  (bytes)
+
+# Find big keys (blocking — use on replica)
+redis-cli --bigkeys
+# Scans keyspace, reports largest keys by type:
+# [00.00%] Biggest string found so far: "session:abc123" (524288 bytes)
+# [15.32%] Biggest hash found so far: "user:99999:cart" (1048576 bytes)
+
+# Memory doctor — automated diagnostics
+redis-cli MEMORY DOCTOR
+# "Sam, I have a few things to report:
+#  * Peak memory: 8.00GB, currently: 7.84GB (98% of peak)
+#  * High fragmentation ratio: 1.42"</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>⚠️ Never run DEBUG or KEYS on production.</strong> Use <code>SCAN</code> with COUNT for iterative key discovery. <code>KEYS *</code> blocks Redis (single-threaded) and causes cascading timeouts.</p>
+        </div>
+      </details>
+      <details>
+        <summary>SLOWLOG — identifying performance bottlenecks</summary>
+        <pre><code class="language-bash"># Get last 10 slow queries (default threshold: 10ms)
+redis-cli SLOWLOG GET 10
+
+# Output:
+# 1) 1) (integer) 142        ← Entry ID
+#    2) (integer) 1625847234  ← Unix timestamp
+#    3) (integer) 23451       ← Duration in microseconds (23ms!)
+#    4) 1) "KEYS"            ← The command
+#       2) "user:*"          ← Arguments (KEYS in production! 🚨)
+#    5) "10.0.1.42:53421"   ← Client address
+
+# Lower the threshold to catch more issues
+CONFIG SET slowlog-log-slower-than 5000  # 5ms
+CONFIG SET slowlog-max-len 256           # Keep more entries</code></pre>
+      </details>
+      <details>
+        <summary>Keyspace notifications for real-time monitoring</summary>
+        <pre><code class="language-bash"># Enable keyspace notifications for eviction and expiry events
+CONFIG SET notify-keyspace-events "Egx"
+# E = keyevent events
+# g = generic commands (DEL, EXPIRE, etc.)
+# x = expired events
+
+# Subscribe to eviction events
+redis-cli SUBSCRIBE "__keyevent@0__:evicted"
+redis-cli SUBSCRIBE "__keyevent@0__:expired"</code></pre>
+        <pre><code class="language-java">// Spring Boot listener for cache eviction events
+@Component
+public class CacheEvictionListener {
+
+    private final MeterRegistry meterRegistry;
+
+    @Bean
+    public RedisMessageListenerContainer redisListenerContainer(
+            RedisConnectionFactory connectionFactory) {
+        RedisMessageListenerContainer container =
+            new RedisMessageListenerContainer();
+        container.setConnectionFactory(connectionFactory);
+
+        // Listen for eviction events
+        container.addMessageListener(
+            (message, pattern) -> {
+                String key = new String(message.getBody());
+                meterRegistry.counter("cache.eviction",
+                    "key_prefix", extractPrefix(key)).increment();
+                log.warn("Key evicted: {}", key);
+            },
+            new PatternTopic("__keyevent@*__:evicted")
+        );
+
+        return container;
+    }
+
+    private String extractPrefix(String key) {
+        int idx = key.indexOf(':');
+        return idx > 0 ? key.substring(0, idx) : key;
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Grafana dashboard queries for hit ratio monitoring</summary>
+        <pre><code class="language-bash"># Prometheus metrics to export from Redis (via redis_exporter)
+# These power your Grafana cache dashboard:
+
+# Hit ratio over time (PromQL)
+rate(redis_keyspace_hits_total[5m]) /
+  (rate(redis_keyspace_hits_total[5m]) + rate(redis_keyspace_misses_total[5m]))
+
+# Eviction rate
+rate(redis_evicted_keys_total[5m])
+
+# Memory usage percentage
+redis_memory_used_bytes / redis_memory_max_bytes
+
+# Connected clients
+redis_connected_clients
+
+# Alert rule: hit ratio drop
+- alert: CacheHitRatioLow
+  expr: |
+    (rate(redis_keyspace_hits_total[5m]) /
+     (rate(redis_keyspace_hits_total[5m]) + rate(redis_keyspace_misses_total[5m])))
+    < 0.7
+  for: 2m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Cache hit ratio below 70% for 2 minutes"</code></pre>
+      </details>
+    </section>
+
+    <section id="production-incident">
+      <h2>Production Incident: Serialization Format Change</h2>
+      <details>
+        <summary>The incident timeline</summary>
+        <div class="callout callout-danger">
+          <p><strong>🚨 Real Incident:</strong> A deployment changed the Jackson serialization configuration for cached entities. All existing cache entries became unreadable. Hit ratio dropped from 95% to ~5% in 30 seconds. Database connection pool exhausted within 2 minutes.</p>
+        </div>
+        <pre class="diagram">
+Timeline:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+14:00  Deploy v2.4.1 starts rolling out (canary → 10% traffic)
+       - Changed: ObjectMapper now uses SNAKE_CASE property naming
+       - Changed: Added @JsonTypeInfo for polymorphic entities
+
+14:01  Cache hit ratio drops to 82% (canary nodes missing on reads)
+       - Old format: {"userId": 42, "firstName": "John"}
+       - New format: {"user_id": 42, "first_name": "John", "@type": "..."}
+       - Deserialization throws InvalidFormatException → treated as MISS
+
+14:03  Full rollout triggered (automated, hit ratio threshold was 50%)
+       - All nodes now read with new format
+       - 100% of existing cache entries are unreadable
+       - Hit ratio: 5%
+
+14:04  Database connection pool exhausted (200 connections maxed)
+       - p99 latency: 12s (up from 45ms)
+       - Error rate: 34% (connection timeouts)
+
+14:06  Alert fires. On-call engineer paged.
+
+14:08  Mitigation: Scaled DB read replicas from 2 → 6
+
+14:10  DB stabilizes but cache is still cold (rebuilding)
+
+14:25  Hit ratio recovers to 60% (natural warming from traffic)
+
+14:45  Hit ratio back to 90%
+
+15:30  Full recovery to 95%
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        </pre>
+      </details>
+      <details>
+        <summary>Root cause analysis</summary>
+        <p>The root cause was a seemingly innocent configuration change in <code>JacksonAutoConfiguration</code>:</p>
+        <pre><code class="language-java">// BEFORE (v2.4.0)
+@Bean
+public ObjectMapper objectMapper() {
+    return new ObjectMapper()
+        .registerModule(new JavaTimeModule())
+        .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+}
+
+// AFTER (v2.4.1) — "improvement" for API consistency
+@Bean
+public ObjectMapper objectMapper() {
+    return new ObjectMapper()
+        .registerModule(new JavaTimeModule())
+        .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+        .setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE) // 💣
+        .activateDefaultTyping(                                         // 💣
+            BasicPolymorphicTypeValidator.builder()
+                .allowIfSubType("com.company")
+                .build(),
+            ObjectMapper.DefaultTyping.NON_FINAL);
+}</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>⚠️ The ObjectMapper was shared between REST API serialization and cache serialization.</strong> Changing it for API consistency broke all cached data. Cache serialization should use its own dedicated ObjectMapper.</p>
+        </div>
+      </details>
+      <details>
+        <summary>The fix: isolated cache serializer</summary>
+        <pre><code class="language-java">@Configuration
+public class CacheSerializationConfig {
+
+    /**
+     * Dedicated ObjectMapper for cache serialization.
+     * NEVER share with REST API ObjectMapper.
+     * Version the format to detect incompatibilities.
+     */
+    @Bean("cacheObjectMapper")
+    public ObjectMapper cacheObjectMapper() {
+        return new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+            .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+            // Explicit: do NOT use naming strategies
+            .setPropertyNamingStrategy(PropertyNamingStrategies.LOWER_CAMEL_CASE);
+    }
+
+    @Bean
+    public RedisSerializer&lt;Object&gt; cacheValueSerializer(
+            @Qualifier("cacheObjectMapper") ObjectMapper mapper) {
+        GenericJackson2JsonRedisSerializer serializer =
+            new GenericJackson2JsonRedisSerializer(mapper);
+        return serializer;
+    }
+
+    @Bean
+    public RedisCacheConfiguration redisCacheConfiguration(
+            RedisSerializer&lt;Object&gt; cacheValueSerializer) {
+        return RedisCacheConfiguration.defaultCacheConfig()
+            .serializeValuesWith(
+                RedisSerializationContext.SerializationPair
+                    .fromSerializer(cacheValueSerializer))
+            .prefixCacheNameWith("v1:");  // Version prefix for future migrations
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Prevention: serialization compatibility testing</summary>
+        <pre><code class="language-java">/**
+ * Integration test that catches serialization incompatibilities
+ * BEFORE they reach production.
+ */
+@SpringBootTest
+@TestPropertySource(properties = "spring.redis.host=localhost")
+class CacheSerializationCompatibilityTest {
+
+    @Autowired
+    private RedisTemplate&lt;String, Object&gt; redisTemplate;
+
+    @Autowired
+    @Qualifier("cacheObjectMapper")
+    private ObjectMapper cacheObjectMapper;
+
+    @Test
+    void existingCacheEntriesRemainReadable() throws Exception {
+        // Simulate "old format" data already in Redis
+        String oldFormatJson = """
+            {"userId":42,"firstName":"John","lastName":"Doe",
+             "email":"john@example.com","createdAt":"2024-01-15T10:30:00"}
+            """;
+
+        redisTemplate.opsForValue().set("user:42", oldFormatJson);
+
+        // Verify current ObjectMapper can still deserialize it
+        String cached = (String) redisTemplate.opsForValue().get("user:42");
+        User user = cacheObjectMapper.readValue(cached, User.class);
+
+        assertThat(user.getUserId()).isEqualTo(42L);
+        assertThat(user.getFirstName()).isEqualTo("John");
+    }
+
+    @Test
+    void roundTripSerializationIsStable() throws Exception {
+        User user = new User(42L, "John", "Doe",
+            "john@example.com", Instant.parse("2024-01-15T10:30:00Z"));
+
+        // Serialize
+        String serialized = cacheObjectMapper.writeValueAsString(user);
+        // Deserialize
+        User deserialized = cacheObjectMapper.readValue(serialized, User.class);
+
+        assertThat(deserialized).isEqualTo(user);
+
+        // Serialize again — must produce same output (idempotent)
+        String reSerialized = cacheObjectMapper.writeValueAsString(deserialized);
+        assertThat(reSerialized).isEqualTo(serialized);
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <section id="debugging-workflow">
+      <h2>Step-by-Step Debugging Workflow</h2>
+      <details>
+        <summary>Systematic investigation playbook</summary>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────┐
+│              Cache Hit Ratio Drop — Investigation Flowchart          │
+└─────────────────────────────────────────────────────────────────────┘
+
+  START: Hit ratio dropped from 95% → 30%
+       │
+       ▼
+  ┌─────────────────────────┐     YES     ┌──────────────────────────┐
+  │ Was there a deployment  │────────────▶│ Check: key format change, │
+  │ in the last hour?       │             │ serialization change,     │
+  └─────────┬───────────────┘             │ FLUSHALL in migration     │
+            │ NO                           └──────────────────────────┘
+            ▼
+  ┌─────────────────────────┐     YES     ┌──────────────────────────┐
+  │ Is Redis memory at      │────────────▶│ Check: maxmemory-policy, │
+  │ maxmemory?              │             │ evicted_keys counter,     │
+  └─────────┬───────────────┘             │ big keys, fragmentation  │
+            │ NO                           └──────────────────────────┘
+            ▼
+  ┌─────────────────────────┐     YES     ┌──────────────────────────┐
+  │ Are expired_keys        │────────────▶│ Check: synchronized TTLs,│
+  │ spiking?                │             │ add jitter, check if     │
+  └─────────┬───────────────┘             │ warm-up caused mass TTL  │
+            │ NO                           └──────────────────────────┘
+            ▼
+  ┌─────────────────────────┐     YES     ┌──────────────────────────┐
+  │ Is there a traffic      │────────────▶│ Check: new bot/scraper,  │
+  │ pattern change?         │             │ cache pollution, key     │
+  └─────────┬───────────────┘             │ cardinality explosion    │
+            │ NO                           └──────────────────────────┘
+            ▼
+  ┌─────────────────────────┐     YES     ┌──────────────────────────┐
+  │ Network issues to       │────────────▶│ Check: Redis latency,    │
+  │ Redis cluster?          │             │ cluster health, slot     │
+  └─────────┬───────────────┘             │ migration, split-brain   │
+            │ NO                           └──────────────────────────┘
+            ▼
+  ┌─────────────────────────┐
+  │ Check application logs  │
+  │ for serialization       │
+  │ errors, timeouts,       │
+  │ connection pool issues  │
+  └─────────────────────────┘
+        </pre>
+      </details>
+      <details>
+        <summary>Step 1: Correlate with timeline</summary>
+        <pre><code class="language-bash"># When exactly did the drop start?
+# Check deployment history
+kubectl get deployments -o wide --show-labels
+kubectl rollout history deployment/user-service
+
+# Check recent config changes
+git log --oneline --since="2 hours ago" -- "*.yml" "*.yaml" "*.properties"
+
+# Check Redis config changes
+redis-cli CONFIG GET maxmemory*
+redis-cli CONFIG GET save</code></pre>
+      </details>
+      <details>
+        <summary>Step 2: Redis health check</summary>
+        <pre><code class="language-bash"># Comprehensive health check script
+#!/bin/bash
+echo "=== Redis Health Check ==="
+
+echo -e "\n--- Hit Ratio (last 5 seconds) ---"
+HITS_1=$(redis-cli INFO stats | grep keyspace_hits | cut -d: -f2 | tr -d '\r')
+MISS_1=$(redis-cli INFO stats | grep keyspace_misses | cut -d: -f2 | tr -d '\r')
+sleep 5
+HITS_2=$(redis-cli INFO stats | grep keyspace_hits | cut -d: -f2 | tr -d '\r')
+MISS_2=$(redis-cli INFO stats | grep keyspace_misses | cut -d: -f2 | tr -d '\r')
+DELTA_HITS=$((HITS_2 - HITS_1))
+DELTA_MISS=$((MISS_2 - MISS_1))
+TOTAL=$((DELTA_HITS + DELTA_MISS))
+if [ $TOTAL -gt 0 ]; then
+  RATIO=$(echo "scale=2; $DELTA_HITS * 100 / $TOTAL" | bc)
+  echo "Current hit ratio: ${RATIO}%"
+fi
+
+echo -e "\n--- Memory ---"
+redis-cli INFO memory | grep -E "used_memory_human|maxmemory_human|mem_fragmentation"
+
+echo -e "\n--- Eviction ---"
+redis-cli INFO stats | grep -E "evicted_keys|expired_keys"
+
+echo -e "\n--- Clients ---"
+redis-cli INFO clients | grep -E "connected_clients|blocked_clients"
+
+echo -e "\n--- Slow Log ---"
+redis-cli SLOWLOG GET 5</code></pre>
+      </details>
+      <details>
+        <summary>Step 3: Application-level diagnostics</summary>
+        <pre><code class="language-java">// Add temporary diagnostic logging for cache operations
+@Aspect
+@Component
+@ConditionalOnProperty("cache.diagnostics.enabled")
+public class CacheDiagnosticAspect {
+
+    private final MeterRegistry meterRegistry;
+    private static final Logger log = LoggerFactory.getLogger(
+        CacheDiagnosticAspect.class);
+
+    @Around("@annotation(cacheable)")
+    public Object diagnoseCache(ProceedingJoinPoint pjp,
+                                 Cacheable cacheable) throws Throwable {
+        String cacheName = cacheable.value().length > 0
+            ? cacheable.value()[0] : "default";
+        String key = generateKey(pjp, cacheable);
+
+        long start = System.nanoTime();
+        Object result = pjp.proceed();
+        long elapsed = System.nanoTime() - start;
+
+        // If the method executed (not from cache), it's a miss
+        if (elapsed > 1_000_000) { // > 1ms suggests DB call, not cache hit
+            meterRegistry.counter("cache.diagnostic.miss",
+                "cache", cacheName,
+                "method", pjp.getSignature().toShortString())
+                .increment();
+            log.debug("Cache MISS: cache={}, key={}, elapsed={}ms",
+                cacheName, key, elapsed / 1_000_000);
+        } else {
+            meterRegistry.counter("cache.diagnostic.hit",
+                "cache", cacheName).increment();
+        }
+
+        return result;
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Step 4: Immediate mitigation checklist</summary>
+        <ol>
+          <li><strong>Scale database read replicas</strong> — absorb the extra load while cache rebuilds</li>
+          <li><strong>Enable circuit breaker</strong> — prevent cascade failures:
+            <pre><code class="language-java">@CircuitBreaker(name = "userService", fallbackMethod = "getUserFallback")
+@Cacheable("users")
+public User getUser(Long userId) {
+    return userRepository.findById(userId).orElseThrow();
+}
+
+public User getUserFallback(Long userId, Throwable t) {
+    log.warn("Circuit open for user {}: {}", userId, t.getMessage());
+    // Return degraded response or cached stale data
+    return User.placeholder(userId);
+}</code></pre>
+          </li>
+          <li><strong>Rate-limit cache-miss path</strong> — prevent DB overload:
+            <pre><code class="language-java">private final RateLimiter dbRateLimiter =
+    RateLimiter.create(1000); // Max 1000 DB queries/sec
+
+public User getUserWithBackpressure(Long userId) {
+    String cached = redis.opsForValue().get("user:" + userId);
+    if (cached != null) return deserialize(cached);
+
+    if (!dbRateLimiter.tryAcquire(100, TimeUnit.MILLISECONDS)) {
+        throw new ServiceUnavailableException("DB backpressure active");
+    }
+    return loadFromDbAndCache(userId);
+}</code></pre>
+          </li>
+          <li><strong>Trigger emergency cache warm-up</strong> — preload hot keys from DB</li>
+          <li><strong>Rollback deployment</strong> — if correlated with a deploy</li>
+        </ol>
+      </details>
+    </section>
+
+    <section id="code-examples">
+      <h2>Production Code Examples</h2>
+      <details>
+        <summary>Cache warming strategy</summary>
+        <pre><code class="language-java">@Component
+public class CacheWarmer {
+
+    private final UserRepository userRepository;
+    private final RedisTemplate&lt;String, String&gt; redis;
+    private final ObjectMapper cacheMapper;
+    private final MeterRegistry metrics;
+
+    private static final int BATCH_SIZE = 500;
+    private static final int WARM_PARALLELISM = 4;
+
+    /**
+     * Warm cache with top-N most accessed entities.
+     * Called on startup or after cache flush incident.
+     */
+    @Async
+    @EventListener(ApplicationReadyEvent.class)
+    public void warmOnStartup() {
+        log.info("Starting cache warm-up...");
+        Instant start = Instant.now();
+
+        // Get hot keys from access logs or pre-computed list
+        List&lt;Long&gt; hotUserIds = userRepository
+            .findMostAccessedUserIds(PageRequest.of(0, 10000));
+
+        AtomicInteger warmed = new AtomicInteger(0);
+        AtomicInteger errors = new AtomicInteger(0);
+
+        // Process in parallel batches
+        Lists.partition(hotUserIds, BATCH_SIZE).parallelStream()
+            .forEach(batch -> {
+                try {
+                    List&lt;User&gt; users = userRepository.findAllById(batch);
+                    Pipeline pipeline = redis.executePipelined(
+                        (RedisCallback&lt;Object&gt;) connection -> {
+                            for (User user : users) {
+                                String key = "v2:user:" + user.getId();
+                                String value = cacheMapper.writeValueAsString(user);
+                                Duration ttl = jitteredTtl(Duration.ofMinutes(30));
+                                connection.stringCommands().setEx(
+                                    key.getBytes(),
+                                    ttl.getSeconds(),
+                                    value.getBytes());
+                            }
+                            return null;
+                        });
+                    warmed.addAndGet(users.size());
+                } catch (Exception e) {
+                    errors.addAndGet(batch.size());
+                    log.error("Warm-up batch failed", e);
+                }
+            });
+
+        Duration elapsed = Duration.between(start, Instant.now());
+        log.info("Cache warm-up complete: warmed={}, errors={}, duration={}s",
+            warmed.get(), errors.get(), elapsed.getSeconds());
+        metrics.gauge("cache.warmup.keys", warmed.get());
+    }
+
+    /**
+     * Emergency warm-up — triggered by hit ratio alert.
+     * More aggressive: uses read replicas and higher parallelism.
+     */
+    public CompletableFuture&lt;Integer&gt; emergencyWarmUp() {
+        return CompletableFuture.supplyAsync(() -> {
+            // Use read replica to avoid loading primary DB
+            List&lt;Long&gt; hotKeys = accessLogService.getHotKeysLastHour();
+            // ... similar batch logic with higher parallelism
+            return hotKeys.size();
+        });
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Complete multi-tier cache with Caffeine + Redis</summary>
+        <pre><code class="language-java">@Component
+public class MultiTierCache implements Cache {
+
+    private final String name;
+    private final com.github.benmanes.caffeine.cache.Cache&lt;String, Object&gt; l1;
+    private final StringRedisTemplate redis;
+    private final ObjectMapper mapper;
+    private final MeterRegistry metrics;
+    private final Duration redisTtl;
+
+    public MultiTierCache(String name,
+                          int l1MaxSize,
+                          Duration l1Ttl,
+                          Duration redisTtl,
+                          StringRedisTemplate redis,
+                          ObjectMapper mapper,
+                          MeterRegistry metrics) {
+        this.name = name;
+        this.redisTtl = redisTtl;
+        this.redis = redis;
+        this.mapper = mapper;
+        this.metrics = metrics;
+        this.l1 = Caffeine.newBuilder()
+            .maximumSize(l1MaxSize)
+            .expireAfterWrite(l1Ttl)
+            .recordStats()
+            .build();
+    }
+
+    @Override
+    public ValueWrapper get(Object key) {
+        String cacheKey = toKey(key);
+
+        // L1: In-process (Caffeine)
+        Object l1Value = l1.getIfPresent(cacheKey);
+        if (l1Value != null) {
+            metrics.counter("cache.hit", "tier", "L1", "cache", name).increment();
+            return new SimpleValueWrapper(l1Value);
+        }
+
+        // L2: Redis
+        try {
+            String redisValue = redis.opsForValue().get(redisKey(cacheKey));
+            if (redisValue != null) {
+                Object deserialized = mapper.readValue(redisValue, Object.class);
+                l1.put(cacheKey, deserialized); // Promote to L1
+                metrics.counter("cache.hit", "tier", "L2", "cache", name).increment();
+                return new SimpleValueWrapper(deserialized);
+            }
+        } catch (RedisConnectionException e) {
+            // Redis down — degrade gracefully, don't fail
+            metrics.counter("cache.error", "type", "connection", "cache", name)
+                .increment();
+            log.warn("Redis unavailable for key {}: {}", cacheKey, e.getMessage());
+        } catch (Exception e) {
+            // Deserialization error — key is corrupted/incompatible
+            metrics.counter("cache.error", "type", "deserialization", "cache", name)
+                .increment();
+            log.warn("Cache deserialization failed for key {}: {}",
+                cacheKey, e.getMessage());
+            // Delete corrupted entry
+            redis.delete(redisKey(cacheKey));
+        }
+
+        metrics.counter("cache.miss", "cache", name).increment();
+        return null;
+    }
+
+    @Override
+    public void put(Object key, Object value) {
+        String cacheKey = toKey(key);
+
+        // Write to both tiers
+        l1.put(cacheKey, value);
+
+        try {
+            String serialized = mapper.writeValueAsString(value);
+            redis.opsForValue().set(redisKey(cacheKey), serialized,
+                jitteredTtl(redisTtl));
+        } catch (Exception e) {
+            metrics.counter("cache.error", "type", "write", "cache", name)
+                .increment();
+            log.error("Failed to write to Redis cache: {}", cacheKey, e);
+        }
+    }
+
+    @Override
+    public void evict(Object key) {
+        String cacheKey = toKey(key);
+        l1.invalidate(cacheKey);
+        redis.delete(redisKey(cacheKey));
+    }
+
+    @Override
+    public void clear() {
+        l1.invalidateAll();
+        // Don't FLUSHALL! Only clear keys with our prefix
+        Set&lt;String&gt; keys = redis.keys(name + ":*");
+        if (keys != null &amp;&amp; !keys.isEmpty()) {
+            redis.delete(keys);
+        }
+    }
+
+    private String redisKey(String key) {
+        return name + ":" + key;
+    }
+
+    private String toKey(Object key) {
+        return key == null ? "null" : key.toString();
+    }
+
+    private Duration jitteredTtl(Duration base) {
+        long jitter = ThreadLocalRandom.current()
+            .nextLong(-base.toSeconds() / 5, base.toSeconds() / 5);
+        return base.plusSeconds(jitter);
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Distributed lock for stampede prevention (Redisson)</summary>
+        <pre><code class="language-java">@Service
+public class StampedeProtectedUserService {
+
+    private final UserRepository userRepository;
+    private final StringRedisTemplate redis;
+    private final RedissonClient redisson;
+    private final ObjectMapper mapper;
+
+    private static final Duration CACHE_TTL = Duration.ofMinutes(30);
+    private static final Duration LOCK_WAIT = Duration.ofSeconds(5);
+    private static final Duration LOCK_LEASE = Duration.ofSeconds(10);
+
+    @Cacheable(value = "users", unless = "#result == null")
+    public User getUser(Long userId) {
+        return loadWithStampedeProtection(userId);
+    }
+
+    private User loadWithStampedeProtection(Long userId) {
+        String key = "user:" + userId;
+        String lockKey = "lock:user:" + userId;
+
+        // Try cache
+        String cached = redis.opsForValue().get(key);
+        if (cached != null) {
+            return deserialize(cached);
+        }
+
+        // Cache miss — acquire lock to prevent stampede
+        RLock lock = redisson.getLock(lockKey);
+        try {
+            boolean acquired = lock.tryLock(
+                LOCK_WAIT.toMillis(), LOCK_LEASE.toMillis(),
+                TimeUnit.MILLISECONDS);
+
+            if (acquired) {
+                try {
+                    // Double-check pattern
+                    cached = redis.opsForValue().get(key);
+                    if (cached != null) {
+                        return deserialize(cached);
+                    }
+
+                    // Single thread loads from DB
+                    User user = userRepository.findById(userId)
+                        .orElseThrow(() -> new UserNotFoundException(userId));
+
+                    redis.opsForValue().set(key, serialize(user),
+                        jitteredTtl(CACHE_TTL));
+                    return user;
+                } finally {
+                    if (lock.isHeldByCurrentThread()) {
+                        lock.unlock();
+                    }
+                }
+            } else {
+                // Lock timeout — another thread is loading
+                // Wait briefly and retry cache
+                Thread.sleep(100);
+                cached = redis.opsForValue().get(key);
+                if (cached != null) {
+                    return deserialize(cached);
+                }
+                // Fallback: load from DB (accept duplicate query)
+                return userRepository.findById(userId)
+                    .orElseThrow(() -> new UserNotFoundException(userId));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new CacheException("Interrupted during cache load", e);
+        }
+    }
+}</code></pre>
+      </details>
+      <details>
+        <summary>Stale-while-revalidate with Spring Boot</summary>
+        <pre><code class="language-java">@Component
+public class StaleWhileRevalidateService {
+
+    private final StringRedisTemplate redis;
+    private final ObjectMapper mapper;
+    private final ThreadPoolTaskExecutor refreshExecutor;
+
+    // Track in-flight refreshes to avoid duplicate background loads
+    private final ConcurrentHashMap&lt;String, Boolean&gt; refreshInFlight =
+        new ConcurrentHashMap&lt;&gt;();
+
+    public &lt;T&gt; T get(String key, Class&lt;T&gt; type, Supplier&lt;T&gt; loader,
+                      Duration softTtl, Duration hardTtl) {
+        String raw = redis.opsForValue().get(key);
+
+        if (raw == null) {
+            // Hard miss — synchronous load
+            T value = loader.get();
+            store(key, value, softTtl, hardTtl);
+            return value;
+        }
+
+        TimestampedValue&lt;T&gt; entry = deserializeWithTimestamp(raw, type);
+
+        if (entry.isSoftExpired(softTtl)) {
+            // Soft expired — return stale, refresh in background
+            triggerAsyncRefresh(key, type, loader, softTtl, hardTtl);
+        }
+
+        return entry.getValue();
+    }
+
+    private &lt;T&gt; void triggerAsyncRefresh(String key, Class&lt;T&gt; type,
+                                           Supplier&lt;T&gt; loader,
+                                           Duration softTtl,
+                                           Duration hardTtl) {
+        // Deduplicate concurrent refresh attempts
+        if (refreshInFlight.putIfAbsent(key, Boolean.TRUE) != null) {
+            return; // Already refreshing
+        }
+
+        refreshExecutor.execute(() -> {
+            try {
+                T fresh = loader.get();
+                store(key, fresh, softTtl, hardTtl);
+            } catch (Exception e) {
+                log.warn("Background refresh failed for key {}: {}",
+                    key, e.getMessage());
+            } finally {
+                refreshInFlight.remove(key);
+            }
+        });
+    }
+
+    private &lt;T&gt; void store(String key, T value,
+                            Duration softTtl, Duration hardTtl) {
+        TimestampedValue&lt;T&gt; entry = new TimestampedValue&lt;&gt;(value, Instant.now());
+        String serialized = serialize(entry);
+        redis.opsForValue().set(key, serialized, hardTtl);
+    }
+
+    @Data
+    @AllArgsConstructor
+    @NoArgsConstructor
+    static class TimestampedValue&lt;T&gt; {
+        private T value;
+        private Instant storedAt;
+
+        boolean isSoftExpired(Duration softTtl) {
+            return Instant.now().isAfter(storedAt.plus(softTtl));
+        }
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Mistakes that cause or worsen hit ratio drops</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Mistake</th>
+              <th>Why It's Wrong</th>
+              <th>Correct Approach</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Shared ObjectMapper for API and cache</td>
+              <td>API serialization changes break cached data</td>
+              <td>Dedicated, version-pinned ObjectMapper for cache</td>
+            </tr>
+            <tr>
+              <td>Same TTL for all keys</td>
+              <td>Mass expiry causes thundering herd</td>
+              <td>TTL jitter (±20%) and tiered TTLs by data type</td>
+            </tr>
+            <tr>
+              <td>No eviction monitoring</td>
+              <td>Silent memory pressure goes unnoticed</td>
+              <td>Alert on evicted_keys rate and memory usage</td>
+            </tr>
+            <tr>
+              <td>FLUSHALL in deployment scripts</td>
+              <td>100% cache miss rate, DB overload</td>
+              <td>Targeted invalidation with SCAN + DEL</td>
+            </tr>
+            <tr>
+              <td>Caching null/empty results without TTL</td>
+              <td>Cache pollution with useless entries</td>
+              <td>Short TTL for negative caching (30s-5min)</td>
+            </tr>
+            <tr>
+              <td>No fallback when Redis is down</td>
+              <td>Complete service failure on Redis outage</td>
+              <td>L1 cache + circuit breaker + graceful degradation</td>
+            </tr>
+            <tr>
+              <td>Unbounded cache key cardinality</td>
+              <td>Memory explosion, constant eviction</td>
+              <td>Bound key space, use aggregation for high-cardinality data</td>
+            </tr>
+            <tr>
+              <td>No cache versioning</td>
+              <td>Schema changes make entries unreadable</td>
+              <td>Version prefix in cache name (v1:users:42)</td>
+            </tr>
+            <tr>
+              <td>Ignoring serialization errors</td>
+              <td>Silent misses counted as cache "misses"</td>
+              <td>Log and metric on deserialization failures separately</td>
+            </tr>
+            <tr>
+              <td>Using KEYS command in production</td>
+              <td>Blocks Redis (single-threaded), causes timeouts</td>
+              <td>Use SCAN with COUNT for iterative discovery</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <section id="trade-offs">
+      <h2>Cache Consistency vs Performance Matrix</h2>
+      <details>
+        <summary>Trade-off analysis</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Consistency</th>
+              <th>Hit Ratio</th>
+              <th>Latency (p50)</th>
+              <th>Latency (p99)</th>
+              <th>Complexity</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Write-through</td>
+              <td>Strong</td>
+              <td>95%+</td>
+              <td>~5ms (write penalty)</td>
+              <td>~15ms</td>
+              <td>Low</td>
+            </tr>
+            <tr>
+              <td>Write-behind (async)</td>
+              <td>Eventual</td>
+              <td>98%+</td>
+              <td>~1ms</td>
+              <td>~5ms</td>
+              <td>High (data loss risk)</td>
+            </tr>
+            <tr>
+              <td>Cache-aside (lazy)</td>
+              <td>Eventual</td>
+              <td>85-95%</td>
+              <td>~2ms (hit)</td>
+              <td>~200ms (miss)</td>
+              <td>Low</td>
+            </tr>
+            <tr>
+              <td>Read-through</td>
+              <td>Eventual</td>
+              <td>90-95%</td>
+              <td>~2ms</td>
+              <td>~100ms</td>
+              <td>Medium</td>
+            </tr>
+            <tr>
+              <td>Refresh-ahead</td>
+              <td>Eventual</td>
+              <td>98%+</td>
+              <td>~1ms</td>
+              <td>~3ms</td>
+              <td>High</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout-info">
+          <p><strong>Choosing the right strategy:</strong></p>
+          <ul>
+            <li><strong>Write-through:</strong> When consistency matters more than write latency (user profiles, permissions)</li>
+            <li><strong>Cache-aside:</strong> General purpose, most common in Spring Boot apps</li>
+            <li><strong>Refresh-ahead:</strong> For hot keys where you can predict access (product catalog, config)</li>
+            <li><strong>Write-behind:</strong> High-write workloads where eventual consistency is acceptable (analytics, counters)</li>
+          </ul>
+        </div>
+      </details>
+      <details>
+        <summary>Consistency patterns in distributed caching</summary>
+        <pre class="diagram">
+Write-Through:                        Cache-Aside:
+                                      
+  App ──write──▶ Cache ──▶ DB         App ──write──▶ DB
+                   │                        │
+                   ▼                        ▼
+              Consistent              Invalidate Cache
+                                      (or let TTL expire)
+
+Problem: Write latency               Problem: Stale reads between
+         doubled                              write and TTL expiry
+                                      
+═══════════════════════════════════════════════════════════════
+
+Read-Through:                         Refresh-Ahead:
+
+  App ──read──▶ Cache                  Background Thread:
+                  │ miss                 Monitors TTL, refreshes
+                  ▼                     BEFORE expiry
+                 DB
+                  │                   App ──read──▶ Cache (always HIT)
+                  ▼
+            Cache populated           Problem: Wasted refreshes for
+                                               keys nobody reads
+        </pre>
+        <div class="callout callout-tip">
+          <p><strong>💡 For preventing hit ratio drops:</strong> Refresh-ahead (stale-while-revalidate) gives the best hit ratio because keys never actually expire from the reader's perspective. The trade-off is background thread overhead and potential staleness.</p>
+        </div>
+      </details>
+    </section>
+
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Questions the interviewer might ask next</summary>
+        <ol>
+          <li>
+            <strong>"How would you handle a hot key that receives 100K requests/second?"</strong>
+            <p>Use local L1 cache (Caffeine) to absorb hot key traffic. For Redis, use read replicas or key replication across multiple slots. Consider client-side caching with Redis 6+ RESP3 protocol and server-assisted invalidation.</p>
+          </li>
+          <li>
+            <strong>"How do you ensure cache consistency across microservices?"</strong>
+            <p>Event-driven invalidation via Kafka/SNS. Publish cache invalidation events when data changes. Each service subscribes and invalidates its local cache. Use logical timestamps to handle out-of-order events.</p>
+          </li>
+          <li>
+            <strong>"What if your Redis cluster goes down completely?"</strong>
+            <p>Circuit breaker to bypass cache, fall through to DB with aggressive rate limiting. L1 (Caffeine) serves what it can. Pre-provision DB capacity for cache-down scenario. Consider Redis Sentinel or Cluster mode for HA.</p>
+          </li>
+          <li>
+            <strong>"How would you migrate from one cache key format to another without downtime?"</strong>
+            <p>Dual-read strategy: try new format first, fall back to old format. Write in new format only. Old keys naturally expire. Monitor both key spaces. Similar to blue-green but for cache data.</p>
+          </li>
+          <li>
+            <strong>"How do you prevent cache penetration (queries for non-existent data)?"</strong>
+            <p>Bloom filter at the cache layer to reject known-missing keys. Cache null results with short TTL (negative caching). Rate-limit per-key to prevent enumeration attacks.</p>
+          </li>
+          <li>
+            <strong>"How would you size your Redis cluster for this workload?"</strong>
+            <p>Calculate: (average_value_size × key_count × replication_factor) + overhead. Add 30% headroom for fragmentation. Consider: peak QPS × avg_latency for connection pool sizing. Use Redis benchmarks to validate.</p>
+          </li>
+        </ol>
+      </details>
+    </section>
+
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Key points to remember</summary>
+        <div class="callout callout-tip">
+          <ol>
+            <li><strong>Correlate first:</strong> Always check deployment history, config changes, and traffic patterns before diving into Redis internals</li>
+            <li><strong>Mitigate before debugging:</strong> Scale DB, enable circuit breakers, rate-limit the miss path — then investigate root cause</li>
+            <li><strong>Serialization is the #1 killer:</strong> Use a dedicated, versioned ObjectMapper for cache — never share with REST API configuration</li>
+            <li><strong>TTL jitter prevents stampedes:</strong> Add ±20% randomness to all TTLs to prevent synchronized mass expiry</li>
+            <li><strong>Multi-tier caching (L1+L2) provides resilience:</strong> Caffeine absorbs hot keys locally even when Redis has issues</li>
+            <li><strong>Monitor eviction rate, not just hit ratio:</strong> Rising evictions are a leading indicator of future hit ratio drops</li>
+            <li><strong>LFU over LRU for scan-heavy workloads:</strong> Prevents cache pollution from batch jobs and scrapers</li>
+            <li><strong>Stale-while-revalidate eliminates user-visible misses:</strong> Return stale data immediately, refresh asynchronously</li>
+            <li><strong>Test serialization compatibility in CI:</strong> Catch format changes before they reach production</li>
+            <li><strong>Version your cache key format:</strong> Enables safe migrations and rollbacks without data loss</li>
+          </ol>
+        </div>
+      </details>
+    </section>
+
+    <nav class="chapter-nav">
+      <a href="ch09-zero-downtime-schema-changes.html" class="chapter-nav-prev">← Chapter 9</a>
+      <a href="ch11-slow-downstream-service.html" class="chapter-nav-next">Chapter 11 →</a>
+    </nav>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

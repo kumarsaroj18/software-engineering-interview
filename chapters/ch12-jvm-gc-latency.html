@@ -1,0 +1,2219 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 12 — JVM GC Latency | Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="../assets/css/prism.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 12</span>
+      <span class="chapter-title">JVM GC & Latency</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#gc-fundamentals">GC Fundamentals</a></li>
+        <li><a href="#gc-algorithms">GC Algorithms</a></li>
+        <li><a href="#why-latency-spikes">Why Latency Spikes</a></li>
+        <li><a href="#heap-sizing">Heap Sizing</a></li>
+        <li><a href="#allocation-rate">Allocation Rate</a></li>
+        <li><a href="#gc-log-analysis">GC Log Analysis</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#tuning">JVM Tuning</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo; <a href="../index.html#part-iii">Part III — Production Engineering &amp; Debugging</a> &rsaquo; <span>Chapter 12</span>
+    </nav>
+
+    <h1>Chapter 12 — JVM GC Latency</h1>
+    <div class="chapter-meta">
+      <span class="badge badge-hard">Hard</span>
+      <span class="badge badge-topic">GC</span>
+      <span class="badge badge-topic">JVM Tuning</span>
+    </div>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+    <p class="chapter-question"><strong>"Why can JVM garbage collection suddenly increase API latency without high CPU usage?"</strong></p>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 1: INTERVIEWER INTENT                                 -->
+    <!-- ============================================================ -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>What is the interviewer really assessing?</summary>
+
+        <div class="callout callout-info">
+          <p><strong>This question targets deep JVM internals knowledge.</strong> The interviewer wants to see:</p>
+        </div>
+
+        <ul>
+          <li><strong>JVM memory model understanding</strong> — Can you explain generational GC, GC roots, card tables, and remembered sets without hand-waving?</li>
+          <li><strong>Stop-the-world awareness</strong> — Do you understand that GC pauses freeze ALL application threads regardless of CPU availability?</li>
+          <li><strong>Collector knowledge</strong> — Can you compare G1GC, ZGC, and Shenandoah with specific pause-time characteristics?</li>
+          <li><strong>Production debugging</strong> — Have you actually read GC logs at 3 AM and correlated pause events with P99 latency spikes?</li>
+          <li><strong>Tuning experience</strong> — Do you know which JVM flags matter and why default settings fail at scale?</li>
+          <li><strong>Allocation-aware coding</strong> — Can you write code that minimizes GC pressure without sacrificing readability?</li>
+          <li><strong>Container awareness</strong> — Do you understand JVM ergonomics in Kubernetes pods with cgroup memory limits?</li>
+          <li><strong>Trade-off articulation</strong> — Can you explain why lower pause times cost throughput, and when that trade-off is acceptable?</li>
+        </ul>
+
+        <div class="callout callout-warning">
+          <p><strong>Red flag:</strong> Candidates who say "just increase heap size" or "switch to ZGC" without explaining <em>why</em> the current collector is causing pauses will not pass the bar at FAANG companies.</p>
+        </div>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 2: QUICK ANSWER                                       -->
+    <!-- ============================================================ -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <details>
+        <summary>30-second elevator pitch</summary>
+
+        <div class="callout callout-tip">
+          <p><strong>The core insight:</strong> GC pauses are <em>stop-the-world</em> events that freeze all application threads — not because the CPU is busy computing, but because the JVM needs a consistent heap snapshot. During a 200ms Full GC pause, every API request in flight is frozen, causing latency spikes with zero CPU activity.</p>
+        </div>
+
+        <p>The structured answer:</p>
+        <ol>
+          <li><strong>STW pauses ≠ CPU usage.</strong> During a GC pause, threads are suspended at safepoints. The CPU is mostly idle while the collector traces object references.</li>
+          <li><strong>Old generation collections are expensive.</strong> Minor GC in young gen takes 5-20ms, but mixed/full GC in old gen can take 200ms-2s with G1GC.</li>
+          <li><strong>Promotion pressure triggers long pauses.</strong> Long-lived objects (caches, connection pools, session state) get promoted to old gen, eventually triggering expensive collections.</li>
+          <li><strong>Humongous allocations bypass young gen.</strong> Objects larger than half a G1 region go directly to old gen, causing fragmentation and early mixed GC cycles.</li>
+          <li><strong>Container memory limits compound the problem.</strong> JVM ergonomics may calculate heap size incorrectly in containers, leading to more frequent GC.</li>
+        </ol>
+
+        <p><strong>Fix strategy:</strong> Analyze GC logs → identify promotion rate → tune heap regions → reduce allocation rate → consider low-latency collector (ZGC/Shenandoah) → implement off-heap caching for large objects.</p>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 3: GC FUNDAMENTALS                                    -->
+    <!-- ============================================================ -->
+    <section id="gc-fundamentals">
+      <h2>GC Fundamentals</h2>
+      <details>
+        <summary>How garbage collection works in the JVM</summary>
+
+        <h3>Generational Hypothesis</h3>
+        <p>The JVM heap is divided into generations based on the empirical observation that most objects die young:</p>
+
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────┐
+│                          JVM Heap                                    │
+├─────────────────────────────────┬───────────────────────────────────┤
+│         Young Generation        │         Old Generation            │
+│  ┌───────┬────────┬────────┐   │                                   │
+│  │ Eden  │  S0    │  S1    │   │   Tenured Space                   │
+│  │       │(from)  │ (to)   │   │   (long-lived objects)            │
+│  │ new   │survivor│survivor│   │                                   │
+│  │objects│ space  │ space  │   │                                   │
+│  └───────┴────────┴────────┘   │                                   │
+├─────────────────────────────────┼───────────────────────────────────┤
+│  ~33% of heap (typical)         │  ~67% of heap (typical)           │
+│  Minor GC: 5-20ms              │  Major/Full GC: 50ms-2s+          │
+└─────────────────────────────────┴───────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Metaspace (off-heap)                          │
+│   Class metadata, method bytecode, constant pools                   │
+│   Grows dynamically (can trigger Full GC if limited)                │
+└─────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Object Lifecycle</h3>
+        <ol>
+          <li><strong>Allocation:</strong> New objects are allocated in Eden space (TLAB — Thread Local Allocation Buffer for lock-free allocation)</li>
+          <li><strong>Minor GC:</strong> When Eden fills, live objects are copied to a survivor space. Dead objects are reclaimed. This is a STW event but typically fast (5-20ms).</li>
+          <li><strong>Aging:</strong> Objects surviving multiple minor GCs (tenuring threshold, default 15) get promoted to old generation.</li>
+          <li><strong>Major GC:</strong> When old gen fills, a much more expensive collection occurs — marking all live objects from GC roots through the entire old gen.</li>
+        </ol>
+
+        <h3>GC Roots — Where Liveness Tracing Begins</h3>
+        <pre><code class="language-java">// GC Roots include:
+// 1. Local variables on thread stacks
+// 2. Active threads themselves
+// 3. Static fields of loaded classes
+// 4. JNI references
+// 5. Synchronization monitors (locked objects)
+// 6. JVM internal references (class loaders, etc.)
+
+public class GCRootsExample {
+    // Static field — always a GC root
+    private static final Map&lt;String, byte[]&gt; GLOBAL_CACHE = new ConcurrentHashMap&lt;&gt;();
+
+    public void processRequest(HttpServletRequest request) {
+        // Local variable 'data' — GC root while this method is on the stack
+        byte[] data = new byte[1024 * 1024]; // 1MB allocation
+
+        // If we store in static cache, this object becomes reachable
+        // from a GC root even after this method returns
+        GLOBAL_CACHE.put(request.getRequestId(), data); // LEAK!
+    }
+}</code></pre>
+
+        <h3>Stop-the-World (STW) Pauses</h3>
+        <div class="callout callout-danger">
+          <p><strong>Critical concept:</strong> During a STW pause, <em>every</em> application thread is suspended at a safepoint. No application code executes. No requests are processed. No responses are sent. The CPU may show 0% user-space utilization because threads are simply <em>parked</em>.</p>
+        </div>
+
+        <p>Safepoints are specific locations in code where the JVM can safely stop a thread:</p>
+        <ul>
+          <li>Method entry/exit</li>
+          <li>Loop backedges (with counted loop optimization — loops with known bounds may NOT have safepoints)</li>
+          <li>Allocation sites</li>
+          <li>Monitor operations (synchronized)</li>
+        </ul>
+
+        <h3>Time-to-Safepoint (TTSP)</h3>
+        <pre><code class="language-java">// DANGEROUS: Counted loop without safepoint
+// JVM optimizes away safepoint polls in counted loops
+public long sumArray(int[] array) {
+    long sum = 0;
+    // This loop may NOT have a safepoint poll
+    // It can delay GC for ALL threads until it completes
+    for (int i = 0; i &lt; array.length; i++) {
+        sum += array[i];
+    }
+    return sum;
+}
+
+// SAFER: Use long index or add explicit safepoint
+public long sumArraySafe(int[] array) {
+    long sum = 0;
+    for (long i = 0; i &lt; array.length; i++) { // long index = uncounted loop
+        sum += array[(int) i];
+    }
+    return sum;
+}</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>JDK 17+:</strong> JEP 376 (ZGC) and JEP 377 improved safepoint behavior. JDK 21+ with virtual threads introduces additional safepoint considerations for carrier threads.</p>
+        </div>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 4: GC ALGORITHMS                                      -->
+    <!-- ============================================================ -->
+    <section id="gc-algorithms">
+      <h2>GC Algorithms</h2>
+      <details>
+        <summary>G1GC, ZGC, and Shenandoah — comparison and selection criteria</summary>
+
+        <h3>G1GC (Garbage-First Garbage Collector)</h3>
+        <p>Default collector since JDK 9. Divides heap into equal-sized regions (~2048 regions).</p>
+
+        <pre class="diagram">
+┌────────────────────────────────────────────────────────────────────┐
+│                    G1GC Region Layout                                │
+├────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┤
+│ E  │ E  │ S  │ O  │ O  │ H  │ H  │ E  │ O  │ E  │ S  │ O  │Free│
+│den │den │urv │ld  │ld  │umon│umon│den │ld  │den │urv │ld  │    │
+└────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+  E = Eden    S = Survivor    O = Old    H = Humongous    Free = Empty
+
+G1GC Phases:
+1. Young-only phase    → Evacuates young regions (STW, ~5-20ms)
+2. Concurrent marking  → Traces old gen (mostly concurrent, brief STW for remark)
+3. Mixed collection    → Evacuates young + selected old regions (STW, ~30-100ms)
+4. Full GC (fallback)  → Single-threaded compaction (STW, 500ms-5s+) ← DISASTER
+        </pre>
+
+        <h3>ZGC (Z Garbage Collector)</h3>
+        <p>Ultra-low latency collector. Available since JDK 11 (experimental), production-ready JDK 15+, generational in JDK 21+.</p>
+
+        <pre><code class="language-bash"># Enable ZGC (JDK 17+)
+-XX:+UseZGC
+
+# Enable Generational ZGC (JDK 21+) — significantly better throughput
+-XX:+UseZGC -XX:+ZGenerational</code></pre>
+
+        <p><strong>Key characteristics:</strong></p>
+        <ul>
+          <li>Pause times &lt; 1ms (sub-millisecond) regardless of heap size</li>
+          <li>Supports heaps from 8MB to 16TB</li>
+          <li>Uses colored pointers (metadata in pointer bits) and load barriers</li>
+          <li>Concurrent relocation — moves objects without stopping application</li>
+          <li>~3-5% throughput overhead vs G1GC (generational ZGC reduces this to ~1-2%)</li>
+        </ul>
+
+        <h3>Shenandoah</h3>
+        <p>Low-pause collector developed by Red Hat. Available in OpenJDK (not Oracle JDK).</p>
+
+        <pre><code class="language-bash"># Enable Shenandoah
+-XX:+UseShenandoahGC
+
+# Shenandoah modes
+-XX:ShenandoahGCMode=normal    # Default balanced mode
+-XX:ShenandoahGCMode=iu        # Incremental-update for lower footprint
+-XX:ShenandoahGCMode=passive   # No concurrent work (debugging only)</code></pre>
+
+        <p><strong>Key characteristics:</strong></p>
+        <ul>
+          <li>Pause times typically &lt; 10ms</li>
+          <li>Uses Brooks forwarding pointers (extra word per object)</li>
+          <li>Concurrent compaction via read/write barriers</li>
+          <li>Available in OpenJDK and Amazon Corretto</li>
+          <li>Slightly higher memory overhead (~5-10%) due to forwarding pointers</li>
+        </ul>
+
+        <h3>Comparison Table</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Characteristic</th>
+              <th>G1GC</th>
+              <th>ZGC</th>
+              <th>Shenandoah</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Max pause time</td>
+              <td>50-200ms (target: 200ms)</td>
+              <td>&lt; 1ms</td>
+              <td>&lt; 10ms</td>
+            </tr>
+            <tr>
+              <td>Throughput overhead</td>
+              <td>Baseline</td>
+              <td>3-5% (gen: 1-2%)</td>
+              <td>5-10%</td>
+            </tr>
+            <tr>
+              <td>Memory overhead</td>
+              <td>Low</td>
+              <td>Low-Medium</td>
+              <td>Medium (forwarding ptrs)</td>
+            </tr>
+            <tr>
+              <td>Min JDK (production)</td>
+              <td>JDK 9</td>
+              <td>JDK 15 (gen: JDK 21)</td>
+              <td>JDK 12</td>
+            </tr>
+            <tr>
+              <td>Best for</td>
+              <td>General purpose, balanced</td>
+              <td>Ultra-low latency, large heaps</td>
+              <td>Low latency, OpenJDK only</td>
+            </tr>
+            <tr>
+              <td>Heap size sweet spot</td>
+              <td>4-32GB</td>
+              <td>8GB-16TB</td>
+              <td>4-64GB</td>
+            </tr>
+            <tr>
+              <td>Compaction</td>
+              <td>Evacuation (STW)</td>
+              <td>Concurrent relocation</td>
+              <td>Concurrent compaction</td>
+            </tr>
+            <tr>
+              <td>Oracle JDK support</td>
+              <td>Yes</td>
+              <td>Yes</td>
+              <td>No (OpenJDK only)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>When to Use Which</h3>
+        <div class="callout callout-tip">
+          <p><strong>Decision framework:</strong></p>
+          <ul>
+            <li><strong>G1GC:</strong> Default choice. Good for most Spring Boot services with 4-16GB heaps where 50-100ms pauses are acceptable.</li>
+            <li><strong>ZGC:</strong> When P99 latency SLA is &lt; 10ms, heap &gt; 16GB, or you cannot tolerate any pause &gt; 1ms (trading, real-time bidding, gaming).</li>
+            <li><strong>Shenandoah:</strong> Similar goals to ZGC but you're on OpenJDK/Corretto and need sub-10ms pauses without Oracle licensing considerations.</li>
+          </ul>
+        </div>
+
+        <pre class="diagram">
+Decision Tree:
+                    ┌─────────────────────┐
+                    │ P99 latency SLA?    │
+                    └──────────┬──────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                 │
+         &lt; 5ms           5-50ms            &gt; 50ms
+              │                │                 │
+              ▼                ▼                 ▼
+    ┌─────────────┐   ┌──────────────┐   ┌───────────┐
+    │ ZGC or      │   │ Tuned G1GC   │   │ Default   │
+    │ Shenandoah  │   │ or Shenandoah│   │ G1GC      │
+    └─────────────┘   └──────────────┘   └───────────┘
+              │                │
+              ▼                ▼
+    ┌─────────────┐   ┌──────────────┐
+    │ Heap &gt; 32GB?│   │ Heap &gt; 16GB? │
+    │ → ZGC       │   │ → ZGC/G1     │
+    │ Heap &lt; 32GB │   │ Heap &lt; 16GB  │
+    │ → Either    │   │ → G1GC tuned │
+    └─────────────┘   └──────────────┘
+        </pre>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 5: WHY LATENCY SPIKES                                 -->
+    <!-- ============================================================ -->
+    <section id="why-latency-spikes">
+      <h2>Why GC Causes Latency Without High CPU</h2>
+      <details>
+        <summary>The mechanics of GC-induced latency spikes</summary>
+
+        <h3>Root Cause: STW Pauses Freeze ALL Application Threads</h3>
+        <div class="callout callout-danger">
+          <p><strong>The key insight that answers the interview question:</strong> During a GC pause, application threads are <em>suspended</em>, not <em>computing</em>. The CPU is largely idle — it's waiting for GC work to complete, not processing requests. This is why you see latency spikes without corresponding CPU spikes.</p>
+        </div>
+
+        <pre class="diagram">
+Timeline: GC Pause Impact on Request Processing
+
+Thread-1: ──────────[REQUEST A]────────┤ FROZEN ├──────[RESUME]──→ response (slow)
+Thread-2: ──[REQ B]──────┤ FROZEN ├──────────────────[RESUME]──→ response (slow)
+Thread-3: ────────────────┤ FROZEN ├─────────────────[RESUME]──→ idle
+Thread-4: ─────[REQUEST C]┤ FROZEN ├──────────────────[RESUME]──→ response (slow)
+                          │        │
+GC Thread: ───────────────│MARKING │SWEEPING│COMPACT│──→ done
+                          │&lt;── STW PAUSE ──&gt;│
+                          t0    200ms      t1
+
+CPU Usage during pause:
+  User:   ~2%  (only GC threads doing tracing work)
+  System: ~1%  (minimal kernel activity)
+  Idle:   ~97% (all app threads parked!)
+
+External observation:
+  - P99 latency spikes by 200ms
+  - No CPU alarm fires
+  - Thread dump shows all threads at safepoint
+  - Connection pool looks full (threads frozen mid-request)
+        </pre>
+
+        <h3>Cause 1: Mixed GC on Old Generation</h3>
+        <p>G1GC mixed collections evacuate both young and old regions. When the old gen has many live objects, evacuation takes longer:</p>
+
+        <pre><code class="language-java">// Scenario: Large in-memory cache causes long mixed GC
+@Service
+public class ProductCatalogService {
+    // 2GB of long-lived objects → all promoted to old gen
+    private final Map&lt;String, ProductDetails&gt; catalog = new ConcurrentHashMap&lt;&gt;();
+
+    @PostConstruct
+    public void loadCatalog() {
+        // Loads 500K products into memory
+        // Each product: ~4KB (with descriptions, images metadata)
+        // Total: ~2GB in old gen
+        productRepository.findAll().forEach(p -&gt;
+            catalog.put(p.getSku(), p)
+        );
+    }
+
+    // Every 30 minutes, refresh the catalog
+    @Scheduled(fixedRate = 1800000)
+    public void refreshCatalog() {
+        Map&lt;String, ProductDetails&gt; newCatalog = productRepository.findAll()
+            .stream().collect(Collectors.toMap(Product::getSku, this::toDetails));
+
+        // OLD catalog objects become garbage in old gen
+        // NEW catalog objects allocated → promoted to old gen
+        // Result: 2GB of garbage in old gen + 2GB new allocation
+        // This triggers a MIXED GC or even FULL GC!
+        catalog.clear();
+        catalog.putAll(newCatalog);
+    }
+}</code></pre>
+
+        <h3>Cause 2: Humongous Object Allocation</h3>
+        <p>In G1GC, objects larger than half a region size (~16MB with default 32MB regions) are "humongous" and allocated directly in old gen:</p>
+
+        <pre><code class="language-java">// PROBLEM: Humongous allocations
+public class ReportGenerator {
+    public byte[] generateLargeReport(String reportId) {
+        // With 32MB G1 regions, any allocation &gt; 16MB is humongous
+        // Allocated directly in old gen, spanning multiple contiguous regions
+        byte[] buffer = new byte[20 * 1024 * 1024]; // 20MB → HUMONGOUS
+
+        // These objects cause:
+        // 1. Fragmentation (need contiguous regions)
+        // 2. Eager reclamation only during marking cycle
+        // 3. Potential Full GC if no contiguous free regions available
+        fillReportData(buffer, reportId);
+        return buffer;
+    }
+}
+
+// SOLUTION: Stream the report or use smaller buffers
+public class ReportGeneratorFixed {
+    public void generateLargeReport(String reportId, OutputStream out) {
+        byte[] buffer = new byte[8192]; // 8KB chunks — young gen allocation
+        try (var input = reportDataSource.stream(reportId)) {
+            int bytesRead;
+            while ((bytesRead = input.read(buffer)) != -1) {
+                out.write(buffer, 0, bytesRead);
+            }
+        }
+    }
+}</code></pre>
+
+        <h3>Cause 3: Metaspace Expansion</h3>
+        <pre><code class="language-java">// Metaspace issues in Spring Boot applications
+// Each dynamically generated class consumes metaspace
+
+// PROBLEM: Excessive use of reflection/proxies/lambdas in hot paths
+@Service
+public class DynamicProxyHeavyService {
+    // Spring creates CGLIB proxies for @Transactional methods
+    // Each proxy generates a new class in metaspace
+
+    // Groovy scripts, JSP compilation, or dynamic class generation
+    // can cause metaspace to grow continuously
+
+    // When metaspace hits MaxMetaspaceSize, it triggers a FULL GC
+    // to unload classes — this is a very expensive STW pause
+}</code></pre>
+
+        <pre><code class="language-bash"># Monitor metaspace growth
+-XX:MetaspaceSize=256m           # Initial metaspace size
+-XX:MaxMetaspaceSize=512m        # Maximum (default: unlimited!)
+-XX:MinMetaspaceFreeRatio=20     # Minimum free before expansion
+-XX:MaxMetaspaceFreeRatio=80     # Maximum free before shrinking
+
+# Log class loading/unloading
+-Xlog:class+load=info
+-Xlog:class+unload=info</code></pre>
+
+        <h3>Cause 4: Memory Fragmentation</h3>
+        <pre class="diagram">
+Fragmented Old Generation (G1GC):
+
+Before compaction:
+┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+│Live│Free│Live│Free│Live│Free│Live│Free│Live│Free│
+│ 4M │ 2M │ 8M │ 1M │ 3M │ 4M │ 6M │ 1M │ 5M │ 3M │
+└────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+Total free: 11MB — but largest contiguous: 4MB!
+Cannot allocate a 5MB object → triggers Full GC compaction
+
+After Full GC compaction (expensive STW):
+┌────┬────┬────┬────┬────┬─────────────────────────┐
+│Live│Live│Live│Live│Live│       Free: 11MB         │
+│ 4M │ 8M │ 3M │ 6M │ 5M │    (contiguous!)        │
+└────┴────┴────┴────┴────┴─────────────────────────┘
+        </pre>
+
+        <h3>Cause 5: Concurrent Mode Failure</h3>
+        <div class="callout callout-warning">
+          <p><strong>G1GC "evacuation failure":</strong> When G1 cannot find free regions to copy live objects during a mixed GC, it falls back to a serial Full GC. This single-threaded compaction can take seconds on large heaps.</p>
+        </div>
+
+        <pre><code class="language-bash"># GC log showing evacuation failure → Full GC
+[2024-03-15T14:22:01.234+0000] GC(4521) Pause Young (Normal) (G1 Evacuation Pause)
+[2024-03-15T14:22:01.234+0000] GC(4521)   To-space exhausted
+[2024-03-15T14:22:01.456+0000] GC(4522) Pause Full (G1 Evacuation Failure)
+[2024-03-15T14:22:03.891+0000] GC(4522) Pause Full (G1 Evacuation Failure) 7834M-&gt;3201M(8192M) 2435.123ms
+#                                                                                              ^^^^^^^^^^
+#                                                                                              2.4 SECONDS!</code></pre>
+
+        <h3>Summary: Why No CPU Spike?</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>GC Phase</th>
+              <th>App Threads</th>
+              <th>CPU Profile</th>
+              <th>Latency Impact</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>STW Mark Start</td>
+              <td>Suspended</td>
+              <td>Low user CPU (GC threads only)</td>
+              <td>Adds to pause time</td>
+            </tr>
+            <tr>
+              <td>Concurrent Mark</td>
+              <td>Running</td>
+              <td>Moderate (shared with app)</td>
+              <td>Minimal direct impact</td>
+            </tr>
+            <tr>
+              <td>STW Remark</td>
+              <td>Suspended</td>
+              <td>Brief CPU spike from GC</td>
+              <td>Typically &lt; 5ms</td>
+            </tr>
+            <tr>
+              <td>STW Evacuation</td>
+              <td>Suspended</td>
+              <td>Low user CPU</td>
+              <td>Main pause contributor</td>
+            </tr>
+            <tr>
+              <td>Full GC</td>
+              <td>Suspended</td>
+              <td>Single-threaded, low total CPU</td>
+              <td>Catastrophic (seconds)</td>
+            </tr>
+          </tbody>
+        </table>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 6: HEAP SIZING                                        -->
+    <!-- ============================================================ -->
+    <section id="heap-sizing">
+      <h2>Heap Sizing Strategies</h2>
+      <details>
+        <summary>Balancing heap size: too small vs too large</summary>
+
+        <h3>The Heap Sizing Dilemma</h3>
+        <pre class="diagram">
+Heap Size vs GC Behavior:
+
+Small Heap (2GB)              Medium Heap (8GB)             Large Heap (32GB)
+┌──────────────────┐          ┌──────────────────┐          ┌──────────────────┐
+│ Frequent GC      │          │ Balanced          │          │ Infrequent GC    │
+│ Short pauses     │          │ Moderate pauses   │          │ LONG pauses      │
+│ High throughput  │          │ Good throughput   │          │ when they occur   │
+│ loss (cumulative)│          │                   │          │                   │
+│                  │          │                   │          │ Full GC = 5-10s   │
+│ GC every 2-5s   │          │ GC every 30-60s   │          │ GC every 5-10min  │
+│ Pause: 10-30ms  │          │ Pause: 30-80ms    │          │ Pause: 200ms-2s+  │
+└──────────────────┘          └──────────────────┘          └──────────────────┘
+
+Throughput:  ██████░░ (75%)     ████████░ (92%)              ████████░ (95%*)
+P99 Latency: ████░░░░ (ok)     ██████░░ (good)              ██░░░░░░ (spiky!)
+
+* Throughput is high BETWEEN GC events, but P99 is terrible
+        </pre>
+
+        <h3>Sizing Rules of Thumb</h3>
+        <div class="callout callout-tip">
+          <p><strong>The 3-4x rule:</strong> Set heap size to 3-4x your live data set (long-lived objects). This gives enough headroom for allocation and avoids frequent old-gen collections.</p>
+        </div>
+
+        <pre><code class="language-bash"># Step 1: Determine live data set size
+# Run with verbose GC and check heap after Full GC
+-Xlog:gc*=info -XX:+UseG1GC
+
+# After Full GC, remaining heap usage = live data set
+# Example: Full GC shows 1.2GB remaining → live data = 1.2GB
+# Recommended heap: 1.2GB × 3.5 ≈ 4.2GB → set -Xmx4g
+
+# Step 2: Set initial = max to avoid resize pauses
+-Xms4g -Xmx4g
+
+# Step 3: For G1GC, consider region size
+# Region size = heap / 2048 (rounded to power of 2)
+# 4GB heap → 2MB regions
+# 8GB heap → 4MB regions
+# 32GB heap → 16MB regions (humongous threshold = 8MB!)
+-XX:G1HeapRegionSize=4m  # Override if needed</code></pre>
+
+        <h3>Container-Aware Sizing</h3>
+        <div class="callout callout-warning">
+          <p><strong>Container pitfall:</strong> In Kubernetes, the JVM sees cgroup memory limits. If you set <code>-Xmx</code> too close to the container limit, the OS kills the process (OOMKilled) because native memory (thread stacks, metaspace, direct buffers, JIT codecache) also needs space.</p>
+        </div>
+
+        <pre><code class="language-yaml"># Kubernetes deployment with proper JVM sizing
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: order-service
+          image: order-service:1.4.2
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"    # Container limit
+              cpu: "2000m"
+          env:
+            - name: JAVA_OPTS
+              value: >-
+                -Xms2560m
+                -Xmx2560m
+                -XX:MaxMetaspaceSize=256m
+                -XX:MaxDirectMemorySize=256m
+                -XX:ReservedCodeCacheSize=128m
+                -XX:+UseG1GC
+                -XX:+UseContainerSupport
+                -XX:MaxRAMPercentage=65.0</code></pre>
+
+        <pre class="diagram">
+Container Memory Budget (4GB limit):
+
+┌────────────────────────────────────────────────────────┐
+│                 Container: 4096MB                       │
+├──────────────────────────────┬─────────────────────────┤
+│        JVM Heap: 2560MB      │    Non-Heap: ~1536MB    │
+│        (-Xmx2560m)           │                         │
+│                              │  Metaspace:    256MB    │
+│                              │  Thread stacks: 300MB   │
+│                              │  (300 threads × 1MB)    │
+│                              │  Direct buffers: 256MB  │
+│                              │  Code cache:    128MB   │
+│                              │  GC overhead:   100MB   │
+│                              │  Native/JNI:    200MB   │
+│                              │  OS/buffer:     ~296MB  │
+└──────────────────────────────┴─────────────────────────┘
+                                        Total: ~4096MB ✓
+        </pre>
+
+        <pre><code class="language-bash"># WRONG: Heap too close to container limit
+-Xmx3800m  # In a 4GB container → OOMKilled!
+
+# RIGHT: Leave 30-40% for non-heap
+-Xmx2560m  # 62% of 4GB container → safe
+
+# Alternative: Use percentage-based sizing
+-XX:MaxRAMPercentage=65.0  # JVM calculates heap as 65% of available RAM
+-XX:InitialRAMPercentage=65.0
+
+# Verify what the JVM sees in container
+java -XX:+UseContainerSupport -XshowSettings:vm -version
+# Look for: Max. Heap Size (Estimated)</code></pre>
+
+        <h3>Young Gen Sizing for G1GC</h3>
+        <pre><code class="language-bash"># G1GC automatically sizes young gen (5-60% of heap)
+# Override only when you understand your allocation pattern
+
+# If allocation rate is very high (lots of short-lived objects):
+-XX:G1NewSizePercent=30      # Minimum young gen (default: 5%)
+-XX:G1MaxNewSizePercent=60   # Maximum young gen (default: 60%)
+
+# If you have many long-lived objects (caches, connection pools):
+-XX:G1NewSizePercent=20      # Smaller young gen, more room for old gen
+-XX:G1MaxNewSizePercent=40
+
+# WARNING: Fixed young gen size disables adaptive sizing
+# Only use if you've profiled extensively
+-XX:NewSize=1g -XX:MaxNewSize=1g  # ← Usually a mistake with G1GC</code></pre>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 7: ALLOCATION RATE                                    -->
+    <!-- ============================================================ -->
+    <section id="allocation-rate">
+      <h2>Object Allocation Rate and Churn</h2>
+      <details>
+        <summary>How high allocation rates drive frequent GC</summary>
+
+        <h3>Allocation Rate Fundamentals</h3>
+        <div class="callout callout-info">
+          <p><strong>Allocation rate</strong> = bytes allocated per second in young gen. <strong>Promotion rate</strong> = bytes promoted from young to old gen per second. High allocation rate → frequent minor GC. High promotion rate → old gen fills → mixed/full GC.</p>
+        </div>
+
+        <pre class="diagram">
+Allocation Rate Impact:
+
+Low allocation (200 MB/s):        High allocation (2 GB/s):
+┌─────────────────────────┐       ┌─────────────────────────┐
+│ Eden: 512MB             │       │ Eden: 512MB             │
+│ Fills in: ~2.5 seconds  │       │ Fills in: ~250ms        │
+│ Minor GC every 2.5s    │       │ Minor GC every 250ms!   │
+│ Pause: 8ms             │       │ Pause: 15ms             │
+│                         │       │                         │
+│ GC overhead: 0.3%      │       │ GC overhead: 6%         │
+│ P99 impact: minimal    │       │ P99 impact: noticeable  │
+└─────────────────────────┘       └─────────────────────────┘
+        </pre>
+
+        <h3>Common High-Allocation Patterns in Spring Boot</h3>
+        <pre><code class="language-java">// PROBLEM 1: String concatenation in loops
+public String buildReport(List&lt;OrderItem&gt; items) {
+    String result = "";  // Each += creates a new String object
+    for (OrderItem item : items) {
+        result += item.getName() + ": $" + item.getPrice() + "\n";
+        // 3 intermediate String objects per iteration
+        // 10K items = 30K short-lived String allocations
+    }
+    return result;
+}
+
+// FIX: Use StringBuilder (pre-sized)
+public String buildReportFixed(List&lt;OrderItem&gt; items) {
+    StringBuilder sb = new StringBuilder(items.size() * 64); // estimate
+    for (OrderItem item : items) {
+        sb.append(item.getName()).append(": $")
+          .append(item.getPrice()).append('\n');
+    }
+    return sb.toString();
+}
+
+// PROBLEM 2: Excessive autoboxing
+public Map&lt;Long, Double&gt; calculateTotals(List&lt;Order&gt; orders) {
+    Map&lt;Long, Double&gt; totals = new HashMap&lt;&gt;();
+    for (Order order : orders) {
+        // Long.valueOf() + Double.valueOf() on every put
+        // Plus iterator objects, Entry objects, etc.
+        totals.merge(order.getCustomerId(), order.getTotal(), Double::sum);
+    }
+    return totals;
+}
+
+// FIX: Use primitive-specialized collections (Eclipse Collections, Koloboke)
+public LongDoubleHashMap calculateTotalsFixed(List&lt;Order&gt; orders) {
+    LongDoubleHashMap totals = new LongDoubleHashMap(orders.size());
+    for (Order order : orders) {
+        totals.addToValue(order.getCustomerId(), order.getTotal());
+    }
+    return totals;
+}
+
+// PROBLEM 3: Stream API in hot paths
+public List&lt;String&gt; getActiveUserNames(List&lt;User&gt; users) {
+    return users.stream()                    // Stream object allocated
+        .filter(User::isActive)              // Predicate + pipeline stage
+        .map(User::getName)                  // Function + pipeline stage
+        .collect(Collectors.toList());       // ArrayList + intermediate arrays
+    // For 1M calls/second: massive allocation pressure
+}
+
+// FIX: Simple loop in hot path (benchmark first!)
+public List&lt;String&gt; getActiveUserNamesFixed(List&lt;User&gt; users) {
+    List&lt;String&gt; result = new ArrayList&lt;&gt;(users.size());
+    for (User user : users) {
+        if (user.isActive()) {
+            result.add(user.getName());
+        }
+    }
+    return result;
+}
+
+// PROBLEM 4: Logging allocations
+public void processOrder(Order order) {
+    // Even if DEBUG is disabled, String.format allocates!
+    log.debug(String.format("Processing order %s for customer %s amount %.2f",
+        order.getId(), order.getCustomerId(), order.getAmount()));
+}
+
+// FIX: Use parameterized logging
+public void processOrderFixed(Order order) {
+    // SLF4J checks level BEFORE constructing the message
+    log.debug("Processing order {} for customer {} amount {}",
+        order.getId(), order.getCustomerId(), order.getAmount());
+}</code></pre>
+
+        <h3>Measuring Allocation Rate</h3>
+        <pre><code class="language-bash"># From GC logs — calculate allocation between young GCs
+# Before GC: Eden used = allocation since last GC
+# Time between GCs = interval
+# Allocation rate = Eden used / interval
+
+# Example from GC log:
+# [0.523s] GC(0) Pause Young (Normal) 24M-&gt;4M(256M) 5.234ms
+# [0.891s] GC(1) Pause Young (Normal) 24M-&gt;4M(256M) 4.891ms
+# Eden = 24MB - 4MB = 20MB allocated between GCs
+# Interval = 0.891 - 0.523 = 0.368s
+# Allocation rate = 20MB / 0.368s ≈ 54 MB/s (low, healthy)
+
+# JMX monitoring via Micrometer
+# jvm.gc.memory.allocated (counter) — total bytes allocated
+# Rate = delta(allocated) / delta(time)</code></pre>
+
+        <pre><code class="language-java">// Micrometer metrics for allocation rate monitoring
+@Configuration
+public class GCMetricsConfig {
+
+    @Bean
+    public MeterBinder gcAllocationMetrics() {
+        return registry -> {
+            // Track allocation rate via GarbageCollectorMXBean
+            for (GarbageCollectorMXBean gc :
+                    ManagementFactory.getGarbageCollectorMXBeans()) {
+                if (gc instanceof NotificationEmitter) {
+                    ((NotificationEmitter) gc).addNotificationListener(
+                        (notification, handback) -> {
+                            GarbageCollectionNotificationInfo info =
+                                GarbageCollectionNotificationInfo.from(
+                                    (CompositeData) notification.getUserData());
+                            GcInfo gcInfo = info.getGcInfo();
+
+                            Timer.builder("jvm.gc.pause")
+                                .tag("action", info.getGcAction())
+                                .tag("cause", info.getGcCause())
+                                .register(registry)
+                                .record(gcInfo.getDuration(), TimeUnit.MILLISECONDS);
+                        }, null, null);
+                }
+            }
+        };
+    }
+}</code></pre>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 8: GC LOG ANALYSIS                                    -->
+    <!-- ============================================================ -->
+    <section id="gc-log-analysis">
+      <h2>GC Log Analysis</h2>
+      <details>
+        <summary>Reading GC logs, JFR, GCViewer, and GCEasy</summary>
+
+        <h3>Enabling GC Logging (JDK 11+)</h3>
+        <pre><code class="language-bash"># Unified logging (JDK 9+)
+# Production-recommended settings:
+-Xlog:gc*=info,gc+phases=debug,gc+age=trace,gc+humongous=debug:file=/var/log/gc/gc-%t.log:time,uptime,level,tags:filecount=10,filesize=100M
+
+# Breakdown:
+# gc*=info           → All GC events at info level
+# gc+phases=debug    → GC phase timings
+# gc+age=trace       → Object age distribution (promotion analysis)
+# gc+humongous=debug → Humongous allocation tracking
+# file=...           → Log to file with timestamp in name
+# time,uptime,level  → Decorators
+# filecount=10       → Rotate 10 files
+# filesize=100M      → 100MB per file
+
+# Safepoint logging (detect time-to-safepoint issues)
+-Xlog:safepoint=info:file=/var/log/gc/safepoint-%t.log:time,uptime:filecount=5,filesize=50M</code></pre>
+
+        <h3>Reading G1GC Logs</h3>
+        <pre><code class="language-bash"># Normal Young GC — healthy
+[2024-03-15T10:00:01.234+0000][info][gc] GC(1234) Pause Young (Normal) (G1 Evacuation Pause) 1843M->412M(4096M) 12.345ms
+#                                                                                             ^Eden+Surv ^After ^Heap  ^Pause
+# Interpretation: 1843MB used before, 412MB after, 4096MB heap, 12ms pause — GOOD
+
+# Mixed GC — watch the duration
+[2024-03-15T10:02:01.456+0000][info][gc] GC(1235) Pause Young (Mixed) (G1 Evacuation Pause) 3012M->1834M(4096M) 87.654ms
+# 87ms pause during mixed GC — getting concerning for latency-sensitive APIs
+
+# Full GC — RED ALERT
+[2024-03-15T10:05:01.789+0000][info][gc] GC(1236) Pause Full (G1 Evacuation Failure) 3891M->1523M(4096M) 2341.567ms
+# 2.3 SECONDS! All API requests frozen for 2.3 seconds!
+# Cause: Evacuation Failure = no free regions to copy objects to
+
+# GC Phase Details (debug level)
+[2024-03-15T10:00:01.234+0000][debug][gc,phases] GC(1234) Pre Evacuate Collection Set: 0.2ms
+[2024-03-15T10:00:01.234+0000][debug][gc,phases] GC(1234) Merge Heap Roots: 0.4ms
+[2024-03-15T10:00:01.234+0000][debug][gc,phases] GC(1234) Evacuate Collection Set: 10.1ms  ← Main work
+[2024-03-15T10:00:01.234+0000][debug][gc,phases] GC(1234) Post Evacuate Collection Set: 1.2ms
+[2024-03-15T10:00:01.234+0000][debug][gc,phases] GC(1234) Other: 0.4ms</code></pre>
+
+        <h3>Key Metrics to Extract</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Healthy Range</th>
+              <th>Alarm Threshold</th>
+              <th>What It Means</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Young GC pause</td>
+              <td>5-20ms</td>
+              <td>&gt; 50ms</td>
+              <td>Too many objects surviving → increase Eden or reduce allocation</td>
+            </tr>
+            <tr>
+              <td>Mixed GC pause</td>
+              <td>30-80ms</td>
+              <td>&gt; 150ms</td>
+              <td>Old gen has too many live objects or regions to evacuate</td>
+            </tr>
+            <tr>
+              <td>Full GC frequency</td>
+              <td>Never</td>
+              <td>Any occurrence</td>
+              <td>Heap exhaustion, evacuation failure, or metaspace limit</td>
+            </tr>
+            <tr>
+              <td>Allocation rate</td>
+              <td>&lt; 500 MB/s</td>
+              <td>&gt; 2 GB/s</td>
+              <td>High churn — optimize hot allocation paths</td>
+            </tr>
+            <tr>
+              <td>Promotion rate</td>
+              <td>&lt; 50 MB/s</td>
+              <td>&gt; 200 MB/s</td>
+              <td>Objects living too long → check tenuring threshold</td>
+            </tr>
+            <tr>
+              <td>Heap after GC</td>
+              <td>&lt; 60% of max</td>
+              <td>&gt; 80% of max</td>
+              <td>Live data growing — possible memory leak</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Java Flight Recorder (JFR)</h3>
+        <pre><code class="language-bash"># Start JFR recording in production (low overhead: ~1-2%)
+-XX:StartFlightRecording=duration=60s,filename=/tmp/recording.jfr,settings=profile
+
+# Continuous recording (circular buffer)
+-XX:StartFlightRecording=disk=true,dumponexit=true,filename=/tmp/app.jfr,maxage=1h,maxsize=500m,settings=default
+
+# Trigger recording via jcmd (no restart needed!)
+jcmd &lt;pid&gt; JFR.start name=latency_debug duration=120s filename=/tmp/debug.jfr settings=profile
+
+# Dump ongoing recording
+jcmd &lt;pid&gt; JFR.dump name=latency_debug filename=/tmp/dump.jfr</code></pre>
+
+        <pre><code class="language-java">// Programmatic JFR event for correlating GC with latency
+import jdk.jfr.*;
+
+@Name("app.RequestLatency")
+@Label("Request Latency")
+@Category({"Application", "HTTP"})
+@StackTrace(false)
+public class RequestLatencyEvent extends Event {
+    @Label("Endpoint")
+    public String endpoint;
+
+    @Label("Duration (ms)")
+    public long durationMs;
+
+    @Label("Status Code")
+    public int statusCode;
+
+    @Label("GC Count During Request")
+    public long gcCountDelta;
+}
+
+// Usage in a filter/interceptor
+@Component
+public class LatencyTrackingFilter extends OncePerRequestFilter {
+    private final GarbageCollectorMXBean youngGC;
+
+    public LatencyTrackingFilter() {
+        this.youngGC = ManagementFactory.getGarbageCollectorMXBeans().stream()
+            .filter(gc -> gc.getName().contains("Young"))
+            .findFirst().orElseThrow();
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req,
+            HttpServletResponse resp, FilterChain chain) throws Exception {
+        long gcCountBefore = youngGC.getCollectionCount();
+        long start = System.nanoTime();
+
+        chain.doFilter(req, resp);
+
+        RequestLatencyEvent event = new RequestLatencyEvent();
+        event.endpoint = req.getRequestURI();
+        event.durationMs = (System.nanoTime() - start) / 1_000_000;
+        event.statusCode = resp.getStatus();
+        event.gcCountDelta = youngGC.getCollectionCount() - gcCountBefore;
+        event.commit();
+    }
+}</code></pre>
+
+        <h3>Tools for GC Log Analysis</h3>
+        <div class="callout callout-tip">
+          <p><strong>Recommended workflow:</strong></p>
+          <ol>
+            <li><strong>GCEasy.io</strong> — Upload GC logs for automated analysis. Identifies problems, shows allocation rate, pause distribution.</li>
+            <li><strong>GCViewer</strong> — Desktop tool for detailed timeline visualization. Shows pause patterns over time.</li>
+            <li><strong>JFR + JDK Mission Control</strong> — Correlate GC events with thread activity, allocations, and lock contention.</li>
+            <li><strong>Grafana + Micrometer</strong> — Real-time dashboards for <code>jvm.gc.pause</code>, <code>jvm.memory.used</code>, allocation rate.</li>
+          </ol>
+        </div>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 9: PRODUCTION INCIDENT                                -->
+    <!-- ============================================================ -->
+    <section id="production-incident">
+      <h2>Production Incident</h2>
+      <details>
+        <summary>Real incident: P99 latency spikes every 2 minutes from Full GC</summary>
+
+        <h3>Incident Summary</h3>
+        <div class="callout callout-danger">
+          <p><strong>Severity: P1</strong> — Payment processing service experiencing 2-3 second latency spikes every ~2 minutes. Downstream timeout errors causing failed transactions. No CPU or memory alarms firing.</p>
+        </div>
+
+        <pre class="diagram">
+Incident Timeline:
+
+14:00  Deploy v2.8.0 (added product recommendation cache)
+14:15  First PagerDuty alert: P99 latency > 2s on /api/checkout
+14:18  On-call checks: CPU 35%, Memory 78%, no errors in app logs
+14:22  Dashboard shows periodic 2s latency spikes every ~120 seconds
+14:25  Thread dump during spike: ALL threads at safepoint
+14:28  GC logs reveal: Full GC every 2 minutes, duration 2.1-2.4 seconds
+14:32  Root cause identified: recommendation cache promoting 1.5GB to old gen
+14:35  Mitigation: Disable recommendation cache via feature flag
+14:36  Latency normalizes immediately
+14:40  Incident mitigated
+
+Post-incident: Moved cache to Redis, tuned GC, added GC pause alerting
+        </pre>
+
+        <h3>The Setup: What Changed</h3>
+        <pre><code class="language-java">// v2.8.0 introduced this "optimization" — a local cache for recommendations
+@Service
+public class RecommendationCache {
+
+    // 200K products × ~8KB each = ~1.5GB in-memory cache
+    private final Cache&lt;String, List&lt;ProductRecommendation&gt;&gt; cache =
+        Caffeine.newBuilder()
+            .maximumSize(200_000)
+            .expireAfterWrite(Duration.ofMinutes(2))  // ← KEY: 2 minute expiry!
+            .build();
+
+    @Scheduled(fixedRate = 120_000)  // Refresh every 2 minutes
+    public void refreshCache() {
+        // Fetches all recommendations from ML service
+        Map&lt;String, List&lt;ProductRecommendation&gt;&gt; fresh = mlClient.getAllRecommendations();
+
+        // Problem: This invalidates ALL 200K entries simultaneously
+        // Old entries (1.5GB) become garbage in OLD gen
+        // New entries (1.5GB) allocated → promoted to old gen
+        // Total: 3GB of GC work needed, old gen fills → Full GC
+        cache.invalidateAll();
+        fresh.forEach(cache::put);
+    }
+}</code></pre>
+
+        <h3>Why It Caused Full GC</h3>
+        <pre class="diagram">
+Memory State Over Time:
+
+Time 0:00 - Cache loaded (1.5GB in old gen, stable)
+┌──────────────────────────────────────────────────────────────────┐
+│ Heap: 6GB max                                                     │
+│ Young: [Eden 512MB | S0 64MB | S1 64MB]                          │
+│ Old:   [Cache 1.5GB | App objects 1.2GB | Free 2.7GB]            │
+│ Status: Healthy, minor GC every 3 seconds, 10ms pause            │
+└──────────────────────────────────────────────────────────────────┘
+
+Time 2:00 - Cache refresh triggered
+┌──────────────────────────────────────────────────────────────────┐
+│ Old:   [Dead cache 1.5GB | New cache 1.5GB | App 1.2GB | Free 0.3GB]│
+│ Status: Old gen at 95%! Initiating concurrent marking...          │
+│         But allocation outpaces collection → EVACUATION FAILURE   │
+│         Fallback: Full GC (single-threaded compaction)            │
+│                                                                    │
+│ FULL GC: 2.3 seconds STW                                         │
+│ All 200 active API threads FROZEN                                 │
+│ 200 in-flight requests timeout at downstream services             │
+│ Circuit breakers trip, retry storms begin                         │
+└──────────────────────────────────────────────────────────────────┘
+
+Time 2:02.3 - After Full GC
+┌──────────────────────────────────────────────────────────────────┐
+│ Old:   [New cache 1.5GB | App 1.2GB | Free 3.3GB]               │
+│ Status: Healthy again... for another 2 minutes                   │
+└──────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Investigation Process</h3>
+        <pre><code class="language-bash"># Step 1: Check GC logs (should always be enabled in production!)
+grep "Pause Full" /var/log/gc/gc-2024-03-15.log
+
+# Output:
+# [2024-03-15T14:15:01] GC(891) Pause Full (G1 Evacuation Failure) 5734M->2712M(6144M) 2341.234ms
+# [2024-03-15T14:17:03] GC(934) Pause Full (G1 Evacuation Failure) 5689M->2698M(6144M) 2287.891ms
+# [2024-03-15T14:19:02] GC(978) Pause Full (G1 Evacuation Failure) 5712M->2701M(6144M) 2312.456ms
+
+# Step 2: Check what's in old gen — heap dump
+jcmd &lt;pid&gt; GC.heap_dump /tmp/heapdump.hprof
+
+# Step 3: Analyze with Eclipse MAT (Memory Analyzer Tool)
+# Leak Suspects Report shows:
+# - ConcurrentHashMap$Node[] holding 1.5GB
+# - Retained by RecommendationCache.cache field
+# - 200,431 entries of List&lt;ProductRecommendation&gt;
+
+# Step 4: Correlate with deployment
+git log --oneline --since="2024-03-15T13:00" --until="2024-03-15T15:00"
+# abc1234 feat: add local recommendation cache for faster lookups</code></pre>
+
+        <h3>The Fix</h3>
+        <pre><code class="language-java">// Fix 1: Move to external cache (Redis) — eliminates GC pressure
+@Service
+public class RecommendationCacheFixed {
+
+    private final RedisTemplate&lt;String, List&lt;ProductRecommendation&gt;&gt; redis;
+
+    public List&lt;ProductRecommendation&gt; getRecommendations(String productId) {
+        return redis.opsForValue().get("recs:" + productId);
+    }
+
+    // Refresh incrementally, not all-at-once
+    @Scheduled(fixedRate = 10_000)  // Every 10 seconds, refresh a batch
+    public void refreshBatch() {
+        List&lt;String&gt; batch = getNextBatchToRefresh(1000); // 1K at a time
+        Map&lt;String, List&lt;ProductRecommendation&gt;&gt; fresh = mlClient.getRecommendations(batch);
+        fresh.forEach((k, v) -> redis.opsForValue().set("recs:" + k, v, Duration.ofMinutes(5)));
+    }
+}
+
+// Fix 2: If local cache is needed, use off-heap (Chronicle Map)
+@Service
+public class RecommendationCacheOffHeap {
+
+    private final ChronicleMap&lt;String, byte[]&gt; cache;
+
+    public RecommendationCacheOffHeap() {
+        this.cache = ChronicleMap.of(String.class, byte[].class)
+            .name("recommendations")
+            .entries(200_000)
+            .averageKeySize(32)
+            .averageValueSize(8192)
+            .createPersistedTo(new File("/dev/shm/recs-cache")); // Off-heap!
+    }
+
+    // Objects stored off-heap — NOT visible to GC
+    // Serialization cost but zero GC pressure
+}
+
+// Fix 3: If using Caffeine, stagger expiration
+@Service
+public class RecommendationCacheStaggered {
+
+    private final Cache&lt;String, List&lt;ProductRecommendation&gt;&gt; cache =
+        Caffeine.newBuilder()
+            .maximumSize(200_000)
+            // Use expireAfterWrite with JITTER to prevent thundering herd
+            .expireAfter(new Expiry&lt;String, List&lt;ProductRecommendation&gt;&gt;() {
+                @Override
+                public long expireAfterCreate(String key, List&lt;ProductRecommendation&gt; value, long currentTime) {
+                    // Random expiry between 90-150 seconds — staggers eviction
+                    return Duration.ofSeconds(90 + ThreadLocalRandom.current().nextInt(60)).toNanos();
+                }
+                @Override
+                public long expireAfterUpdate(String key, List&lt;ProductRecommendation&gt; value,
+                        long currentTime, long currentDuration) {
+                    return Duration.ofSeconds(90 + ThreadLocalRandom.current().nextInt(60)).toNanos();
+                }
+                @Override
+                public long expireAfterRead(String key, List&lt;ProductRecommendation&gt; value,
+                        long currentTime, long currentDuration) {
+                    return currentDuration; // Don't reset on read
+                }
+            })
+            .build();
+}</code></pre>
+
+        <h3>Post-Incident Actions</h3>
+        <div class="callout callout-info">
+          <p><strong>Prevention measures implemented:</strong></p>
+          <ol>
+            <li>Added Grafana alert: <code>jvm_gc_pause_seconds{action="end of major GC"} > 0.5</code></li>
+            <li>Added deployment gate: heap dump analysis for objects &gt; 100MB</li>
+            <li>Architecture review: any local cache &gt; 256MB requires off-heap or external cache</li>
+            <li>Added <code>-XX:G1ReservePercent=15</code> to prevent evacuation failures</li>
+            <li>Runbook created: "GC-induced latency" with step-by-step diagnosis</li>
+          </ol>
+        </div>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 10: TUNING                                            -->
+    <!-- ============================================================ -->
+    <section id="tuning">
+      <h2>JVM Flags for Production</h2>
+      <details>
+        <summary>G1GC tuning, ZGC setup, and container-aware settings</summary>
+
+        <h3>G1GC Production Configuration</h3>
+        <pre><code class="language-bash"># ═══════════════════════════════════════════════════════════════
+# G1GC Production Template — Spring Boot Microservice (8GB heap)
+# ═══════════════════════════════════════════════════════════════
+
+# Memory sizing
+-Xms8g -Xmx8g                        # Fixed heap (no resize pauses)
+-XX:MaxMetaspaceSize=512m             # Cap metaspace growth
+-XX:MaxDirectMemorySize=512m          # Cap off-heap NIO buffers
+-XX:ReservedCodeCacheSize=256m        # JIT compiled code cache
+
+# Collector selection
+-XX:+UseG1GC                          # G1 (default JDK 9+)
+-XX:MaxGCPauseMillis=100              # Target max pause (default: 200ms)
+-XX:G1HeapRegionSize=4m               # 8GB/2048 = 4MB regions
+
+# G1 tuning for latency
+-XX:G1NewSizePercent=25               # Min young gen (default: 5%)
+-XX:G1MaxNewSizePercent=50            # Max young gen (default: 60%)
+-XX:InitiatingHeapOccupancyPercent=35 # Start concurrent mark earlier (default: 45%)
+-XX:G1ReservePercent=15               # Reserve 15% to prevent evacuation failure
+-XX:G1MixedGCCountTarget=8           # Spread mixed GC over 8 cycles
+
+# Concurrent marking
+-XX:ConcGCThreads=4                   # Concurrent GC threads (default: ~1/4 of ParallelGCThreads)
+-XX:ParallelGCThreads=8               # STW GC threads (default: CPU cores for &lt;= 8)
+
+# String deduplication (saves heap for String-heavy apps)
+-XX:+UseStringDeduplication            # G1 only — dedup identical Strings
+
+# GC logging (ALWAYS enable in production)
+-Xlog:gc*=info,gc+phases=debug,gc+age=trace:file=/var/log/gc/gc-%t.log:time,uptime,level,tags:filecount=10,filesize=100M
+
+# Safepoint logging
+-Xlog:safepoint=info:file=/var/log/gc/safepoint-%t.log:time,uptime:filecount=5,filesize=50M
+
+# JFR (continuous, low-overhead recording)
+-XX:StartFlightRecording=disk=true,dumponexit=true,filename=/var/log/jfr/app.jfr,maxage=6h,maxsize=1g,settings=default</code></pre>
+
+        <h3>ZGC Production Configuration</h3>
+        <pre><code class="language-bash"># ═══════════════════════════════════════════════════════════════
+# ZGC Production Template — Low-latency service (16GB heap)
+# JDK 21+ with Generational ZGC
+# ═══════════════════════════════════════════════════════════════
+
+# Memory sizing
+-Xms16g -Xmx16g                      # Fixed heap
+-XX:MaxMetaspaceSize=512m
+-XX:MaxDirectMemorySize=1g
+
+# Collector selection — Generational ZGC (JDK 21+)
+-XX:+UseZGC
+-XX:+ZGenerational                     # Generational mode (much better throughput)
+
+# ZGC tuning (minimal tuning needed!)
+-XX:SoftMaxHeapSize=12g               # ZGC tries to keep heap below this
+                                       # Useful for returning memory to container
+
+# ZGC does NOT use these (they're G1-specific):
+# -XX:MaxGCPauseMillis (ZGC always sub-ms)
+# -XX:G1HeapRegionSize
+# -XX:InitiatingHeapOccupancyPercent
+
+# Concurrent threads
+-XX:ConcGCThreads=4                   # ZGC concurrent threads
+                                       # Default: ~1/8 of CPUs, rarely needs tuning
+
+# GC logging
+-Xlog:gc*=info:file=/var/log/gc/gc-%t.log:time,uptime,level,tags:filecount=10,filesize=100M
+
+# Verify ZGC is working
+# In logs you should see:
+# [info][gc] GC(0) Garbage Collection (Warmup) 210M(3%)->58M(1%)
+# [info][gc] GC(0) Pause Mark Start 0.023ms      ← sub-millisecond!
+# [info][gc] GC(0) Pause Mark End 0.018ms
+# [info][gc] GC(0) Pause Relocate Start 0.012ms</code></pre>
+
+        <h3>Container-Aware Settings (Kubernetes)</h3>
+        <pre><code class="language-bash"># ═══════════════════════════════════════════════════════════════
+# Container-Aware JVM Settings
+# ═══════════════════════════════════════════════════════════════
+
+# Container support (default on JDK 11+, but be explicit)
+-XX:+UseContainerSupport
+
+# Percentage-based sizing (adapts to container limits)
+-XX:MaxRAMPercentage=65.0             # Heap = 65% of container memory
+-XX:InitialRAMPercentage=65.0         # Start at same size (no growth)
+-XX:MinRAMPercentage=65.0             # For small containers (&lt; 256MB)
+
+# CPU awareness
+-XX:ActiveProcessorCount=2            # Override if container CPU != physical
+                                       # Critical for GC thread count calculation!
+
+# Thread stack size (reduce for high-thread-count apps)
+-Xss512k                              # Default is 1MB — often wasteful
+                                       # 512k saves 50% stack memory
+
+# Large pages (if supported by container runtime)
+-XX:+UseLargePages                    # Requires hugepages configured in host
+-XX:LargePageSizeInBytes=2m           # 2MB hugepages (default on Linux)</code></pre>
+
+        <h3>Dockerfile Best Practices</h3>
+        <pre><code class="language-bash"># Multi-stage build with JVM tuning
+FROM eclipse-temurin:21-jre-alpine AS runtime
+
+# Create non-root user
+RUN addgroup -S app && adduser -S app -G app
+
+# Copy application
+COPY --from=builder /app/target/app.jar /app/app.jar
+
+# JVM configuration via environment variable
+ENV JAVA_OPTS="-XX:+UseG1GC \
+  -XX:MaxRAMPercentage=65.0 \
+  -XX:InitialRAMPercentage=65.0 \
+  -XX:+UseContainerSupport \
+  -XX:MaxMetaspaceSize=256m \
+  -XX:+UseStringDeduplication \
+  -Xlog:gc*=info:file=/var/log/gc/gc.log:time,uptime:filecount=5,filesize=50M \
+  -XX:StartFlightRecording=disk=true,dumponexit=true,filename=/var/log/jfr/app.jfr,maxage=1h,maxsize=200m"
+
+USER app
+EXPOSE 8080
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]</code></pre>
+
+        <h3>Flags That Look Helpful But Hurt</h3>
+        <div class="callout callout-warning">
+          <p><strong>Anti-patterns in JVM tuning:</strong></p>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Flag</th>
+              <th>Why It Seems Good</th>
+              <th>Why It Hurts</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>-XX:+UseCompressedOops</code></td>
+              <td>Save memory with 32-bit references</td>
+              <td>Only works with heap ≤ 32GB. Auto-enabled — don't set manually.</td>
+            </tr>
+            <tr>
+              <td><code>-XX:NewRatio=2</code></td>
+              <td>Control young/old ratio</td>
+              <td>Disables G1's adaptive sizing. Let G1 manage it.</td>
+            </tr>
+            <tr>
+              <td><code>-XX:+DisableExplicitGC</code></td>
+              <td>Prevent System.gc() calls</td>
+              <td>Breaks NIO direct buffer reclamation. Use <code>-XX:+ExplicitGCInvokesConcurrent</code> instead.</td>
+            </tr>
+            <tr>
+              <td><code>-XX:MaxGCPauseMillis=10</code></td>
+              <td>Ultra-low pause target</td>
+              <td>G1 cannot achieve this — it just makes young gen tiny, increasing frequency.</td>
+            </tr>
+            <tr>
+              <td><code>-Xmn4g</code> (fixed young gen)</td>
+              <td>Predictable sizing</td>
+              <td>Disables G1 adaptive sizing. G1 needs flexibility to meet pause targets.</td>
+            </tr>
+            <tr>
+              <td><code>-XX:SurvivorRatio=8</code></td>
+              <td>Control survivor sizing</td>
+              <td>G1 doesn't use traditional survivor spaces the same way. Irrelevant.</td>
+            </tr>
+          </tbody>
+        </table>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 11: CODE EXAMPLES                                     -->
+    <!-- ============================================================ -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Object pooling, off-heap caching, reducing allocation rate, JFR monitoring</summary>
+
+        <h3>Object Pooling for Expensive Objects</h3>
+        <pre><code class="language-java">import org.apache.commons.pool2.BasePooledObjectFactory;
+import org.apache.commons.pool2.PooledObject;
+import org.apache.commons.pool2.impl.DefaultPooledObject;
+import org.apache.commons.pool2.impl.GenericObjectPool;
+import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
+
+/**
+ * Object pool for expensive-to-create objects that would otherwise
+ * be allocated and discarded rapidly, causing GC churn.
+ *
+ * Use case: PDF generators, XML parsers, encryption contexts, large buffers.
+ */
+public class PdfGeneratorPool {
+
+    private final GenericObjectPool&lt;PdfGenerator&gt; pool;
+
+    public PdfGeneratorPool(int maxPoolSize) {
+        GenericObjectPoolConfig&lt;PdfGenerator&gt; config = new GenericObjectPoolConfig&lt;&gt;();
+        config.setMaxTotal(maxPoolSize);          // Max objects in pool
+        config.setMaxIdle(maxPoolSize / 2);       // Max idle objects
+        config.setMinIdle(2);                     // Pre-warm 2 instances
+        config.setBlockWhenExhausted(true);       // Wait rather than fail
+        config.setMaxWaitDuration(Duration.ofSeconds(5));
+        config.setTestOnBorrow(true);             // Validate before use
+
+        this.pool = new GenericObjectPool&lt;&gt;(new PdfGeneratorFactory(), config);
+    }
+
+    public byte[] generatePdf(ReportData data) throws Exception {
+        PdfGenerator generator = pool.borrowObject();
+        try {
+            return generator.generate(data);  // Reuse heavy object
+        } finally {
+            pool.returnObject(generator);     // Return to pool, not GC'd
+        }
+    }
+
+    private static class PdfGeneratorFactory extends BasePooledObjectFactory&lt;PdfGenerator&gt; {
+        @Override
+        public PdfGenerator create() {
+            // Expensive: loads fonts, initializes rendering engine
+            return new PdfGenerator(); // ~50MB of state
+        }
+
+        @Override
+        public PooledObject&lt;PdfGenerator&gt; wrap(PdfGenerator obj) {
+            return new DefaultPooledObject&lt;&gt;(obj);
+        }
+
+        @Override
+        public void passivateObject(PooledObject&lt;PdfGenerator&gt; p) {
+            p.getObject().reset(); // Clear state for reuse
+        }
+
+        @Override
+        public boolean validateObject(PooledObject&lt;PdfGenerator&gt; p) {
+            return p.getObject().isHealthy();
+        }
+    }
+}</code></pre>
+
+        <h3>Off-Heap Caching with Chronicle Map</h3>
+        <pre><code class="language-java">import net.openhft.chronicle.map.ChronicleMap;
+
+/**
+ * Off-heap cache — stores data outside JVM heap.
+ * GC never sees these objects. Zero GC pressure for large caches.
+ *
+ * Trade-off: Requires serialization/deserialization on each access.
+ * Best for: Large caches (> 256MB) with objects that serialize efficiently.
+ */
+@Configuration
+public class OffHeapCacheConfig {
+
+    @Bean(destroyMethod = "close")
+    public ChronicleMap&lt;String, byte[]&gt; productCache() throws IOException {
+        return ChronicleMap.of(String.class, byte[].class)
+            .name("product-cache")
+            .entries(500_000)                    // Expected entry count
+            .averageKeySize(36)                  // UUID length
+            .averageValueSize(4096)              // ~4KB per product
+            .maxBloatFactor(2.0)                 // Allow 2x growth
+            .createPersistedTo(                  // Memory-mapped file
+                new File("/dev/shm/product-cache.dat")  // tmpfs = fast
+            );
+    }
+}
+
+@Service
+public class ProductCacheService {
+
+    private final ChronicleMap&lt;String, byte[]&gt; cache;
+    private final ObjectMapper objectMapper;
+
+    public ProductCacheService(ChronicleMap&lt;String, byte[]&gt; cache,
+                               ObjectMapper objectMapper) {
+        this.cache = cache;
+        this.objectMapper = objectMapper;
+    }
+
+    public Optional&lt;Product&gt; get(String productId) {
+        byte[] data = cache.get(productId);  // Off-heap read
+        if (data == null) return Optional.empty();
+        try {
+            return Optional.of(objectMapper.readValue(data, Product.class));
+        } catch (IOException e) {
+            return Optional.empty();
+        }
+    }
+
+    public void put(String productId, Product product) {
+        try {
+            byte[] data = objectMapper.writeValueAsBytes(product);
+            cache.put(productId, data);  // Off-heap write — no GC impact
+        } catch (JsonProcessingException e) {
+            log.warn("Failed to cache product {}", productId, e);
+        }
+    }
+}</code></pre>
+
+        <h3>Reducing Allocation Rate — Before and After</h3>
+        <pre><code class="language-java">/**
+ * Example: High-throughput event processing pipeline.
+ * Before: 2.4 GB/s allocation rate → Minor GC every 200ms
+ * After:  180 MB/s allocation rate → Minor GC every 2.8s
+ */
+
+// ═══════════════════════════════════════════════════════════════
+// BEFORE: Allocation-heavy (2.4 GB/s)
+// ═══════════════════════════════════════════════════════════════
+public class EventProcessorBefore {
+
+    public ProcessingResult processEvent(RawEvent event) {
+        // Allocation 1: Parse JSON into new object tree
+        Map&lt;String, Object&gt; parsed = objectMapper.readValue(event.getPayload(), Map.class);
+
+        // Allocation 2: Create intermediate DTOs
+        EventContext context = new EventContext(
+            parsed.get("userId").toString(),      // new String
+            parsed.get("action").toString(),      // new String
+            Instant.parse(parsed.get("ts").toString()),  // new Instant, new String
+            Map.copyOf(parsed)                    // defensive copy = new HashMap + entries
+        );
+
+        // Allocation 3: Validation creates error list even when valid
+        List&lt;ValidationError&gt; errors = validator.validate(context); // always new ArrayList
+
+        // Allocation 4: Enrichment creates new object
+        EnrichedEvent enriched = enricher.enrich(context);  // new object + new fields
+
+        // Allocation 5: Serialization
+        byte[] output = objectMapper.writeValueAsBytes(enriched); // new byte[]
+
+        return new ProcessingResult(output, errors.isEmpty());  // new result object
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AFTER: Allocation-aware (180 MB/s)
+// ═══════════════════════════════════════════════════════════════
+public class EventProcessorAfter {
+
+    // Reusable thread-local buffers
+    private static final ThreadLocal&lt;ByteArrayOutputStream&gt; BUFFER =
+        ThreadLocal.withInitial(() -> new ByteArrayOutputStream(8192));
+
+    // Pre-allocated result objects (flyweight pattern)
+    private static final ProcessingResult SUCCESS = new ProcessingResult(true);
+    private static final ProcessingResult FAILURE = new ProcessingResult(false);
+
+    // Object reuse via Jackson's reusable token buffer
+    private final ObjectReader eventReader = objectMapper.readerFor(EventContext.class);
+
+    public ProcessingResult processEvent(RawEvent event, ByteBuffer outputBuffer) {
+        // Reuse: Parse directly into pooled object
+        EventContext context = contextPool.borrow();
+        try {
+            // Allocation-free: read into existing object
+            eventReader.readValue(event.getPayload(), context);
+
+            // Allocation-free: validate without creating error list
+            if (!validator.isValid(context)) {
+                return FAILURE;  // No allocation for common path
+            }
+
+            // Allocation-free: enrich in-place
+            enricher.enrichInPlace(context);
+
+            // Reuse: Write to pre-allocated buffer
+            ByteArrayOutputStream buffer = BUFFER.get();
+            buffer.reset();  // Reuse without reallocating
+            objectMapper.writeValue(buffer, context);
+
+            // Copy to caller's buffer (zero-copy if possible)
+            outputBuffer.put(buffer.toByteArray(), 0, buffer.size());
+
+            return SUCCESS;
+        } finally {
+            context.reset();           // Clear for reuse
+            contextPool.release(context);  // Return to pool
+        }
+    }
+}</code></pre>
+
+        <h3>JFR Event Monitoring for GC Correlation</h3>
+        <pre><code class="language-java">import jdk.jfr.*;
+import jdk.jfr.consumer.*;
+
+/**
+ * Real-time GC event monitoring using JFR streaming API (JDK 14+).
+ * Correlates GC pauses with application latency in real-time.
+ */
+@Component
+public class GCLatencyMonitor implements SmartLifecycle {
+
+    private static final Logger log = LoggerFactory.getLogger(GCLatencyMonitor.class);
+    private final MeterRegistry meterRegistry;
+    private RecordingStream stream;
+
+    public GCLatencyMonitor(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+    }
+
+    @Override
+    public void start() {
+        stream = new RecordingStream();
+
+        // Monitor GC pauses
+        stream.enable("jdk.GCPhasePause").withThreshold(Duration.ofMillis(1));
+        stream.enable("jdk.GarbageCollection");
+        stream.enable("jdk.G1GarbageCollection");
+        stream.enable("jdk.OldGarbageCollection");
+
+        // Monitor allocation pressure
+        stream.enable("jdk.ObjectAllocationOutsideTLAB");
+        stream.enable("jdk.ObjectAllocationInNewTLAB");
+
+        // Monitor safepoint time
+        stream.enable("jdk.SafepointBegin");
+
+        // GC pause handler
+        stream.onEvent("jdk.GarbageCollection", event -> {
+            Duration pause = event.getDuration();
+            String cause = event.getString("cause");
+            String name = event.getString("name");
+
+            // Record metrics
+            Timer.builder("jvm.gc.detailed.pause")
+                .tag("cause", cause)
+                .tag("collector", name)
+                .register(meterRegistry)
+                .record(pause);
+
+            // Alert on long pauses
+            if (pause.toMillis() > 100) {
+                log.warn("Long GC pause: {}ms, cause={}, collector={}",
+                    pause.toMillis(), cause, name);
+            }
+
+            if (pause.toMillis() > 500) {
+                log.error("CRITICAL GC pause: {}ms! cause={}, collector={}. " +
+                    "Likely impacting API latency!", pause.toMillis(), cause, name);
+                // Trigger PagerDuty/alerting
+                meterRegistry.counter("jvm.gc.critical.pause",
+                    "cause", cause).increment();
+            }
+        });
+
+        // Safepoint monitoring (time-to-safepoint)
+        stream.onEvent("jdk.SafepointBegin", event -> {
+            Duration ttsp = event.getDuration();
+            if (ttsp.toMillis() > 50) {
+                log.warn("Slow time-to-safepoint: {}ms. " +
+                    "Check for counted loops or large array copies.", ttsp.toMillis());
+            }
+        });
+
+        stream.startAsync();
+    }
+
+    @Override
+    public void stop() {
+        if (stream != null) {
+            stream.close();
+        }
+    }
+
+    @Override
+    public boolean isRunning() {
+        return stream != null && !stream.isClosed();
+    }
+}</code></pre>
+
+        <h3>Spring Boot Actuator GC Endpoint</h3>
+        <pre><code class="language-java">/**
+ * Custom actuator endpoint exposing GC health status.
+ * Useful for load balancer health checks that consider GC pressure.
+ */
+@Component
+@Endpoint(id = "gchealth")
+public class GCHealthEndpoint {
+
+    private final List&lt;GarbageCollectorMXBean&gt; gcBeans;
+    private final MemoryMXBean memoryBean;
+    private volatile long lastFullGcTime = 0;
+    private volatile long lastFullGcDuration = 0;
+
+    public GCHealthEndpoint() {
+        this.gcBeans = ManagementFactory.getGarbageCollectorMXBeans();
+        this.memoryBean = ManagementFactory.getMemoryMXBean();
+    }
+
+    @ReadOperation
+    public Map&lt;String, Object&gt; gcHealth() {
+        Map&lt;String, Object&gt; health = new LinkedHashMap&lt;&gt;();
+
+        // Heap utilization
+        MemoryUsage heapUsage = memoryBean.getHeapMemoryUsage();
+        double heapUtilization = (double) heapUsage.getUsed() / heapUsage.getMax();
+        health.put("heapUtilization", String.format("%.1f%%", heapUtilization * 100));
+        health.put("heapUsedMB", heapUsage.getUsed() / (1024 * 1024));
+        health.put("heapMaxMB", heapUsage.getMax() / (1024 * 1024));
+
+        // GC stats per collector
+        List&lt;Map&lt;String, Object&gt;&gt; collectors = new ArrayList&lt;&gt;();
+        for (GarbageCollectorMXBean gc : gcBeans) {
+            Map&lt;String, Object&gt; collector = new LinkedHashMap&lt;&gt;();
+            collector.put("name", gc.getName());
+            collector.put("collectionCount", gc.getCollectionCount());
+            collector.put("collectionTimeMs", gc.getCollectionTime());
+            if (gc.getCollectionCount() > 0) {
+                collector.put("avgPauseMs",
+                    gc.getCollectionTime() / gc.getCollectionCount());
+            }
+            collectors.add(collector);
+        }
+        health.put("collectors", collectors);
+
+        // Health status
+        String status = "HEALTHY";
+        if (heapUtilization > 0.9) status = "CRITICAL";
+        else if (heapUtilization > 0.75) status = "WARNING";
+        health.put("status", status);
+
+        return health;
+    }
+}</code></pre>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 12: COMMON MISTAKES                                   -->
+    <!-- ============================================================ -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>GC-related anti-patterns and misconceptions</summary>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Mistake</th>
+              <th>Why It's Wrong</th>
+              <th>Correct Approach</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>"Just increase the heap"</td>
+              <td>Larger heap = longer GC pauses when they occur. 32GB heap with G1GC can have 2-5s Full GC pauses.</td>
+              <td>Size heap to 3-4x live data. If you need &gt; 16GB, consider ZGC.</td>
+            </tr>
+            <tr>
+              <td>Setting <code>-Xms</code> ≠ <code>-Xmx</code></td>
+              <td>JVM must GC to grow heap. Growth events trigger Full GC for compaction.</td>
+              <td>Always set <code>-Xms</code> = <code>-Xmx</code> in production to avoid resize pauses.</td>
+            </tr>
+            <tr>
+              <td>Calling <code>System.gc()</code></td>
+              <td>Triggers a Full GC (STW) at unpredictable times. In hot paths, catastrophic.</td>
+              <td>Never call explicitly. Use <code>-XX:+ExplicitGCInvokesConcurrent</code> as safety net.</td>
+            </tr>
+            <tr>
+              <td>No GC logging in production</td>
+              <td>Cannot diagnose GC issues post-incident. Flying blind.</td>
+              <td>Always enable GC logging. Overhead is negligible (&lt; 1%). Rotate files.</td>
+            </tr>
+            <tr>
+              <td>Tuning without measuring</td>
+              <td>Random flags based on blog posts. Cargo-culting settings from other apps.</td>
+              <td>Measure first: GC logs → identify problem → targeted flag change → measure again.</td>
+            </tr>
+            <tr>
+              <td>Ignoring promotion rate</td>
+              <td>Focus on young GC pause time while old gen silently fills up.</td>
+              <td>Monitor promotion rate. If &gt; 50 MB/s, investigate object lifetimes.</td>
+            </tr>
+            <tr>
+              <td>Large local caches without GC impact analysis</td>
+              <td>1GB+ in-memory caches create massive GC pressure on refresh/eviction.</td>
+              <td>Use off-heap (Chronicle Map, MapDB) or external cache (Redis) for &gt; 256MB.</td>
+            </tr>
+            <tr>
+              <td><code>-XX:+DisableExplicitGC</code></td>
+              <td>Breaks DirectByteBuffer cleanup. NIO apps can OOM on native memory.</td>
+              <td>Use <code>-XX:+ExplicitGCInvokesConcurrent</code> — makes System.gc() use concurrent collector.</td>
+            </tr>
+            <tr>
+              <td>Ignoring container memory limits</td>
+              <td>Setting <code>-Xmx</code> to 90% of container memory → OOMKilled by kernel.</td>
+              <td>Leave 30-40% for non-heap (metaspace, threads, native, direct buffers).</td>
+            </tr>
+            <tr>
+              <td>Using CMS in JDK 14+</td>
+              <td>CMS was removed in JDK 14. Still appears in Stack Overflow answers.</td>
+              <td>Use G1GC (default) or ZGC/Shenandoah for low latency.</td>
+            </tr>
+            <tr>
+              <td>Finalizers and <code>finalize()</code></td>
+              <td>Objects with finalizers survive extra GC cycles, clog Finalizer thread.</td>
+              <td>Use <code>Cleaner</code> (JDK 9+) or try-with-resources for cleanup.</td>
+            </tr>
+            <tr>
+              <td>Weak/Soft references as "free" caching</td>
+              <td>SoftReferences cleared during GC pressure → thundering herd on cache miss. WeakReferences cleared every GC cycle.</td>
+              <td>Use sized LRU cache (Caffeine) with explicit eviction policy.</td>
+            </tr>
+          </tbody>
+        </table>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 13: TRADE-OFFS                                        -->
+    <!-- ============================================================ -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Key trade-offs in GC tuning and memory management</summary>
+
+        <h3>Latency vs Throughput</h3>
+        <pre class="diagram">
+The Fundamental GC Trade-off:
+
+         Low Latency                              High Throughput
+         (sub-ms pauses)                          (max req/sec)
+              ◄──────────────────────────────────────────►
+              │                                          │
+    ZGC/Shenandoah                              G1GC/Parallel GC
+    • Sub-ms pauses                             • Fewer GC cycles total
+    • 3-5% throughput cost                      • Less concurrent work
+    • More CPU for GC threads                   • Longer individual pauses
+    • Higher memory overhead                    • Better raw throughput
+              │                                          │
+    Use for:                                    Use for:
+    • User-facing APIs (P99 &lt; 10ms)            • Batch processing
+    • Trading systems                           • Data pipelines
+    • Real-time bidding                         • Background jobs
+    • Gaming servers                            • Report generation
+        </pre>
+
+        <h3>Heap Size vs Pause Duration</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>Small Heap (2-4GB)</th>
+              <th>Large Heap (16-64GB)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>GC frequency</td>
+              <td>High (every 1-5s)</td>
+              <td>Low (every 1-10min)</td>
+            </tr>
+            <tr>
+              <td>Pause duration</td>
+              <td>Short (5-30ms)</td>
+              <td>Long when it happens (100ms-5s)</td>
+            </tr>
+            <tr>
+              <td>P99 latency pattern</td>
+              <td>Consistent but slightly elevated</td>
+              <td>Usually great, occasional catastrophic spike</td>
+            </tr>
+            <tr>
+              <td>Memory efficiency</td>
+              <td>High (less waste)</td>
+              <td>Lower (fragmentation)</td>
+            </tr>
+            <tr>
+              <td>Container cost</td>
+              <td>Low ($)</td>
+              <td>High ($$$)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>On-Heap vs Off-Heap Caching</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>On-Heap (Caffeine)</th>
+              <th>Off-Heap (Chronicle Map)</th>
+              <th>External (Redis)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Access latency</td>
+              <td>~50ns (pointer deref)</td>
+              <td>~1-5μs (deser)</td>
+              <td>~100-500μs (network)</td>
+            </tr>
+            <tr>
+              <td>GC impact</td>
+              <td>Full (objects traced)</td>
+              <td>None (invisible to GC)</td>
+              <td>None (external process)</td>
+            </tr>
+            <tr>
+              <td>Max practical size</td>
+              <td>~256MB-1GB</td>
+              <td>Limited by RAM/disk</td>
+              <td>Unlimited (cluster)</td>
+            </tr>
+            <tr>
+              <td>Consistency</td>
+              <td>Process-local only</td>
+              <td>Process-local only</td>
+              <td>Shared across instances</td>
+            </tr>
+            <tr>
+              <td>Complexity</td>
+              <td>Simple API</td>
+              <td>Serialization required</td>
+              <td>Network + client library</td>
+            </tr>
+            <tr>
+              <td>Failure mode</td>
+              <td>Process restart = loss</td>
+              <td>Persisted to file</td>
+              <td>Redis cluster failure</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>G1GC Tuning vs Switching Collectors</h3>
+        <div class="callout callout-tip">
+          <p><strong>Decision framework:</strong></p>
+          <ul>
+            <li>If G1GC pauses are &lt; 100ms with tuning → stay on G1GC (simpler, well-understood)</li>
+            <li>If you need guaranteed &lt; 10ms pauses → switch to ZGC (JDK 17+) or Shenandoah</li>
+            <li>If heap &gt; 32GB → ZGC is the clear winner (G1GC struggles at this scale)</li>
+            <li>If you're on JDK 21+ → Generational ZGC gives best of both worlds</li>
+          </ul>
+        </div>
+
+        <h3>Object Pooling vs Allocation</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>Fresh Allocation (default)</th>
+              <th>Object Pooling</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Code simplicity</td>
+              <td>Simple, idiomatic Java</td>
+              <td>Complex lifecycle management</td>
+            </tr>
+            <tr>
+              <td>GC pressure</td>
+              <td>High for expensive objects</td>
+              <td>Near-zero for pooled objects</td>
+            </tr>
+            <tr>
+              <td>Thread safety</td>
+              <td>Inherent (no shared mutable state)</td>
+              <td>Must ensure clean state on return</td>
+            </tr>
+            <tr>
+              <td>Memory leaks</td>
+              <td>GC handles it</td>
+              <td>Possible if not returned to pool</td>
+            </tr>
+            <tr>
+              <td>When to use</td>
+              <td>Default for most objects</td>
+              <td>Only for expensive objects (&gt; 1ms to create) in hot paths</td>
+            </tr>
+          </tbody>
+        </table>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 14: FOLLOW-UP QUESTIONS                                -->
+    <!-- ============================================================ -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Questions the interviewer might ask next</summary>
+
+        <h3>Q1: "How would you diagnose a memory leak vs high allocation rate?"</h3>
+        <div class="callout callout-info">
+          <p><strong>Key distinction:</strong></p>
+          <ul>
+            <li><strong>Memory leak:</strong> Heap-after-GC grows monotonically over time. Objects are retained unintentionally (static maps, listener registrations, ThreadLocal not cleaned).</li>
+            <li><strong>High allocation rate:</strong> Heap-after-GC is stable, but GC frequency is high. Objects are created and discarded rapidly.</li>
+          </ul>
+          <p><strong>Diagnosis:</strong> Plot "heap used after GC" over hours. If it trends upward → leak. If it's flat but GC is frequent → allocation rate.</p>
+        </div>
+
+        <h3>Q2: "Your service runs in a 2-CPU, 4GB Kubernetes pod. How do you tune GC?"</h3>
+        <pre><code class="language-bash"># Small container strategy:
+-XX:+UseContainerSupport
+-XX:ActiveProcessorCount=2          # Ensure JVM sees 2 CPUs
+-Xms2560m -Xmx2560m                # 62% of 4GB for heap
+-XX:MaxMetaspaceSize=192m
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=50             # Aggressive pause target
+-XX:ParallelGCThreads=2             # Match CPU count
+-XX:ConcGCThreads=1                 # 1 concurrent GC thread
+-XX:G1HeapRegionSize=2m             # Smaller regions for smaller heap
+
+# With only 2 CPUs, GC threads compete with application threads!
+# Consider ZGC only if GC is still a problem — its concurrent work
+# on 2 CPUs may starve the application.</code></pre>
+
+        <h3>Q3: "How does GC behave differently with virtual threads (JDK 21+)?"</h3>
+        <div class="callout callout-info">
+          <p><strong>Key points:</strong></p>
+          <ul>
+            <li>Virtual threads have small stacks (~few KB vs 1MB for platform threads) — less stack memory pressure</li>
+            <li>Millions of virtual threads mean millions of potential GC roots — root scanning takes longer</li>
+            <li>Virtual threads park/unpark frequently — more safepoint interactions</li>
+            <li>Carrier threads (platform threads pinned during synchronized blocks) affect safepoint behavior</li>
+            <li>Object allocation per virtual thread is typically low, but aggregate allocation across millions can be high</li>
+          </ul>
+        </div>
+
+        <h3>Q4: "How would you handle a service that needs both large cache AND low GC pauses?"</h3>
+        <div class="callout callout-tip">
+          <p><strong>Architecture pattern:</strong></p>
+          <ol>
+            <li>Move large cache off-heap (Chronicle Map for local, Redis for distributed)</li>
+            <li>Keep small "hot" L1 cache on-heap (Caffeine, &lt; 100MB, short TTL)</li>
+            <li>Use ZGC for remaining heap activity</li>
+            <li>Pre-size all collections to avoid resize allocations</li>
+            <li>Monitor promotion rate — if L1 cache entries are being promoted, reduce L1 TTL</li>
+          </ol>
+        </div>
+
+        <h3>Q5: "What's the difference between 'Allocation Failure' and 'Evacuation Failure' in GC logs?"</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Term</th>
+              <th>Meaning</th>
+              <th>Severity</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Allocation Failure</td>
+              <td>Eden is full, cannot allocate → triggers minor GC. Normal operation.</td>
+              <td>Normal (expected trigger for young GC)</td>
+            </tr>
+            <tr>
+              <td>Evacuation Failure</td>
+              <td>G1 cannot find free regions to copy live objects during evacuation. Falls back to Full GC.</td>
+              <td>Critical (indicates heap pressure or fragmentation)</td>
+            </tr>
+            <tr>
+              <td>Concurrent Mode Failure</td>
+              <td>Old gen filled before concurrent marking completed (CMS terminology, similar in G1).</td>
+              <td>Critical (concurrent GC couldn't keep up)</td>
+            </tr>
+            <tr>
+              <td>To-space Exhausted</td>
+              <td>No free regions available as copy destination during young GC.</td>
+              <td>High (G1 specific, precedes evacuation failure)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Q6: "How do you prevent GC issues during deployment (rolling restart)?"</h3>
+        <div class="callout callout-info">
+          <p><strong>Deployment GC considerations:</strong></p>
+          <ul>
+            <li><strong>JIT warmup:</strong> Fresh JVMs haven't compiled hot paths — interpreted code allocates more temporaries. Use CDS (Class Data Sharing) and AOT compilation.</li>
+            <li><strong>Cache cold-start:</strong> Local caches are empty after restart — sudden cache population causes allocation burst. Pre-warm caches before accepting traffic.</li>
+            <li><strong>Readiness probe:</strong> Don't mark pod ready until initial GC pressure stabilizes (first 30-60 seconds).</li>
+            <li><strong>Graceful shutdown:</strong> Drain connections before stopping — avoid in-flight requests during GC of dying instance.</li>
+          </ul>
+        </div>
+
+      </details>
+    </section>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 15: SUMMARY                                           -->
+    <!-- ============================================================ -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Key takeaways for the interview</summary>
+
+        <div class="callout callout-tip">
+          <ol>
+            <li><strong>GC pauses freeze threads, not CPUs.</strong> STW events suspend all application threads at safepoints. CPU is idle while threads are parked — this is why latency spikes happen without CPU alarms.</li>
+            <li><strong>Generational GC is the foundation.</strong> Young gen (fast, frequent, cheap) vs old gen (slow, infrequent, expensive). Most GC pain comes from objects being promoted to old gen.</li>
+            <li><strong>Know your collectors.</strong> G1GC: 50-200ms pauses, good default. ZGC: sub-millisecond, JDK 17+. Shenandoah: sub-10ms, OpenJDK only. Choose based on P99 SLA.</li>
+            <li><strong>Heap sizing is a balance.</strong> Too small = frequent GC. Too large = catastrophic pauses when they occur. Target 3-4x live data set.</li>
+            <li><strong>Allocation rate drives GC frequency.</strong> High allocation fills Eden faster → more minor GCs. Reduce allocation in hot paths by reusing objects, avoiding autoboxing, and using parameterized logging.</li>
+            <li><strong>Large in-memory caches are GC killers.</strong> Caches &gt; 256MB should be off-heap or external. Bulk eviction/refresh causes promotion storms and Full GC.</li>
+            <li><strong>Always enable GC logging in production.</strong> Negligible overhead, invaluable during incidents. Use JFR for detailed correlation with application metrics.</li>
+            <li><strong>Containers need special attention.</strong> Leave 30-40% of container memory for non-heap. Set <code>-Xms</code> = <code>-Xmx</code>. Use <code>-XX:+UseContainerSupport</code>. Match <code>ParallelGCThreads</code> to available CPUs.</li>
+            <li><strong>Measure before tuning.</strong> Read GC logs, calculate allocation rate, identify promotion pressure. Then make ONE targeted change and measure again.</li>
+            <li><strong>Full GC is an emergency.</strong> Any Full GC in a latency-sensitive service is a bug. Set up alerting on <code>jdk.OldGarbageCollection</code> events and treat them as P1 incidents.</li>
+          </ol>
+        </div>
+
+      </details>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- CHAPTER NAVIGATION                                            -->
+    <!-- ============================================================ -->
+    <nav class="chapter-nav">
+      <a href="ch11-slow-downstream-service.html" class="prev">&larr; Chapter 11: Slow Downstream Service</a>
+      <a href="ch13-async-still-blocking.html" class="next">Chapter 13: Async Still Blocking &rarr;</a>
+    </nav>
+
+  </main>
+
+  <script src="../assets/js/prism.js"></script>
+  <script src="../assets/js/prism-java.min.js"></script>
+  <script src="../assets/js/prism-yaml.min.js"></script>
+  <script src="../assets/js/prism-bash.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>
