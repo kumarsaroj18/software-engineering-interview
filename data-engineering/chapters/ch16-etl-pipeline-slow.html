@@ -9,36 +9,38 @@
 </head>
 <body>
   <!-- Sidebar -->
-  <aside class="sidebar" id="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
-      <a href="../index.html" class="brand">DE Interview Handbook</a>
-      <button class="sidebar-close" id="sidebar-close" aria-label="Close sidebar">✕</button>
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
     <div class="sidebar-chapter">
-      <span class="chapter-number">Ch 16</span>
+      <span class="chapter-num">Ch 16</span>
       <span class="chapter-title">ETL Pipeline Slow</span>
     </div>
     <nav class="sidebar-nav">
-      <a href="#interviewer-intent">Interviewer Intent</a>
-      <a href="#quick-answer">Quick Answer</a>
-      <a href="#data-volume-growth">Data Volume Growth</a>
-      <a href="#shuffle-bottleneck">Shuffle Bottleneck</a>
-      <a href="#data-skew">Data Skew</a>
-      <a href="#executor-failures">Executor Failures &amp; Retries</a>
-      <a href="#small-files">Small Files Problem</a>
-      <a href="#metadata-overhead">Metadata &amp; Planning Overhead</a>
-      <a href="#query-plan-regression">Query Plan Regression</a>
-      <a href="#infrastructure">Infrastructure Issues</a>
-      <a href="#production-incident">Production Incident</a>
-      <a href="#debugging-workflow">Debugging Workflow</a>
-      <a href="#code-examples">Code Examples</a>
-      <a href="#common-mistakes">Common Mistakes</a>
-      <a href="#trade-offs">Trade-offs</a>
-      <a href="#follow-up-questions">Follow-up Questions</a>
-      <a href="#summary">Summary</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#data-volume-growth">Data Volume Growth</a></li>
+        <li><a href="#shuffle-bottleneck">Shuffle Bottleneck</a></li>
+        <li><a href="#data-skew">Data Skew</a></li>
+        <li><a href="#executor-failures">Executor Failures &amp; Retries</a></li>
+        <li><a href="#small-files">Small Files Problem</a></li>
+        <li><a href="#metadata-overhead">Metadata &amp; Planning Overhead</a></li>
+        <li><a href="#query-plan-regression">Query Plan Regression</a></li>
+        <li><a href="#infrastructure">Infrastructure Issues</a></li>
+        <li><a href="#production-incident">Production Incident: 500x Partition Explosion</a></li>
+        <li><a href="#debugging-workflow">Systematic Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
     <div class="sidebar-actions">
-      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">☀️</button>
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
     </div>
   </aside>
 
@@ -62,6 +64,10 @@
         <span class="topic">Debugging</span>
       </div>
     </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
 
     <!-- Chapter Navigation -->
     <nav class="chapter-nav">

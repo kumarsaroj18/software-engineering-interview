@@ -11,29 +11,37 @@
   <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
   <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
 
-  <aside class="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
-      <a href="../index.html" class="brand">DE Interview Handbook</a>
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
-    <div class="sidebar-chapter">Ch 3 / Join Order Optimization</div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 3</span>
+      <span class="chapter-title">Join Order Optimization</span>
+    </div>
     <nav class="sidebar-nav">
-      <a href="#interviewer-intent">Interviewer Intent</a>
-      <a href="#quick-answer">Quick Answer</a>
-      <a href="#join-algorithms">Join Algorithms</a>
-      <a href="#cost-based-enumeration">Cost-Based Enumeration</a>
-      <a href="#cardinality-estimation">Cardinality Estimation</a>
-      <a href="#join-reordering">Join Reordering in Engines</a>
-      <a href="#small-to-big">Why Small Joins Big</a>
-      <a href="#forcing-join-order">Forcing Join Order</a>
-      <a href="#production-incident">Production Incident</a>
-      <a href="#debugging-workflow">Debugging Workflow</a>
-      <a href="#code-examples">Code Examples</a>
-      <a href="#common-mistakes">Common Mistakes</a>
-      <a href="#trade-offs">Trade-offs</a>
-      <a href="#follow-up-questions">Follow-up Questions</a>
-      <a href="#summary">Summary</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#join-algorithms">Join Algorithms Explained</a></li>
+        <li><a href="#cost-based-enumeration">Cost-Based Join Enumeration</a></li>
+        <li><a href="#cardinality-estimation">Cardinality Estimation</a></li>
+        <li><a href="#join-reordering">Join Reordering in Different Engines</a></li>
+        <li><a href="#small-to-big">Why "Small Joins Big"</a></li>
+        <li><a href="#forcing-join-order">How to Force/Influence Join Order</a></li>
+        <li><a href="#production-incident">Production Incident: 12-Table Join Gone Wrong</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
-    <div class="sidebar-actions"></div>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
   </aside>
 
   <main class="content">
@@ -51,7 +59,7 @@
     </header>
 
     <div class="search-container">
-      <input type="search" placeholder="Search this chapter..." aria-label="Search chapter">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
     </div>
 
     <!-- ============================================================

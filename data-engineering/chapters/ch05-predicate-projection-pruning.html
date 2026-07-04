@@ -11,32 +11,37 @@
   <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark/light theme">☀️</button>
   <button class="mobile-menu-toggle" id="mobile-menu-toggle" aria-label="Toggle sidebar menu">☰</button>
 
-  <aside class="sidebar" id="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
-      <a href="../index.html" class="brand">DE Interview Handbook</a>
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
-    <div class="sidebar-chapter">Ch 5 / Predicate &amp; Projection Pushdown</div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 5</span>
+      <span class="chapter-title">Predicate & Projection Pushdown</span>
+    </div>
     <nav class="sidebar-nav">
-      <a href="#interviewer-intent">Interviewer Intent</a>
-      <a href="#quick-answer">Quick Answer</a>
-      <a href="#predicate-pushdown">Predicate Pushdown</a>
-      <a href="#projection-pushdown">Projection Pushdown</a>
-      <a href="#nested-pruning">Nested Pruning</a>
-      <a href="#columnar-formats">Columnar Formats</a>
-      <a href="#partition-pruning">Partition Pruning</a>
-      <a href="#runtime-filters">Runtime Filters</a>
-      <a href="#cost-impact">Cost Impact</a>
-      <a href="#production-incident">Production Incident</a>
-      <a href="#debugging-workflow">Debugging Workflow</a>
-      <a href="#code-examples">Code Examples</a>
-      <a href="#common-mistakes">Common Mistakes</a>
-      <a href="#trade-offs">Trade-offs</a>
-      <a href="#follow-up-questions">Follow-up Questions</a>
-      <a href="#summary">Summary</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer (60-Second Version)</a></li>
+        <li><a href="#predicate-pushdown">Predicate Pushdown</a></li>
+        <li><a href="#projection-pushdown">Projection Pushdown</a></li>
+        <li><a href="#nested-pruning">Nested / Struct Pruning</a></li>
+        <li><a href="#columnar-formats">Columnar Storage Formats</a></li>
+        <li><a href="#partition-pruning">Partition Pruning</a></li>
+        <li><a href="#runtime-filters">Runtime Filters / Dynamic Pruning</a></li>
+        <li><a href="#cost-impact">Quantifying Performance Impact</a></li>
+        <li><a href="#production-incident">Production Incident: $50K/Month Nested Proto Explosion</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow: Verifying Pushdown</a></li>
+        <li><a href="#code-examples">Code Examples: Before &amp; After</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
     <div class="sidebar-actions">
-      <a href="ch04-small-joins-big.html" class="btn">← Ch 4</a>
-      <a href="ch06-mvcc.html" class="btn">Ch 6 →</a>
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
     </div>
   </aside>
 
@@ -57,7 +62,7 @@
     </header>
 
     <div class="search-container">
-      <input type="search" id="chapter-search" placeholder="Search this chapter..." aria-label="Search chapter content">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
     </div>
 
 

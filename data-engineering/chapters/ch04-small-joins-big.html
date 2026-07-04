@@ -11,32 +11,36 @@
   <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
   <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
 
-  <aside class="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
       <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
-    <div class="sidebar-chapter">Ch 4 / Small Joins Big</div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 4</span>
+      <span class="chapter-title">Small Joins Big</span>
+    </div>
     <nav class="sidebar-nav">
-      <a href="#interviewer-intent">Interviewer Intent</a>
-      <a href="#quick-answer">Quick Answer</a>
-      <a href="#hash-join-mechanics">Hash Join Mechanics</a>
-      <a href="#broadcast-join">Broadcast Join</a>
-      <a href="#intermediate-results">Intermediate Results</a>
-      <a href="#memory-pressure">Memory Pressure &amp; Spill</a>
-      <a href="#shuffle-cost">Shuffle/Network Cost</a>
-      <a href="#adaptive-execution">Adaptive Execution</a>
-      <a href="#engine-specifics">Engine-Specific Behavior</a>
-      <a href="#production-incident">Production Incident</a>
-      <a href="#code-examples">Code Examples</a>
-      <a href="#common-mistakes">Common Mistakes</a>
-      <a href="#trade-offs">Trade-offs</a>
-      <a href="#follow-up-questions">Follow-up Questions</a>
-      <a href="#summary">Summary</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#hash-join-mechanics">Hash Join Build/Probe Mechanics</a></li>
+        <li><a href="#broadcast-join">Broadcast Join in Distributed Systems</a></li>
+        <li><a href="#intermediate-results">Intermediate Result Explosion</a></li>
+        <li><a href="#memory-pressure">Memory Pressure &amp; Spill</a></li>
+        <li><a href="#shuffle-cost">Shuffle/Network Cost</a></li>
+        <li><a href="#adaptive-execution">Adaptive Query Execution</a></li>
+        <li><a href="#engine-specifics">Engine-Specific Behavior</a></li>
+        <li><a href="#production-incident">Production Incident: Broadcast Threshold Breach</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
     <div class="sidebar-actions">
-      <button data-action="print">🖨️ Print</button>
-      <button data-action="bookmark">🔖 Bookmark</button>
-      <button data-action="share">🔗 Share</button>
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
     </div>
   </aside>
 
@@ -55,7 +59,7 @@
     </header>
 
     <div class="search-container">
-      <input type="search" placeholder="Search this chapter..." aria-label="Search" />
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
     </div>
 
 

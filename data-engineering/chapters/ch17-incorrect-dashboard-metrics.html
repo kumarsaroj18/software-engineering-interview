@@ -10,42 +10,40 @@
 <body>
   <div class="layout">
     <!-- Sidebar -->
-    <aside class="sidebar">
-      <div class="sidebar-header">
-        <div class="brand">
-          <a href="../../index.html">Interview Handbook</a>
-        </div>
-      </div>
-      <div class="sidebar-chapter">
-        <span class="chapter-number">Ch 17</span>
-        <span class="chapter-title">Incorrect Metrics</span>
-      </div>
-      <nav class="sidebar-nav">
-        <ul>
-          <li><a href="#interviewer-intent">Interviewer Intent</a></li>
-          <li><a href="#quick-answer">Quick Answer</a></li>
-          <li><a href="#data-validation">Data Validation Patterns</a></li>
-          <li><a href="#reconciliation">Reconciliation</a></li>
-          <li><a href="#schema-evolution">Schema Evolution Issues</a></li>
-          <li><a href="#null-handling">Null Handling Bugs</a></li>
-          <li><a href="#duplicate-events">Duplicate Events</a></li>
-          <li><a href="#late-arriving-data">Late-Arriving Data</a></li>
-          <li><a href="#cdc-issues">CDC Issues</a></li>
-          <li><a href="#backfill-problems">Backfill &amp; Reprocessing</a></li>
-          <li><a href="#production-incident">Production Incident</a></li>
-          <li><a href="#debugging-workflow">Debugging Workflow</a></li>
-          <li><a href="#code-examples">Code Examples</a></li>
-          <li><a href="#common-mistakes">Common Mistakes</a></li>
-          <li><a href="#trade-offs">Trade-offs</a></li>
-          <li><a href="#follow-up-questions">Follow-up Questions</a></li>
-          <li><a href="#summary">Summary</a></li>
-        </ul>
-      </nav>
-      <div class="sidebar-actions">
-        <button class="btn-prev" onclick="location.href='ch16-etl-pipeline-slow.html'">Previous Chapter</button>
-        <button class="btn-next" onclick="location.href='ch18-lakehouse-platform.html'">Next Chapter</button>
-      </div>
-    </aside>
+      <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 17</span>
+      <span class="chapter-title">Incorrect Metrics</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#data-validation">Data Validation Patterns</a></li>
+        <li><a href="#reconciliation">Reconciliation</a></li>
+        <li><a href="#schema-evolution">Schema Evolution Issues</a></li>
+        <li><a href="#null-handling">Null Handling Bugs</a></li>
+        <li><a href="#duplicate-events">Duplicate Events</a></li>
+        <li><a href="#late-arriving-data">Late-Arriving Data</a></li>
+        <li><a href="#cdc-issues">CDC Issues</a></li>
+        <li><a href="#backfill-problems">Backfill &amp; Reprocessing</a></li>
+        <li><a href="#production-incident">Production Incident: Revenue Dashboard 30% Drop</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
 
     <!-- Main Content -->
     <main class="content">
@@ -71,6 +69,11 @@
         <a href="ch16-etl-pipeline-slow.html" class="nav-prev">Previous: ETL Pipeline Slow</a>
         <a href="ch18-lakehouse-platform.html" class="nav-next">Next: Lakehouse Platform</a>
       </div>
+
+      <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
 
 
       <!-- Section 1: Interviewer Intent -->

@@ -11,33 +11,38 @@
   <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark/light theme">☀️</button>
   <button class="mobile-menu-toggle" id="mobile-menu-toggle" aria-label="Toggle sidebar menu">☰</button>
 
-  <aside class="sidebar" id="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
-      <a href="../index.html" class="brand">DE Interview Handbook</a>
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
-    <div class="sidebar-chapter">Ch 7 / Locking Mechanisms</div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 7</span>
+      <span class="chapter-title">Locking Mechanisms</span>
+    </div>
     <nav class="sidebar-nav">
-      <a href="#interviewer-intent">Interviewer Intent</a>
-      <a href="#quick-answer">Quick Answer</a>
-      <a href="#lock-types">Lock Types</a>
-      <a href="#lock-granularity">Lock Granularity</a>
-      <a href="#lock-compatibility">Compatibility Matrix</a>
-      <a href="#deadlocks">Deadlocks</a>
-      <a href="#lock-escalation">Lock Escalation</a>
-      <a href="#advisory-locks">Advisory Locks</a>
-      <a href="#mvcc-vs-locking">MVCC vs Locking</a>
-      <a href="#distributed-locking">Distributed Locking</a>
-      <a href="#production-incident">Production Incident</a>
-      <a href="#debugging-workflow">Debugging Workflow</a>
-      <a href="#code-examples">Code Examples</a>
-      <a href="#common-mistakes">Common Mistakes</a>
-      <a href="#trade-offs">Trade-offs</a>
-      <a href="#follow-up-questions">Follow-up Questions</a>
-      <a href="#summary">Summary</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer (60-Second Version)</a></li>
+        <li><a href="#lock-types">Lock Types</a></li>
+        <li><a href="#lock-granularity">Lock Granularity</a></li>
+        <li><a href="#lock-compatibility">Lock Compatibility Matrix</a></li>
+        <li><a href="#deadlocks">Deadlocks</a></li>
+        <li><a href="#lock-escalation">Lock Escalation</a></li>
+        <li><a href="#advisory-locks">Advisory Locks</a></li>
+        <li><a href="#mvcc-vs-locking">MVCC vs Pure Locking</a></li>
+        <li><a href="#distributed-locking">Locking in Distributed Systems</a></li>
+        <li><a href="#production-incident">Production Incident: Deadlock Cascade During ETL + OLTP</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow: pg_locks, pg_stat_activity, Blocking Queries</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
     <div class="sidebar-actions">
-      <a href="ch06-mvcc.html" class="btn">← Ch 6</a>
-      <a href="ch08-query-suddenly-slow.html" class="btn">Ch 8 →</a>
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
     </div>
   </aside>
 
@@ -58,7 +63,7 @@
     </header>
 
     <div class="search-container">
-      <input type="search" id="chapter-search" placeholder="Search this chapter..." aria-label="Search chapter content">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
     </div>
 
 

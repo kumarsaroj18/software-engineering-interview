@@ -11,17 +11,38 @@
   <button class="menu-toggle" aria-label="Toggle sidebar">Menu</button>
   <button class="theme-toggle" aria-label="Toggle theme">Theme</button>
 
-  <aside class="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
-      <a href="../index.html" class="brand">DE Interview Handbook</a>
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
-    <div class="sidebar-chapter">Ch 13 / Spark Spill</div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 13</span>
+      <span class="chapter-title">Spark Spill</span>
+    </div>
     <nav class="sidebar-nav">
-      <a href="ch12-spark-execution.html">← Ch 12: Spark Execution</a>
-      <a href="ch14-realtime-pipeline.html">Ch 14: Real-time Pipeline →</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer (60-Second Version)</a></li>
+        <li><a href="#memory-model">Spark Memory Model</a></li>
+        <li><a href="#shuffle-spill">Shuffle Spill</a></li>
+        <li><a href="#executor-memory">Executor Memory Layout</a></li>
+        <li><a href="#data-skew">Data Skew</a></li>
+        <li><a href="#gc-pressure">GC Pressure &amp; Object Overhead</a></li>
+        <li><a href="#broadcast-threshold">Broadcast Threshold</a></li>
+        <li><a href="#aqe-solutions">AQE Solutions</a></li>
+        <li><a href="#repartition-strategies">Repartition &amp; Coalesce</a></li>
+        <li><a href="#production-incident">Production Incident: 500 GB Spill After Schema Change</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow: Spark UI</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
     <div class="sidebar-actions">
-      <a href="../index.html">Back to Index</a>
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
     </div>
   </aside>
 
@@ -41,6 +62,10 @@
         <span class="topic-tag">Memory</span>
       </div>
     </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
 
     <!-- ═══════════════════════════════════════════════════════════════
          SECTION 1: INTERVIEWER INTENT

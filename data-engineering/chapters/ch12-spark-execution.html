@@ -11,17 +11,39 @@
   <button class="menu-toggle" aria-label="Toggle sidebar">☰</button>
   <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
 
-  <aside class="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
-      <a href="../index.html" class="brand">DE Interview Handbook</a>
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
-    <div class="sidebar-chapter">Ch 12 / Spark Execution</div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 12</span>
+      <span class="chapter-title">Spark Execution</span>
+    </div>
     <nav class="sidebar-nav">
-      <a href="ch11-snowflake-internals.html">← Ch 11: Snowflake Internals</a>
-      <a href="ch13-spark-spill.html">Ch 13: Spark Spill →</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer (60-Second Version)</a></li>
+        <li><a href="#spark-architecture">Spark Architecture</a></li>
+        <li><a href="#dag">DAG &amp; Lazy Evaluation</a></li>
+        <li><a href="#catalyst-optimizer">Catalyst Optimizer</a></li>
+        <li><a href="#tungsten">Tungsten Engine</a></li>
+        <li><a href="#job-stages-tasks">Jobs, Stages, Tasks</a></li>
+        <li><a href="#shuffle">Shuffle Deep Dive</a></li>
+        <li><a href="#joins-in-spark">Join Strategies in Spark</a></li>
+        <li><a href="#aqe">Adaptive Query Execution (AQE)</a></li>
+        <li><a href="#fault-tolerance">Fault Tolerance</a></li>
+        <li><a href="#production-incident">Production Incident: OOM from Skewed Shuffle Partition</a></li>
+        <li><a href="#debugging-workflow">Spark UI Walkthrough</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
     <div class="sidebar-actions">
-      <a href="../index.html">Back to Index</a>
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
     </div>
   </aside>
 
@@ -41,6 +63,10 @@
         <span class="topic-tag">Catalyst</span>
       </div>
     </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
 
     <!-- ═══════════════════════════════════════════════════════════════
          SECTION 1: INTERVIEWER INTENT

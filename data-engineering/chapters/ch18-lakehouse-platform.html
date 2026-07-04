@@ -9,34 +9,36 @@
 </head>
 <body>
   <!-- Sidebar -->
-  <aside class="sidebar" id="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
-      <span class="brand"><a href="../index.html">DE Interview Handbook</a></span>
-      <button class="sidebar-close" id="sidebar-close" aria-label="Close sidebar">✕</button>
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
     <div class="sidebar-chapter">
-      <span class="chapter-number">Ch 18</span>
+      <span class="chapter-num">Ch 18</span>
       <span class="chapter-title">Lakehouse Platform</span>
     </div>
     <nav class="sidebar-nav">
-      <a href="#interviewer-intent">Interviewer Intent</a>
-      <a href="#quick-answer">Quick Answer</a>
-      <a href="#lake-vs-warehouse">Lake vs Warehouse vs Lakehouse</a>
-      <a href="#table-formats">Open Table Formats</a>
-      <a href="#medallion-architecture">Medallion Architecture</a>
-      <a href="#governance">Data Governance</a>
-      <a href="#metadata-catalog">Metadata &amp; Discovery</a>
-      <a href="#ingestion-patterns">Ingestion Patterns</a>
-      <a href="#cost-optimization">Cost Optimization</a>
-      <a href="#production-incident">Production Incident</a>
-      <a href="#code-examples">Code Examples</a>
-      <a href="#common-mistakes">Common Mistakes</a>
-      <a href="#trade-offs">Trade-offs</a>
-      <a href="#follow-up-questions">Follow-up Questions</a>
-      <a href="#summary">Summary</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#lake-vs-warehouse">Data Lake vs Data Warehouse vs Lakehouse</a></li>
+        <li><a href="#table-formats">Open Table Formats</a></li>
+        <li><a href="#medallion-architecture">Medallion Architecture Deep Dive</a></li>
+        <li><a href="#governance">Data Governance</a></li>
+        <li><a href="#metadata-catalog">Metadata &amp; Discovery</a></li>
+        <li><a href="#ingestion-patterns">Ingestion Patterns</a></li>
+        <li><a href="#cost-optimization">Cost Optimization</a></li>
+        <li><a href="#production-incident">Production Incident: 2 Million Small Files</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
     <div class="sidebar-actions">
-      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">☀️</button>
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
     </div>
   </aside>
 
@@ -50,6 +52,10 @@
     </nav>
     <button class="theme-toggle" id="theme-toggle-mobile" aria-label="Toggle theme">☀️</button>
   </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
 
   <main class="content">
     <!-- Chapter Header -->

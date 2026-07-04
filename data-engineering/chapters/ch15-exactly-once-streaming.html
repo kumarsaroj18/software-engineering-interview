@@ -10,41 +10,39 @@
 <body>
   <div class="layout">
     <!-- Sidebar -->
-    <aside class="sidebar">
-      <div class="sidebar-header">
-        <div class="brand">
-          <a href="../../index.html">Interview Handbook</a>
-        </div>
-      </div>
-      <div class="sidebar-chapter">
-        <span class="chapter-number">Ch 15</span>
-        <span class="chapter-title">Exactly-Once Processing</span>
-      </div>
-      <nav class="sidebar-nav">
-        <ul>
-          <li><a href="#interviewer-intent">Interviewer Intent</a></li>
-          <li><a href="#quick-answer">Quick Answer</a></li>
-          <li><a href="#delivery-semantics">Delivery Semantics</a></li>
-          <li><a href="#kafka-transactions">Kafka Transactions</a></li>
-          <li><a href="#checkpointing">Checkpointing</a></li>
-          <li><a href="#idempotent-sinks">Idempotent Sinks</a></li>
-          <li><a href="#two-phase-commit">Two-Phase Commit</a></li>
-          <li><a href="#deduplication">Deduplication Patterns</a></li>
-          <li><a href="#failure-recovery">Failure Recovery &amp; Replay</a></li>
-          <li><a href="#end-to-end">End-to-End Exactly-Once</a></li>
-          <li><a href="#production-incident">Production Incident</a></li>
-          <li><a href="#code-examples">Code Examples</a></li>
-          <li><a href="#common-mistakes">Common Mistakes</a></li>
-          <li><a href="#trade-offs">Trade-offs</a></li>
-          <li><a href="#follow-up-questions">Follow-up Questions</a></li>
-          <li><a href="#summary">Summary</a></li>
-        </ul>
-      </nav>
-      <div class="sidebar-actions">
-        <button class="btn-prev" onclick="location.href='ch14-realtime-pipeline.html'">Previous Chapter</button>
-        <button class="btn-next" onclick="location.href='ch16-etl-pipeline-slow.html'">Next Chapter</button>
-      </div>
-    </aside>
+      <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 15</span>
+      <span class="chapter-title">Exactly-Once Processing</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#delivery-semantics">Delivery Semantics</a></li>
+        <li><a href="#kafka-transactions">Kafka Transactions</a></li>
+        <li><a href="#checkpointing">Checkpointing</a></li>
+        <li><a href="#idempotent-sinks">Idempotent Sinks</a></li>
+        <li><a href="#two-phase-commit">Two-Phase Commit in Streaming</a></li>
+        <li><a href="#deduplication">Deduplication Patterns</a></li>
+        <li><a href="#failure-recovery">Failure Recovery &amp; Replay</a></li>
+        <li><a href="#end-to-end">End-to-End Exactly-Once</a></li>
+        <li><a href="#production-incident">Production Incident: Duplicate Payments After Checkpoint Failure</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
 
     <!-- Main Content -->
     <main class="content">
@@ -70,6 +68,11 @@
         <a href="ch14-realtime-pipeline.html" class="nav-prev">Previous: Real-Time Pipeline</a>
         <a href="ch16-etl-pipeline-slow.html" class="nav-next">Next: ETL Pipeline Slow</a>
       </div>
+
+      <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
 
 
       <!-- Section 1: Interviewer Intent -->

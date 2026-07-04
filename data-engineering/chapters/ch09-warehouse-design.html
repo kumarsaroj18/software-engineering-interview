@@ -9,32 +9,37 @@
 </head>
 <body>
   <!-- Sidebar -->
-  <aside class="sidebar" id="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
-      <a href="../index.html" class="brand">DE Interview Handbook</a>
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
-    <div class="sidebar-chapter">Ch 9 / Warehouse Design</div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 9</span>
+      <span class="chapter-title">Warehouse Design</span>
+    </div>
     <nav class="sidebar-nav">
-      <a href="#interviewer-intent">Interviewer Intent</a>
-      <a href="#quick-answer">Quick Answer</a>
-      <a href="#star-schema">Star Schema</a>
-      <a href="#snowflake-schema">Snowflake Schema</a>
-      <a href="#scd">Slowly Changing Dimensions</a>
-      <a href="#fact-types">Fact Table Types</a>
-      <a href="#partitioning-clustering">Partitioning &amp; Clustering</a>
-      <a href="#materialized-views">Materialized Views</a>
-      <a href="#medallion">Medallion Architecture</a>
-      <a href="#cost-optimization">Cost Optimization</a>
-      <a href="#production-incident">Production Incident</a>
-      <a href="#code-examples">Code Examples</a>
-      <a href="#common-mistakes">Common Mistakes</a>
-      <a href="#trade-offs">Trade-offs</a>
-      <a href="#follow-up-questions">Follow-up Questions</a>
-      <a href="#summary">Summary</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#star-schema">Star Schema</a></li>
+        <li><a href="#snowflake-schema">Snowflake Schema</a></li>
+        <li><a href="#scd">Slowly Changing Dimensions</a></li>
+        <li><a href="#fact-types">Fact Table Types</a></li>
+        <li><a href="#partitioning-clustering">Partitioning &amp; Clustering</a></li>
+        <li><a href="#materialized-views">Materialized Views &amp; Aggregation Tables</a></li>
+        <li><a href="#medallion">Medallion Architecture</a></li>
+        <li><a href="#cost-optimization">Cost Optimization</a></li>
+        <li><a href="#production-incident">Production Incident: $5K to $80K/Month Query Cost Explosion</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
     <div class="sidebar-actions">
-      <button data-action="toggle-theme">☀️</button>
-      <button data-action="toggle-sidebar">☰</button>
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
     </div>
   </aside>
 
@@ -56,6 +61,10 @@
         <span class="topic">Modeling</span>
       </div>
     </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
 
     <!-- Chapter Navigation -->
     <nav class="chapter-nav">

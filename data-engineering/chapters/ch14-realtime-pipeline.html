@@ -9,35 +9,37 @@
 </head>
 <body>
   <!-- Sidebar -->
-  <aside class="sidebar" id="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
-      <span class="brand"><a href="../index.html">DE Interview Handbook</a></span>
-      <button class="sidebar-close" id="sidebar-close" aria-label="Close sidebar">✕</button>
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
     <div class="sidebar-chapter">
-      <span class="chapter-number">Ch 14</span>
+      <span class="chapter-num">Ch 14</span>
       <span class="chapter-title">Real-Time Pipeline</span>
     </div>
     <nav class="sidebar-nav">
-      <a href="#interviewer-intent">Interviewer Intent</a>
-      <a href="#quick-answer">Quick Answer</a>
-      <a href="#event-time-vs-processing">Event Time vs Processing Time</a>
-      <a href="#windowing">Windowing Strategies</a>
-      <a href="#watermarks">Watermarks</a>
-      <a href="#state-management">State Management</a>
-      <a href="#kafka-architecture">Kafka as Event Backbone</a>
-      <a href="#flink-vs-spark">Flink vs Spark vs Kafka Streams</a>
-      <a href="#out-of-order">Out-of-Order Events</a>
-      <a href="#backpressure">Backpressure &amp; Flow Control</a>
-      <a href="#production-incident">Production Incident</a>
-      <a href="#code-examples">Code Examples</a>
-      <a href="#common-mistakes">Common Mistakes</a>
-      <a href="#trade-offs">Trade-offs</a>
-      <a href="#follow-up-questions">Follow-up Questions</a>
-      <a href="#summary">Summary</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#event-time-vs-processing">Event Time vs Processing Time</a></li>
+        <li><a href="#windowing">Windowing Strategies</a></li>
+        <li><a href="#watermarks">Watermarks</a></li>
+        <li><a href="#state-management">State Management</a></li>
+        <li><a href="#kafka-architecture">Kafka as Event Backbone</a></li>
+        <li><a href="#flink-vs-spark">Flink vs Spark Streaming vs Kafka Streams</a></li>
+        <li><a href="#out-of-order">Handling Out-of-Order Events</a></li>
+        <li><a href="#backpressure">Backpressure &amp; Flow Control</a></li>
+        <li><a href="#production-incident">Production Incident: Watermark Too Tight</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
     <div class="sidebar-actions">
-      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">☀️</button>
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
     </div>
   </aside>
 
@@ -51,6 +53,10 @@
     </nav>
     <button class="theme-toggle" id="theme-toggle-mobile" aria-label="Toggle theme">☀️</button>
   </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
 
   <main class="content">
     <!-- Chapter Header -->

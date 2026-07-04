@@ -8,36 +8,38 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
 </head>
 <body>
-  <aside class="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
-      <span class="brand">Interview Handbook</span>
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
     <div class="sidebar-chapter">
-      <span class="chapter-number">Ch 10</span>
+      <span class="chapter-num">Ch 10</span>
       <span class="chapter-title">BigQuery Internals</span>
     </div>
     <nav class="sidebar-nav">
-      <a href="#interviewer-intent">Interviewer Intent</a>
-      <a href="#quick-answer">Quick Answer</a>
-      <a href="#serverless-architecture">Serverless Architecture</a>
-      <a href="#dremel-tree">Dremel Execution Tree</a>
-      <a href="#capacitor-storage">Capacitor Storage Format</a>
-      <a href="#shuffle-service">Shuffle Service</a>
-      <a href="#slot-scheduling">Slot Scheduling</a>
-      <a href="#query-stages">Query Stages &amp; Execution</a>
-      <a href="#nested-data">Nested &amp; Repeated Data</a>
-      <a href="#cost-model">BigQuery Cost Model</a>
-      <a href="#vs-postgresql">Key Differences from PostgreSQL</a>
-      <a href="#production-incident">Production Incident</a>
-      <a href="#code-examples">Code Examples</a>
-      <a href="#common-mistakes">Common Mistakes</a>
-      <a href="#trade-offs">Trade-offs</a>
-      <a href="#follow-up-questions">Follow-up Questions</a>
-      <a href="#summary">Summary</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#serverless-architecture">Serverless Architecture</a></li>
+        <li><a href="#dremel-tree">Dremel Execution Tree</a></li>
+        <li><a href="#capacitor-storage">Capacitor Storage Format</a></li>
+        <li><a href="#shuffle-service">Shuffle Service</a></li>
+        <li><a href="#slot-scheduling">Slot Scheduling</a></li>
+        <li><a href="#query-stages">Query Stages &amp; Execution</a></li>
+        <li><a href="#nested-data">Nested &amp; Repeated Data</a></li>
+        <li><a href="#cost-model">BigQuery Cost Model</a></li>
+        <li><a href="#vs-postgresql">Key Differences from PostgreSQL</a></li>
+        <li><a href="#production-incident">Production Incident: Nested Data Scan Explosion</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
     <div class="sidebar-actions">
-      <button class="btn-prev" onclick="location.href='ch09-warehouse-design.html'">Previous Chapter</button>
-      <button class="btn-next" onclick="location.href='ch11-snowflake-internals.html'">Next Chapter</button>
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
     </div>
   </aside>
 
@@ -56,6 +58,10 @@
         <span class="topic-tag">Dremel</span>
       </div>
     </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
 
     <nav class="chapter-nav">
       <a class="prev" href="ch09-warehouse-design.html">Previous: Warehouse Design</a>

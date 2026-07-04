@@ -11,17 +11,37 @@
   <button class="menu-toggle" aria-label="Toggle sidebar">☰</button>
   <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
 
-  <aside class="sidebar">
+    <aside class="sidebar">
     <div class="sidebar-header">
-      <a href="../index.html" class="brand">DE Interview Handbook</a>
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
     </div>
-    <div class="sidebar-chapter">Ch 11 / Snowflake Internals</div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 11</span>
+      <span class="chapter-title">Snowflake Internals</span>
+    </div>
     <nav class="sidebar-nav">
-      <a href="ch10-bigquery-internals.html">← Ch 10: BigQuery Internals</a>
-      <a href="ch12-spark-execution.html">Ch 12: Spark Execution →</a>
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer (60-Second Version)</a></li>
+        <li><a href="#shared-data-arch">Shared-Data Architecture</a></li>
+        <li><a href="#storage-layer">Storage Layer</a></li>
+        <li><a href="#compute-layer">Compute Layer</a></li>
+        <li><a href="#cloud-services">Cloud Services Layer</a></li>
+        <li><a href="#micro-partitions">Micro-partition Deep Dive</a></li>
+        <li><a href="#pruning">Pruning &amp; Clustering</a></li>
+        <li><a href="#time-travel">Time Travel &amp; Fail-Safe</a></li>
+        <li><a href="#query-processing">Query Processing</a></li>
+        <li><a href="#production-incident">Real Production Incident: Auto-Scaling Cost Spike</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
     </nav>
     <div class="sidebar-actions">
-      <a href="../index.html">Back to Index</a>
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
     </div>
   </aside>
 
@@ -41,6 +61,10 @@
         <span class="topic-tag">Micro-partitions</span>
       </div>
     </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
 
     <!-- ═══════════════════════════════════════════════════════════════
          SECTION 1: INTERVIEWER INTENT
