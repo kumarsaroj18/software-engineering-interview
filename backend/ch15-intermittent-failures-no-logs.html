@@ -258,6 +258,10 @@ public class OrderService {
           <li>Use tools like <code>jcstress</code> for low-level concurrency testing</li>
         </ul>
         <pre><code class="language-java">// FIXED: Optimistic locking with retry
+// NOTE: For @Retryable + @Transactional to work correctly, the retry aspect
+// must wrap the transaction aspect (retry is outer, transaction is inner).
+// Ensure proper ordering via @Order or by placing @Retryable on a separate
+// bean from @Transactional, so each retry starts a fresh transaction.
 @Retryable(value = OptimisticLockingFailureException.class, maxAttempts = 3)
 @Transactional
 public OrderResult placeOrder(String itemId, int quantity) {
@@ -285,7 +289,7 @@ $ kubectl exec -it app-pod -- dig +stats payment-service.payments.svc.cluster.lo
         <p><strong>Common causes in Kubernetes:</strong></p>
         <ul>
           <li><strong>CoreDNS overload:</strong> Too many pods, not enough CoreDNS replicas</li>
-          <li><strong>ndots:5 default:</strong> Kubernetes default causes 4-5 DNS lookups before the correct one</li>
+          <li><strong>ndots:5 default:</strong> Kubernetes sets <code>ndots:5</code> in <code>/etc/resolv.conf</code>, meaning any name with fewer than 5 dots is treated as a relative name and has search domains appended first. A query for <code>payment-service</code> (0 dots) triggers up to 5 DNS lookups (one per search domain) before the final absolute lookup succeeds.</li>
           <li><strong>Conntrack table overflow:</strong> UDP DNS packets get dropped at high scale</li>
           <li><strong>Node-local DNS cache miss:</strong> If using NodeLocal DNSCache and it restarts</li>
         </ul>
@@ -306,16 +310,26 @@ spec:
       image: myapp:latest</code></pre>
         <p><strong>Java-specific DNS caching issues:</strong></p>
         <pre><code class="language-java">// JVM caches DNS results — can cause issues when IPs change
-// Default: successful lookups cached for 30s, failed lookups cached for 10s
-// In security manager: successful lookups cached FOREVER
+// Behavior varies by JDK version:
+//   JDK 8-11 without SecurityManager: cache for 30s (default)
+//   JDK 8-11 WITH SecurityManager: cache FOREVER (networkaddress.cache.ttl = -1)
+//   JDK 12+: cache for 30s regardless of SecurityManager
+//
+// NOTE: SecurityManager is deprecated since JDK 17 (JEP 411) and removed in JDK 24.
+// The "cache forever" behavior is primarily a concern for older JDK base images
+// still common in production (JDK 8, JDK 11 LTS).
 
 // Check current settings
 System.out.println(java.security.Security.getProperty("networkaddress.cache.ttl"));
 System.out.println(java.security.Security.getProperty("networkaddress.cache.negative.ttl"));
 
-// Fix: Set reasonable TTL in JVM args
+// Fix: Set reasonable TTL in JVM args (HotSpot-specific system property)
 // -Dsun.net.inetaddr.ttl=30
-// -Dsun.net.inetaddr.negative.ttl=10</code></pre>
+// -Dsun.net.inetaddr.negative.ttl=10
+//
+// Portable approach (works across JVM vendors): set in java.security file
+// networkaddress.cache.ttl=30
+// networkaddress.cache.negative.ttl=10</code></pre>
       </details>
 
       <details>
@@ -439,7 +453,10 @@ $ grep "pause" gc.log | awk '{print $NF}' | sort -n | tail -5
       <details>
         <summary>Firewall/Security Group Intermittent Drops</summary>
         <p>Cloud security groups and firewalls can drop packets without sending RST or ICMP unreachable
-        messages. This causes connections to hang until TCP retransmission timeout (typically 15-30 seconds).</p>
+        messages. This causes connections to hang until the application-level timeout fires (typically 15-30 seconds
+        if configured). Without an explicit timeout, Linux's TCP stack will retransmit for much longer —
+        the default <code>tcp_retries2=15</code> results in approximately 13-30 minutes before giving up on an
+        established connection.</p>
         <pre><code class="language-bash"># Detect dropped packets at the network level
 $ iptables -L -v -n | grep DROP
     1234  98765 DROP  all  --  *  *  0.0.0.0/0  0.0.0.0/0  /* rate limit */
@@ -1256,10 +1273,12 @@ $ curl -m 3 http://10.0.5.47:8080/health
 
       <details>
         <summary>Prevention: DNS Configuration for Java Services</summary>
-        <pre><code class="language-java">// Option 1: JVM argument (preferred — works for all DNS resolution)
+        <pre><code class="language-java">// Option 1: JVM argument (widely used in production)
 // Add to JAVA_OPTS or JVM_ARGS in Dockerfile/deployment:
 // -Dsun.net.inetaddr.ttl=30
 // -Dsun.net.inetaddr.negative.ttl=10
+// NOTE: sun.* properties are HotSpot-specific (OpenJDK, Oracle JDK, Corretto).
+// For portability across JVM vendors, prefer Option 3 (java.security file).
 
 // Option 2: Programmatic (early in application startup)
 public static void main(String[] args) {

@@ -149,6 +149,7 @@
         </pre>
         <div class="callout callout-info">
           <p><strong>Why multi-tier?</strong> L1 eliminates serialization and network overhead for hot keys. L2 provides shared state across a cluster. The ratio drop could be at any layer — isolate which one first.</p>
+          <p><strong>⚠️ L1 coherence:</strong> L1 caches are per-JVM. Updates to Redis do NOT automatically propagate to other JVMs' L1 caches. Use short L1 TTLs, pub/sub invalidation, or Redis 6+ client-side caching for cross-JVM coherence.</p>
         </div>
       </details>
       <details>
@@ -185,7 +186,9 @@ public class MultiTierCacheConfig {
         return new MultiTierCacheManager(l1CacheManager, l2CacheManager);
     }
 }</code></pre>
-        <pre><code class="language-java">public class MultiTierCacheManager implements CacheManager {
+        <pre><code class="language-java">// Note: Spring Cache has no built-in multi-level cache manager.
+// This is a custom implementation that composes L1 (Caffeine) and L2 (Redis).
+public class MultiTierCacheManager implements CacheManager {
 
     private final CaffeineCacheManager l1;
     private final RedisCacheManager l2;
@@ -227,7 +230,7 @@ String key = "v2:user:" + userId;
 String key = "v2:user:" + userId + ":profile";
 String key = "v2:user:" + userId + ":preferences";</code></pre>
         <div class="callout callout-warning">
-          <p><strong>⚠️ Key format changes are the #1 cause of sudden hit ratio drops.</strong> If a deployment changes <code>user:{id}</code> to <code>v2:user:{id}</code>, all existing keys become orphaned misses until they naturally expire.</p>
+          <p><strong>⚠️ Key format changes are one of the most common deployment-related causes of sudden hit ratio drops.</strong> If a deployment changes <code>user:{id}</code> to <code>v2:user:{id}</code>, all existing keys become orphaned misses until they naturally expire.</p>
         </div>
       </details>
     </section>
@@ -353,12 +356,9 @@ public void init() {
         .getConnection().flushAll();
 }
 
-// ❌ In application.yml
-spring:
-  cache:
-    redis:
-      # This causes FLUSHALL on startup
-      flush-on-connect: true</code></pre>
+// ❌ Misconfigured CacheManager that flushes on initialization
+// (there is no built-in 'flush-on-connect' Spring property — but custom
+// initializers or @PostConstruct methods can accidentally do this)</code></pre>
         <div class="callout callout-danger">
           <p><strong>🚨 Never FLUSHALL in production.</strong> If you need to invalidate specific keys after a schema change, use targeted key deletion with a pattern scan: <code>SCAN 0 MATCH "user:*" COUNT 100</code> with batched DEL.</p>
         </div>
@@ -417,7 +417,7 @@ During Resharding (adding Node D):
   ██████
         </pre>
         <div class="callout callout-info">
-          <p><strong>Redis handles ASK/MOVED redirects</strong>, but client libraries may not follow them instantly. Lettuce and Jedis handle this, but connection pool refresh can cause brief miss spikes.</p>
+          <p><strong>Redis handles ASK/MOVED redirects</strong> and modern clients (Lettuce, Jedis) follow them correctly. However, clients may experience brief additional latency or temporary misses while routing tables refresh and connection pools update. The impact is typically seconds, not minutes.</p>
         </div>
       </details>
     </section>
@@ -503,8 +503,9 @@ public class StampedeProtectedCache {
         double beta = 1.0; // Tuning parameter
 
         // XFetch algorithm: probabilistic early recomputation
-        boolean shouldRecompute = remainingTtl &lt;=
-            delta * beta * Math.log(Math.random());
+        // -Math.log(Math.random()) gives an exponentially distributed positive value
+        boolean shouldRecompute = remainingTtl -
+            delta * beta * (-Math.log(Math.random())) &lt;= 0;
 
         if (!shouldRecompute) {
             return entry.getValue(); // Cache HIT
@@ -704,11 +705,12 @@ CONFIG SET maxmemory-policy allkeys-lfu
 
 # Tune LFU parameters
 # lfu-log-factor: higher = slower counter growth (default 10)
-# lfu-decay-time: minutes before counter is halved (default 1)
+# lfu-decay-time: minutes of idle time before the counter is decremented (default 1)
+# Note: this is NOT a halving — the decay is logarithmic based on elapsed time.
 CONFIG SET lfu-log-factor 10
 CONFIG SET lfu-decay-time 1</code></pre>
         <div class="callout callout-tip">
-          <p><strong>💡 When to switch to LFU:</strong> If you have batch jobs, scrapers, or admin scans that pollute the cache with one-time access keys, LFU preserves your hot working set. Check with <code>OBJECT FREQ key</code> to see access frequency counters.</p>
+          <p><strong>💡 When to switch to LFU:</strong> If you have batch jobs, scrapers, or admin scans that pollute the cache with one-time access keys, LFU preserves your hot working set. Check with <code>OBJECT FREQ key</code> to see access frequency counters (only meaningful when Redis is configured with an LFU eviction policy: <code>allkeys-lfu</code> or <code>volatile-lfu</code>).</p>
         </div>
       </details>
       <details>
@@ -765,7 +767,11 @@ expired_keys:15234891          # Keys expired by TTL
 
 # But we need RATE not cumulative — use redis-cli --stat
 redis-cli --stat -i 1
-# Shows per-second stats including hit rate changes</code></pre>
+# Shows per-second stats including hit rate changes
+
+# ⚠️ Production dashboards should calculate hit ratio using the RATE of hits
+# and misses over a moving time window (1-5 min), not lifetime counters.
+# Lifetime counters mask sudden changes in a sea of historical data.</code></pre>
         <pre><code class="language-bash"># Memory diagnostics
 redis-cli INFO memory
 
@@ -773,7 +779,8 @@ redis-cli INFO memory
 # used_memory_human: 7.84G
 # used_memory_peak_human: 8.00G    ← Hit the ceiling!
 # maxmemory_human: 8.00G
-# mem_fragmentation_ratio: 1.42    ← Above 1.5 is problematic
+# mem_fragmentation_ratio: 1.42    ← Sustained above 1.5 deserves investigation
+#                                     (depends on workload, allocator, object sizes)
 # mem_allocator: jemalloc-5.2.1
 
 # Keyspace info — number of keys and expiry stats
@@ -798,7 +805,7 @@ redis-cli MEMORY DOCTOR
 #  * Peak memory: 8.00GB, currently: 7.84GB (98% of peak)
 #  * High fragmentation ratio: 1.42"</code></pre>
         <div class="callout callout-warning">
-          <p><strong>⚠️ Never run DEBUG or KEYS on production.</strong> Use <code>SCAN</code> with COUNT for iterative key discovery. <code>KEYS *</code> blocks Redis (single-threaded) and causes cascading timeouts.</p>
+          <p><strong>⚠️ Never run DEBUG or KEYS on production.</strong> Use <code>SCAN</code> with COUNT for iterative key discovery. <code>KEYS *</code> blocks Redis's single-threaded command execution loop (Redis 6+ uses multi-threaded I/O, but commands still execute sequentially) and causes cascading timeouts.</p>
         </div>
       </details>
       <details>
@@ -1158,6 +1165,8 @@ redis-cli SLOWLOG GET 5</code></pre>
       <details>
         <summary>Step 3: Application-level diagnostics</summary>
         <pre><code class="language-java">// Add temporary diagnostic logging for cache operations
+// Note: The >1ms heuristic below is approximate. Fast DB queries or slow
+// deserialization can produce false signals. Use for directional analysis only.
 @Aspect
 @Component
 @ConditionalOnProperty("cache.diagnostics.enabled")
@@ -1250,6 +1259,8 @@ public class CacheWarmer {
     /**
      * Warm cache with top-N most accessed entities.
      * Called on startup or after cache flush incident.
+     * ⚠️ Warm only the hot working set (e.g., top 10K keys), not the entire database.
+     * Preloading millions of keys delays startup and wastes memory.
      */
     @Async
     @EventListener(ApplicationReadyEvent.class)
@@ -1407,10 +1418,21 @@ public class MultiTierCache implements Cache {
     @Override
     public void clear() {
         l1.invalidateAll();
-        // Don't FLUSHALL! Only clear keys with our prefix
-        Set&lt;String&gt; keys = redis.keys(name + ":*");
-        if (keys != null &amp;&amp; !keys.isEmpty()) {
-            redis.delete(keys);
+        // Don't FLUSHALL! Use SCAN to iteratively find and delete keys with our prefix.
+        // Alternatively, use namespace versioning: increment cache version prefix
+        // so old keys are simply never read (they expire naturally via TTL).
+        ScanOptions options = ScanOptions.scanOptions().match(name + ":*").count(100).build();
+        try (Cursor&lt;byte[]&gt; cursor = redis.getConnectionFactory().getConnection()
+                .scan(options)) {
+            List&lt;String&gt; batch = new ArrayList&lt;&gt;();
+            while (cursor.hasNext()) {
+                batch.add(new String(cursor.next()));
+                if (batch.size() >= 100) {
+                    redis.delete(batch);
+                    batch.clear();
+                }
+            }
+            if (!batch.isEmpty()) redis.delete(batch);
         }
     }
 

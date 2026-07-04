@@ -105,6 +105,17 @@
           <li><strong>Default executor issues:</strong> SimpleAsyncTaskExecutor creates a new thread per invocation with no pooling, leading to unbounded thread creation under load.</li>
         </ol>
         <p><strong>Key insight:</strong> @Async does not make code non-blocking — it offloads execution to another thread. If that thread pool is saturated or the caller blocks waiting for the result, the request still appears to block from the client's perspective.</p>
+        <table>
+          <thead>
+            <tr><th>Technique</th><th>Worker thread blocked?</th><th>Request thread blocked?</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Synchronous call</td><td>Yes</td><td>Yes</td></tr>
+            <tr><td>@Async (thread pool)</td><td>Yes (pool thread may block on I/O)</td><td>No (unless caller waits on result)</td></tr>
+            <tr><td>WebFlux (Reactive)</td><td>No (non-blocking I/O throughout)</td><td>No</td></tr>
+            <tr><td>Virtual Threads</td><td>Virtual thread blocks (cheap)</td><td>Carrier thread usually freed</td></tr>
+          </tbody>
+        </table>
       </details>
     </section>
 
@@ -171,7 +182,7 @@ public class OrderService {
             ));
     }
 }</code></pre>
-        <p><strong>Key pitfall:</strong> If you call <code>.get()</code> or <code>.join()</code> on the HTTP request thread, you convert the async pipeline back into a synchronous, blocking call.</p>
+        <p><strong>Key pitfall:</strong> If you call <code>.get()</code> or <code>.join()</code> on the HTTP request thread, you convert the async pipeline back into a synchronous, blocking call. Both methods block the calling thread — the only difference is exception handling: <code>get()</code> throws checked <code>ExecutionException</code>, while <code>join()</code> throws unchecked <code>CompletionException</code>.</p>
       </details>
       <details>
         <summary>WebFlux / Project Reactor (Reactive Streams)</summary>
@@ -214,7 +225,7 @@ public class ReactiveOrderController {
             <tr>
               <td>Thread count under load</td>
               <td>Grows to max pool size</td>
-              <td>Fixed (CPU cores × 2)</td>
+              <td>Fixed (availableProcessors() — one event loop thread per CPU core)</td>
             </tr>
             <tr>
               <td>Debugging</td>
@@ -252,7 +263,7 @@ public class OrderController {
 }</code></pre>
         <p><strong>Why this matters:</strong> Virtual Threads allow you to write straightforward synchronous-looking code while achieving the throughput of asynchronous systems. The JVM handles the multiplexing — when a virtual thread blocks on I/O, its carrier (platform) thread is released to run other virtual threads.</p>
         <ul>
-          <li>Millions of virtual threads can exist simultaneously</li>
+          <li>Hundreds of thousands to millions of virtual threads can exist simultaneously (depending on workload and available memory)</li>
           <li>Blocking I/O automatically yields the carrier thread</li>
           <li>No need for reactive APIs or callback chains</li>
           <li>Standard debugging tools work (stack traces are preserved)</li>
@@ -465,8 +476,8 @@ public void monitorAsyncPool() {
             </tr>
             <tr>
               <td>CallerRunsPolicy</td>
-              <td>Executes on caller's thread</td>
-              <td><strong>YES — blocks HTTP thread</strong></td>
+              <td>Executes on caller's thread (intentional backpressure)</td>
+              <td><strong>YES — blocks HTTP thread</strong> (can be desirable to slow upstream)</td>
             </tr>
             <tr>
               <td>DiscardPolicy</td>
@@ -530,6 +541,7 @@ Hooks.onOperatorDebug();  // Expensive — use only in development</code></pre>
           <li><code>InputStream.read()</code> / <code>OutputStream.write()</code></li>
           <li><code>InetAddress.getByName()</code> (DNS lookup)</li>
           <li>Logging frameworks writing to disk (Log4j2 without async appender)</li>
+          <li><code>Mono.just(repository.find())</code> — looks reactive but <code>find()</code> executes eagerly on the calling thread! Use <code>Mono.fromCallable(() -&gt; repository.find())</code> for lazy evaluation.</li>
         </ul>
       </details>
       <details>
@@ -649,7 +661,8 @@ public class SimpleAsyncTaskExecutor implements AsyncTaskExecutor {
         Thread t = new Thread(task, getThreadNamePrefix() + this.threadCount.incrementAndGet());
         t.start();
     }
-    // No pool, no queue, no upper bound (unless concurrencyLimit is set)
+    // No pool, no queue, no upper bound by default.
+    // Note: setConcurrencyLimit(n) can cap concurrent threads, but there's still no reuse.
 }</code></pre>
         <p><strong>Under high load, this means:</strong></p>
         <ul>
@@ -1075,7 +1088,8 @@ groups:
 
 // Memory comparison:
 // Platform thread: ~1MB stack (1000 threads = 1GB RAM)
-// Virtual thread:  ~1KB initially, grows as needed (1M threads = ~1GB RAM)</code></pre>
+// Virtual thread:  very small initial footprint, stack grows dynamically as needed
+//                  (hundreds of thousands to millions feasible depending on workload)</code></pre>
         <pre><code class="language-java">// Manual virtual thread usage (Java 21+)
 try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
     List&lt;Future&lt;OrderResult&gt;&gt; futures = orders.stream()
@@ -1112,8 +1126,9 @@ public class ModernConnectionPool {
     private final ReentrantLock lock = new ReentrantLock();
 
     public Connection getConnection() {
-        lock.lock();  // Virtual thread can unmount while waiting
+        lock.lock();  // Waiting to acquire does NOT pin (VT unmounts while waiting)
         try {
+            // Once acquired, carrier is occupied for execution (normal behavior)
             return pool.borrowConnection();
         } finally {
             lock.unlock();
@@ -1142,6 +1157,9 @@ java -Djdk.tracePinnedThreads=full -jar app.jar
       <details>
         <summary>Structured Concurrency (JEP 453 — Preview)</summary>
         <p>Structured concurrency ensures child tasks have a clear lifecycle tied to their parent scope, preventing thread leaks and orphaned operations:</p>
+        <div class="callout callout-warning">
+          <p><strong>Preview feature:</strong> Structured Concurrency was incubating in JDK 21 (JEP 453) and became a preview feature in JDK 22+ (JEP 462). The API may change across versions. Use <code>--enable-preview</code> to compile and run.</p>
+        </div>
         <pre><code class="language-java">// Java 21+ (Preview feature)
 // --enable-preview required
 
@@ -1186,10 +1204,11 @@ spring:
       enabled: true   # Tomcat/Jetty uses virtual threads for request handling
 
 # This single property:
-# 1. Configures Tomcat to use virtual threads for HTTP request handling
-# 2. Configures @Async to use virtual thread executor
-# 3. Configures @Scheduled to use virtual threads
-# 4. Configures Spring MVC async support with virtual threads</code></pre>
+# 1. Configures Tomcat/Jetty to use virtual threads for HTTP request handling
+# 2. Configures the default applicationTaskExecutor to use virtual threads
+# 3. Configures the default taskScheduler to use virtual threads
+# ⚠️ Custom-defined executor beans (@Bean) are NOT automatically changed.
+# If you define your own ThreadPoolTaskExecutor, it remains a platform thread pool.</code></pre>
         <pre><code class="language-java">// Custom virtual thread executor for @Async (if you need fine-grained control)
 @Configuration
 @EnableAsync
@@ -2239,7 +2258,8 @@ public class HybridController {
         try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
             var task1 = scope.fork(() -&gt; service1.fetch(id));
             var task2 = scope.fork(() -&gt; service2.fetch(id));
-            scope.join().throwIfFailed();
+            scope.join();           // Blocks virtual thread (cheap)
+            scope.throwIfFailed();  // Propagates first failure
             return new AggregateResult(task1.get(), task2.get());
         }
     }

@@ -74,7 +74,7 @@
       <div class="callout callout-info">
         <p><strong>What they're really testing:</strong></p>
         <ul>
-          <li>Do you understand why true exactly-once is impossible in distributed systems (Two Generals' Problem, FLP impossibility)?</li>
+          <li>Do you understand why true exactly-once is impossible in distributed systems? (The <strong>Two Generals' Problem</strong> shows why reliable acknowledgment over an unreliable channel is impossible. The <strong>FLP impossibility</strong> is a related but distinct result about consensus termination.)</li>
           <li>Can you articulate the difference between <strong>delivery guarantees</strong> (network-level) vs <strong>processing guarantees</strong> (application-level)?</li>
           <li>Do you know how Kafka's idempotent producer and transactional API work at a protocol level?</li>
           <li>Can you design consumer-side idempotency using deduplication tables and atomic offset commits?</li>
@@ -252,7 +252,8 @@
   If seq arrives out of order (gap):
   Send(key=E, seq=5) ──────────────→  Broker sees: last_seq=3, got seq=5
                                        → OutOfOrderSequenceException!
-                                       (Indicates data loss — fatal error)
+                                       (Potentially fatal — may require producer restart.
+                                        Since Kafka 2.5/KIP-360, some cases are recoverable.)
         </pre>
 
         <h3>Producer Configuration for Exactly-Once</h3>
@@ -266,8 +267,8 @@ spring:
         enable.idempotence: true          # Enables PID + sequence numbers
         acks: all                          # Wait for all ISR replicas (forced by idempotence)
         max.in.flight.requests.per.connection: 5  # Max 5 with idempotence (was 1 before KIP-185)
-        retries: 2147483647                # Infinite retries (forced by idempotence)
-        delivery.timeout.ms: 120000        # 2 min total delivery timeout
+        retries: 2147483647                # Effectively infinite (forced by idempotence)
+        delivery.timeout.ms: 120000        # 2 min — this is the ACTUAL retry bound, not retries count
       # Transactional producer (for read-process-write)
       transaction-id-prefix: payment-processor  # Enables transactions
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
@@ -277,7 +278,7 @@ spring:
         <div class="callout callout-info">
           <p><strong>Implicit settings when idempotence is enabled:</strong></p>
           <ul>
-            <li><code>acks=all</code> — forced (must wait for all in-sync replicas)</li>
+            <li><code>acks=all</code> — forced (must wait for all in-sync replicas). Note: pair with <code>min.insync.replicas=2</code> on the broker — otherwise acks=all with a single ISR replica is equivalent to acks=1.</li>
             <li><code>retries=Integer.MAX_VALUE</code> — forced (must retry to ensure delivery)</li>
             <li><code>max.in.flight.requests.per.connection ≤ 5</code> — enforced (broker can track up to 5 in-flight batches per PID+partition)</li>
           </ul>
@@ -344,7 +345,7 @@ public class KafkaTransactionalConfig {
 
         <h3>Producer Sequence Numbers — Deep Dive</h3>
         <div class="callout callout-warning">
-          <p><strong>PID lifecycle:</strong> The PID is ephemeral — assigned when the producer initializes and lost when the producer restarts. This means idempotent producer alone does NOT deduplicate across producer restarts. For cross-restart deduplication, you need the <strong>transactional API</strong> with a stable <code>transactional.id</code>. The broker uses the transactional.id to fence old producer instances (zombie fencing).</p>
+          <p><strong>PID lifecycle:</strong> The PID is ephemeral — assigned when the producer initializes and lost when the producer restarts. On restart, a new PID is assigned AND sequence numbers reset to 0. The broker cannot correlate new sequences with the old PID, so retries spanning a restart can create duplicates. For cross-restart deduplication, you need the <strong>transactional API</strong> with a stable <code>transactional.id</code>. The broker uses the transactional.id to fence old producer instances (zombie fencing).</p>
         </div>
 
         <pre><code class="language-java">// Demonstrating the difference: idempotent vs transactional
@@ -378,14 +379,15 @@ public class KafkaTransactionalConfig {
   ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
   │ 0  │ 1  │ 2  │ 3  │ 4  │ 5  │ 6  │ 7  │ 8  │ 9  │  Messages
   └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
-                          ↑              ↑
-                   committed=4      position=7
-                   (stored in        (next poll
-                    __consumer_       starts here)
-                    offsets topic)
+                     ↑                   ↑
+              committed=3           position=7
+              (next to fetch=3,     (consumer's current
+               stored in             in-memory position)
+               __consumer_offsets)
 
-  On rebalance/restart: consumer resumes from committed offset (4)
-  Messages 4, 5, 6 will be RE-DELIVERED → potential duplicates!
+  On rebalance/restart: consumer resumes from committed offset (3)
+  Messages 3, 4, 5, 6 will be RE-DELIVERED → potential duplicates!
+  (Messages 3-6 were already processed but offset was not committed)
         </pre>
 
         <h3>Auto Commit vs Manual Commit</h3>
@@ -402,8 +404,8 @@ public class KafkaTransactionalConfig {
             <tr>
               <td><strong>Auto-commit (default)</strong></td>
               <td><code>enable.auto.commit=true</code>, <code>auto.commit.interval.ms=5000</code></td>
-              <td>At-most-once (if commit before processing) or At-least-once (if commit after)</td>
-              <td>Commits on timer, not aligned with processing</td>
+              <td>Effectively at-least-once in most cases</td>
+              <td>Commits periodically during <code>poll()</code>, not aligned with processing completion. Can lose messages if consumer crashes after commit but before processing finishes.</td>
             </tr>
             <tr>
               <td><strong>Manual sync commit</strong></td>
@@ -438,10 +440,13 @@ processMessage(record); // ← process first
 consumer.commitSync();  // ← if crash here, message redelivered (duplicate)
 
 // SAFEST: Atomic commit with processing → Effectively Exactly-Once
-// Store offset in same DB transaction as business logic
+// Store offset (or event ID) in same DB transaction as business logic
+// ⚠️ CRITICAL: Both MUST be in the SAME transaction. If the business write and
+// the offset/dedup record are in separate transactions, a crash between them
+// reintroduces the duplicate-processing window.
 @Transactional
 public void process(ConsumerRecord&lt;String, PaymentEvent&gt; record) {
-    // Business logic
+    // Business logic + offset stored atomically
     paymentRepository.save(toEntity(record.value()));
     // Store offset in DB (same transaction!)
     offsetRepository.save(new ProcessedOffset(
@@ -546,10 +551,11 @@ public void handlePayment(
 spring:
   kafka:
     producer:
-      transaction-id-prefix: order-processor
+      transaction-id-prefix: order-processor  # Spring Kafka appends a unique suffix per producer
+      # ⚠️ Do NOT also set transactional.id in properties — Spring manages this via the prefix.
+      # Use transaction-id-prefix (Spring) OR transactional.id (raw Kafka), never both.
       properties:
         enable.idempotence: true
-        transactional.id: order-processor-${HOSTNAME}
         transaction.timeout.ms: 60000
 
     # Consumer config (read committed)
@@ -571,19 +577,20 @@ spring:
           <tbody>
             <tr>
               <td><code>read_uncommitted</code> (default)</td>
-              <td>Consumer sees ALL messages, including those in open transactions</td>
-              <td>Maximum throughput, duplicates acceptable</td>
+              <td>Consumer sees ALL messages including those from open or aborted transactions</td>
+              <td>Default behavior; use when all producers are non-transactional or duplicates are acceptable</td>
             </tr>
             <tr>
               <td><code>read_committed</code></td>
-              <td>Consumer only sees messages from committed transactions</td>
-              <td>Required for exactly-once consumers</td>
+              <td>Hides messages from aborted or in-progress transactions. Non-transactional messages are still visible immediately.</td>
+              <td>Required for consumers downstream of transactional producers</td>
             </tr>
           </tbody>
         </table>
 
         <div class="callout callout-info">
           <p><strong>How read_committed works internally:</strong> The broker maintains a <code>Last Stable Offset (LSO)</code> — the offset of the first message in an open transaction. Consumers with <code>read_committed</code> cannot read beyond the LSO. This means a long-running transaction blocks all downstream consumers on that partition, even for messages from other producers. Keep transactions short!</p>
+          <p><strong>Important nuance:</strong> Non-transactional messages (produced without a transactional.id) are visible immediately to <code>read_committed</code> consumers, regardless of any open transactions from other producers. The filtering only applies to messages produced within a transaction.</p>
         </div>
 
         <h3>Zombie Fencing with Epochs</h3>
@@ -610,6 +617,8 @@ spring:
 
   Result: Even if Pod A "wakes up" later, it gets ProducerFencedException
           on any send/commit attempt. The zombie is fenced.
+          ⚠️ ProducerFencedException is FATAL and unrecoverable.
+          The producer must be closed and a new instance created. Do not retry.
         </pre>
 
         <h3>Complete Transactional Consumer-Producer</h3>
@@ -778,12 +787,15 @@ public class IdempotentPaymentConsumer {
     }
     
     private String extractEventId(ConsumerRecord&lt;String, PaymentEvent&gt; record) {
-        // Prefer a business-level unique ID from the message headers or payload
+        // ALWAYS prefer a business-level unique ID from the message headers or payload.
+        // Business IDs (UUID, payment_id) survive topic recreation, offset resets,
+        // and republishing — Kafka offsets do not.
         Header eventIdHeader = record.headers().lastHeader("event-id");
         if (eventIdHeader != null) {
             return new String(eventIdHeader.value(), StandardCharsets.UTF_8);
         }
-        // Fallback: topic-partition-offset (unique within Kafka)
+        // Fallback only: topic-partition-offset (unique within current topic lifetime)
+        // ⚠️ Fragile — breaks if topic is recreated or offsets are reset
         return String.format("%s-%d-%d", 
             record.topic(), record.partition(), record.offset());
     }
@@ -1038,6 +1050,9 @@ public class OutboxPublisher {
             }
         }
     }
+    // ⚠️ This polling publisher provides AT-LEAST-ONCE delivery to Kafka.
+    // If crash occurs after Kafka send succeeds but before DB status update commits,
+    // the event will be re-published on recovery. Downstream consumers MUST be idempotent.
 }</code></pre>
 
         <h3>Debezium Outbox Connector Configuration</h3>
@@ -1273,7 +1288,7 @@ spring:
         max.poll.records: 100         # Process 100 records per poll
         max.poll.interval.ms: 300000  # 5 min processing time before rebalance
         session.timeout.ms: 45000     # 45s heartbeat timeout
-        heartbeat.interval.ms: 15000  # Heartbeat every 15s
+        heartbeat.interval.ms: 15000  # Heartbeat every 15s (rule of thumb: ≤ session.timeout.ms / 3)
         partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
         spring.json.trusted.packages: "com.company.payments.events"
     
@@ -1859,9 +1874,9 @@ rate(spring_kafka_listener_seconds_count[1m])
             </tr>
             <tr>
               <td>7</td>
-              <td><strong>Using topic-partition-offset as dedup key for compacted topics</strong></td>
-              <td>After compaction, offsets are reused — dedup table has stale entries</td>
-              <td>Use business-level event ID (UUID, payment_id) as dedup key, not Kafka offset</td>
+              <td><strong>Using topic-partition-offset as sole dedup key</strong></td>
+              <td>Offsets don't survive topic recreation, offset resets, or republishing from another system. Dedup table becomes invalid after operational changes.</td>
+              <td>Use business-level event ID (UUID, payment_id) as dedup key. Offsets are only unique within a topic-partition's current lifetime.</td>
             </tr>
             <tr>
               <td>8</td>
@@ -1906,6 +1921,9 @@ rate(spring_kafka_listener_seconds_count[1m])
         <summary>When to use Kafka EOS vs pragmatic idempotency</summary>
 
         <h3>Performance Comparison</h3>
+        <div class="callout callout-info">
+          <p><strong>Note:</strong> These are approximate benchmarks. Actual numbers vary significantly with message size, cluster configuration, replication factor, and hardware.</p>
+        </div>
         <table>
           <thead>
             <tr>

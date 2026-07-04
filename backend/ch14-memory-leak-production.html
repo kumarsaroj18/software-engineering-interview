@@ -84,6 +84,9 @@
       <details>
         <summary>30-second elevator pitch</summary>
         <blockquote class="callout-tip">
+          <div class="callout callout-info">
+            <p><strong>What is a Java memory leak?</strong> Objects remain reachable via unintended references even though the application no longer needs them. The garbage collector works correctly — it simply cannot collect objects that are still reachable. A "leak" in Java is a reference leak, not a true unreachable-memory leak like in C/C++.</p>
+          </div>
           <p><strong>TL;DR:</strong> I would approach this systematically: (1) Confirm the leak using heap metrics trending over days — look for monotonically increasing Old Gen usage that GC cannot reclaim. (2) Enable <code>-XX:+HeapDumpOnOutOfMemoryError</code> proactively and take comparative heap dumps at day 1 vs day 5. (3) Analyze with Eclipse MAT — inspect the dominator tree, find the largest retained-size objects, and trace GC roots to identify what's holding references. (4) Common culprits for multi-day leaks: ThreadLocals not cleaned in request filters, static Maps/Lists used as caches without eviction, listener registrations without deregistration, and connection/stream handles not closed in error paths. (5) Fix with proper lifecycle management (try-finally, @PreDestroy, WeakReferences for caches), then validate with a soak test reproducing production traffic patterns over 7+ days.</p>
         </blockquote>
       </details>
@@ -109,6 +112,7 @@
 # └────┴───────┴─────────────────────┴────────────┴────────────────┘</code></pre>
         <ul>
           <li><strong>Young Generation (Eden + Survivor Spaces)</strong> — Short-lived objects. Minor GC collects here frequently (~100ms pauses). Objects surviving multiple minor GCs get promoted to Old Gen.</li>
+          <li><strong>Note:</strong> Young/Old are logical concepts. G1 uses equal-sized regions that dynamically serve as either. ZGC and Shenandoah have their own layouts. The generational model remains useful for understanding leak behavior regardless of physical implementation.</li>
           <li><strong>Old Generation (Tenured)</strong> — Long-lived objects. Full GC is expensive (seconds of pause). In a memory leak, this is where leaked objects accumulate.</li>
           <li><strong>Promotion rate</strong> — Objects surviving <code>-XX:MaxTenuringThreshold</code> (default 15 for G1) minor GCs get promoted. A leak causes higher-than-normal promotion rates.</li>
         </ul>
@@ -118,12 +122,15 @@ java -Xms8g -Xmx8g \
   -XX:MaxGCPauseMillis=200 \
   -XX:+HeapDumpOnOutOfMemoryError \
   -XX:HeapDumpPath=/var/dumps/heap-$(date +%s).hprof \
+  # Pre-Java 9 GC logging (legacy):
   -XX:+PrintGCDetails \
   -XX:+PrintGCDateStamps \
   -Xloggc:/var/log/gc/gc.log \
   -XX:+UseGCLogFileRotation \
   -XX:NumberOfGCLogFiles=10 \
   -XX:GCLogFileSize=50M \
+  # Java 9+ unified logging (preferred for modern JVMs):
+  # -Xlog:gc*:file=/var/log/gc/gc.log:time,uptime,level:filecount=10,filesize=50M \
   -jar application.jar</code></pre>
       </details>
 
@@ -190,12 +197,15 @@ public class DirectBufferLeak {
         buffer.flip();
         byte[] data = new byte[buffer.remaining()];
         buffer.get(data);
-        // buffer goes out of scope but native memory lingers
-        // until next Full GC (which may be days away!)
+        // buffer goes out of scope but native memory lingers until GC
+        // collects the buffer's Java reference and triggers the Cleaner.
+        // Timing is unpredictable — may not occur for days under low GC pressure.
         return data;
     }
 
     // GOOD: Reuse pooled direct buffers
+    // Note: This intentionally keeps one 64KB buffer per thread permanently.
+    // Acceptable for fixed-size thread pools. Memory freed only when thread dies.
     private static final ThreadLocal&lt;ByteBuffer&gt; BUFFER_POOL =
         ThreadLocal.withInitial(() -&gt; ByteBuffer.allocateDirect(64 * 1024));
 
@@ -521,7 +531,8 @@ jeprof --svg /path/to/java /tmp/jeprof.*.heap &gt; leak.svg</code></pre>
       <details>
         <summary>jmap — Heap Dump &amp; Histogram</summary>
         <p><code>jmap</code> provides heap snapshots and quick histograms. Use with caution in production — heap dumps pause the JVM.</p>
-        <pre><code class="language-bash"># Quick histogram (minimal pause, no full dump)
+        <pre><code class="language-bash"># Class histogram with live objects (forces a Full GC via :live flag,
+# but output is much smaller than a full heap dump)
 jmap -histo:live &lt;pid&gt; | head -30
 
 # Output shows top objects by count and size:
@@ -776,6 +787,7 @@ aws elbv2 register-targets \
 # - The ThreadLocal value is a RequestContext
 # - Which contains a HashMap with 65536 entries (way too many!)</code></pre>
         <p><strong>Key insight:</strong> If you see threads dominating disproportionate memory, it's almost certainly a ThreadLocal leak in a thread-pool environment.</p>
+        <p><strong>Important nuance:</strong> The largest retained object isn't always the leak. A 2GB Caffeine cache may be intentional. The real signal comes from <em>comparative</em> analysis: what grew between day-1 and day-5 dumps? Absolute size alone doesn't prove a leak — unexpected growth does.</p>
       </details>
 
       <details>
@@ -1149,6 +1161,9 @@ groups:
 # Did this start after a specific deployment?
 kubectl rollout history deployment/my-app
 git log --oneline --since="5 days ago" -- src/main/java/com/example/filter/</code></pre>
+        <div class="callout callout-info">
+          <p><strong>Leak vs. memory pressure:</strong> Not all memory growth is a leak. Legitimate causes of high memory include increased workload, cache warming, or undersized heap. The distinguishing signal: <em>post-Full-GC Old Gen that grows monotonically over days = leak</em>. Post-Full-GC Old Gen that stabilizes at a higher level = increased working set (not a leak, may need more heap).</p>
+        </div>
         <p><strong>Key decision:</strong> Is this urgent (hours until OOM) or can you investigate over days?</p>
         <ul>
           <li><strong>Urgent:</strong> Take heap dump immediately, rolling-restart to buy time</li>
@@ -1266,6 +1281,8 @@ public class MemoryLeakRegressionTest {
         }
 
         // Force GC and measure baseline
+        // Note: System.gc() is a hint, not guaranteed. This test provides
+        // directional signal for CI, not deterministic proof of leak absence.
         System.gc();
         Thread.sleep(1000);
         long baselineMemory = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
@@ -1674,6 +1691,9 @@ public class BatchExportService {
             ByteBuffer bufferRef = this.directBuffer;
             this.cleanable = CLEANER.register(this, () -&gt; {
                 // Release direct buffer's native memory
+                // ⚠️ sun.nio.ch.DirectBuffer is JDK-internal API.
+                // Requires --add-opens java.base/sun.nio.ch=ALL-UNNAMED on Java 9+.
+                // For portable code, rely on GC-triggered cleanup or Netty's buffer pooling.
                 if (bufferRef instanceof sun.nio.ch.DirectBuffer db) {
                     db.cleaner().clean();
                 }

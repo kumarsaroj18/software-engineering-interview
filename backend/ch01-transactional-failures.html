@@ -84,7 +84,7 @@
           <li>Do you understand the difference between framework magic and actual behavior?</li>
         </ul>
       </div>
-      <p>This question separates engineers who've memorized the <code>@Transactional</code> annotation from those who understand how Spring's transaction infrastructure actually works at the bytecode level. Interviewers want to see that you can reason about proxy boundaries, AOP interceptors, and the subtle ways declarative transactions can silently fail.</p>
+      <p>This question separates engineers who've memorized the <code>@Transactional</code> annotation from those who understand how Spring's transaction infrastructure actually works. Interviewers want to see that you can reason about proxy boundaries, AOP interceptors, and the subtle ways declarative transactions can silently fail.</p>
     </section>
 
     <!-- Section 2: 60-Second Interview Answer -->
@@ -96,7 +96,7 @@
           "<code>@Transactional</code> relies on Spring AOP proxies. The transaction only activates when the method is called <em>through the proxy</em>. There are several scenarios where the proxy is bypassed or misconfigured:
           <br><br>
           <strong>1. Self-invocation</strong> — calling a <code>@Transactional</code> method from within the same class bypasses the proxy entirely.<br>
-          <strong>2. Private/final methods</strong> — CGLIB can't override them, so the advice is never applied.<br>
+          <strong>2. Private/final methods</strong> — with Spring's default proxy-based AOP, CGLIB can't override final methods and private methods are never visible to the proxy. This limitation does not apply when using AspectJ weaving.<br>
           <strong>3. Checked exceptions</strong> — by default, Spring only rolls back on unchecked exceptions (<code>RuntimeException</code>). A checked exception commits the transaction.<br>
           <strong>4. Wrong propagation</strong> — <code>SUPPORTS</code> or <code>NOT_SUPPORTED</code> won't start a new transaction if none exists.<br>
           <strong>5. Async boundaries</strong> — <code>@Async</code> methods run on a different thread, outside the caller's transaction context.
@@ -115,7 +115,7 @@
         <p>When Spring Boot starts, it performs the following at bean initialization time:</p>
         <ol>
           <li><strong>Component Scanning</strong> — finds your <code>@Service</code> class</li>
-          <li><strong>BeanPostProcessor</strong> — <code>InfrastructureAdvisorAutoProxyCreator</code> detects <code>@Transactional</code></li>
+          <li><strong>BeanPostProcessor</strong> — <code>InfrastructureAdvisorAutoProxyCreator</code> (registered by <code>@EnableTransactionManagement</code>) creates proxies for beans with transactional metadata, detected via <code>AnnotationTransactionAttributeSource</code></li>
           <li><strong>Proxy Creation</strong> — wraps your bean in a CGLIB (or JDK dynamic) proxy</li>
           <li><strong>Advice Registration</strong> — attaches <code>TransactionInterceptor</code> as around-advice</li>
         </ol>
@@ -125,7 +125,7 @@
           <li>Calls <code>getTransaction()</code> with the appropriate <code>TransactionDefinition</code></li>
           <li>Executes your method</li>
           <li>On success → <code>commit()</code></li>
-          <li>On <code>RuntimeException</code> → <code>rollback()</code></li>
+          <li>On exception → evaluates rollback rules (<code>rollbackOn()</code>) and calls <code>rollback()</code> or <code>commit()</code> accordingly</li>
         </ol>
       </details>
 
@@ -221,7 +221,7 @@
             <tr>
               <td><strong>Requirement</strong></td>
               <td>Target must implement an interface</td>
-              <td>No interface needed (default in Spring Boot)</td>
+              <td>No interface needed; Spring Boot enables class-based proxies (<code>proxyTargetClass=true</code>) by default, even when interfaces exist</td>
             </tr>
             <tr>
               <td><strong>Final methods</strong></td>
@@ -235,12 +235,12 @@
             </tr>
             <tr>
               <td><strong>Performance</strong></td>
-              <td>Slightly slower (reflection)</td>
-              <td>Faster (direct bytecode)</td>
+              <td>Negligible overhead</td>
+              <td>Negligible overhead</td>
             </tr>
             <tr>
               <td><strong>Spring Boot default</strong></td>
-              <td>No (since Spring Boot 2.0)</td>
+              <td>No (since Spring Boot 2.x)</td>
               <td>✅ Yes (<code>proxyTargetClass=true</code>)</td>
             </tr>
           </tbody>
@@ -392,7 +392,41 @@ public class OrderService {
 }</code></pre>
 
         <p><strong>Fix Options:</strong></p>
-        <pre><code class="language-java">// Fix 1: Inject self (proxy-aware)
+        <pre><code class="language-java">// Fix 1: Extract to a separate bean (preferred — clean, no coupling)
+@Service
+public class OrderProcessingService {
+    @Autowired
+    private OrderService orderService;
+
+    public void processAllOrders(List&lt;Order&gt; orders) {
+        for (Order order : orders) {
+            orderService.placeOrder(order); // ✅ External call through proxy
+        }
+    }
+}
+
+// Fix 2: AopContext.currentProxy() — explicit, avoids circular dependency
+// Requires @EnableAspectJAutoProxy(exposeProxy = true) on a @Configuration class
+@Service
+public class OrderService {
+
+    public void processAllOrders(List&lt;Order&gt; orders) {
+        OrderService proxy = (OrderService) AopContext.currentProxy();
+        for (Order order : orders) {
+            proxy.placeOrder(order); // ✅ Goes through proxy
+        }
+    }
+
+    @Transactional
+    public void placeOrder(Order order) {
+        orderRepository.save(order);
+        paymentService.charge(order);
+    }
+}
+
+// Fix 3: Self-injection — works but introduces a circular dependency.
+// Spring resolves it, but it can confuse static analysis tools and
+// is generally considered a code smell. Prefer Fix 1 or Fix 2.
 @Service
 public class OrderService {
     @Autowired
@@ -408,32 +442,6 @@ public class OrderService {
     public void placeOrder(Order order) {
         orderRepository.save(order);
         paymentService.charge(order);
-    }
-}
-
-// Fix 2: Extract to a separate service
-@Service
-public class OrderProcessingService {
-    @Autowired
-    private OrderService orderService;
-
-    public void processAllOrders(List&lt;Order&gt; orders) {
-        for (Order order : orders) {
-            orderService.placeOrder(order); // ✅ External call through proxy
-        }
-    }
-}
-
-// Fix 3: Use ApplicationContext (less clean)
-@Service
-public class OrderService implements ApplicationContextAware {
-    private ApplicationContext ctx;
-
-    public void processAllOrders(List&lt;Order&gt; orders) {
-        OrderService proxy = ctx.getBean(OrderService.class);
-        for (Order order : orders) {
-            proxy.placeOrder(order); // ✅ Gets proxy from container
-        }
     }
 }</code></pre>
       </details>
@@ -589,7 +597,7 @@ public class InventoryService {
         itemRepository.save(item);
     }
 }</code></pre>
-        <p>Spring's <code>TransactionAttributeSource</code> actually <em>ignores</em> <code>@Transactional</code> on non-public methods by design. See <code>AbstractFallbackTransactionAttributeSource.computeTransactionAttribute()</code>:</p>
+        <p>Private methods cannot be transactional in proxy mode — they are invisible to the generated subclass. <code>AbstractFallbackTransactionAttributeSource.computeTransactionAttribute()</code> returns <code>null</code> for private methods. Note: since Spring Framework 6, class-based proxies can intercept protected and package-private methods in some configurations, but <strong>private methods remain impossible</strong> and public methods are the safe, recommended practice.</p>
         <pre><code class="language-java">// Spring Framework source (simplified)
 protected TransactionAttribute computeTransactionAttribute(Method method, Class&lt;?&gt; targetClass) {
     // Don't allow non-public methods, as configured.
@@ -710,7 +718,7 @@ public class ReportService {
           </tbody>
         </table>
         <div class="callout callout-tip">
-          <p><strong>Best Practice:</strong> Always use <code>@Transactional(rollbackFor = Exception.class)</code> for critical operations. The default behavior is a holdover from the EJB era and causes real production bugs.</p>
+          <p><strong>Best Practice:</strong> Consider <code>@Transactional(rollbackFor = Exception.class)</code> for operations where checked exceptions should also trigger rollback — for example, financial or payment flows. The default commit-on-checked-exception behavior is a holdover from the EJB era. That said, it is not a blanket rule: many business exceptions are intentionally checked and should commit. Apply <code>rollbackFor</code> deliberately, not universally.</p>
         </div>
       </details>
 
@@ -800,7 +808,7 @@ public OrderResult placeOrder(Order order) {
               <td><code>REPEATABLE_READ</code></td>
               <td>✅ No</td>
               <td>✅ No</td>
-              <td>⚠️ Yes</td>
+              <td>⚠️ Yes (per SQL standard; MySQL/InnoDB prevents phantoms in practice via MVCC + gap locks)</td>
               <td><strong>Default in MySQL/InnoDB</strong> — financial calculations</td>
             </tr>
             <tr>
@@ -827,7 +835,9 @@ public BigDecimal calculateAccountBalance(Long accountId) {
 public void innerMethod() {
     // If called within an existing REQUIRED transaction,
     // this joins the OUTER transaction's isolation level.
-    // Spring logs a warning but does NOT fail.
+    // The isolation parameter is silently ignored — no exception is thrown.
+    // A warning is only logged if validateExistingTransactions=true is set
+    // on the transaction manager, which most applications never enable.
 }</code></pre>
         <div class="callout callout-warning">
           <p><strong>Gotcha:</strong> Isolation level only takes effect when a <em>new</em> transaction is created. With <code>Propagation.REQUIRED</code> (default), if a transaction already exists, the isolation parameter is <strong>silently ignored</strong>. Use <code>REQUIRES_NEW</code> if you need a specific isolation level guaranteed.</p>
@@ -889,7 +899,7 @@ public class AuditService {
     }
 }</code></pre>
         <div class="callout callout-danger">
-          <p><strong>Connection Pool Risk:</strong> <code>REQUIRES_NEW</code> suspends the outer transaction but <em>holds its connection</em>. The inner transaction acquires a <em>second</em> connection. Under load, nested <code>REQUIRES_NEW</code> calls can exhaust HikariCP pools (see Chapter 4). With a pool size of 10 and 10 concurrent requests each doing <code>REQUIRES_NEW</code>, you need 20 connections — instant deadlock.</p>
+          <p><strong>Connection Pool Risk:</strong> <code>REQUIRES_NEW</code> suspends the outer transaction but typically holds its connection (with <code>DataSourceTransactionManager</code> + HikariCP). The inner transaction acquires a second connection. Under load, nested <code>REQUIRES_NEW</code> calls can exhaust the connection pool — for example, with a pool size of 10 and 10 concurrent requests each triggering <code>REQUIRES_NEW</code>, you may need up to 20 connections, which can lead to blocked threads or apparent deadlocks (see Chapter 4).</p>
         </div>
       </details>
     </section>
@@ -939,7 +949,8 @@ public class CheckoutService {
             // ❌ BUG: This is a CHECKED exception!
             // Transaction COMMITS — order saved without payment
             log.warn("Payment gateway timeout for order {}", order.getId());
-            throw e; // Propagates, but damage is done — transaction already committed
+            throw e; // Re-thrown (method declares `throws PaymentGatewayTimeoutException`)
+                     // but the damage is done — Spring already committed the transaction
         }
         
         order.setStatus("PAID");
@@ -1144,10 +1155,12 @@ public class OrderEventListener {
         <pre><code class="language-java">@Transactional(readOnly = true)
 public List&lt;OrderSummary&gt; getOrderHistory(Long userId) {
     // What readOnly = true actually does:
-    // 1. Hibernate: sets FlushMode to MANUAL (no dirty checking)
-    // 2. JDBC: connection.setReadOnly(true) — hint to DB
-    // 3. PostgreSQL: routes to read replica (if configured)
-    // 4. MySQL: allows InnoDB to skip gap locks
+    // 1. Spring hints the JPA provider that the transaction is read-only.
+    //    With Hibernate + JpaTransactionManager this typically results in
+    //    reduced flushing/dirty-checking, but exact behavior depends on
+    //    the provider and version.
+    // 2. JDBC: connection.setReadOnly(true) — a hint to the driver/DB;
+    //    actual behavior is driver-dependent.
     return orderRepository.findByUserId(userId);
 }
 
@@ -1156,8 +1169,9 @@ public List&lt;OrderSummary&gt; getOrderHistory(Long userId) {
 public void updateLastAccess(Long userId) {
     User user = userRepository.findById(userId).orElseThrow();
     user.setLastAccessTime(Instant.now());
-    // ❌ This change is SILENTLY IGNORED — flush is disabled
-    // No exception, no error — just lost data
+    // ❌ Entity modifications inside a read-only transaction should not
+    // be relied upon to persist. Depending on the JPA provider and version,
+    // the change may be silently dropped or may throw — never assume either.
 }</code></pre>
       </details>
 
@@ -1235,8 +1249,8 @@ class OrderServiceIntegrationTest {
             <tr>
               <td>3</td>
               <td><code>@Transactional</code> on interface methods (with CGLIB)</td>
-              <td>CGLIB proxies the class, not the interface — annotation may be missed</td>
-              <td>Always put <code>@Transactional</code> on the implementation</td>
+              <td>Spring does scan interface annotations, but behavior can vary by proxy type and lookup strategy — relying on interface-level annotations is fragile</td>
+              <td>Put <code>@Transactional</code> on the concrete implementation unless your project consistently annotates interfaces</td>
             </tr>
             <tr>
               <td>4</td>
@@ -1246,15 +1260,9 @@ class OrderServiceIntegrationTest {
             </tr>
             <tr>
               <td>5</td>
-              <td>Using <code>@Transactional</code> on <code>@Configuration</code> classes</td>
-              <td>CGLIB already proxies <code>@Configuration</code> — double proxy issues</td>
-              <td>Use on <code>@Service</code> classes only</td>
-            </tr>
-            <tr>
-              <td>6</td>
               <td>Lazy loading outside transaction</td>
               <td><code>LazyInitializationException</code> in controller/view layer</td>
-              <td>Use <code>@EntityGraph</code>, DTOs, or keep session open</td>
+              <td>Use <code>@EntityGraph</code>, fetch joins, or DTOs — avoid Open Session In View in new code</td>
             </tr>
           </tbody>
         </table>
@@ -1339,13 +1347,13 @@ class OrderServiceIntegrationTest {
           <dd>@Transactional only works for local transactions (single datasource). For distributed transactions: use the Saga pattern (choreography or orchestration), the Outbox pattern with CDC, or in rare cases, XA/2PC with JTA. I strongly prefer Sagas for microservices.</dd>
 
           <dt><strong>Q: "Can you use @Transactional with Kotlin coroutines or reactive streams?"</strong></dt>
-          <dd>No — @Transactional relies on thread-local state. For reactive (WebFlux), use ReactiveTransactionManager with TransactionalOperator. For Kotlin coroutines, use @Transactional with spring-tx's coroutine support (Spring 6.1+) or transactionalOperator.executeAndAwait {}.</dd>
+          <dd>For imperative code, <code>@Transactional</code> relies on thread-local state and does not propagate across thread boundaries. For reactive (WebFlux), Spring provides <code>ReactiveTransactionManager</code> with <code>TransactionalOperator</code>, which propagates transaction context via Reactor's <code>Context</code> rather than <code>ThreadLocal</code>. For Kotlin coroutines, <code>@Transactional</code> coroutine support has been available since Spring 5.2 (improved further in Spring 6.1); alternatively use <code>transactionalOperator.executeAndAwait {}</code>.</dd>
 
           <dt><strong>Q: "How does @Transactional interact with Spring's retry mechanism?"</strong></dt>
           <dd>@Retryable should wrap @Transactional (retry at a higher level). If @Transactional wraps @Retryable, the retry happens inside the same transaction — which is already marked for rollback. The correct ordering: Caller → @Retryable → @Transactional → business logic. See Chapter 2 for deep dive on retry + idempotency.</dd>
 
           <dt><strong>Q: "What's the performance impact of @Transactional?"</strong></dt>
-          <dd>Minimal per-call overhead (~0.1ms for proxy dispatch + connection acquisition). The real cost is holding connections: a transaction that takes 100ms holds a HikariCP connection for 100ms. With pool size 10 and 100 concurrent requests, that's the bottleneck — not the proxy overhead.</dd>
+          <dd>The proxy dispatch overhead is negligible compared to database I/O. The real cost is holding connections: a transaction that takes 100ms holds a HikariCP connection for 100ms. With a small pool and many concurrent requests, connection contention is the bottleneck — not the proxy itself.</dd>
         </dl>
       </details>
     </section>
@@ -1359,7 +1367,7 @@ class OrderServiceIntegrationTest {
         <ol>
           <li><code>@Transactional</code> = AOP proxy. No proxy → no transaction.</li>
           <li><strong>Self-invocation</strong> is the #1 production trap — fix with self-injection or extract to another bean.</li>
-          <li>Default rollback is <strong>only on RuntimeException</strong> — always use <code>rollbackFor = Exception.class</code> for critical paths.</li>
+          <li>Default rollback is <strong>only on RuntimeException and Error</strong> — use <code>rollbackFor</code> deliberately on critical paths where checked exceptions should also roll back.</li>
           <li><strong>Final/private methods</strong> silently skip transactional advice — no compile error, no runtime error.</li>
           <li>Transaction context is <strong>thread-local</strong> — @Async, CompletableFuture, reactive break it.</li>
           <li><strong>Isolation level is ignored</strong> when joining an existing transaction.</li>

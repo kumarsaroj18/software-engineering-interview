@@ -260,11 +260,13 @@ management:
       show-details: always
       group:
         liveness:
-          include: livenessState, ping
+          include: livenessState
           # Only checks: Is the JVM alive? No external deps!
         readiness:
           include: readinessState, db, redis, customThreadPool
           # Checks: Can this pod serve traffic right now?
+          # Only include dependencies whose failure prevents serving CORE requests.
+          # Don't fail readiness for non-critical services (recommendations, analytics).
   health:
     livenessstate:
       enabled: true
@@ -327,10 +329,12 @@ management:
 // Health check: GET /actuator/health → 200 OK (runs on its own thread)
 // Real request: GET /api/payments → waits in accept queue → timeout → 503
 
-// Why health check passes:
-// - Spring Boot health endpoint is lightweight (no I/O to downstream)
-// - Tomcat has a separate acceptor thread that accepts the health check connection
-// - The health response is tiny, doesn't need a worker thread for long
+// Why health check passes (without separate management port):
+// - Health endpoint is lightweight (no I/O to downstream)
+// - It DOES use the same Tomcat worker thread pool as real traffic
+// - But it completes in ~1ms, so under partial exhaustion it still gets through
+// - At 100% saturation with deep queuing, health checks can ALSO timeout
+// - FIX: Use a separate management port (8081) to fully isolate probes
 
 // But real requests:
 // - Need a Tomcat worker thread (all 200 are blocked on downstream HTTP calls)
@@ -407,9 +411,11 @@ spec:
 │                         ▲                                           │
 │                         │                                           │
 │                    ┌────┴────┐                                      │
-│                    │ 503     │  ← Zero ready pods!                  │
+│                    │ 503     │  ← Reduced capacity (50%)            │
 │                    │ WINDOW  │  maxUnavailable=1 + slow startup     │
-│                    └─────────┘  = brief period with no backends     │
+│                    └─────────┘  = remaining pod overloaded → 503    │
+│                                   (zero backends only if last pod's │
+│                                    readiness also fails under load) │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘</code></pre>
         <pre><code class="language-yaml"># Deployment strategy that CAUSES 503s:
@@ -508,7 +514,11 @@ resources:
 # - Requests pile up → thread pool exhausted → 503
 #
 # Evidence: `kubectl top pods` shows CPU at limit
-# container_cpu_cfs_throttled_seconds_total keeps increasing</code></pre>
+# container_cpu_cfs_throttled_seconds_total keeps increasing
+#
+# ⚠️ JVM amplification: CPU throttling extends GC pause durations,
+# which further increases request latency in a feedback loop.
+# A 100ms GC pause can become 500ms+ under heavy throttling.</code></pre>
 
         <div class="callout callout-info">
           <p><strong>Summary table — 503 causes vs health check status:</strong></p>
@@ -603,10 +613,12 @@ resources:
 │  T=~1s:  Endpoint controller removes Pod IP from Endpoints object          │
 │  T=~2s:  kube-proxy watches Endpoints, sees change                         │
 │  T=~2-5s: kube-proxy regenerates iptables rules                            │
-│  T=~3-7s: New iptables rules active on ALL nodes                           │
+│  T=~3-7s: New iptables rules active on ALL nodes (iptables mode;           │
+│           IPVS mode is faster with sub-second incremental updates)          │
 │                                                                             │
 │  ╔═══════════════════════════════════════════════════════╗                  │
-│  ║  DURING THIS 3-7 SECOND WINDOW:                      ║                  │
+│  ║  DURING THIS PROPAGATION WINDOW (typically a few      ║                  │
+│  ║  seconds, varies by cluster/CNI/kube-proxy mode):     ║                  │
 │  ║  Traffic is STILL being sent to the failing pod!      ║                  │
 │  ║  Result: 503 errors (connection refused / timeout)    ║                  │
 │  ╚═══════════════════════════════════════════════════════╝                  │
@@ -726,7 +738,8 @@ spec:
               - /bin/sh
               - -c
               - "sleep 10"     # ← Wait for endpoint removal to propagate
-                               #   (covers the 3-7s iptables propagation delay)
+                               #   Validate this duration against your cluster's
+                               #   actual propagation time; don't treat as universal.
         # Readiness probe: once this fails, no NEW traffic is sent
         readinessProbe:
           httpGet:
@@ -809,7 +822,9 @@ spec:
 # This prevents:
 # - kubectl drain from killing all pods at once
 # - Cluster autoscaler from scaling down too aggressively
-# - Node upgrades from disrupting more pods than allowed</code></pre>
+# - Node upgrades from disrupting more pods than allowed
+# ⚠️ PDBs do NOT prevent Deployment rollouts from terminating pods.
+# They only guard against voluntary disruptions (drain, eviction, upgrades).</code></pre>
 
       </details>
     </section>
@@ -855,6 +870,8 @@ spec:
 │            Health check: ✅ (still passes — dedicated management port!)     │
 │            NGINX ingress: 502 Bad Gateway (connection accepted but no       │
 │            response within proxy_read_timeout)                              │
+│            Note: NGINX returns 502 when upstream times out/resets,          │
+│            and 503 when NO upstreams are available at all.                  │
 │                                                                             │
 │  14:27:00  PagerDuty alert fires on 5xx rate > 10%                         │
 │            SRE team investigates                                            │
@@ -937,6 +954,9 @@ public class ThreadPoolHealthIndicator implements HealthIndicator {
         int maxPoolSize = executor.getMaximumPoolSize();
         double utilization = (double) activeCount / maxPoolSize;
         
+        // Threshold should be tuned per workload using production metrics.
+        // Also consider monitoring queue length (executor.getQueue().size())
+        // as an early warning signal before active threads hit the limit.
         if (utilization > 0.9) {  // >90% threads busy = not ready
             return Health.down()
                 .withDetail("activeThreads", activeCount)
@@ -1032,7 +1052,9 @@ kubectl top pods -l app=payment-service
 # payment-svc-abc12-uvw   245m         512Mi
 
 # Check for CPU throttling:
+# cgroups v1 (older kernels):
 kubectl exec payment-svc-abc12-xyz -- cat /sys/fs/cgroup/cpu/cpu.stat
+# cgroups v2 (K8s 1.25+ / modern Linux): /sys/fs/cgroup/cpu.stat
 # nr_throttled 15234     ← Being throttled frequently!
 # throttled_time 45000000000  ← 45 seconds total throttled time
 
@@ -1262,6 +1284,9 @@ public class ReadinessHealthIndicator implements HealthIndicator {
         <pre><code class="language-java">@Component
 @Slf4j
 public class GracefulShutdownHandler {
+    // NOTE: This is an educational example showing the mechanism.
+    // Spring Boot 2.3+ server.shutdown=graceful handles this natively.
+    // Use this pattern only if you need custom shutdown logic beyond what Spring provides.
     
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
     private final AtomicInteger activeRequests = new AtomicInteger(0);
@@ -1400,6 +1425,8 @@ public class KafkaStartupCheck implements StartupCheck {
     @Override
     public void verify() throws Exception {
         // Verify broker connectivity
+        // Note: sending a message is heavy for startup. A lighter alternative:
+        // adminClient.describeCluster().clusterId().get(5, TimeUnit.SECONDS);
         kafkaTemplate.send("health-check-topic", "startup-ping").get(5, TimeUnit.SECONDS);
     }
 }</code></pre>
@@ -1422,7 +1449,10 @@ management:
   server:
     port: 8081              # ← Health checks on SEPARATE port!
                             # This ensures health probes NEVER compete
-                            # with real traffic for Tomcat threads
+                            # with real traffic for Tomcat threads.
+                            # Trade-off: probes always respond, but can mask
+                            # thread starvation unless readiness explicitly
+                            # checks thread pool utilization (see below).
   endpoints:
     web:
       exposure:
@@ -1702,7 +1732,9 @@ resources:
 # Real requests need CPU for JSON parsing, encryption, logging
 # CFS scheduler throttles → requests take 10x longer → timeout → 503
 
-# GOOD: Remove CPU limits entirely (Google's recommendation)
+# GOOD: Remove CPU limits for latency-sensitive services
+# (popularized by Google SRE; debated for multi-tenant clusters
+#  where limits help prevent noisy-neighbor issues)
 # Or set limit = 4-8x request for burst capacity
 resources:
   requests:

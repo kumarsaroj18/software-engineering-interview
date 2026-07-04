@@ -137,33 +137,35 @@
         </table>
 
         <h3>Example 1: Renaming a Column</h3>
-        <p>Suppose you need to rename <code>user.userName</code> to <code>user.username</code> (fixing case convention).</p>
+        <p>Suppose you need to rename <code>users.full_name</code> to <code>users.display_name</code> (better domain language).</p>
 
         <h4>Phase 1 — Expand (Release N)</h4>
-        <pre><code class="language-sql">-- V2023.09.01__expand_add_username_column.sql
-ALTER TABLE users ADD COLUMN username VARCHAR(255);
+        <pre><code class="language-sql">-- V2023.09.01__expand_add_display_name_column.sql
+ALTER TABLE users ADD COLUMN display_name VARCHAR(255);
 
 -- Trigger to keep columns in sync during transition
-CREATE OR REPLACE FUNCTION sync_username_columns()
+-- Note: Sync can also be done in application code (dual-write) instead of triggers.
+-- Many teams prefer app-level dual-writes because triggers hide logic and complicate CDC.
+CREATE OR REPLACE FUNCTION sync_name_columns()
 RETURNS TRIGGER AS $$
 BEGIN
   IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
-    IF NEW.username IS NULL AND NEW.userName IS NOT NULL THEN
-      NEW.username := NEW.userName;
-    ELSIF NEW.userName IS NULL AND NEW.username IS NOT NULL THEN
-      NEW.userName := NEW.username;
+    IF NEW.display_name IS NULL AND NEW.full_name IS NOT NULL THEN
+      NEW.display_name := NEW.full_name;
+    ELSIF NEW.full_name IS NULL AND NEW.display_name IS NOT NULL THEN
+      NEW.full_name := NEW.display_name;
     END IF;
   END IF;
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_sync_username
+CREATE TRIGGER trg_sync_name
   BEFORE INSERT OR UPDATE ON users
-  FOR EACH ROW EXECUTE FUNCTION sync_username_columns();</code></pre>
+  FOR EACH ROW EXECUTE FUNCTION sync_name_columns();</code></pre>
 
         <h4>Phase 1 — Backfill</h4>
-        <pre><code class="language-sql">-- V2023.09.02__backfill_username.sql
+        <pre><code class="language-sql">-- V2023.09.02__backfill_display_name.sql
 -- Batch update to avoid locking entire table
 DO $$
 DECLARE
@@ -172,11 +174,11 @@ DECLARE
 BEGIN
   LOOP
     UPDATE users
-    SET username = userName
-    WHERE username IS NULL
+    SET display_name = full_name
+    WHERE display_name IS NULL
       AND id IN (
         SELECT id FROM users
-        WHERE username IS NULL
+        WHERE display_name IS NULL
         LIMIT batch_size
         FOR UPDATE SKIP LOCKED
       );
@@ -189,29 +191,32 @@ END $$;</code></pre>
 
         <h4>Phase 2 — Migrate Application (Release N+1)</h4>
         <pre><code class="language-java">// Entity now reads from new column, writes to both
+// ⚠️ Choose ONE sync strategy: app dual-write OR DB trigger, not both.
+// If using the trigger above, mark legacy field as read-only:
+//   @Column(name = "full_name", insertable = false, updatable = false)
 @Entity
 @Table(name = "users")
 public class User {
 
-    @Column(name = "username")
-    private String username;
+    @Column(name = "display_name")
+    private String displayName;
 
-    // Keep writing to old column for rollback safety
-    @Column(name = "userName", insertable = true, updatable = true)
-    private String userNameLegacy;
+    // Keep writing to old column for rollback safety (app-level dual-write)
+    @Column(name = "full_name")
+    private String fullNameLegacy;
 
-    public void setUsername(String value) {
-        this.username = value;
-        this.userNameLegacy = value; // dual-write
+    public void setDisplayName(String value) {
+        this.displayName = value;
+        this.fullNameLegacy = value; // dual-write
     }
 }</code></pre>
 
         <h4>Phase 3 — Contract (Release N+2)</h4>
-        <pre><code class="language-sql">-- V2023.10.01__contract_remove_old_username.sql
+        <pre><code class="language-sql">-- V2023.10.01__contract_remove_old_full_name.sql
 -- Only run after ALL pods are on Release N+1 or later
-DROP TRIGGER IF EXISTS trg_sync_username ON users;
-DROP FUNCTION IF EXISTS sync_username_columns();
-ALTER TABLE users DROP COLUMN IF EXISTS userName;</code></pre>
+DROP TRIGGER IF EXISTS trg_sync_name ON users;
+DROP FUNCTION IF EXISTS sync_name_columns();
+ALTER TABLE users DROP COLUMN IF EXISTS full_name;</code></pre>
 
         <h3>Example 2: Changing Column Type (INT → BIGINT)</h3>
         <p>This is common when an ID column approaches INTEGER overflow (~2.1 billion).</p>
@@ -305,6 +310,9 @@ ALTER TABLE users DROP COLUMN IF EXISTS website;</code></pre>
 
         <div class="callout callout-warning">
           <p><strong>Timing matters:</strong> Never execute the Contract phase until you are 100% certain no running application instance reads from the old structure. In Kubernetes, this means waiting for all old pods to terminate after a rolling deployment completes.</p>
+        </div>
+        <div class="callout callout-info">
+          <p><strong>Triggers vs. application dual-write:</strong> The examples above use database triggers for synchronization. Many teams prefer application-level dual-writes instead, because triggers hide business logic, complicate debugging, and can cause surprises with CDC/replication tooling. Choose the approach that fits your team's conventions.</p>
         </div>
       </details>
     </section>
@@ -400,13 +408,21 @@ ALTER TABLE users DROP COLUMN IF EXISTS website;</code></pre>
         <pre><code class="language-sql">-- Safe: Add nullable column (no table rewrite in PG 11+)
 ALTER TABLE orders ADD COLUMN notes TEXT;
 
--- Safe: Add column with volatile default (PG 11+ does NOT rewrite table)
-ALTER TABLE orders ADD COLUMN created_at TIMESTAMP DEFAULT NOW();
+-- Safe: Add column with non-volatile constant default (PG 11+ does NOT rewrite table)
+-- Examples: DEFAULT 0, DEFAULT 'ACTIVE', DEFAULT false
+ALTER TABLE orders ADD COLUMN status VARCHAR(20) DEFAULT 'PENDING';
+-- ⚠️ Volatile functions like NOW() DO trigger a table rewrite in older behavior.
+-- For timestamps, use DEFAULT clock_timestamp() cautiously or backfill after adding nullable.
 
--- Safe: Create index without locking
+-- Safe: Create index without blocking writes
 CREATE INDEX CONCURRENTLY idx_orders_customer_id ON orders(customer_id);
+-- ⚠️ Cannot run inside a transaction block! Flyway wraps migrations in
+-- transactions by default. Use a separate non-transactional migration file,
+-- or in Flyway, disable transactions for this migration.
 
--- UNSAFE: This locks the table!
+-- UNSAFE on large tables: many type changes require a full table rewrite
+-- and blocking locks (though some binary-compatible changes like
+-- VARCHAR(50)→VARCHAR(100) are metadata-only in PostgreSQL).
 ALTER TABLE orders ALTER COLUMN amount TYPE NUMERIC(12,2);
 
 -- UNSAFE: Adding NOT NULL without default rewrites table
@@ -414,6 +430,8 @@ ALTER TABLE orders ALTER COLUMN status SET NOT NULL;</code></pre>
 
         <h3>MySQL/InnoDB Considerations</h3>
         <pre><code class="language-sql">-- MySQL 8.0+: INSTANT algorithm for adding columns
+-- ⚠️ Limited to adding columns at the end of the table.
+-- Some operations silently fall back to INPLACE or COPY.
 ALTER TABLE orders ADD COLUMN notes TEXT, ALGORITHM=INSTANT;
 
 -- pt-online-schema-change for type changes (Percona Toolkit)
@@ -447,7 +465,7 @@ spring:
     locations: classpath:db/migration
     baseline-on-migrate: true
     baseline-version: '0'
-    # Critical for zero-downtime: don't fail if migration already applied
+    # Handles intentionally removed or skipped migrations without failing
     ignore-migration-patterns: '*:missing'
     # Validate checksums to prevent tampering
     validate-on-migrate: true
@@ -745,6 +763,7 @@ private boolean isConsistent(Order old, Order newRec) {
         <h3>Dual-Write Pitfalls</h3>
         <div class="callout callout-danger">
           <p><strong>Transaction boundaries matter!</strong> Both writes MUST be in the same database transaction. If you write to old, commit, then write to new and that fails — you have inconsistent data.</p>
+          <p><strong>Cross-database caveat:</strong> If the new schema lives in another database or service, single-transaction dual-write isn't possible. In that case, use outbox/event-based synchronization or CDC for eventual consistency.</p>
         </div>
 
         <div class="callout callout-warning">
@@ -895,6 +914,7 @@ public Optional&lt;Order&gt; findById(Long id) {
 
         <div class="callout callout-tip">
           <p><strong>Pro tip:</strong> Use deterministic bucketing (based on entity ID hash) rather than random selection. This ensures the same record is always read from the same source, preventing read-your-write inconsistencies.</p>
+          <p><strong>Important:</strong> Begin percentage rollout only after verifying the backfill is 100% complete and data is consistent between old and new schemas. Reading from the new schema before backfill finishes will return NULL/missing data.</p>
         </div>
       </details>
     </section>
@@ -954,9 +974,9 @@ public Optional&lt;Order&gt; findById(Long id) {
             </tr>
             <tr>
               <td><strong>Blue-Green</strong></td>
-              <td>✅ All pods switch at once — no mixed versions</td>
+              <td>✅ All pods switch at once — no mixed app versions</td>
               <td>Easy (switch back to blue)</td>
-              <td>Low (but DB migration must be applied to shared DB)</td>
+              <td>Low (⚠️ but both environments share the same DB — schema changes must still be backward-compatible)</td>
             </tr>
             <tr>
               <td><strong>Canary</strong></td>
@@ -1061,6 +1081,10 @@ UPDATE orders SET buyer_name = customer_name WHERE buyer_name IS NULL;
 -- V6__contract_drop_customer_name.sql (Phase 3: CONTRACT)
 ALTER TABLE orders DROP COLUMN customer_name;</code></pre>
 
+        <div class="callout callout-info">
+          <p><strong>Key lesson:</strong> Database schema changes should generally be <em>rolled forward</em> (fix with a new migration) rather than rolled back. Destructive rollbacks (restoring a dropped column) may not recover lost data and require DBA intervention. Design migrations to be additive so rollback means simply deploying the old application code — not undoing the schema change.</p>
+        </div>
+
         <h4>Preventive Measures</h4>
         <ul>
           <li><strong>CI check:</strong> Added a linter that rejects migrations containing <code>DROP COLUMN</code>, <code>RENAME COLUMN</code>, or <code>ALTER COLUMN ... TYPE</code> without a paired expand migration</li>
@@ -1092,8 +1116,12 @@ BEGIN
   LOOP
     UPDATE users 
     SET email = email_address 
-    WHERE email IS NULL 
-    LIMIT batch_size;
+    WHERE id IN (
+      SELECT id FROM users
+      WHERE email IS NULL
+      LIMIT batch_size
+      FOR UPDATE SKIP LOCKED
+    );
     
     GET DIAGNOSTICS updated = ROW_COUNT;
     EXIT WHEN updated = 0;
@@ -1251,8 +1279,8 @@ DROP FUNCTION sync_amount();</code></pre>
             <tr>
               <td>5</td>
               <td>CREATE INDEX without CONCURRENTLY</td>
-              <td>Locks table for writes during index build (minutes on large tables)</td>
-              <td>Always use <code>CREATE INDEX CONCURRENTLY</code></td>
+              <td>Blocks writes (SHARE lock) for the duration of the index build (minutes on large tables)</td>
+              <td>Prefer <code>CREATE INDEX CONCURRENTLY</code> for large production tables</td>
             </tr>
             <tr>
               <td>6</td>
@@ -1292,7 +1320,7 @@ DROP FUNCTION sync_amount();</code></pre>
               <td><strong>Expand-Contract</strong></td>
               <td>High (3 phases)</td>
               <td>Zero</td>
-              <td>Excellent (each phase reversible)</td>
+              <td>Good (expand phases reversible; contract phases require backup to restore dropped data)</td>
               <td>Breaking changes on critical tables</td>
             </tr>
             <tr>
@@ -1356,7 +1384,7 @@ DROP FUNCTION sync_amount();</code></pre>
           <li>Never make <strong>destructive schema changes</strong> (DROP, RENAME, ALTER TYPE) in the same deploy as code changes.</li>
           <li>Use the <strong>Expand-Contract</strong> pattern: add new → migrate data → remove old. Each phase is a separate deployment.</li>
           <li>During rolling deploys, <strong>old and new code coexist</strong> — the schema must work with both versions simultaneously.</li>
-          <li><code>CREATE INDEX CONCURRENTLY</code> — always. Regular CREATE INDEX takes an ACCESS EXCLUSIVE lock.</li>
+          <li>Prefer <code>CREATE INDEX CONCURRENTLY</code> for large production tables where write availability matters. Regular CREATE INDEX blocks writes for the duration of the build.</li>
           <li><strong>Backfill in batches</strong> with throttling — never a single UPDATE statement on large tables.</li>
           <li>Use <strong>triggers for dual-write sync</strong> during the transition period (remove after contract phase).</li>
           <li><strong>Test backward compatibility in CI</strong> — run old app tests against new schema before merging.</li>

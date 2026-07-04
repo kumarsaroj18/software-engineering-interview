@@ -108,14 +108,20 @@
 
         <div class="callout callout-tip">
           <blockquote>
-            <p>When a downstream service responds in 8 seconds instead of the expected 200ms, the immediate risk is <strong>thread pool exhaustion</strong> — every inbound request blocks a thread waiting for the slow dependency, and your service quickly runs out of capacity to serve <em>any</em> request, including those that don't touch the slow service.</p>
+            <p>When a downstream service responds in 8 seconds instead of the expected 200ms, the immediate risk is <strong>resource pool exhaustion</strong> — every inbound request blocks a thread (or connection) waiting for the slow dependency. This can manifest as:</p>
+            <ul>
+              <li><strong>Request thread pool exhaustion</strong> (Tomcat/Jetty threads) — cannot accept new HTTP requests</li>
+              <li><strong>HTTP client connection pool exhaustion</strong> (Apache/Netty pool) — cannot open new outbound connections</li>
+              <li><strong>Database connection pool exhaustion</strong> (HikariCP) — if slow calls hold DB connections open</li>
+            </ul>
+            <p>Any of these causes your service to stop serving <em>all</em> requests, including those that don't touch the slow dependency.</p>
             <p>The defense is <strong>layered resilience</strong>:</p>
             <ol>
               <li><strong>Aggressive timeouts</strong> — fail fast (e.g., 2s total budget) instead of waiting 8s</li>
               <li><strong>Circuit breaker</strong> — stop calling the failing service entirely once error rate exceeds threshold</li>
               <li><strong>Bulkhead</strong> — isolate the slow service's thread pool so it cannot starve other call paths</li>
               <li><strong>Fallback strategy</strong> — return cached data, degraded response, or queue for async processing</li>
-              <li><strong>Retry with exponential backoff + jitter</strong> — only for transient failures, never for slowness</li>
+              <li><strong>Retry with exponential backoff + jitter</strong> — only for transient failures; avoid retrying persistent slowness as it amplifies load (retry only when a timeout is likely transient — e.g., one overloaded replica — and your retry budget is tightly controlled)</li>
             </ol>
             <p>In Spring Boot with Resilience4j, you compose these as decorators around your WebClient or RestTemplate calls, each pattern addressing a different failure mode.</p>
           </blockquote>
@@ -161,7 +167,7 @@
         <p>The most fundamental pattern. Set an upper bound on how long you're willing to wait. If the downstream doesn't respond within the budget, fail immediately and free the thread.</p>
 
         <h3>2. Retries with Backoff</h3>
-        <p>Automatically retry failed requests with exponential backoff and jitter. <strong>Critical:</strong> Only retry on transient errors (5xx, connection reset), never on slowness — retrying a slow service multiplies load.</p>
+        <p>Automatically retry failed requests with exponential backoff and jitter. <strong>Critical:</strong> Only retry on transient errors (5xx, connection reset). Avoid retrying persistent slowness — it multiplies load on an already-struggling downstream. Retry a timeout only when you have evidence it's transient (e.g., one bad replica) and your retry budget is tightly controlled.</p>
 
         <h3>3. Circuit Breakers</h3>
         <p>Monitor the failure rate. When it exceeds a threshold, "open" the circuit — immediately reject calls without attempting the downstream. Periodically allow a probe request to check if the service has recovered.</p>
@@ -178,10 +184,18 @@
         <h3>7. Hedged Requests</h3>
         <p>Send the same request to multiple replicas. Take the first response and cancel the rest. Used at Google for tail latency reduction (see Jeff Dean's "Tail at Scale" paper).</p>
 
+        <div class="callout callout-warning">
+          <p><strong>Downside:</strong> Hedged requests intentionally increase request volume (each logical request becomes 2+ physical requests), so they should be used only for idempotent reads, only when multiple replicas are available, and ideally only after a delay threshold (e.g., send the hedge only if the first request hasn't responded within p95 latency). Sending hedges immediately doubles your downstream load.</p>
+        </div>
+
         <div class="callout callout-info">
           <p><strong>Pattern composition order matters.</strong> Resilience4j applies decorators in a specific order:</p>
           <pre><code>Retry → CircuitBreaker → RateLimiter → TimeLimiter → Bulkhead → Function</code></pre>
           <p>The outermost decorator (Retry) wraps everything. The innermost (Bulkhead) is closest to the actual call.</p>
+        </div>
+
+        <div class="callout callout-danger">
+          <p><strong>Retry safety:</strong> Retries should be applied only for transient failures (connection resets, 503 Service Unavailable). Never retry business validation errors, client errors (4xx), or requests that are not idempotent. Retrying a non-idempotent POST (e.g., a payment charge) can cause duplicate side effects.</p>
         </div>
 
         <h3>When to use which pattern</h3>
@@ -255,9 +269,9 @@
 │  │   TLS negotiation   │                                             │
 │  │                     │                                             │
 │  │                     ├── Read Timeout (per-read) ──────────────┤   │
-│  │                     │   Time between data packets              │   │
+│  │                     │   Max idle time waiting for data         │   │
 │  │                     │                                          │   │
-│  ├── Total Timeout (Socket Timeout) ────────────────────────────────┤│
+│  ├── Total Request Timeout ──────────────────────────────────────────┤│
 │  │   End-to-end: connect + send + wait + receive                    ││
 │  │                                                                   ││
 │  └───────────────────────────────────────────────────────────────────┘│
@@ -282,7 +296,7 @@
             </tr>
             <tr>
               <td><strong>Read timeout</strong></td>
-              <td>Time between response bytes</td>
+              <td>Maximum idle time on socket (no data received)</td>
               <td>5–10 seconds</td>
               <td>Slow trickle of data holds thread open</td>
             </tr>
@@ -328,6 +342,9 @@ public class WebClientConfig {
 }</code></pre>
 
         <h3>RestTemplate timeout configuration</h3>
+        <div class="callout callout-info">
+          <p><strong>Spring Boot 3.x note:</strong> The <code>setConnectTimeout(int)</code> and <code>setReadTimeout(int)</code> methods on <code>HttpComponentsClientHttpRequestFactory</code> are deprecated in Spring Framework 6+ / Spring Boot 3+. For new projects, configure timeouts directly on the underlying <code>HttpClient</code> builder or use the new <code>RestClient</code> API. The example below uses the simpler deprecated form for clarity.</p>
+        </div>
         <pre><code class="language-java">@Configuration
 public class RestTemplateConfig {
 
@@ -372,7 +389,7 @@ public class RestTemplateConfig {
         </pre>
 
         <div class="callout callout-danger">
-          <p><strong>Anti-pattern: Uniform timeouts.</strong> Setting every service to the same 30-second timeout is a recipe for cascading failures. If Service-D is 4 hops deep, the caller at hop-1 will wait 30s × 4 = 2 minutes in the worst case. Always decrease timeouts as you go deeper in the call chain.</p>
+          <p><strong>Anti-pattern: Uniform timeouts.</strong> Setting every service to the same 30-second timeout is a recipe for cascading failures. The caller's own timeout caps how long <em>they</em> wait — but the real problem is intermediate resource waste. If Service-A times out at 30s and gives up, Service-B (which A called) is still holding a thread and connection waiting for Service-C's response. Those intermediate resources stay pinned for the full 30 seconds even after the original caller has abandoned the request. Always decrease timeouts as you go deeper in the call chain, and use deadline propagation to cancel in-flight work.</p>
         </div>
 
         <div class="callout callout-tip">
@@ -581,6 +598,9 @@ CircuitBreakerConfig config = CircuitBreakerConfig.custom()
     .build();</code></pre>
 
         <h3>Monitoring circuit breaker state</h3>
+        <div class="callout callout-info">
+          <p><strong>Automatic metrics:</strong> In Spring Boot applications with Micrometer on the classpath, Resilience4j automatically exports circuit breaker metrics (state, failure rate, slow call rate, call counts) without custom code. The custom gauges below are useful for <em>additional</em> business-specific metrics or when you need specific metric names for existing dashboards.</p>
+        </div>
         <pre><code class="language-java">@Component
 @RequiredArgsConstructor
 public class CircuitBreakerMetrics {
@@ -688,7 +708,7 @@ public class CircuitBreakerMetrics {
               <td><strong>Semaphore</strong></td>
               <td>Limit concurrent calls using a semaphore. Calls run on caller's thread.</td>
               <td>No context switch; preserves ThreadLocal; low overhead</td>
-              <td>No queuing; no timeout (relies on downstream timeout); less isolation</td>
+              <td>No execution timeout (has <code>maxWaitDuration</code> for permit acquisition, but once acquired, release depends on the downstream call completing); less isolation</td>
               <td>Reactive/async code, fast dependencies, memory-sensitive</td>
             </tr>
           </tbody>
@@ -748,9 +768,10 @@ public class PaymentService {
     @Bulkhead(name = "paymentService", type = Bulkhead.Type.THREADPOOL,
               fallbackMethod = "paymentFallback")
     public CompletableFuture&lt;PaymentResult&gt; processPayment(PaymentRequest request) {
-        // This runs in the isolated thread pool
-        return CompletableFuture.supplyAsync(() ->
-            paymentClient.charge(request));
+        // Resilience4j's THREADPOOL bulkhead already executes this method
+        // on the isolated thread pool — no need to wrap in another supplyAsync.
+        // Just return the CompletableFuture from the client call.
+        return paymentClient.chargeAsync(request);
     }
 
     private CompletableFuture&lt;PaymentResult&gt; paymentFallback(
@@ -764,8 +785,10 @@ public class PaymentService {
 }</code></pre>
 
         <div class="callout callout-info">
-          <p><strong>Sizing the bulkhead:</strong> Calculate based on expected throughput and latency:</p>
+          <p><strong>Sizing the bulkhead (Little's Law):</strong> The required concurrency is derived from Little's Law: <code>L = λ × W</code> (concurrency = throughput × latency).</p>
           <pre><code>maxConcurrentCalls = (requests_per_second) × (avg_latency_seconds) × safety_factor
+
+Little's Law: Concurrency ≈ Throughput × Latency
 
 Example: 100 RPS × 0.2s latency × 1.5 safety = 30 concurrent calls
 If latency spikes to 8s: 100 × 8 × 1.5 = 1200 (way over budget!)
@@ -967,6 +990,10 @@ public ResponseEntity&lt;OrderStatus&gt; getOrderStatus(@PathVariable String ord
     return ResponseEntity.ok(status);
 }</code></pre>
 
+        <div class="callout callout-warning">
+          <p><strong>Idempotency key required:</strong> When accepting async payments via 202, the client should send an idempotency key (e.g., <code>Idempotency-Key: ord-abc-123</code>) so that client retries — which are common with 202 patterns since clients may not receive the response — do not create duplicate payment charges. Most payment APIs (Stripe, Adyen) require this.</p>
+        </div>
+
         <div class="callout callout-tip">
           <p><strong>Choose async when:</strong></p>
           <ul>
@@ -1030,7 +1057,9 @@ public ResponseEntity&lt;OrderStatus&gt; getOrderStatus(@PathVariable String ord
 │         → PagerDuty SEV-1 escalation                                    │
 │                                                                         │
 │  14:45  On-call identifies root cause via thread dumps                  │
-│         → All threads in TIMED_WAITING state on Payment HTTP calls      │
+│         → Many request-handling threads blocked waiting on outbound     │
+│           HTTP calls to Payment Service (depending on client library,   │
+│           may appear as TIMED_WAITING, WAITING, or RUNNABLE)           │
 │                                                                         │
 │  14:52  Mitigation: Kill long-running DB migration on Payment Service   │
 │         → Payment Service latency returns to normal                     │
@@ -1101,6 +1130,11 @@ public ResponseEntity&lt;OrderStatus&gt; getOrderStatus(@PathVariable String ord
               <td>Separate connection pools per service; dedicated pool per dependency</td>
             </tr>
             <tr>
+              <td>HTTP connection pool exhaustion</td>
+              <td>Even with free request threads, the HTTP client connection pool (e.g., Apache HttpClient, Reactor Netty) can become saturated when all connections are waiting on slow responses — producing similar symptoms to thread exhaustion.</td>
+              <td>Configure HTTP client connection pool limits per downstream; monitor <code>pendingAcquireTimeout</code>; add pool metrics to dashboards</td>
+            </tr>
+            <tr>
               <td>No load shedding</td>
               <td>Services accepted requests they couldn't process, worsening backpressure.</td>
               <td>Return 503 with Retry-After when thread pool &gt; 80% utilized</td>
@@ -1135,7 +1169,9 @@ public class OrderService {
                 .bodyValue(req)
                 .retrieve()
                 .bodyToMono(PaymentResult.class)
-                .block()
+                .block() // NOTE: block() converts reactive back to synchronous.
+                         // In a fully reactive (WebFlux) app, prefer propagating
+                         // the Mono through the call chain instead of blocking.
         );
     }
 
@@ -1199,7 +1235,9 @@ public class OrderService {
 │                                                                          │
 │  4. MITIGATE (stop the bleeding)                                         │
 │     ├── If CB not configured: manually block traffic to slow service     │
-│     ├── Scale up caller service (more threads = buy time)                │
+│     ├── Scale up caller service (more threads) only if bottleneck is   │
+│     │   local resource exhaustion — if downstream is already overloaded,│
+│     │   more callers will worsen the problem; use load shedding instead │
 │     ├── Enable feature flag to disable slow dependency call              │
 │     └── Activate async fallback / cached response                        │
 │                                                                          │
@@ -1872,7 +1910,7 @@ class PaymentIntegrationServiceTest {
         </table>
 
         <div class="callout callout-warning">
-          <p><strong>The "retry storm" anti-pattern:</strong> Service A retries 3×, Service B retries 3×, Service C retries 3×. One failure at Service C generates 27 attempts (3³). Add jitter and limit total retries across the chain. Consider a retry budget (e.g., max 20% of requests can be retries).</p>
+          <p><strong>The "retry storm" anti-pattern:</strong> Service A retries 3× (maxAttempts=3), Service B retries 3×, Service C retries 3×. One failure at Service C generates 3 × 3 × 3 = 27 attempts at the final downstream. Add jitter and limit total retries across the chain. Consider a retry budget (e.g., max 20% of requests can be retries).</p>
         </div>
 
       </details>

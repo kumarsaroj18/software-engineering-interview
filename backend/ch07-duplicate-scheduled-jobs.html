@@ -260,9 +260,12 @@ public class RedisLeaderElection {
     private static final Duration LEASE_DURATION = Duration.ofSeconds(30);
     private volatile boolean isLeader = false;
 
+    // ⚠️ Note: The get() + expire() pattern below has a small race window.
+    // For production, use a Lua script to atomically check ownership + renew:
+    //   if redis.call('get', KEY) == myId then redis.call('pexpire', KEY, ttl); return 1 end
     @Scheduled(fixedRate = 10_000)
     public void tryAcquireLeadership() {
-        // Try to set leader key (only succeeds if not exists or we already own it)
+        // Try to set leader key (only succeeds if not exists)
         Boolean acquired = redis.opsForValue()
             .setIfAbsent(LEADER_KEY, podId, LEASE_DURATION);
 
@@ -452,7 +455,8 @@ CREATE TABLE shedlock (
 CREATE INDEX idx_shedlock_lock_until ON shedlock(lock_until);</code></pre>
 
         <h3>Maven Dependencies</h3>
-<pre><code class="language-xml">&lt;dependency&gt;
+<pre><code class="language-xml">&lt;!-- Use the latest version from https://github.com/lukas-krecan/ShedLock/releases --&gt;
+&lt;dependency&gt;
     &lt;groupId&gt;net.javacrumbs.shedlock&lt;/groupId&gt;
     &lt;artifactId&gt;shedlock-spring&lt;/artifactId&gt;
     &lt;version&gt;5.10.0&lt;/version&gt;
@@ -552,10 +556,10 @@ public class ScheduledTasks {
             </tr>
             <tr>
               <td>Redis</td>
-              <td>Eventual (single instance)</td>
+              <td>Strong locally, but locks can be lost on failover (no durability guarantee during Redis restart/Sentinel failover)</td>
               <td>Excellent</td>
-              <td>Redis cluster</td>
-              <td>High-frequency tasks</td>
+              <td>Redis instance or cluster</td>
+              <td>High-frequency tasks where occasional double-exec is tolerable</td>
             </tr>
             <tr>
               <td>MongoDB</td>
@@ -639,7 +643,8 @@ spring:
       org.quartz.scheduler.instanceName: MyClusteredScheduler
       org.quartz.scheduler.instanceId: AUTO
       org.quartz.jobStore.isClustered: true
-      org.quartz.jobStore.clusterCheckinInterval: 15000
+      org.quartz.jobStore.clusterCheckinInterval: 15000  # Trade-off: lower = faster
+      # failover detection, but more DB polling load. 15s is a good default.
       org.quartz.jobStore.class: org.quartz.impl.jdbcjobstore.JobStoreTX
       org.quartz.jobStore.driverDelegateClass: org.quartz.impl.jdbcjobstore.PostgreSQLDelegate
       org.quartz.jobStore.tablePrefix: QRTZ_
@@ -862,7 +867,9 @@ spec:
         - name: LEADER_ELECTION_URL
           value: "http://localhost:4040/leader"
       - name: leader-elector
-        image: k8s.gcr.io/leader-elector:0.5
+        image: k8s.gcr.io/leader-elector:0.5  # ⚠️ Deprecated image
+        # Modern alternative: use in-process leader election via
+        # Spring Cloud Kubernetes Lease API or client-go leaderelection
         args:
         - "--election=my-app-election"
         - "--http=0.0.0.0:4040"
@@ -1040,6 +1047,10 @@ public class RedissonScheduler {
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
         </pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Redlock controversy:</strong> Martin Kleppmann's 2016 analysis argues Redlock is unsafe under process pauses (GC) and clock drift, even with majority agreement. For correctness-critical systems (financial transactions), prefer a consensus-based system (ZooKeeper, etcd) or use fencing tokens (shown below) as an additional safety layer. Redlock remains popular for distributed scheduling where occasional double-execution is tolerable with idempotent tasks.</p>
+        </div>
 
 <pre><code class="language-java">// Redisson Redlock (multi-master)
 @Component
@@ -1551,6 +1562,9 @@ spec:
         description: "CronJob has been in failed state for 5 minutes."</code></pre>
       </details>
     </section>
+
+    <!-- Sections: common-mistakes, trade-offs, follow-up-questions, summary -->
+    <!-- These sections are referenced in the sidebar nav but pending content creation -->
 
     <!-- Chapter Navigation -->
     <nav class="chapter-nav">
