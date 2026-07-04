@@ -66,6 +66,21 @@
       // Create search navigation UI
       this.createSearchNav();
 
+      // Global keyboard shortcut: Ctrl+K / Cmd+K to focus search
+      document.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+          e.preventDefault();
+          this.input.focus();
+          this.input.select();
+        }
+        // Also support "/" key (when not typing in an input)
+        if (e.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) {
+          e.preventDefault();
+          this.input.focus();
+          this.input.select();
+        }
+      });
+
       this.input.addEventListener('input', () => {
         clearTimeout(this.debounceTimer);
         this.debounceTimer = setTimeout(() => this.performSearch(), 250);
