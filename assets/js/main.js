@@ -419,11 +419,34 @@
   // ==========================================================================
   const MobileMenu = {
     init() {
-      this.hamburger = document.querySelector('.hamburger');
       this.sidebar = document.querySelector('.sidebar');
+      if (!this.sidebar) return;
+
+      this.hamburger = document.querySelector('.hamburger');
       this.overlay = document.querySelector('.sidebar-overlay');
 
-      if (!this.hamburger || !this.sidebar) return;
+      // Dynamically create hamburger button if it doesn't exist
+      if (!this.hamburger) {
+        this.hamburger = document.createElement('button');
+        this.hamburger.className = 'hamburger';
+        this.hamburger.setAttribute('aria-label', 'Open navigation menu');
+        this.hamburger.setAttribute('aria-expanded', 'false');
+        this.hamburger.innerHTML = '☰';
+        // Insert at the top of main content or body
+        const main = document.querySelector('main.content') || document.querySelector('.content-area');
+        if (main) {
+          main.insertBefore(this.hamburger, main.firstChild);
+        } else {
+          document.body.insertBefore(this.hamburger, this.sidebar.nextSibling);
+        }
+      }
+
+      // Dynamically create overlay if it doesn't exist
+      if (!this.overlay) {
+        this.overlay = document.createElement('div');
+        this.overlay.className = 'sidebar-overlay';
+        document.body.appendChild(this.overlay);
+      }
 
       this.hamburger.addEventListener('click', () => this.toggle());
 
