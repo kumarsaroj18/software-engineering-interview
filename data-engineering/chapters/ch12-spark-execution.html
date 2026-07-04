@@ -1,0 +1,2135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 12 — Spark Execution | Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <button class="menu-toggle" aria-label="Toggle sidebar">☰</button>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="brand">DE Interview Handbook</a>
+    </div>
+    <div class="sidebar-chapter">Ch 12 / Spark Execution</div>
+    <nav class="sidebar-nav">
+      <a href="ch11-snowflake-internals.html">← Ch 11: Snowflake Internals</a>
+      <a href="ch13-spark-spill.html">Ch 13: Spark Spill →</a>
+    </nav>
+    <div class="sidebar-actions">
+      <a href="../index.html">Back to Index</a>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <a href="../index.html#part-iv">Part IV — Apache Spark</a> &gt;
+      <span>Chapter 12</span>
+    </nav>
+
+    <header class="chapter-header">
+      <span class="badge badge-hard">Hard</span>
+      <h1>Spark Execution</h1>
+      <p class="subtitle">Explain how Spark executes a job.</p>
+      <div class="topics">
+        <span class="topic-tag">DAG</span>
+        <span class="topic-tag">Catalyst</span>
+      </div>
+    </header>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 1: INTERVIEWER INTENT
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <p>When an interviewer asks "Explain how Spark executes a job," they are probing for:</p>
+      <ul>
+        <li><strong>End-to-end execution understanding</strong> — Can you trace the full lifecycle from user code submission through DAG construction, optimization, physical planning, stage splitting, task scheduling, and result collection?</li>
+        <li><strong>Optimizer fluency</strong> — Do you understand Catalyst's four-phase pipeline and how logical plans become physical plans with concrete join strategies and scan operators?</li>
+        <li><strong>Distributed systems reasoning</strong> — Can you explain shuffle mechanics, fault tolerance via lineage, speculative execution, and why wide dependencies create stage boundaries?</li>
+        <li><strong>Performance intuition</strong> — Do you know how Tungsten's memory management, whole-stage code generation, and Adaptive Query Execution eliminate bottlenecks at scale?</li>
+        <li><strong>Production debugging skills</strong> — Have you used the Spark UI to diagnose skew, spill, GC pressure, and stragglers? Can you relate executor metrics to root causes?</li>
+        <li><strong>Join strategy knowledge</strong> — Can you articulate when Spark chooses BroadcastHashJoin vs SortMergeJoin, the thresholds involved, and how AQE can switch strategies at runtime?</li>
+        <li><strong>Operational maturity</strong> — Have you dealt with real production incidents involving OOM, data skew, shuffle service failures, or driver bottlenecks?</li>
+      </ul>
+      <p>This question separates candidates who merely call <code>df.write.parquet()</code> from those who can architect, tune, and troubleshoot petabyte-scale Spark pipelines — the caliber expected at FAANG for senior data engineering roles.</p>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 2: QUICK ANSWER
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="quick-answer">
+      <h2>Quick Answer (60-Second Version)</h2>
+      <p>When you call an <em>action</em> (e.g., <code>.count()</code>, <code>.write</code>), Spark's driver constructs a <strong>DAG of transformations</strong> from your lazy DataFrame/RDD operations. The <strong>Catalyst optimizer</strong> converts this logical plan through four phases — analysis, logical optimization, physical planning, and code generation — producing an optimized physical plan. The <strong>DAG scheduler</strong> splits the physical plan at <em>shuffle boundaries</em> (wide dependencies) into <strong>stages</strong>, where each stage contains <strong>tasks</strong> equal to the number of input partitions. The <strong>task scheduler</strong> dispatches tasks to <strong>executors</strong> across the cluster, respecting data locality. Executors run tasks using <strong>Tungsten's</strong> off-heap memory manager and whole-stage code generation for CPU efficiency. Intermediate shuffle data is written to local disk, read by downstream stages, and if any task fails, Spark recomputes it from its lineage (the DAG) rather than replaying logs. <strong>Adaptive Query Execution</strong> (AQE) further refines this at runtime by coalescing partitions, switching join strategies, and handling skew based on actual shuffle statistics.</p>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 3: SPARK ARCHITECTURE
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="spark-architecture">
+      <h2>Spark Architecture</h2>
+
+      <h3>High-Level Components</h3>
+      <pre><code class="language-text">┌────────────────────────────────────────────────────────────────────┐
+│                         DRIVER PROCESS                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐   │
+│  │ SparkContext │  │   Catalyst   │  │    DAG Scheduler       │   │
+│  │ / Session    │  │   Optimizer  │  │    (stages, tasks)     │   │
+│  └──────────────┘  └──────────────┘  └────────────────────────┘   │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐   │
+│  │ Task         │  │ Block        │  │  Scheduler Backend     │   │
+│  │ Scheduler    │  │ Manager      │  │  (FIFO / Fair)         │   │
+│  │              │  │ Master       │  │                        │   │
+│  └──────────────┘  └──────────────┘  └────────────────────────┘   │
+├────────────────────────────────────────────────────────────────────┤
+│                      CLUSTER MANAGER                                │
+│        (YARN / Kubernetes / Mesos / Standalone)                     │
+├───────────────┬───────────────┬───────────────┬────────────────────┤
+│  EXECUTOR 1   │  EXECUTOR 2   │  EXECUTOR 3   │  EXECUTOR N        │
+│  ┌─────────┐  │  ┌─────────┐  │  ┌─────────┐  │  ┌─────────┐      │
+│  │ Task    │  │  │ Task    │  │  │ Task    │  │  │ Task    │      │
+│  │ Thread  │  │  │ Thread  │  │  │ Thread  │  │  │ Thread  │      │
+│  ├─────────┤  │  ├─────────┤  │  ├─────────┤  │  ├─────────┤      │
+│  │ Task    │  │  │ Task    │  │  │ Task    │  │  │ Task    │      │
+│  │ Thread  │  │  │ Thread  │  │  │ Thread  │  │  │ Thread  │      │
+│  ├─────────┤  │  ├─────────┤  │  ├─────────┤  │  ├─────────┤      │
+│  │ Block   │  │  │ Block   │  │  │ Block   │  │  │ Block   │      │
+│  │ Manager │  │  │ Manager │  │  │ Manager │  │  │ Manager │      │
+│  └─────────┘  │  └─────────┘  │  └─────────┘  │  └─────────┘      │
+└───────────────┴───────────────┴───────────────┴────────────────────┘</code></pre>
+
+      <h3>The Driver</h3>
+      <p>The driver is the JVM process that runs your <code>main()</code> function. Its responsibilities include:</p>
+      <ul>
+        <li><strong>SparkSession creation</strong> — Initializes the SparkContext, which establishes a connection to the cluster manager and negotiates executor resources.</li>
+        <li><strong>Logical plan construction</strong> — Converts your DataFrame/SQL operations into an unresolved logical plan (a tree of relational operators).</li>
+        <li><strong>Optimization</strong> — Runs the Catalyst optimizer pipeline to produce an optimized physical plan.</li>
+        <li><strong>DAG scheduling</strong> — Splits the physical plan into stages at shuffle boundaries and computes task locality preferences.</li>
+        <li><strong>Task dispatch</strong> — Sends serialized task closures to executors via the scheduler backend.</li>
+        <li><strong>Result aggregation</strong> — Collects results from executors (e.g., for <code>.collect()</code>, <code>.count()</code>).</li>
+        <li><strong>Metadata tracking</strong> — Maintains the web UI, event log, and accumulator updates.</li>
+      </ul>
+
+      <h3>Executors</h3>
+      <p>Executors are long-running JVM processes on worker nodes. Each executor:</p>
+      <ul>
+        <li>Runs multiple <strong>task threads</strong> concurrently (controlled by <code>spark.executor.cores</code>).</li>
+        <li>Manages a <strong>Block Manager</strong> that caches RDD partitions in memory or disk.</li>
+        <li>Writes shuffle output to local disk for consumption by other executors.</li>
+        <li>Reports heartbeats and task metrics back to the driver every 10 seconds.</li>
+        <li>Has a fixed memory pool split between execution (shuffles, joins, sorts) and storage (cached data).</li>
+      </ul>
+
+      <h3>Cluster Manager</h3>
+      <p>The cluster manager is responsible for resource allocation, not job scheduling:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Manager</th>
+            <th>Use Case</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>YARN</td>
+            <td>Hadoop ecosystem integration</td>
+            <td>Most common in enterprise; supports dynamic allocation natively</td>
+          </tr>
+          <tr>
+            <td>Kubernetes</td>
+            <td>Cloud-native deployments</td>
+            <td>Executor pods auto-scaled; growing rapidly in adoption</td>
+          </tr>
+          <tr>
+            <td>Standalone</td>
+            <td>Development / simple clusters</td>
+            <td>Built-in master/worker; no external dependency</td>
+          </tr>
+          <tr>
+            <td>Mesos</td>
+            <td>Legacy multi-tenant clusters</td>
+            <td>Deprecated in Spark 3.2+; removed in Spark 4.0</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>SparkSession vs SparkContext</h3>
+      <p>Since Spark 2.0, <code>SparkSession</code> is the unified entry point:</p>
+      <pre><code class="language-python">from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .appName("ETL Pipeline") \
+    .config("spark.sql.adaptive.enabled", "true") \
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+    .config("spark.executor.memory", "8g") \
+    .config("spark.executor.cores", "4") \
+    .config("spark.dynamicAllocation.enabled", "true") \
+    .getOrCreate()
+
+# SparkContext is accessible via spark.sparkContext
+sc = spark.sparkContext
+print(f"App ID: {sc.applicationId}")
+print(f"Default parallelism: {sc.defaultParallelism}")</code></pre>
+      <p><code>SparkSession</code> encapsulates <code>SparkContext</code> (cluster connection), <code>SQLContext</code> (SQL parsing), and <code>HiveContext</code> (metastore access) into a single object. You should never create multiple SparkContexts in one JVM — use <code>.getOrCreate()</code> to reuse existing sessions.</p>
+
+      <h3>Memory Architecture (Per Executor)</h3>
+      <pre><code class="language-text">┌─────────────────────────────────────────────────────┐
+│              Executor JVM Heap (8 GB example)        │
+├─────────────────────────────────────────────────────┤
+│  Reserved Memory (300 MB fixed)                     │
+├─────────────────────────────────────────────────────┤
+│  User Memory (40% of remaining = ~3.1 GB)           │
+│  - User data structures, UDF variables              │
+├─────────────────────────────────────────────────────┤
+│  Unified Memory (60% of remaining = ~4.6 GB)        │
+│  ┌───────────────────┬─────────────────────────┐    │
+│  │ Storage Memory    │ Execution Memory         │    │
+│  │ (cached RDDs,     │ (shuffles, joins,        │    │
+│  │  broadcast vars)  │  sorts, aggregations)    │    │
+│  │                   │                          │    │
+│  │ ← can borrow →   │  ← can borrow →          │    │
+│  └───────────────────┴─────────────────────────┘    │
+├─────────────────────────────────────────────────────┤
+│  Off-Heap (optional, via spark.memory.offHeap.size) │
+│  - Tungsten binary format data                      │
+│  - Avoids GC pressure                              │
+└─────────────────────────────────────────────────────┘</code></pre>
+      <p>The unified memory model (introduced in Spark 1.6) allows execution and storage to borrow from each other dynamically. Execution memory can evict cached data when needed (but not vice versa unless execution memory is idle).</p>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 4: DAG & LAZY EVALUATION
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="dag">
+      <h2>DAG &amp; Lazy Evaluation</h2>
+
+      <h3>Transformations vs Actions</h3>
+      <p>Spark operations fall into two categories:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Behavior</th>
+            <th>Examples</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Transformations</strong></td>
+            <td>Lazy — define a new RDD/DataFrame but don't compute anything</td>
+            <td><code>filter</code>, <code>map</code>, <code>select</code>, <code>join</code>, <code>groupBy</code>, <code>withColumn</code></td>
+          </tr>
+          <tr>
+            <td><strong>Actions</strong></td>
+            <td>Eager — trigger actual computation and return results</td>
+            <td><code>count</code>, <code>collect</code>, <code>write</code>, <code>show</code>, <code>take</code>, <code>foreach</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Why Lazy Evaluation?</h3>
+      <p>Laziness is not a limitation — it's a deliberate design choice that enables:</p>
+      <ul>
+        <li><strong>Optimization opportunity</strong> — Catalyst sees the entire computation graph before executing, enabling predicate pushdown, projection pruning, and join reordering that would be impossible with eager evaluation.</li>
+        <li><strong>Pipelining</strong> — Multiple narrow transformations can be fused into a single pass over the data (no intermediate materialization).</li>
+        <li><strong>Reduced I/O</strong> — Filters pushed before expensive operations eliminate unnecessary data reads.</li>
+        <li><strong>Fault tolerance</strong> — The lineage DAG serves as the recovery plan; Spark never needs write-ahead logs for intermediate results.</li>
+      </ul>
+
+      <h3>The Lineage Graph (DAG)</h3>
+      <p>Every transformation creates a new node in the Directed Acyclic Graph. Each node records:</p>
+      <ul>
+        <li>The parent RDD(s) it depends on</li>
+        <li>The function to compute this RDD from its parents</li>
+        <li>Partitioning metadata (how many partitions, what partitioner)</li>
+        <li>Preferred locations for data locality</li>
+      </ul>
+
+      <pre><code class="language-python"># Example: building a DAG (nothing executes until .count())
+raw = spark.read.parquet("s3://data-lake/events/")      # Scan node
+filtered = raw.filter(col("event_date") >= "2024-01-01") # Filter node
+projected = filtered.select("user_id", "event_type")     # Project node
+grouped = projected.groupBy("event_type").count()        # Aggregate node
+
+# This triggers execution — the entire DAG runs
+result = grouped.count()  # Action!</code></pre>
+
+      <pre><code class="language-text">DAG Visualization:
+
+  [ParquetScan]  ─── narrow ───▶  [Filter]  ─── narrow ───▶  [Project]
+                                                                  │
+                                                            wide (shuffle)
+                                                                  │
+                                                                  ▼
+                                                          [HashAggregate]
+                                                          (partial + final)</code></pre>
+
+      <h3>Narrow vs Wide Dependencies</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Dependency Type</th>
+            <th>Definition</th>
+            <th>Examples</th>
+            <th>Impact</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Narrow</strong></td>
+            <td>Each parent partition maps to at most one child partition</td>
+            <td><code>map</code>, <code>filter</code>, <code>union</code>, <code>coalesce</code></td>
+            <td>Can pipeline; no shuffle needed</td>
+          </tr>
+          <tr>
+            <td><strong>Wide</strong></td>
+            <td>Each parent partition may contribute to multiple child partitions</td>
+            <td><code>groupBy</code>, <code>join</code>, <code>repartition</code>, <code>distinct</code></td>
+            <td>Requires shuffle; creates stage boundary</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>DAG Construction Walkthrough</h3>
+      <pre><code class="language-python"># Real-world ETL example showing DAG structure
+orders = spark.read.parquet("s3://warehouse/orders/")
+customers = spark.read.parquet("s3://warehouse/customers/")
+
+# Stage 1: Narrow transformations (pipelined)
+recent_orders = orders \
+    .filter(col("order_date") >= "2024-01-01") \
+    .select("order_id", "customer_id", "amount", "order_date")
+
+# Stage 1 (continued): Narrow transformations on second input
+active_customers = customers \
+    .filter(col("status") == "active") \
+    .select("customer_id", "customer_name", "segment")
+
+# SHUFFLE BOUNDARY — creates Stage 2
+joined = recent_orders.join(
+    active_customers,
+    on="customer_id",
+    how="inner"
+)
+
+# Stage 2 (continued): Narrow transformation after join
+enriched = joined.withColumn(
+    "amount_bucket",
+    when(col("amount") > 1000, "high")
+    .when(col("amount") > 100, "medium")
+    .otherwise("low")
+)
+
+# SHUFFLE BOUNDARY — creates Stage 3
+summary = enriched.groupBy("segment", "amount_bucket") \
+    .agg(
+        count("order_id").alias("order_count"),
+        sum("amount").alias("total_amount")
+    )
+
+# ACTION triggers execution of all 3 stages
+summary.write.parquet("s3://warehouse/segment_summary/")</code></pre>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 5: CATALYST OPTIMIZER
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="catalyst-optimizer">
+      <h2>Catalyst Optimizer</h2>
+
+      <h3>Overview</h3>
+      <p>Catalyst is Spark SQL's extensible query optimizer, built on Scala's pattern matching and functional programming. It transforms your DataFrame/SQL operations through four phases to produce highly optimized JVM bytecode:</p>
+
+      <pre><code class="language-text">┌────────────────┐    ┌────────────────────┐    ┌─────────────────┐    ┌───────────────┐
+│   ANALYSIS     │───▶│ LOGICAL            │───▶│   PHYSICAL      │───▶│    CODE       │
+│                │    │ OPTIMIZATION       │    │   PLANNING      │    │  GENERATION   │
+│ Resolve refs,  │    │ Predicate pushdown │    │ Choose join     │    │ Whole-stage   │
+│ type checking, │    │ Constant folding,  │    │ strategies,     │    │ codegen,      │
+│ catalog lookup │    │ Column pruning,    │    │ cost-based      │    │ Janino        │
+│                │    │ Simplify exprs     │    │ selection       │    │ compilation   │
+└────────────────┘    └────────────────────┘    └─────────────────┘    └───────────────┘
+  Unresolved Plan       Optimized Logical          Physical Plan         Generated Java
+                             Plan                (with strategies)          Bytecode</code></pre>
+
+      <h3>Phase 1: Analysis</h3>
+      <p>The analyzer resolves references using the catalog (Hive metastore, Unity Catalog, or in-memory catalog):</p>
+      <ul>
+        <li><strong>Attribute resolution</strong> — Maps column names to specific input relations.</li>
+        <li><strong>Relation resolution</strong> — Looks up table/view definitions in the catalog.</li>
+        <li><strong>Type coercion</strong> — Inserts implicit casts (e.g., comparing INT with BIGINT).</li>
+        <li><strong>Function resolution</strong> — Resolves function names to implementations (built-in or UDF).</li>
+        <li><strong>Star expansion</strong> — Expands <code>SELECT *</code> to explicit column references.</li>
+      </ul>
+      <pre><code class="language-sql">-- Before analysis: unresolved
+SELECT t.* FROM events t WHERE t.ts > '2024-01-01'
+
+-- After analysis: resolved with types
+Project [event_id#12L, user_id#13, event_type#14, ts#15]
+  Filter (cast(ts#15 as date) > 2024-01-01)
+    UnresolvedRelation [events]  →  Relation[event_id#12L, user_id#13, ...] parquet</code></pre>
+
+      <h3>Phase 2: Logical Optimization</h3>
+      <p>Catalyst applies rule-based optimizations in multiple passes (a fixed-point computation). Key rules include:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Rule</th>
+            <th>What It Does</th>
+            <th>Impact</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Predicate Pushdown</td>
+            <td>Moves filters below joins/aggregations, closer to data sources</td>
+            <td>Reduces data read from storage by orders of magnitude</td>
+          </tr>
+          <tr>
+            <td>Column Pruning</td>
+            <td>Drops columns not needed by downstream operators</td>
+            <td>Reduces I/O and memory pressure in columnar formats</td>
+          </tr>
+          <tr>
+            <td>Constant Folding</td>
+            <td>Evaluates constant expressions at plan time</td>
+            <td>Eliminates runtime computation (e.g., <code>1 + 1 → 2</code>)</td>
+          </tr>
+          <tr>
+            <td>Boolean Simplification</td>
+            <td>Simplifies <code>true AND x → x</code>, <code>false OR x → x</code></td>
+            <td>Reduces expression evaluation overhead</td>
+          </tr>
+          <tr>
+            <td>Combine Filters</td>
+            <td>Merges adjacent Filter nodes into one</td>
+            <td>Reduces plan tree depth</td>
+          </tr>
+          <tr>
+            <td>Null Propagation</td>
+            <td>Short-circuits expressions that always produce NULL</td>
+            <td>Eliminates dead computation paths</td>
+          </tr>
+          <tr>
+            <td>Subquery Elimination</td>
+            <td>Rewrites correlated subqueries as joins</td>
+            <td>Enables parallel execution of formerly sequential plans</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <pre><code class="language-python"># Example: Catalyst pushes filter below join
+df = orders.join(customers, "customer_id") \
+    .filter(col("order_date") >= "2024-01-01") \
+    .select("order_id", "customer_name")
+
+# Physical plan shows filter pushed to orders scan:
+# == Physical Plan ==
+# *(2) Project [order_id, customer_name]
+# +- *(2) BroadcastHashJoin [customer_id], [customer_id]
+#    :- *(1) Filter (order_date >= 2024-01-01)    ← PUSHED DOWN
+#    :  +- *(1) ColumnarToRow
+#    :     +- FileScan parquet [order_id, customer_id, order_date]
+#    :        PushedFilters: [GreaterThanOrEqual(order_date, 2024-01-01)]
+#    +- BroadcastExchange
+#       +- *(3) Project [customer_id, customer_name]
+#          +- *(3) FileScan parquet [customer_id, customer_name]</code></pre>
+
+      <h3>Phase 3: Physical Planning</h3>
+      <p>The physical planner converts the optimized logical plan into one or more physical plans, then selects the best using a cost model:</p>
+      <ul>
+        <li><strong>Join strategy selection</strong> — Chooses between BroadcastHashJoin, SortMergeJoin, ShuffledHashJoin based on table sizes and <code>spark.sql.autoBroadcastJoinThreshold</code> (default 10 MB).</li>
+        <li><strong>Aggregation strategy</strong> — Partial aggregation (map-side combine) vs full shuffle aggregation.</li>
+        <li><strong>Sort implementation</strong> — In-memory sort vs external sort based on data size vs available memory.</li>
+        <li><strong>Scan planning</strong> — Chooses between file scan, bucket scan, or cached data scan.</li>
+        <li><strong>Partition pruning</strong> — Static pruning at plan time or dynamic pruning at runtime (DPP).</li>
+      </ul>
+
+      <h3>Phase 4: Code Generation</h3>
+      <p>Spark uses <strong>whole-stage code generation</strong> (WholeStageCodegen) to compile entire query stages into single Java functions:</p>
+      <ul>
+        <li><strong>Traditional volcano model</strong> — Each operator calls <code>next()</code> on its child, producing one row at a time. This causes virtual function dispatch overhead and poor CPU cache utilization.</li>
+        <li><strong>Whole-stage codegen</strong> — Fuses operators within a stage into a single tight loop that processes rows without virtual calls. Uses the Janino compiler to produce bytecode at runtime.</li>
+      </ul>
+      <pre><code class="language-python"># See the generated code for a query
+df = spark.sql("""
+    SELECT customer_id, SUM(amount)
+    FROM orders
+    WHERE order_date >= '2024-01-01'
+    GROUP BY customer_id
+""")
+
+# View the physical plan with codegen indicators (asterisks)
+df.explain(mode="formatted")
+# *(1) means whole-stage codegen is active for that subtree
+
+# View actual generated Java code (for debugging)
+# spark.conf.set("spark.sql.codegen.comments", "true")
+# df.queryExecution.debug.codegen()</code></pre>
+
+      <h3>Viewing the Optimizer at Work</h3>
+      <pre><code class="language-python"># .explain(True) shows all plan phases
+df.explain(True)
+
+# Output structure:
+# == Parsed Logical Plan ==       (raw user intent)
+# == Analyzed Logical Plan ==     (resolved references)
+# == Optimized Logical Plan ==    (after rule-based optimization)
+# == Physical Plan ==             (concrete execution strategy)</code></pre>
+
+      <pre><code class="language-python"># Programmatic access to plans
+print(df.queryExecution.logical)       # Unresolved
+print(df.queryExecution.analyzed)      # After analysis
+print(df.queryExecution.optimizedPlan) # After logical optimization
+print(df.queryExecution.sparkPlan)     # Physical plan
+print(df.queryExecution.executedPlan)  # With codegen wrappers</code></pre>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 6: TUNGSTEN ENGINE
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="tungsten">
+      <h2>Tungsten Engine</h2>
+
+      <h3>Motivation</h3>
+      <p>Before Tungsten (pre-Spark 1.4), Spark stored data as Java objects on the JVM heap. This caused:</p>
+      <ul>
+        <li><strong>Memory overhead</strong> — A Java String "hello" occupies ~56 bytes (vs 5 bytes raw). Object headers, padding, and pointer chasing waste 2–5× memory.</li>
+        <li><strong>GC pressure</strong> — Billions of short-lived objects trigger long GC pauses that stall all executor threads.</li>
+        <li><strong>Cache misses</strong> — Pointer-heavy object graphs scatter data across the heap, defeating CPU L1/L2/L3 cache prefetching.</li>
+        <li><strong>Serialization cost</strong> — Shuffles required full Java serialization/deserialization of each object.</li>
+      </ul>
+      <p>Tungsten addresses all four problems with a custom memory management and execution backend.</p>
+
+      <h3>Off-Heap Memory Management</h3>
+      <p>Tungsten allocates memory outside the JVM heap using <code>sun.misc.Unsafe</code> (or <code>java.nio.DirectByteBuffer</code>):</p>
+      <ul>
+        <li>Explicit allocation and deallocation — no GC involvement.</li>
+        <li>Memory pages managed by Spark's <code>TaskMemoryManager</code> per task.</li>
+        <li>Memory is accounted precisely, enabling graceful spill-to-disk when limits are reached.</li>
+        <li>Configurable via <code>spark.memory.offHeap.enabled=true</code> and <code>spark.memory.offHeap.size</code>.</li>
+      </ul>
+
+      <h3>Binary Storage Format (UnsafeRow)</h3>
+      <p>Tungsten stores rows in a compact binary format called <code>UnsafeRow</code>:</p>
+      <pre><code class="language-text">UnsafeRow Layout (example: 3 columns — INT, STRING, DOUBLE):
+
+┌───────────────┬────────────────────────────────┬───────────────────┐
+│ Null Bitmap   │ Fixed-width values region       │ Variable-length   │
+│ (1 bit/field) │ (8 bytes per field)             │ data region       │
+├───────────────┼────────────────────────────────┼───────────────────┤
+│ 0b000         │ [42][offset+len][3.14159...]    │ ["hello"]         │
+│ (3 bits)      │ INT   STRING ref   DOUBLE       │                   │
+└───────────────┴────────────────────────────────┴───────────────────┘
+
+Benefits:
+- Fixed offsets for O(1) field access (no deserialization needed)
+- Contiguous memory layout for CPU cache-friendly access
+- Direct binary comparison for sort operations
+- No object creation — operates directly on byte arrays</code></pre>
+
+      <h3>Cache-Friendly Data Structures</h3>
+      <p>Tungsten's data structures are designed for modern CPU architectures:</p>
+      <ul>
+        <li><strong>Cache-conscious hash maps</strong> — Open-addressing hash tables with linear probing store keys/values in contiguous memory, maximizing L1/L2 cache hits during hash joins.</li>
+        <li><strong>Pointer-free sorting</strong> — Sort operations compare binary key prefixes inline (no pointer dereference), falling back to full comparison only on prefix collision.</li>
+        <li><strong>Sequential memory access</strong> — Scan operations iterate over contiguous byte arrays rather than chasing pointers across the heap.</li>
+      </ul>
+
+      <h3>Whole-Stage Code Generation</h3>
+      <p>WholeStageCodegen eliminates the iterator model overhead by generating a single Java method for an entire pipeline stage:</p>
+      <pre><code class="language-text">Traditional Volcano Model (per-row virtual dispatch):
+
+  Aggregate.next()
+    → Project.next()
+      → Filter.next()
+        → Scan.next()
+          → return Row(...)
+        → if predicate(row): return row
+      → return project(row)
+    → update aggregate(row)
+
+≈ 4 virtual method calls per row × 1 billion rows = catastrophic overhead
+
+Whole-Stage Codegen (tight loop):
+
+  while (scan.hasNext()) {
+    row = scan.next();
+    if (row.getInt(3) >= 20240101) {           // filter inlined
+      long key = row.getLong(0);                // project inlined
+      aggregateBuffer.update(key, row.getDouble(2));  // agg inlined
+    }
+  }
+
+≈ 0 virtual calls, CPU branch prediction friendly, vectorization-ready</code></pre>
+
+      <pre><code class="language-python"># Verify codegen is active in your query plan
+df.explain(mode="formatted")
+# Look for asterisks (*) before operator names:
+# *(1) HashAggregate(keys=[customer_id], ...)
+# +- *(1) Filter (order_date >= 2024-01-01)
+#    +- *(1) ColumnarToRow
+#       +- FileScan parquet
+#
+# The *(1) indicates WholeStageCodegen stage #1
+
+# Disable codegen for debugging (not for production!)
+spark.conf.set("spark.sql.codegen.wholeStage", "false")</code></pre>
+
+      <h3>Tungsten Sort</h3>
+      <p>For shuffle operations, Tungsten sort uses a specialized algorithm:</p>
+      <ul>
+        <li>Records stored in serialized binary form (no deserialization during sort).</li>
+        <li>Sort key prefix (8 bytes) stored alongside pointer in a compact array.</li>
+        <li>Comparison uses prefix first (cache-friendly), full record only on tie.</li>
+        <li>External merge sort with efficient spill-to-disk when memory is exhausted.</li>
+        <li>Enabled by default via <code>spark.shuffle.manager=sort</code> (only option since Spark 2.0).</li>
+      </ul>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 7: JOBS, STAGES, TASKS
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="job-stages-tasks">
+      <h2>Jobs, Stages, Tasks</h2>
+
+      <h3>The Execution Hierarchy</h3>
+      <pre><code class="language-text">Application (one SparkSession)
+  └── Job 1 (triggered by action: .write())
+  │     └── Stage 0 (ResultStage)
+  │     │     └── Task 0.0 (partition 0)
+  │     │     └── Task 0.1 (partition 1)
+  │     │     └── ... Task 0.N
+  │     └── Stage 1 (ShuffleMapStage)
+  │           └── Task 1.0 (partition 0)
+  │           └── Task 1.1 (partition 1)
+  │           └── ... Task 1.M
+  └── Job 2 (triggered by action: .count())
+        └── Stage 2 ...</code></pre>
+
+      <h3>Jobs</h3>
+      <p>Every <strong>action</strong> triggers exactly one job. A single application can have many jobs (e.g., a notebook with multiple <code>.show()</code> or <code>.write()</code> calls):</p>
+      <pre><code class="language-python"># This creates 3 jobs:
+df = spark.read.parquet("s3://data/events/")
+df.cache()          # Job 0: materialize cache
+df.count()          # Job 1: count action
+df.write.parquet("s3://output/")  # Job 2: write action</code></pre>
+
+      <h3>Stages</h3>
+      <p>The DAG scheduler splits each job into stages at <strong>shuffle boundaries</strong> (wide dependencies). Within a stage, all transformations have narrow dependencies and can be pipelined:</p>
+      <ul>
+        <li><strong>ShuffleMapStage</strong> — Produces shuffle output (map side of a shuffle). Its tasks write shuffle files to local disk.</li>
+        <li><strong>ResultStage</strong> — The final stage that produces the action's result (e.g., collected rows, written files).</li>
+      </ul>
+
+      <pre><code class="language-python"># How many stages? Count the shuffle boundaries + 1
+orders = spark.read.parquet("...")          # ─┐
+  .filter(col("date") >= "2024-01-01")     #  │ Stage 0
+  .select("order_id", "customer_id", "amt")# ─┘
+
+customers = spark.read.parquet("...")       # ─┐
+  .filter(col("active") == True)           #  │ Stage 1
+  .select("customer_id", "name")           # ─┘
+
+joined = orders.join(customers, "customer_id")  # SHUFFLE → Stage 2
+
+result = joined.groupBy("name") \
+    .agg(sum("amt"))                       # SHUFFLE → Stage 3
+
+result.write.parquet("...")                # Action triggers all stages
+
+# Total: 4 stages (2 scan stages + join stage + aggregation stage)</code></pre>
+
+      <h3>Tasks</h3>
+      <p>Each stage is divided into <strong>tasks</strong> — the smallest unit of work. The number of tasks equals the number of input partitions for that stage:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Stage Type</th>
+            <th>Number of Tasks</th>
+            <th>Determined By</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Scan stage</td>
+            <td>Number of input file splits</td>
+            <td>File size ÷ <code>spark.sql.files.maxPartitionBytes</code> (128 MB default)</td>
+          </tr>
+          <tr>
+            <td>Shuffle read stage</td>
+            <td><code>spark.sql.shuffle.partitions</code></td>
+            <td>Default 200; tune to cluster cores × 2–3</td>
+          </tr>
+          <tr>
+            <td>Repartitioned stage</td>
+            <td>Specified partition count</td>
+            <td>User-specified via <code>.repartition(N)</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Task Lifecycle</h3>
+      <pre><code class="language-text">1. DAG Scheduler creates TaskSet for the stage
+2. Task Scheduler assigns tasks to executors (respecting locality)
+3. Driver serializes task closure (function + partition info)
+4. Executor deserializes task and creates a TaskRunner thread
+5. TaskRunner executes the generated code on its partition
+6. For ShuffleMapStage: writes shuffle output to local disk
+   For ResultStage: sends results back to driver
+7. Executor reports task completion + metrics to driver
+8. DAG Scheduler marks stage complete when all tasks succeed</code></pre>
+
+      <h3>Task Scheduling and Locality</h3>
+      <p>Spark prefers to schedule tasks where data already resides:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Locality Level</th>
+            <th>Description</th>
+            <th>Wait Time</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>PROCESS_LOCAL</td>
+            <td>Data is in the executor's memory (cached RDD)</td>
+            <td>Immediate</td>
+          </tr>
+          <tr>
+            <td>NODE_LOCAL</td>
+            <td>Data is on the same node (HDFS block, local shuffle file)</td>
+            <td>3s default</td>
+          </tr>
+          <tr>
+            <td>RACK_LOCAL</td>
+            <td>Data is on a node in the same rack</td>
+            <td>3s default</td>
+          </tr>
+          <tr>
+            <td>ANY</td>
+            <td>Data must be fetched from a remote node</td>
+            <td>Fallback</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>Configure locality wait via <code>spark.locality.wait</code> (default 3s). For clusters with fast networks (cloud), reducing this to 0–1s can improve overall throughput by avoiding idle executors waiting for locality.</p>
+
+      <h3>Parallel Execution</h3>
+      <pre><code class="language-python"># Cluster: 10 executors × 4 cores = 40 task slots
+# Stage with 200 partitions → 200 tasks
+# Tasks run in 5 waves: 40 + 40 + 40 + 40 + 40 = 200
+
+# Ideal: partitions ≈ 2-3× total cores for even distribution
+# Too few partitions → underutilized cores, possible OOM
+# Too many partitions → scheduling overhead, small-file problem
+
+spark.conf.set("spark.sql.shuffle.partitions", "120")
+# 120 tasks / 40 slots = 3 waves (good parallelism, manageable overhead)</code></pre>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 8: SHUFFLE DEEP DIVE
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="shuffle">
+      <h2>Shuffle Deep Dive</h2>
+
+      <h3>What is a Shuffle?</h3>
+      <p>A shuffle is the mechanism Spark uses to redistribute data across partitions when a wide dependency requires each output partition to read from multiple input partitions. It is the most expensive operation in Spark — involving disk I/O, network transfer, and serialization/deserialization.</p>
+
+      <pre><code class="language-text">Shuffle Operation (groupBy example):
+
+STAGE 1 (Map Side / Shuffle Write)          STAGE 2 (Reduce Side / Shuffle Read)
+┌─────────────┐                             ┌─────────────┐
+│ Partition 0  │──── key A ────────────────▶│ Partition 0  │ (all key A rows)
+│ [A,B,C,A,B] │──── key B ─────────┐       │             │
+└─────────────┘──── key C ───┐      │       └─────────────┘
+                              │      │
+┌─────────────┐              │      │       ┌─────────────┐
+│ Partition 1  │── key A ────│──────│──────▶│ Partition 1  │ (all key B rows)
+│ [B,A,C,B,A] │── key B ────│──────┘       │             │
+└─────────────┘── key C ────┘               └─────────────┘
+                              │
+┌─────────────┐              │              ┌─────────────┐
+│ Partition 2  │── key A ────│─────────────▶│ Partition 2  │ (all key C rows)
+│ [C,C,A,B,C] │── key B ────│              │             │
+└─────────────┘── key C ────┘              └─────────────┘</code></pre>
+
+      <h3>Shuffle Write (Map Side)</h3>
+      <p>Each map task produces shuffle output by:</p>
+      <ol>
+        <li><strong>Partitioning</strong> — Computes the target partition for each record using the partitioner (hash or range).</li>
+        <li><strong>Sorting</strong> — Sorts records by (partition_id, optional_key) within an in-memory buffer.</li>
+        <li><strong>Spilling</strong> — When the buffer exceeds <code>spark.shuffle.spill.initialMemoryThreshold</code>, spills sorted runs to disk.</li>
+        <li><strong>Merging</strong> — Merges all spill files + remaining in-memory data into final shuffle files.</li>
+        <li><strong>Writing</strong> — Produces one data file + one index file per map task (consolidated format since Spark 1.4).</li>
+      </ol>
+
+      <pre><code class="language-text">Shuffle File Layout (per map task):
+
+shuffle_0_0_0.data     ← Concatenated sorted records for all reduce partitions
+shuffle_0_0_0.index    ← Byte offsets for each reduce partition's data
+
+Index file enables reduce tasks to seek directly to their portion
+without reading the entire file.</code></pre>
+
+      <h3>Shuffle Read (Reduce Side)</h3>
+      <p>Each reduce task:</p>
+      <ol>
+        <li><strong>Fetches</strong> its partition's data from all map tasks (via BlockTransferService over Netty).</li>
+        <li><strong>Buffers</strong> fetched blocks in memory (controlled by <code>spark.reducer.maxSizeInFlight</code>, default 48 MB).</li>
+        <li><strong>Merges</strong> sorted blocks if sort-based aggregation is required.</li>
+        <li><strong>Processes</strong> the merged stream through downstream operators.</li>
+      </ol>
+      <p>Remote fetches happen in parallel (5 concurrent requests per reduce task by default, controlled by <code>spark.reducer.maxReqsInFlight</code>).</p>
+
+      <h3>Sort-Based Shuffle (Default)</h3>
+      <p>Since Spark 2.0, the only shuffle implementation is <strong>sort-based shuffle</strong> (<code>SortShuffleManager</code>):</p>
+      <ul>
+        <li>All records sorted by partition ID in a single pass.</li>
+        <li>One output file per map task (regardless of reduce partition count) — eliminates the N×M file explosion of the old hash-based shuffle.</li>
+        <li>Index file allows random access to any partition's data.</li>
+        <li>For aggregation operations (like <code>reduceByKey</code>), a map-side combine is performed during the sort.</li>
+      </ul>
+
+      <h3>Tungsten Sort Optimization</h3>
+      <p>When conditions are met, Spark uses Tungsten's unsafe sort:</p>
+      <ul>
+        <li><strong>Requirements</strong>: No aggregation, no ordering required within partitions, serialized record size fits in a page.</li>
+        <li><strong>Mechanism</strong>: Stores serialized records in off-heap pages. Sort operates on 8-byte pointers (partition_id + page_offset) — never deserializes records.</li>
+        <li><strong>Benefit</strong>: 3–5× faster sort for large shuffles due to cache-efficient memory access and zero deserialization.</li>
+      </ul>
+
+      <h3>Shuffle Configuration Tuning</h3>
+      <pre><code class="language-python"># Key shuffle configurations
+spark.conf.set("spark.sql.shuffle.partitions", "200")    # Reduce partitions (tune to data size)
+spark.conf.set("spark.shuffle.compress", "true")         # Compress shuffle files (default: true)
+spark.conf.set("spark.shuffle.file.buffer", "64k")       # Write buffer size (default: 32k)
+spark.conf.set("spark.reducer.maxSizeInFlight", "96m")   # Fetch buffer per reduce task
+spark.conf.set("spark.shuffle.io.maxRetries", "10")      # Retry fetches on failure
+spark.conf.set("spark.shuffle.io.retryWait", "60s")      # Wait between retries
+spark.conf.set("spark.shuffle.service.enabled", "true")  # External shuffle service
+
+# External Shuffle Service — critical for dynamic allocation
+# Runs on each node independently of executors
+# Serves shuffle files even after executor is terminated
+# Enables safe executor scale-down without losing shuffle data</code></pre>
+
+      <h3>Shuffle Metrics to Monitor</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Healthy Range</th>
+            <th>Red Flag</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Shuffle Write Size</td>
+            <td>Proportional to input</td>
+            <td>Write ≈ Input size → no predicate pushdown benefit</td>
+          </tr>
+          <tr>
+            <td>Shuffle Read Size</td>
+            <td>Balanced across tasks</td>
+            <td>Max ≫ Median → data skew</td>
+          </tr>
+          <tr>
+            <td>Shuffle Spill (Memory)</td>
+            <td>0 (ideal)</td>
+            <td>Spill &gt; 0 → increase executor memory or partitions</td>
+          </tr>
+          <tr>
+            <td>Shuffle Spill (Disk)</td>
+            <td>0 (ideal)</td>
+            <td>Disk spill → severe memory pressure</td>
+          </tr>
+          <tr>
+            <td>Fetch Wait Time</td>
+            <td>&lt; 1% of task time</td>
+            <td>&gt; 10% → network bottleneck or straggler</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 9: JOIN STRATEGIES IN SPARK
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="joins-in-spark">
+      <h2>Join Strategies in Spark</h2>
+
+      <h3>Overview of Join Strategies</h3>
+      <p>Spark's physical planner selects from five join implementations based on data characteristics:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Mechanism</th>
+            <th>When Chosen</th>
+            <th>Shuffle Required?</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>BroadcastHashJoin (BHJ)</strong></td>
+            <td>Small table broadcast to all executors; hash table probed by large table</td>
+            <td>One side ≤ <code>autoBroadcastJoinThreshold</code> (10 MB)</td>
+            <td>No shuffle for broadcast side</td>
+          </tr>
+          <tr>
+            <td><strong>ShuffledHashJoin (SHJ)</strong></td>
+            <td>Both sides shuffled by join key; smaller side built as hash table</td>
+            <td>One side fits in memory per partition; <code>preferSortMergeJoin=false</code></td>
+            <td>Yes (both sides)</td>
+          </tr>
+          <tr>
+            <td><strong>SortMergeJoin (SMJ)</strong></td>
+            <td>Both sides shuffled and sorted by join key; merge-join scan</td>
+            <td>Default for large-large equi-joins</td>
+            <td>Yes (both sides)</td>
+          </tr>
+          <tr>
+            <td><strong>BroadcastNestedLoopJoin (BNLJ)</strong></td>
+            <td>Broadcast small side; nested loop comparison</td>
+            <td>Non-equi joins when one side is small</td>
+            <td>No shuffle for broadcast side</td>
+          </tr>
+          <tr>
+            <td><strong>CartesianProduct</strong></td>
+            <td>Full cross join</td>
+            <td>Cross joins or non-equi joins where neither side is broadcastable</td>
+            <td>Depends</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>BroadcastHashJoin (BHJ)</h3>
+      <p>The fastest join strategy — eliminates shuffle entirely for one side:</p>
+      <pre><code class="language-python"># Automatic: Spark broadcasts tables ≤ 10 MB by default
+small_df = spark.read.parquet("s3://data/dim_countries/")  # 2 MB
+large_df = spark.read.parquet("s3://data/fact_events/")    # 500 GB
+
+# Spark auto-selects BroadcastHashJoin
+joined = large_df.join(small_df, "country_id")
+
+# Force broadcast with hint (override size threshold)
+from pyspark.sql.functions import broadcast
+
+joined = large_df.join(broadcast(small_df), "country_id")
+
+# Adjust threshold
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "50m")  # 50 MB</code></pre>
+
+      <pre><code class="language-text">BroadcastHashJoin Execution:
+
+1. Driver collects small DataFrame to driver memory
+2. Driver broadcasts serialized hash table to all executors
+3. Each executor stores broadcast in BlockManager (memory)
+4. Large side tasks probe the hash table — NO SHUFFLE of large side
+
+   Executor 1: [Large partition 0] ──probe──▶ [Broadcast HashTable]
+   Executor 2: [Large partition 1] ──probe──▶ [Broadcast HashTable]
+   Executor 3: [Large partition 2] ──probe──▶ [Broadcast HashTable]</code></pre>
+
+      <h3>SortMergeJoin (SMJ)</h3>
+      <p>The default strategy for joining two large tables:</p>
+      <pre><code class="language-text">SortMergeJoin Execution:
+
+Phase 1: Shuffle both sides by join key
+  Orders (500 GB) ──shuffle by customer_id──▶ 200 partitions
+  Customers (50 GB) ──shuffle by customer_id──▶ 200 partitions
+
+Phase 2: Sort each partition by join key
+  Partition 42 of Orders:   [cust_1, cust_1, cust_3, cust_5, ...]
+  Partition 42 of Customers: [cust_1, cust_2, cust_3, cust_4, cust_5, ...]
+
+Phase 3: Merge-join (single pass, both sorted)
+  Two pointers advance through sorted streams
+  O(N + M) per partition — highly efficient for large datasets</code></pre>
+
+      <h3>ShuffledHashJoin (SHJ)</h3>
+      <p>An alternative when one side is moderately small (fits in memory per partition) but too large to broadcast:</p>
+      <pre><code class="language-python"># ShuffledHashJoin: both sides shuffled, smaller builds hash table
+# Faster than SMJ when skipping sort is possible
+# Requires: spark.sql.join.preferSortMergeJoin = false
+
+spark.conf.set("spark.sql.join.preferSortMergeJoin", "false")
+
+# SHJ chosen when one side per-partition size fits in memory
+# Avoids sort overhead but requires more memory than SMJ</code></pre>
+
+      <h3>Join Strategy Selection Rules</h3>
+      <pre><code class="language-text">Decision Tree (simplified):
+
+1. Is it an equi-join?
+   ├── YES:
+   │   ├── Is one side ≤ broadcast threshold (or has broadcast hint)?
+   │   │   └── YES → BroadcastHashJoin
+   │   │   └── NO → Continue...
+   │   ├── Is preferSortMergeJoin = false AND one side fits in memory?
+   │   │   └── YES → ShuffledHashJoin
+   │   │   └── NO → SortMergeJoin (default)
+   │
+   └── NO (non-equi join):
+       ├── Is one side ≤ broadcast threshold?
+       │   └── YES → BroadcastNestedLoopJoin
+       │   └── NO → CartesianProduct (expensive!)</code></pre>
+
+      <h3>Join Performance Comparison</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Time Complexity</th>
+            <th>Network Cost</th>
+            <th>Memory Requirement</th>
+            <th>Best For</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>BHJ</td>
+            <td>O(N) per partition</td>
+            <td>Broadcast only</td>
+            <td>Small table fits in executor memory</td>
+            <td>Dimension-fact joins</td>
+          </tr>
+          <tr>
+            <td>SMJ</td>
+            <td>O(N log N + M log M)</td>
+            <td>Full shuffle both sides</td>
+            <td>Spill-friendly (streaming merge)</td>
+            <td>Large-large joins</td>
+          </tr>
+          <tr>
+            <td>SHJ</td>
+            <td>O(N + M)</td>
+            <td>Full shuffle both sides</td>
+            <td>Smaller side per-partition in memory</td>
+            <td>Medium-large joins</td>
+          </tr>
+          <tr>
+            <td>BNLJ</td>
+            <td>O(N × M)</td>
+            <td>Broadcast only</td>
+            <td>Small table in memory</td>
+            <td>Non-equi joins, small tables</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Bucket Joins (Avoiding Shuffle)</h3>
+      <pre><code class="language-python"># Pre-bucket tables by join key to eliminate shuffle at join time
+orders.write \
+    .bucketBy(256, "customer_id") \
+    .sortBy("customer_id") \
+    .saveAsTable("orders_bucketed")
+
+customers.write \
+    .bucketBy(256, "customer_id") \
+    .sortBy("customer_id") \
+    .saveAsTable("customers_bucketed")
+
+# Join on bucketed tables — NO SHUFFLE, NO SORT at query time
+orders_b = spark.table("orders_bucketed")
+customers_b = spark.table("customers_bucketed")
+joined = orders_b.join(customers_b, "customer_id")  # Direct SortMergeJoin, 0 shuffle</code></pre>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 10: ADAPTIVE QUERY EXECUTION
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="aqe">
+      <h2>Adaptive Query Execution (AQE)</h2>
+
+      <h3>Why AQE?</h3>
+      <p>Static query optimization has fundamental limitations:</p>
+      <ul>
+        <li><strong>Stale statistics</strong> — Table stats collected at ANALYZE time may not reflect current data distribution.</li>
+        <li><strong>Cardinality estimation errors</strong> — Complex predicates, UDFs, and correlated columns make accurate estimation nearly impossible.</li>
+        <li><strong>Runtime data characteristics</strong> — Actual shuffle partition sizes and skew patterns are unknowable at plan time.</li>
+      </ul>
+      <p>AQE (enabled by default in Spark 3.2+) addresses these by re-optimizing the query plan <em>between stages</em>, using actual runtime statistics from completed shuffle map stages.</p>
+
+      <pre><code class="language-python"># Enable AQE (default true since Spark 3.2)
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+
+# Individual features
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+spark.conf.set("spark.sql.adaptive.localShuffleReader.enabled", "true")</code></pre>
+
+      <h3>Feature 1: Coalesce Shuffle Partitions</h3>
+      <p>Problem: You set <code>spark.sql.shuffle.partitions=200</code> for large stages, but smaller stages produce many tiny partitions (e.g., after a selective filter). Tiny tasks have more scheduling overhead than computation time.</p>
+      <pre><code class="language-text">Before AQE coalescing (200 partitions, many tiny):
+  Partition sizes: [2MB, 1MB, 3MB, 0.5MB, 2MB, 1MB, ...]
+  → 200 tasks, many finish in milliseconds (scheduling overhead dominates)
+
+After AQE coalescing:
+  Adjacent small partitions merged: [64MB, 64MB, 64MB, 58MB, ...]
+  → 8 tasks, each with meaningful work
+
+Controlled by:
+  spark.sql.adaptive.advisoryPartitionSizeInBytes = 64MB (target size)
+  spark.sql.adaptive.coalescePartitions.minPartitionSize = 1MB</code></pre>
+
+      <h3>Feature 2: Dynamic Join Strategy Switch</h3>
+      <p>Problem: At plan time, Spark estimates a table at 500 MB (too large to broadcast). After filters execute, the actual shuffle output is only 8 MB — small enough for BroadcastHashJoin.</p>
+      <pre><code class="language-text">Original plan (based on statistics):
+  SortMergeJoin (both sides estimated > 10 MB)
+    ├── Shuffle (orders filtered)  [estimated: 500 MB]
+    └── Shuffle (customers)        [estimated: 50 MB]
+
+After Stage 0 completes, AQE observes:
+  Actual orders filtered size: 8 MB (selective filter eliminated most data)
+
+AQE re-plans:
+  BroadcastHashJoin (orders now small enough to broadcast)
+    ├── Broadcast (orders filtered)  [actual: 8 MB] ← converted!
+    └── Local shuffle read (customers)
+
+Result: Eliminates shuffle for customers side, massive speedup!</code></pre>
+
+      <h3>Feature 3: Skew Join Optimization</h3>
+      <p>Problem: A single partition has 100× the data of others, creating a straggler task that dominates stage runtime.</p>
+      <pre><code class="language-text">Before AQE skew handling:
+  Partition sizes: [50MB, 45MB, 52MB, 48MB, 5000MB, 47MB, ...]
+                                                ↑ SKEWED (100× median)
+  Stage runtime = time of slowest task ≈ runtime of 5 GB partition
+
+After AQE skew handling:
+  1. Detects partition 4 is skewed (size > median × skewedPartitionFactor)
+  2. Splits partition 4 into ~100 sub-partitions of 50 MB each
+  3. Replicates the matching partition from the other join side
+  4. Runs 100 parallel tasks instead of 1 straggler
+
+  Partition 4 → [50MB, 50MB, 50MB, ... × 100] (each paired with replicated data)
+
+Controlled by:
+  spark.sql.adaptive.skewJoin.skewedPartitionFactor = 5 (default)
+  spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes = 256MB</code></pre>
+
+      <pre><code class="language-python"># Verify AQE is working — check physical plan for "AQE" markers
+df.explain(mode="formatted")
+
+# Look for:
+# AdaptiveSparkPlan isFinalPlan=true
+#   +- CustomShuffleReader coalesced    ← partition coalescing active
+#   +- BroadcastHashJoin               ← dynamically switched from SMJ
+#   +- SkewedJoin                      ← skew optimization active</code></pre>
+
+      <h3>Feature 4: Dynamic Partition Pruning (DPP)</h3>
+      <p>Although technically separate from AQE, DPP works at runtime to prune partitions of fact tables based on the result of dimension table filters:</p>
+      <pre><code class="language-sql">-- DPP Example: prune fact table partitions at runtime
+SELECT f.*
+FROM fact_sales f
+JOIN dim_date d ON f.date_key = d.date_key
+WHERE d.year = 2024
+
+-- Without DPP: Scan all date partitions of fact_sales, then filter
+-- With DPP: Execute dim_date filter first, broadcast matching date_keys,
+--           then scan ONLY fact_sales partitions matching year=2024</code></pre>
+
+      <h3>AQE vs Static Optimization</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Aspect</th>
+            <th>Static (Catalyst alone)</th>
+            <th>Adaptive (AQE)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Statistics</td>
+            <td>Table-level estimates at plan time</td>
+            <td>Exact runtime shuffle statistics</td>
+          </tr>
+          <tr>
+            <td>Join strategy</td>
+            <td>Fixed at plan time</td>
+            <td>Can switch between stages</td>
+          </tr>
+          <tr>
+            <td>Partition count</td>
+            <td>Fixed <code>spark.sql.shuffle.partitions</code></td>
+            <td>Dynamically coalesced</td>
+          </tr>
+          <tr>
+            <td>Skew handling</td>
+            <td>Manual salting required</td>
+            <td>Automatic split + replicate</td>
+          </tr>
+          <tr>
+            <td>Overhead</td>
+            <td>None (single plan)</td>
+            <td>Minimal re-planning between stages</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 11: FAULT TOLERANCE
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="fault-tolerance">
+      <h2>Fault Tolerance</h2>
+
+      <h3>Lineage-Based Recovery</h3>
+      <p>Unlike traditional databases that use write-ahead logs (WAL), Spark achieves fault tolerance through the DAG lineage. If a partition is lost (executor crash, disk failure), Spark recomputes <em>only</em> the lost partition from its parent partitions:</p>
+      <pre><code class="language-text">Lineage-based recovery:
+
+Original execution:
+  [Scan part 0] → [Filter] → [Map] → [Result part 0] ✓
+  [Scan part 1] → [Filter] → [Map] → [Result part 1] ✓
+  [Scan part 2] → [Filter] → [Map] → [Result part 2] ✗ (executor crashed)
+
+Recovery:
+  [Scan part 2] → [Filter] → [Map] → [Result part 2] ✓ (recomputed on new executor)
+
+Key insight: Only partition 2 is recomputed.
+Partitions 0 and 1 are untouched — no global rollback.</code></pre>
+
+      <h3>Task-Level Retry</h3>
+      <p>Individual task failures are retried before failing the entire stage:</p>
+      <ul>
+        <li><strong>Max attempts</strong>: <code>spark.task.maxFailures</code> (default 4) — task retried up to 4 times.</li>
+        <li><strong>Failure causes</strong>: OOM, fetch failure, JVM crash, killed by YARN.</li>
+        <li><strong>Relaunch location</strong>: Failed task may be relaunched on a different executor (blacklisting the failed one).</li>
+        <li><strong>Speculative execution</strong>: If enabled (<code>spark.speculation=true</code>), Spark launches duplicate tasks for slow-running (straggler) tasks and takes the first result.</li>
+      </ul>
+
+      <pre><code class="language-python"># Task retry configuration
+spark.conf.set("spark.task.maxFailures", "4")        # Retry 3 times (4 attempts total)
+spark.conf.set("spark.task.reaper.enabled", "true")  # Kill zombie tasks
+
+# Speculative execution (useful for stragglers)
+spark.conf.set("spark.speculation", "true")
+spark.conf.set("spark.speculation.multiplier", "1.5")    # 1.5× median runtime
+spark.conf.set("spark.speculation.quantile", "0.75")     # After 75% tasks complete
+
+# Executor blacklisting (avoid repeatedly failing executors)
+spark.conf.set("spark.excludeOnFailure.enabled", "true")
+spark.conf.set("spark.excludeOnFailure.task.maxTaskAttemptsPerExecutor", "2")</code></pre>
+
+      <h3>Stage-Level Retry</h3>
+      <p>If a reduce task cannot fetch shuffle data (because the map-side executor died and its shuffle files are lost), Spark retries the <em>entire parent stage</em>:</p>
+      <pre><code class="language-text">FetchFailedException scenario:
+
+1. Stage 0 (ShuffleMapStage) completes — shuffle files on executors A, B, C
+2. Executor B crashes (loses its shuffle files)
+3. Stage 1 tasks try to fetch from B → FetchFailedException
+4. DAG Scheduler resubmits Stage 0 (only the tasks that were on B)
+5. New executor D re-runs those map tasks, produces new shuffle files
+6. Stage 1 retries fetch from D → succeeds
+
+Controlled by:
+  spark.stage.maxConsecutiveAttempts = 4 (default)
+
+Mitigation: Enable External Shuffle Service to decouple shuffle file
+lifecycle from executor lifecycle.</code></pre>
+
+      <h3>Checkpointing</h3>
+      <p>For very long lineage chains (iterative algorithms), recomputation from the start is expensive. Checkpointing materializes an RDD to reliable storage (HDFS/S3), truncating the lineage:</p>
+      <pre><code class="language-python"># Set checkpoint directory (must be reliable distributed storage)
+spark.sparkContext.setCheckpointDir("s3://checkpoints/app-001/")
+
+# Checkpoint an RDD/DataFrame to truncate lineage
+df_iteration_100 = run_iteration(df_iteration_99)
+df_iteration_100.checkpoint()  # Materializes to S3, clears lineage
+
+# Use cases:
+# - Iterative ML algorithms (PageRank, gradient descent)
+# - Very long ETL pipelines with 50+ stages
+# - Streaming state stores
+
+# Two types:
+# 1. Reliable checkpoint — writes to distributed storage (survives driver failure)
+# 2. Local checkpoint — writes to executor local storage (faster, less durable)
+df.localCheckpoint()  # Faster but lost if executor dies</code></pre>
+
+      <h3>Driver Failure Recovery</h3>
+      <p>The driver is a single point of failure. If it crashes:</p>
+      <ul>
+        <li><strong>Without external orchestration</strong> — Application is lost. Executors are terminated by the cluster manager.</li>
+        <li><strong>With cluster mode</strong> — YARN/K8s can restart the driver (but application state is lost).</li>
+        <li><strong>Structured Streaming</strong> — Recoverable from checkpoint directory. Re-reads offsets and re-processes from last committed batch.</li>
+        <li><strong>Best practice</strong> — Run long-lived streaming apps in cluster mode with automatic restart policies.</li>
+      </ul>
+
+      <h3>Fault Tolerance Comparison</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Failure Type</th>
+            <th>Recovery Mechanism</th>
+            <th>Cost</th>
+            <th>User Impact</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Task failure</td>
+            <td>Retry on same/different executor</td>
+            <td>Low (single partition)</td>
+            <td>Transparent (job succeeds)</td>
+          </tr>
+          <tr>
+            <td>Executor loss (no shuffle)</td>
+            <td>Recompute lost cached partitions</td>
+            <td>Low-medium</td>
+            <td>Transparent</td>
+          </tr>
+          <tr>
+            <td>Executor loss (shuffle files lost)</td>
+            <td>Rerun parent stage map tasks</td>
+            <td>High (stage re-execution)</td>
+            <td>Slower job, transparent</td>
+          </tr>
+          <tr>
+            <td>Driver failure</td>
+            <td>Application restart (batch) or checkpoint recovery (streaming)</td>
+            <td>Very high (full restart)</td>
+            <td>Job failure + restart</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 12: PRODUCTION INCIDENT
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="production-incident">
+      <h2>Production Incident: OOM from Skewed Shuffle Partition</h2>
+
+      <h3>Scenario</h3>
+      <p>A daily ETL pipeline joining user events with a device dimension table started failing with <code>java.lang.OutOfMemoryError: Java heap space</code> on 3 of 200 executors after a data source migration added a new high-cardinality device key.</p>
+
+      <h3>Timeline</h3>
+      <pre><code class="language-text">Day 0:  Pipeline runs normally. 500M events/day, 200 shuffle partitions.
+        Join on device_id. Largest partition: ~800 MB. Executors: 8 GB heap.
+
+Day 1:  Upstream source adds new IoT device type. These devices all report
+        with device_id = "UNREGISTERED" (placeholder for unknown devices).
+        50M of 500M events now have device_id = "UNREGISTERED".
+
+Day 2:  Pipeline OOMs. Single partition (hash("UNREGISTERED") % 200)
+        receives 50M rows (~12 GB) — exceeds 8 GB executor memory.
+        3 executors crash attempting this partition. Stage retried 4×, fails.</code></pre>
+
+      <h3>Diagnosis Using Spark UI</h3>
+      <pre><code class="language-text">Spark UI → Stages tab → Failed Stage:
+
+Task Metrics Summary:
+┌─────────────────┬──────────┬──────────┬──────────┬───────────────┐
+│ Metric          │ Min      │ 25th %   │ Median   │ Max           │
+├─────────────────┼──────────┼──────────┼──────────┼───────────────┤
+│ Shuffle Read    │ 180 MB   │ 420 MB   │ 510 MB   │ 12.3 GB  ←!! │
+│ Duration        │ 12s      │ 28s      │ 35s      │ FAILED        │
+│ Spill (Memory)  │ 0 MB     │ 0 MB     │ 0 MB     │ 11.8 GB      │
+│ Spill (Disk)    │ 0 MB     │ 0 MB     │ 0 MB     │ 4.2 GB       │
+│ GC Time         │ 200ms    │ 1.2s     │ 1.8s     │ 45s      ←!! │
+└─────────────────┴──────────┴──────────┴──────────┴───────────────┘
+
+Root Cause: Partition 142 (hash of "UNREGISTERED") has 24× median size.
+The SortMergeJoin task for this partition exceeds executor memory.</code></pre>
+
+      <h3>Investigation Steps</h3>
+      <pre><code class="language-python"># Step 1: Identify the skewed key
+events.groupBy("device_id") \
+    .count() \
+    .orderBy(col("count").desc()) \
+    .show(10)
+
+# Output:
+# +──────────────+──────────+
+# |device_id     |count     |
+# +──────────────+──────────+
+# |UNREGISTERED  |50,234,891|  ← 10% of all events!
+# |device_abc123 |1,245     |
+# |device_def456 |1,198     |
+# ...
+
+# Step 2: Verify partition distribution
+from pyspark.sql.functions import spark_partition_id
+events.repartition(200, "device_id") \
+    .groupBy(spark_partition_id()) \
+    .count() \
+    .orderBy(col("count").desc()) \
+    .show(5)
+
+# Partition 142: 50,234,891 rows (vs median 2,500,000)</code></pre>
+
+      <h3>Resolution Options</h3>
+
+      <h4>Option 1: Enable AQE Skew Join (Recommended for Spark 3.x)</h4>
+      <pre><code class="language-python">spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256m")
+
+# AQE automatically:
+# 1. Detects partition 142 is 12 GB (> 5× median 510 MB AND > 256 MB)
+# 2. Splits it into ~24 sub-partitions of ~512 MB each
+# 3. Replicates the device dimension's matching partition
+# 4. Runs 24 parallel tasks instead of 1 OOM task</code></pre>
+
+      <h4>Option 2: Salting (Manual Skew Handling)</h4>
+      <pre><code class="language-python">from pyspark.sql.functions import lit, rand, concat, col, explode, array
+
+SALT_BUCKETS = 20
+
+# Salt the skewed key in the large table
+events_salted = events.withColumn(
+    "salt",
+    (rand() * SALT_BUCKETS).cast("int")
+).withColumn(
+    "device_id_salted",
+    concat(col("device_id"), lit("_"), col("salt"))
+)
+
+# Explode the dimension table to match all salt values
+salt_array = array([lit(i) for i in range(SALT_BUCKETS)])
+devices_exploded = devices.withColumn(
+    "salt", explode(salt_array)
+).withColumn(
+    "device_id_salted",
+    concat(col("device_id"), lit("_"), col("salt"))
+)
+
+# Join on salted key — "UNREGISTERED" now distributed across 20 partitions
+joined = events_salted.join(
+    devices_exploded,
+    "device_id_salted",
+    "inner"
+).drop("salt", "device_id_salted")</code></pre>
+
+      <h4>Option 3: Isolate and Broadcast Skewed Key</h4>
+      <pre><code class="language-python"># Separate skewed and non-skewed data
+skewed_events = events.filter(col("device_id") == "UNREGISTERED")
+normal_events = events.filter(col("device_id") != "UNREGISTERED")
+
+# Broadcast join for skewed portion (dimension lookup is small)
+skewed_joined = skewed_events.join(
+    broadcast(devices.filter(col("device_id") == "UNREGISTERED")),
+    "device_id"
+)
+
+# Normal SortMergeJoin for the rest
+normal_joined = normal_events.join(devices, "device_id")
+
+# Combine results
+result = skewed_joined.unionByName(normal_joined)</code></pre>
+
+      <h3>Prevention Measures</h3>
+      <ul>
+        <li><strong>Data quality monitoring</strong> — Alert when any key exceeds 1% of total rows in upstream data.</li>
+        <li><strong>AQE always-on</strong> — Enable adaptive skew handling as baseline protection.</li>
+        <li><strong>Partition size monitoring</strong> — Dashboard tracking max/median partition ratio per stage.</li>
+        <li><strong>Circuit breaker</strong> — Fail fast with clear error message when detected skew exceeds threshold, rather than OOM after 30 minutes.</li>
+        <li><strong>Data contract with upstream</strong> — Require notification when new high-cardinality keys are introduced.</li>
+      </ul>
+
+      <h3>Post-Mortem Metrics</h3>
+      <pre><code class="language-text">Before fix:
+  - Stage duration: FAILED (OOM after 45 min, 4 retries)
+  - Max partition: 12.3 GB
+  - Executor OOM events: 12 (3 executors × 4 attempts)
+
+After fix (AQE skew join):
+  - Stage duration: 8 min 22s
+  - Max sub-partition: 512 MB
+  - Executor OOM events: 0
+  - Skewed partition split into: 24 sub-tasks
+  - Overall pipeline: 35 min → 42 min (7 min overhead from extra tasks, acceptable)</code></pre>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 13: DEBUGGING WORKFLOW — SPARK UI
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="debugging-workflow">
+      <h2>Spark UI Walkthrough</h2>
+
+      <h3>Accessing the Spark UI</h3>
+      <pre><code class="language-text">Live application:  http://&lt;driver-host&gt;:4040
+History server:    http://&lt;history-server&gt;:18080
+Databricks:        Cluster → Spark UI tab
+EMR:              Resource Manager → Application → Tracking URL</code></pre>
+
+      <h3>Jobs Tab</h3>
+      <p>Shows all jobs triggered by actions, with status, duration, and stage breakdown:</p>
+      <pre><code class="language-text">Jobs Tab Checklist:
+┌──────────────────────────────────────────────────────────────┐
+│ ✓ Are jobs completing? (Failed jobs show red)                │
+│ ✓ How long does each job take? (Regress = performance issue) │
+│ ✓ How many stages per job? (Unexpected stages = extra shuffles)│
+│ ✓ Job DAG visualization — identify bottleneck stages         │
+└──────────────────────────────────────────────────────────────┘
+
+Key insight: Click a job to see its DAG visualization.
+Boxes are stages. Arrows show shuffle dependencies.
+Look for unexpectedly long stages (dark blue = active, green = done).</code></pre>
+
+      <h3>Stages Tab</h3>
+      <p>The most important tab for performance debugging. Shows per-task metrics:</p>
+      <pre><code class="language-text">Stages Tab — What to Look For:
+
+1. TASK DURATION DISTRIBUTION:
+   - Uniform → healthy parallelism
+   - Long tail (few tasks 10× slower) → data skew or straggler nodes
+
+2. SHUFFLE READ/WRITE SIZE:
+   - Uniform across tasks → good partitioning
+   - One task reads 10 GB while others read 500 MB → skew!
+
+3. SPILL METRICS:
+   - Shuffle Spill (Memory): amount of data spilled from execution memory
+   - Shuffle Spill (Disk): data actually written to disk during spill
+   - Any spill > 0 → executor memory insufficient or skew
+
+4. GC TIME:
+   - Should be < 5% of task duration
+   - > 10% → memory pressure, increase executor memory or reduce partition size
+
+5. LOCALITY LEVEL:
+   - PROCESS_LOCAL > NODE_LOCAL > RACK_LOCAL > ANY
+   - Mostly ANY → data not co-located, consider caching or bucketing
+
+6. TASK ERRORS:
+   - OOM → increase memory or fix skew
+   - FetchFailed → executor lost, check node health
+   - TaskKilled → YARN preemption or dynamic allocation</code></pre>
+
+      <h3>Storage Tab</h3>
+      <p>Shows cached RDDs/DataFrames:</p>
+      <pre><code class="language-text">Storage Tab Checklist:
+┌──────────────────────────────────────────────────────────────┐
+│ ✓ Is the expected data cached? (Missing = cache evicted)     │
+│ ✓ Memory/Disk split — how much spilled to disk?              │
+│ ✓ Fraction cached — is it 100%? Partial = memory pressure    │
+│ ✓ Size in Memory — does it match expected? (Bloat = bad UDTs)│
+│ ✓ Partition distribution — even across executors?            │
+└──────────────────────────────────────────────────────────────┘
+
+Red flag: Cached fraction < 100% means some partitions were evicted.
+Solution: Increase spark.memory.storageFraction or executor memory.</code></pre>
+
+      <h3>SQL Tab</h3>
+      <p>Shows query plans and execution details for Spark SQL / DataFrame operations:</p>
+      <pre><code class="language-text">SQL Tab — Performance Analysis:
+
+1. Click any query to see its PHYSICAL PLAN as a visual DAG
+2. Each node shows:
+   - Number of output rows (actual, not estimated!)
+   - Time spent in that operator
+   - Spill metrics for that operator
+
+3. Key things to check:
+   - Row counts between operators: if Filter outputs 99% of input → filter not selective
+   - Join output rows: N × M → possible cartesian (missing join condition)
+   - Exchange nodes (shuffles): each one = network I/O cost
+   - WholeStageCodegen: should wrap most operators (if not, check UDF usage)
+
+4. Compare ESTIMATED vs ACTUAL rows:
+   - Large discrepancy → Catalyst made bad decisions
+   - Solution: ANALYZE TABLE or enable AQE</code></pre>
+
+      <h3>Environment Tab</h3>
+      <p>Lists all Spark configurations — essential for reproducing issues:</p>
+      <pre><code class="language-text">Environment Tab — Key Configurations to Verify:
+
+Execution:
+  spark.sql.shuffle.partitions = ?          (200 default, often too low)
+  spark.sql.adaptive.enabled = ?            (should be true)
+  spark.sql.autoBroadcastJoinThreshold = ?  (10485760 = 10 MB default)
+
+Memory:
+  spark.executor.memory = ?                 (heap size)
+  spark.executor.memoryOverhead = ?         (off-heap + container overhead)
+  spark.memory.fraction = ?                 (0.6 default)
+  spark.memory.offHeap.enabled = ?          (Tungsten off-heap)
+
+Shuffle:
+  spark.shuffle.service.enabled = ?         (needed for dynamic allocation)
+  spark.shuffle.compress = ?                (should be true)
+
+Dynamic Allocation:
+  spark.dynamicAllocation.enabled = ?
+  spark.dynamicAllocation.minExecutors = ?
+  spark.dynamicAllocation.maxExecutors = ?</code></pre>
+
+      <h3>Event Timeline</h3>
+      <pre><code class="language-text">Timeline View (available on Stage detail page):
+
+Shows per-executor task execution over time:
+
+Executor 1: ████████░░████████████░░░░████████
+Executor 2: ████████████████████░░░████████████
+Executor 3: ████████████░░░░░░░░████████████░░░
+Executor 4: ████████████████████████████████████
+
+░ = idle time (waiting for data fetch, GC, scheduling delay)
+█ = active computation
+
+Patterns to spot:
+- Long idle gaps → fetch wait (network) or GC pauses
+- One executor running much longer → straggler (skew or slow node)
+- All executors idle at same time → barrier between stages (shuffle)</code></pre>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 14: CODE EXAMPLES
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+
+      <h3>Viewing Query Plans with .explain()</h3>
+      <pre><code class="language-python">from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sum, count, broadcast
+
+spark = SparkSession.builder \
+    .appName("Spark Execution Examples") \
+    .config("spark.sql.adaptive.enabled", "true") \
+    .getOrCreate()
+
+# Load data
+orders = spark.read.parquet("s3://data-lake/orders/")
+customers = spark.read.parquet("s3://data-lake/customers/")
+
+# Build a query
+result = orders \
+    .filter(col("order_date") >= "2024-01-01") \
+    .join(customers, "customer_id") \
+    .groupBy("segment") \
+    .agg(
+        count("order_id").alias("num_orders"),
+        sum("amount").alias("total_revenue")
+    )
+
+# View all plan phases
+result.explain(True)
+# == Parsed Logical Plan ==
+# Aggregate [segment], [segment, count(order_id) AS num_orders, sum(amount) AS total_revenue]
+# +- Join Inner, (customer_id = customer_id)
+#    :- Filter (order_date >= 2024-01-01)
+#    :  +- Relation [order_id, customer_id, amount, order_date] parquet
+#    +- Relation [customer_id, segment, name] parquet
+#
+# == Analyzed Logical Plan ==
+# (resolved types and references)
+#
+# == Optimized Logical Plan ==
+# Aggregate [segment#5], [...]
+# +- Join Inner, (customer_id#1 = customer_id#10)
+#    :- Project [order_id#0, customer_id#1, amount#2]  ← column pruning!
+#    :  +- Filter (order_date#3 >= 2024-01-01)         ← pushed down!
+#    :     +- Relation [order_id#0, customer_id#1, amount#2, order_date#3]
+#    +- Project [customer_id#10, segment#5]            ← column pruning!
+#       +- Relation [customer_id#10, segment#5, name#6]
+#
+# == Physical Plan ==
+# *(3) HashAggregate(keys=[segment#5], functions=[count(order_id#0), sum(amount#2)])
+# +- Exchange hashpartitioning(segment#5, 200)         ← SHUFFLE
+#    +- *(2) HashAggregate(keys=[segment#5], functions=[partial_count(...), partial_sum(...)])
+#       +- *(2) Project [order_id#0, amount#2, segment#5]
+#          +- *(2) SortMergeJoin [customer_id#1], [customer_id#10]
+#             :- *(1) Sort [customer_id#1 ASC]
+#             :  +- Exchange hashpartitioning(customer_id#1, 200) ← SHUFFLE
+#             :     +- *(1) Filter (order_date#3 >= 2024-01-01)
+#             :        +- *(1) ColumnarToRow
+#             :           +- FileScan parquet [...] PushedFilters: [>=(...)]
+#             +- *(2) Sort [customer_id#10 ASC]
+#                +- Exchange hashpartitioning(customer_id#10, 200) ← SHUFFLE
+#                   +- *(2) ColumnarToRow
+#                      +- FileScan parquet [customer_id#10, segment#5]</code></pre>
+
+      <h3>Broadcast Hint</h3>
+      <pre><code class="language-python"># Force broadcast join — useful when statistics are inaccurate
+# or table is small but Spark doesn't know it (e.g., temp view)
+from pyspark.sql.functions import broadcast
+
+# Method 1: Python API hint
+result = large_table.join(
+    broadcast(small_dimension),
+    "join_key"
+)
+
+# Method 2: SQL hint
+spark.sql("""
+    SELECT /*+ BROADCAST(d) */ f.*, d.category_name
+    FROM fact_sales f
+    JOIN dim_product d ON f.product_id = d.product_id
+""")
+
+# Method 3: Adjust threshold globally
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "100m")  # 100 MB
+
+# Verify broadcast was used
+result.explain()
+# Look for: BroadcastHashJoin or BroadcastExchange</code></pre>
+
+      <h3>Repartition vs Coalesce</h3>
+      <pre><code class="language-python"># repartition(N) — FULL SHUFFLE, creates exactly N partitions
+# Use when: increasing partitions or redistributing by a key
+
+# Increase parallelism for a compute-heavy operation
+df_repartitioned = df.repartition(500)  # Full shuffle to 500 partitions
+
+# Repartition by key — co-locates data for downstream joins
+df_by_key = df.repartition(200, "customer_id")
+# All rows with same customer_id in same partition
+# Subsequent groupBy("customer_id") requires NO additional shuffle!
+
+# coalesce(N) — NO SHUFFLE, reduces partitions by merging
+# Use when: decreasing partitions (e.g., before write to avoid small files)
+
+# After a filter that reduces data significantly
+filtered = df.filter(col("amount") > 1000)  # 1% of data remains
+# 200 partitions now mostly empty — coalesce to fewer
+coalesced = filtered.coalesce(10)  # Merge into 10 partitions, no shuffle
+
+# COMMON PATTERN: reduce output files before writing
+result \
+    .coalesce(50) \
+    .write \
+    .mode("overwrite") \
+    .parquet("s3://output/result/")
+# Produces exactly 50 output files instead of 200+
+
+# WARNING: coalesce can create uneven partitions
+# If 200 partitions coalesced to 10, each gets ~20 merged partitions
+# If original partitions were skewed, coalesced ones will be too
+# In that case, use repartition() for even distribution</code></pre>
+
+      <h3>Caching Strategies</h3>
+      <pre><code class="language-python">from pyspark import StorageLevel
+
+# Cache in memory (deserialized Java objects — fastest, most memory)
+df.cache()  # Equivalent to: df.persist(StorageLevel.MEMORY_ONLY)
+
+# Cache in memory serialized (less memory, slightly slower access)
+df.persist(StorageLevel.MEMORY_ONLY_SER)
+
+# Cache with disk spillover (recommended for large datasets)
+df.persist(StorageLevel.MEMORY_AND_DISK)
+
+# Cache serialized with disk spillover (best memory efficiency)
+df.persist(StorageLevel.MEMORY_AND_DISK_SER)
+
+# When to cache:
+# 1. DataFrame used multiple times in the same job
+# 2. Expensive computation that shouldn't be repeated
+# 3. Interactive exploration (notebook environment)
+
+# Example: cache a joined dataset used for multiple aggregations
+base = orders.join(customers, "customer_id") \
+    .filter(col("order_date") >= "2024-01-01")
+
+base.cache()
+base.count()  # Trigger cache materialization
+
+# Now these use cached data (no re-reading from S3, no re-joining)
+by_segment = base.groupBy("segment").agg(sum("amount"))
+by_date = base.groupBy("order_date").agg(count("order_id"))
+top_customers = base.groupBy("customer_id").agg(sum("amount")).orderBy(col("sum(amount)").desc())
+
+# ALWAYS unpersist when done to free memory for other operations
+base.unpersist()
+
+# Check what's cached
+spark.catalog.isCached("base")  # For registered tables
+# Or check Storage tab in Spark UI</code></pre>
+
+      <h3>Partition Discovery and Optimization</h3>
+      <pre><code class="language-python"># Check current partition count
+print(f"Partitions: {df.rdd.getNumPartitions()}")
+
+# Check partition sizes (useful for diagnosing skew)
+from pyspark.sql.functions import spark_partition_id
+
+df.groupBy(spark_partition_id().alias("partition")) \
+    .count() \
+    .orderBy(col("count").desc()) \
+    .show(10)
+
+# Optimal partition size: 128 MB - 256 MB per partition
+# Calculate ideal partition count:
+data_size_gb = 100  # 100 GB dataset
+target_partition_mb = 200  # 200 MB per partition
+ideal_partitions = int(data_size_gb * 1024 / target_partition_mb)
+print(f"Ideal partitions: {ideal_partitions}")  # 512
+
+spark.conf.set("spark.sql.shuffle.partitions", str(ideal_partitions))</code></pre>
+
+      <h3>Monitoring Execution Programmatically</h3>
+      <pre><code class="language-python"># Register a SparkListener for custom monitoring
+class CustomListener(spark._jvm.org.apache.spark.scheduler.SparkListener):
+    def onStageCompleted(self, stageCompleted):
+        info = stageCompleted.stageInfo()
+        print(f"Stage {info.stageId()} completed in {info.completionTime().get() - info.submissionTime().get()} ms")
+        metrics = info.taskMetrics()
+        print(f"  Shuffle Read: {metrics.shuffleReadMetrics().totalBytesRead() / 1024/1024:.0f} MB")
+        print(f"  Shuffle Write: {metrics.shuffleWriteMetrics().bytesWritten() / 1024/1024:.0f} MB")
+
+# Alternative: use Spark's built-in metrics for Prometheus/Graphite
+spark.conf.set("spark.metrics.conf.*.sink.prometheusServlet.class",
+               "org.apache.spark.metrics.sink.PrometheusServlet")
+spark.conf.set("spark.metrics.conf.*.sink.prometheusServlet.path", "/metrics/prometheus")</code></pre>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 15: COMMON MISTAKES
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Mistake</th>
+            <th>Why It's Wrong</th>
+            <th>Correct Approach</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Using <code>.collect()</code> on large DataFrames</td>
+            <td>Pulls all data to driver memory — OOM for anything over a few GB</td>
+            <td>Use <code>.take(N)</code>, <code>.show(N)</code>, or write results to storage</td>
+          </tr>
+          <tr>
+            <td>Leaving <code>shuffle.partitions=200</code> for all workloads</td>
+            <td>200 is arbitrary — too few for TB-scale data, too many for MB-scale data</td>
+            <td>Set to 2–3× total cores, or enable AQE coalescing</td>
+          </tr>
+          <tr>
+            <td>Using Python UDFs instead of built-in functions</td>
+            <td>Python UDFs serialize data to Python process (10–100× slower), disable whole-stage codegen</td>
+            <td>Use Spark SQL functions. If UDF needed, use Pandas UDFs (vectorized)</td>
+          </tr>
+          <tr>
+            <td>Caching everything "just in case"</td>
+            <td>Wastes storage memory, triggers evictions of actually useful cached data, causes GC pressure</td>
+            <td>Cache only DataFrames used &gt; 2× in same job, unpersist when done</td>
+          </tr>
+          <tr>
+            <td>Using <code>repartition()</code> before write when <code>coalesce()</code> suffices</td>
+            <td>Unnecessary full shuffle when only reducing partitions</td>
+            <td>Use <code>coalesce(N)</code> when only reducing; <code>repartition()</code> only when increasing or rebalancing</td>
+          </tr>
+          <tr>
+            <td>Ignoring data skew</td>
+            <td>One partition with 100× data = one task takes 100× longer, negating all parallelism</td>
+            <td>Enable AQE skew join, or use salting/isolation for known hot keys</td>
+          </tr>
+          <tr>
+            <td>Not enabling AQE in Spark 3.x</td>
+            <td>Missing free performance wins: partition coalescing, join strategy switching, skew handling</td>
+            <td>Always enable: <code>spark.sql.adaptive.enabled=true</code></td>
+          </tr>
+          <tr>
+            <td>Broadcasting tables that are too large</td>
+            <td>Broadcast exceeding driver memory causes OOM; 1 GB broadcast × 100 executors = 100 GB network</td>
+            <td>Keep broadcasts under 200–500 MB; prefer SortMergeJoin for larger tables</td>
+          </tr>
+          <tr>
+            <td>Running <code>.count()</code> to "trigger" lazy evaluation for debugging</td>
+            <td>Unnecessary full computation; use <code>.take(1)</code> or <code>.limit(1).collect()</code> instead</td>
+            <td>For plan inspection, use <code>.explain()</code> (doesn't execute). For triggering, use minimal action</td>
+          </tr>
+          <tr>
+            <td>Not using the External Shuffle Service with dynamic allocation</td>
+            <td>When executors are removed, their shuffle files are lost → FetchFailedException → stage retry</td>
+            <td>Always enable <code>spark.shuffle.service.enabled=true</code> with dynamic allocation</td>
+          </tr>
+          <tr>
+            <td>Repeated reads from cloud storage in a loop</td>
+            <td>Each iteration re-reads from S3/GCS (high latency, cost per request)</td>
+            <td>Cache the DataFrame before entering a loop, unpersist after</td>
+          </tr>
+          <tr>
+            <td>Using <code>.distinct()</code> when <code>.dropDuplicates(subset)</code> suffices</td>
+            <td><code>.distinct()</code> shuffles ALL columns; <code>.dropDuplicates(["key"])</code> shuffles only the key columns</td>
+            <td>Use <code>.dropDuplicates()</code> with explicit columns when full-row uniqueness isn't needed</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 16: TRADE-OFFS
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Decision</th>
+            <th>Option A</th>
+            <th>Option B</th>
+            <th>When to Choose A</th>
+            <th>When to Choose B</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Join Strategy</td>
+            <td>BroadcastHashJoin</td>
+            <td>SortMergeJoin</td>
+            <td>One side &lt; 500 MB; dimension-fact pattern; no shuffle budget</td>
+            <td>Both sides large; data grows unpredictably; can't guarantee size constraint</td>
+          </tr>
+          <tr>
+            <td>Partition Count</td>
+            <td>Few large partitions</td>
+            <td>Many small partitions</td>
+            <td>Simple pipelines, fewer output files needed, sequential I/O</td>
+            <td>Skew-prone data, many cores available, need parallelism</td>
+          </tr>
+          <tr>
+            <td>Caching</td>
+            <td>Cache aggressively</td>
+            <td>Recompute from source</td>
+            <td>Data reused 3+ times, expensive to compute, fits in cluster memory</td>
+            <td>Single-use data, tight memory, source read is fast (local SSD, small data)</td>
+          </tr>
+          <tr>
+            <td>Executor Sizing</td>
+            <td>Few large executors (e.g., 4×32 GB)</td>
+            <td>Many small executors (e.g., 16×8 GB)</td>
+            <td>Heavy shuffle/joins, broadcast joins (shared broadcast), less network overhead</td>
+            <td>Skew-prone workloads, better fault isolation, YARN fair-share constraints</td>
+          </tr>
+          <tr>
+            <td>Shuffle Partitions</td>
+            <td>Static tuning</td>
+            <td>AQE auto-coalesce</td>
+            <td>Predictable data volumes, consistent SLAs, Spark 2.x</td>
+            <td>Variable data volumes, ad-hoc workloads, Spark 3.x</td>
+          </tr>
+          <tr>
+            <td>File Format</td>
+            <td>Parquet</td>
+            <td>Delta Lake / Iceberg</td>
+            <td>Simple batch reads, wide ecosystem support, no ACID needed</td>
+            <td>Need upserts, time travel, schema evolution, concurrent writers</td>
+          </tr>
+          <tr>
+            <td>Dynamic Allocation</td>
+            <td>Enabled (auto-scale executors)</td>
+            <td>Disabled (fixed executor count)</td>
+            <td>Variable workloads, shared clusters, cost optimization</td>
+            <td>Latency-sensitive streaming, avoid cold-start overhead</td>
+          </tr>
+          <tr>
+            <td>Skew Handling</td>
+            <td>AQE automatic</td>
+            <td>Manual salting</td>
+            <td>Spark 3.2+, unknown skew keys, simplicity</td>
+            <td>Spark 2.x, known hot keys, need precise control over distribution</td>
+          </tr>
+          <tr>
+            <td>Fault Tolerance</td>
+            <td>Lineage recomputation</td>
+            <td>Checkpointing</td>
+            <td>Short pipelines, narrow dependencies, fast sources</td>
+            <td>Iterative algorithms (100+ iterations), very wide lineage, streaming state</td>
+          </tr>
+          <tr>
+            <td>Cluster Mode</td>
+            <td>Client mode</td>
+            <td>Cluster mode</td>
+            <td>Interactive development, notebooks, debugging</td>
+            <td>Production batch jobs, automated pipelines, driver fault tolerance needed</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 17: FOLLOW-UP QUESTIONS
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+
+      <h3>Architecture &amp; Execution</h3>
+      <ul>
+        <li><strong>"What happens if the driver runs out of memory?"</strong> — The application crashes. Common causes: collecting too much data to driver (<code>.collect()</code>), too many broadcast variables accumulated, or accumulator state explosion. Mitigation: increase <code>spark.driver.memory</code>, avoid <code>.collect()</code>, or use cluster mode for automatic restart.</li>
+        <li><strong>"How does dynamic allocation work?"</strong> — Spark requests executors from the cluster manager as pending tasks queue up (<code>spark.dynamicAllocation.schedulerBacklogTimeout=1s</code>). It releases executors after idle timeout (<code>executorIdleTimeout=60s</code>). Requires External Shuffle Service so released executors don't lose shuffle files.</li>
+        <li><strong>"Explain the difference between client mode and cluster mode."</strong> — Client mode: driver runs on the submitting machine (your laptop/gateway). Cluster mode: driver runs inside the cluster (YARN container, K8s pod). Cluster mode is required for production — the driver survives gateway failures and benefits from data locality.</li>
+        <li><strong>"What is speculative execution and when would you enable it?"</strong> — Spark launches a duplicate copy of a slow-running task on a different executor. First to finish wins; the other is killed. Enable when: heterogeneous hardware (some nodes slower), cloud spot instances (preemption causes delays). Disable when: tasks are intentionally slow (writing to slow external systems) or resource-constrained clusters.</li>
+      </ul>
+
+      <h3>Optimization &amp; Tuning</h3>
+      <ul>
+        <li><strong>"How do you choose the right number of shuffle partitions?"</strong> — Target 128–256 MB per partition. Formula: <code>total_shuffle_data_size / target_partition_size</code>. For a 100 GB shuffle with 200 MB target: 500 partitions. With AQE enabled, set a higher initial value (e.g., 2000) and let AQE coalesce — this handles variable data sizes automatically.</li>
+        <li><strong>"When would you NOT use AQE?"</strong> — When you need deterministic execution plans (regulatory audit requirements), when the re-optimization overhead matters (sub-second latency queries), or when running Spark 2.x (AQE requires Spark 3.0+).</li>
+        <li><strong>"Explain predicate pushdown in Spark."</strong> — Catalyst pushes filter predicates as close to the data source as possible. For Parquet, this means (1) partition pruning (skip entire directories), (2) row group filtering via min/max statistics, and (3) page-level filtering via column indexes. For JDBC sources, Spark pushes predicates into the SQL query sent to the database.</li>
+        <li><strong>"What is Dynamic Partition Pruning (DPP)?"</strong> — At runtime, Spark uses the result of one side of a join (typically the dimension filter) to prune partitions on the other side (the fact table). This avoids reading irrelevant fact table partitions. Requires: partition key = join key, one side has a selective filter. Controlled by <code>spark.sql.optimizer.dynamicPartitionPruning.enabled=true</code>.</li>
+        <li><strong>"How do you handle a join between two very large tables?"</strong> — SortMergeJoin is the default and most scalable strategy. Optimize by: (1) bucketing both tables by join key (eliminates shuffle), (2) increasing shuffle partitions to keep per-partition size manageable, (3) filtering before joining to reduce data volume, (4) using AQE to handle runtime skew.</li>
+      </ul>
+
+      <h3>Debugging &amp; Operations</h3>
+      <ul>
+        <li><strong>"How do you detect and fix data skew?"</strong> — Detection: Spark UI shows task duration distribution (long tail), shuffle read size (max ≫ median). Fix: AQE skew join (automatic), salting (manual), isolate + broadcast hot keys, pre-aggregate before join. Prevention: upstream data quality monitoring, alerts on key cardinality changes.</li>
+        <li><strong>"What causes FetchFailedException?"</strong> — Executor holding shuffle files crashed or was removed. The reduce task can't fetch its shuffle data. Resolution: enable External Shuffle Service (decouples file lifecycle from executor), increase <code>spark.shuffle.io.maxRetries</code>, investigate node health (disk full, OOM killer).</li>
+        <li><strong>"How do you debug a slow Spark job?"</strong> — Systematic approach: (1) Jobs tab — identify slowest job, (2) Stages tab — identify slowest stage, (3) Task metrics — check for skew (max vs median), spill, GC time, (4) SQL tab — compare estimated vs actual rows, (5) Event timeline — look for idle gaps (fetch wait, GC). Fix the dominant bottleneck first.</li>
+        <li><strong>"What is GC tuning in Spark and when do you do it?"</strong> — When GC time exceeds 10% of task time (visible in Spark UI). Options: use G1GC (<code>-XX:+UseG1GC</code>), increase <code>spark.executor.memory</code>, reduce cached data, enable off-heap Tungsten memory, switch to Kryo serialization to reduce object count.</li>
+        <li><strong>"Explain the role of the External Shuffle Service."</strong> — A long-running process on each node (independent of executors) that serves shuffle files. Benefits: (1) enables dynamic allocation (executors can be removed without losing shuffle data), (2) improves fault tolerance (shuffle files survive executor crashes), (3) enables push-based shuffle (Spark 3.2+) for better performance.</li>
+      </ul>
+
+      <h3>Advanced Topics</h3>
+      <ul>
+        <li><strong>"What is Photon?"</strong> — Databricks' native C++ execution engine that replaces Spark's JVM-based execution. Uses vectorized processing (operates on column batches, not individual rows), SIMD instructions, and pre-compiled operators instead of code generation. Can be 2–8× faster than standard Spark for scan/filter/join heavy workloads.</li>
+        <li><strong>"How does Spark handle out-of-core processing (data larger than memory)?"</strong> — External sort spills sorted runs to disk and merge-sorts them. External hash aggregation spills hash table entries when memory is full. SortMergeJoin is inherently streaming (bounded memory). The key metric: if you see shuffle spill in the UI, the operation went out-of-core — not a failure, but slower than in-memory.</li>
+        <li><strong>"What changes in Spark 4.0?"</strong> — Spark Connect (client-server architecture), ANSI SQL compliance by default, Variant data type for semi-structured data, improved Python API (type hints, pandas-native operations), removal of deprecated Mesos support, and new streaming state management backend.</li>
+      </ul>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 18: SUMMARY
+    ════════════════════════════════════════════════════════════════ -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <h3>The Complete Spark Execution Flow</h3>
+      <pre><code class="language-text">User Code (.py / .scala / SQL)
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 1. SPARK SESSION                                            │
+│    Receives DataFrame/SQL operations                        │
+│    Builds unresolved logical plan                           │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. CATALYST OPTIMIZER                                       │
+│    Analysis → Logical Optimization → Physical Planning      │
+│    → Code Generation                                        │
+│    Result: Optimized physical plan with concrete strategies  │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. DAG SCHEDULER                                            │
+│    Splits physical plan at shuffle boundaries → Stages      │
+│    Computes task locality preferences                       │
+│    Submits stages in topological order (parents first)      │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. TASK SCHEDULER                                           │
+│    Creates TaskSets (one task per partition)                 │
+│    Assigns tasks to executors respecting locality           │
+│    Handles retries, speculation, blacklisting               │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. EXECUTOR EXECUTION                                       │
+│    Deserializes task closure                                 │
+│    Runs generated code (WholeStageCodegen)                   │
+│    Uses Tungsten memory management (off-heap, UnsafeRow)     │
+│    Writes shuffle output or returns results                  │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 6. AQE RE-OPTIMIZATION (between stages)                     │
+│    Observes actual shuffle statistics                        │
+│    Coalesces partitions, switches joins, handles skew        │
+│    Re-plans subsequent stages with runtime knowledge         │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 7. RESULT                                                   │
+│    ResultStage tasks return data to driver                   │
+│    Or write output to storage (S3/HDFS/Delta)               │
+│    Metrics reported to Spark UI / Event Log                  │
+└─────────────────────────────────────────────────────────────┘</code></pre>
+
+      <h3>Key Takeaways for Interviews</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Concept</th>
+            <th>One-Liner</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Lazy evaluation</td>
+            <td>Transformations build a DAG; only actions trigger execution — enabling full-graph optimization.</td>
+          </tr>
+          <tr>
+            <td>Catalyst</td>
+            <td>Four-phase optimizer (analysis → logical → physical → codegen) that turns declarative operations into efficient bytecode.</td>
+          </tr>
+          <tr>
+            <td>Tungsten</td>
+            <td>Custom memory management with off-heap binary format (UnsafeRow) and whole-stage code generation for CPU efficiency.</td>
+          </tr>
+          <tr>
+            <td>Shuffle</td>
+            <td>Most expensive operation — redistributes data across the network. Minimize by filtering early, broadcasting small tables, and bucketing.</td>
+          </tr>
+          <tr>
+            <td>Stages &amp; Tasks</td>
+            <td>Shuffles create stage boundaries. Each stage has tasks = partitions. Tasks are the unit of parallelism and retry.</td>
+          </tr>
+          <tr>
+            <td>AQE</td>
+            <td>Runtime re-optimization using actual statistics — coalesces partitions, switches joins, splits skewed data.</td>
+          </tr>
+          <tr>
+            <td>Fault tolerance</td>
+            <td>Lineage-based: lost partitions recomputed from parent RDDs. No WAL overhead for intermediate data.</td>
+          </tr>
+          <tr>
+            <td>Join selection</td>
+            <td>BHJ for small-large (no shuffle); SMJ for large-large (scalable); AQE can switch at runtime.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Interview Response Framework</h3>
+      <p>When answering "How does Spark execute a job?" structure your response:</p>
+      <ol>
+        <li><strong>Architecture overview</strong> (20s) — Driver coordinates, executors compute, cluster manager allocates resources.</li>
+        <li><strong>DAG construction</strong> (20s) — Lazy transformations build a lineage graph; actions trigger execution.</li>
+        <li><strong>Optimization</strong> (40s) — Catalyst's four phases produce optimal physical plan with code generation.</li>
+        <li><strong>Execution</strong> (30s) — DAG scheduler splits at shuffle boundaries → stages → tasks → executors.</li>
+        <li><strong>Runtime features</strong> (30s) — AQE adapts the plan; Tungsten handles memory efficiently; lineage provides fault tolerance.</li>
+        <li><strong>Production experience</strong> (60s) — Describe a real skew/OOM/shuffle incident, diagnosis via Spark UI, and resolution.</li>
+      </ol>
+      <p>This gives a structured 3-minute answer demonstrating architecture knowledge, optimization understanding, and production debugging experience — exactly what FAANG senior data engineering interviews target.</p>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch11-snowflake-internals.html" class="prev">← Previous: Snowflake Internals</a>
+      <a href="ch13-spark-spill.html" class="next">Next: Spark Spill →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

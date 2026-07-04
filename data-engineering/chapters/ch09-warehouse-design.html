@@ -1,0 +1,1748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ch 9 — Warehouse Design | Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/main.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="brand">DE Interview Handbook</a>
+    </div>
+    <div class="sidebar-chapter">Ch 9 / Warehouse Design</div>
+    <nav class="sidebar-nav">
+      <a href="#interviewer-intent">Interviewer Intent</a>
+      <a href="#quick-answer">Quick Answer</a>
+      <a href="#star-schema">Star Schema</a>
+      <a href="#snowflake-schema">Snowflake Schema</a>
+      <a href="#scd">Slowly Changing Dimensions</a>
+      <a href="#fact-types">Fact Table Types</a>
+      <a href="#partitioning-clustering">Partitioning &amp; Clustering</a>
+      <a href="#materialized-views">Materialized Views</a>
+      <a href="#medallion">Medallion Architecture</a>
+      <a href="#cost-optimization">Cost Optimization</a>
+      <a href="#production-incident">Production Incident</a>
+      <a href="#code-examples">Code Examples</a>
+      <a href="#common-mistakes">Common Mistakes</a>
+      <a href="#trade-offs">Trade-offs</a>
+      <a href="#follow-up-questions">Follow-up Questions</a>
+      <a href="#summary">Summary</a>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="toggle-theme">☀️</button>
+      <button data-action="toggle-sidebar">☰</button>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="content">
+    <!-- Breadcrumb -->
+    <nav class="breadcrumb">
+      <a href="../../index.html">Home</a> &gt;
+      <a href="../index.html#part-iii">Part III — Data Warehousing</a> &gt;
+      <span>Chapter 9</span>
+    </nav>
+
+    <!-- Chapter Header -->
+    <header class="chapter-header">
+      <span class="badge badge-hard">Hard</span>
+      <h1>How Would You Design a Warehouse for Petabyte-Scale Analytics?</h1>
+      <div class="topics">
+        <span class="topic">Star Schema</span>
+        <span class="topic">Modeling</span>
+      </div>
+    </header>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch08-query-suddenly-slow.html" class="prev">&larr; Previous: Ch 8</a>
+      <a href="ch10-bigquery-internals.html" class="next">Next: Ch 10 &rarr;</a>
+    </nav>
+
+    <!-- Section 1: Interviewer Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <p>When an interviewer asks you to design a warehouse for petabyte-scale analytics, they are evaluating multiple dimensions of your expertise:</p>
+      <ul>
+        <li><strong>Dimensional modeling fluency</strong> — Can you articulate why star schemas dominate analytics workloads and when snowflake schemas are appropriate?</li>
+        <li><strong>Scalability thinking</strong> — Do you understand how partitioning, clustering, and columnar storage enable sub-second queries over petabytes?</li>
+        <li><strong>Cost awareness</strong> — Can you balance performance against cloud billing realities (storage tiering, slot reservations, on-demand pricing)?</li>
+        <li><strong>Production maturity</strong> — Have you dealt with slowly changing dimensions, fact table grain decisions, and schema evolution at scale?</li>
+        <li><strong>Trade-off articulation</strong> — Can you reason about normalization vs. denormalization, freshness vs. cost, and query performance vs. storage efficiency?</li>
+      </ul>
+      <p>This question separates candidates who have only read about data warehousing from those who have built and operated warehouses serving thousands of analysts at FAANG scale.</p>
+    </section>
+
+    <!-- Section 2: Quick Answer -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <p>A petabyte-scale analytical warehouse requires:</p>
+      <ol>
+        <li><strong>Dimensional model</strong> — Star schema with conformed dimensions, clearly defined grain per fact table, and surrogate keys for dimension versioning.</li>
+        <li><strong>Physical optimization</strong> — Time-based partitioning on fact tables, clustering on high-cardinality filter columns, and columnar storage (Parquet/ORC or native columnar engines).</li>
+        <li><strong>Layered architecture</strong> — Bronze (raw), Silver (cleaned/conformed), Gold (business-ready aggregates) with clear ownership boundaries.</li>
+        <li><strong>SCD strategy</strong> — Type 2 for critical dimensions (customer, product), Type 1 for corrections, with audit columns and effective date ranges.</li>
+        <li><strong>Cost controls</strong> — Storage lifecycle policies, materialized views for hot aggregates, slot-based reservations for predictable workloads, and partition pruning enforcement.</li>
+        <li><strong>Governance</strong> — Column-level lineage, data contracts between producers and consumers, and automated data quality checks at each layer boundary.</li>
+      </ol>
+      <p>The key insight: at petabyte scale, <em>physical design decisions</em> (partitioning, clustering, compression) often matter more than logical design — but without a sound logical model, physical optimizations become unmaintainable.</p>
+    </section>
+
+    <!-- Section 3: Star Schema -->
+    <section id="star-schema">
+      <h2>Star Schema</h2>
+      <p>The star schema remains the foundational pattern for analytical warehouses. Its simplicity — a central fact table surrounded by denormalized dimension tables — enables query engines to exploit broadcast joins, partition pruning, and predicate pushdown efficiently.</p>
+
+      <h3>Fact Tables</h3>
+      <p>Fact tables store the measurable events of your business. At petabyte scale, every design decision on the fact table has amplified consequences:</p>
+      <ul>
+        <li><strong>Grain</strong> — The grain defines what one row represents. A transaction-grain fact table stores one row per atomic business event (one purchase, one click, one API call). Declaring grain first prevents the most common modeling errors.</li>
+        <li><strong>Measures</strong> — Additive (revenue, quantity), semi-additive (account balance — additive across all dimensions except time), and non-additive (ratios, percentages — store components separately).</li>
+        <li><strong>Foreign keys</strong> — Every dimension is referenced by a surrogate key (integer or hash). Natural keys are stored for lineage but never used for joins in production queries.</li>
+        <li><strong>Degenerate dimensions</strong> — Transaction numbers, order IDs that live directly in the fact table without a separate dimension.</li>
+      </ul>
+
+      <h3>Dimension Tables</h3>
+      <p>Dimensions provide the "who, what, where, when, why" context for facts:</p>
+      <ul>
+        <li><strong>Wide and denormalized</strong> — A customer dimension might have 50+ columns spanning demographics, segmentation, acquisition channel, and lifetime metrics.</li>
+        <li><strong>Conformed dimensions</strong> — Shared across multiple fact tables. A single <code>dim_date</code> table serves every star in the warehouse, enabling cross-process reporting.</li>
+        <li><strong>Role-playing dimensions</strong> — The same physical dimension (e.g., <code>dim_date</code>) referenced multiple times by a fact table (order_date_key, ship_date_key, delivery_date_key).</li>
+        <li><strong>Junk dimensions</strong> — Low-cardinality flags and indicators combined into a single dimension to avoid fact table bloat.</li>
+      </ul>
+
+      <h3>Surrogate Keys</h3>
+      <p>Surrogate keys serve multiple critical purposes:</p>
+      <ul>
+        <li>Enable SCD Type 2 tracking — multiple rows per natural key, each with a unique surrogate.</li>
+        <li>Insulate the warehouse from source system key changes (mergers, migrations).</li>
+        <li>Provide consistent integer keys that compress better and join faster than composite natural keys.</li>
+        <li>At FAANG scale, surrogate keys are often generated as deterministic hashes (MD5/SHA-256 of the natural key + effective timestamp) to enable distributed generation without coordination.</li>
+      </ul>
+
+      <h3>Grain Declaration</h3>
+      <p>The grain is the single most important design decision. Examples:</p>
+      <ul>
+        <li><code>fact_orders</code> — One row per order line item per order.</li>
+        <li><code>fact_page_views</code> — One row per page view per session per user.</li>
+        <li><code>fact_daily_inventory</code> — One row per product per warehouse per day (periodic snapshot).</li>
+      </ul>
+      <p>Mixing grains in a single fact table is the #1 modeling antipattern. It produces double-counting, incorrect aggregations, and confused analysts.</p>
+    </section>
+
+    <!-- Section 4: Snowflake Schema -->
+    <section id="snowflake-schema">
+      <h2>Snowflake Schema</h2>
+      <p>A snowflake schema normalizes dimension tables into sub-dimensions, creating a multi-level hierarchy. While star schemas are preferred for most analytics, snowflake schemas have legitimate use cases at scale.</p>
+
+      <h3>Normalized Dimensions</h3>
+      <p>In a snowflake schema, a <code>dim_product</code> might be split into:</p>
+      <ul>
+        <li><code>dim_product</code> (product_key, product_name, brand_key, category_key)</li>
+        <li><code>dim_brand</code> (brand_key, brand_name, parent_company)</li>
+        <li><code>dim_category</code> (category_key, category_name, department_key)</li>
+        <li><code>dim_department</code> (department_key, department_name)</li>
+      </ul>
+      <p>Each normalized table reduces redundancy but adds joins to every query that needs the full hierarchy.</p>
+
+      <h3>When to Use Snowflake vs. Star</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Criterion</th>
+            <th>Star Schema</th>
+            <th>Snowflake Schema</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Query simplicity</td>
+            <td>Fewer joins, easier for analysts</td>
+            <td>More joins, requires documentation</td>
+          </tr>
+          <tr>
+            <td>Storage efficiency</td>
+            <td>Some redundancy in dimensions</td>
+            <td>Minimal redundancy</td>
+          </tr>
+          <tr>
+            <td>Dimension size</td>
+            <td>Fine for dimensions &lt; 100M rows</td>
+            <td>Better when dimensions exceed 100M rows</td>
+          </tr>
+          <tr>
+            <td>ETL complexity</td>
+            <td>Simpler — single dimension load</td>
+            <td>More complex — dependency ordering</td>
+          </tr>
+          <tr>
+            <td>Update frequency</td>
+            <td>Denormalized updates cascade</td>
+            <td>Localized updates to sub-dimensions</td>
+          </tr>
+          <tr>
+            <td>Modern engines (BQ, Snowflake)</td>
+            <td>Preferred — engines optimize flat scans</td>
+            <td>Less benefit — joins add latency</td>
+          </tr>
+        </tbody>
+      </table>
+      <p><strong>FAANG reality:</strong> Most FAANG warehouses use star schemas for analyst-facing layers (Gold) and may use normalized forms in Silver/staging layers where ETL correctness matters more than query performance.</p>
+
+      <h3>Hybrid Approach</h3>
+      <p>In practice, you often see a hybrid:</p>
+      <ul>
+        <li>Core dimensions (date, customer, product) remain denormalized stars.</li>
+        <li>Very large dimensions with deeply nested hierarchies (geographic taxonomy with 8 levels, organizational hierarchy) get snowflaked.</li>
+        <li>Bridge tables handle many-to-many relationships (customer ↔ account, product ↔ promotion).</li>
+      </ul>
+    </section>
+
+    <!-- Section 5: Slowly Changing Dimensions -->
+    <section id="scd">
+      <h2>Slowly Changing Dimensions</h2>
+      <p>Dimensions change over time — customers move, products get reclassified, employees change departments. SCDs define how the warehouse captures these changes while preserving historical accuracy.</p>
+
+      <h3>Type 1 — Overwrite</h3>
+      <ul>
+        <li>Simply overwrite the old value with the new value.</li>
+        <li>No history preserved — previous state is lost.</li>
+        <li>Use for: corrections, typo fixes, non-analytically-significant changes.</li>
+        <li>Example: Fixing a misspelled customer name.</li>
+      </ul>
+      <pre><code class="language-sql">-- SCD Type 1: Overwrite
+UPDATE dim_customer
+SET customer_city = 'San Francisco',
+    updated_at = CURRENT_TIMESTAMP
+WHERE customer_natural_key = 'CUST-12345';</code></pre>
+
+      <h3>Type 2 — Add New Row</h3>
+      <ul>
+        <li>Insert a new row with a new surrogate key; mark the old row as expired.</li>
+        <li>Full history preserved — can query "as of" any point in time.</li>
+        <li>Requires: surrogate_key, effective_from, effective_to, is_current flag.</li>
+        <li>Use for: any change that affects analytics (customer segment, product category, employee department).</li>
+        <li>At FAANG scale, Type 2 dimensions can grow 10-50x the source cardinality.</li>
+      </ul>
+      <pre><code class="language-sql">-- SCD Type 2: Close existing row
+UPDATE dim_customer
+SET effective_to = CURRENT_DATE - INTERVAL '1 day',
+    is_current = FALSE,
+    updated_at = CURRENT_TIMESTAMP
+WHERE customer_natural_key = 'CUST-12345'
+  AND is_current = TRUE;
+
+-- SCD Type 2: Insert new version
+INSERT INTO dim_customer (
+  customer_sk, customer_natural_key, customer_name,
+  customer_city, customer_segment,
+  effective_from, effective_to, is_current, created_at
+)
+VALUES (
+  GENERATE_SURROGATE_KEY('CUST-12345', CURRENT_DATE),
+  'CUST-12345', 'Jane Smith',
+  'San Francisco', 'Enterprise',
+  CURRENT_DATE, '9999-12-31', TRUE, CURRENT_TIMESTAMP
+);</code></pre>
+
+      <h3>Type 3 — Add New Column</h3>
+      <ul>
+        <li>Add a "previous" column alongside the current column.</li>
+        <li>Limited history — only captures one prior state.</li>
+        <li>Use for: planned transitions where you need to compare old vs. new (org restructure, territory realignment).</li>
+      </ul>
+      <pre><code class="language-sql">-- SCD Type 3: Column for previous value
+ALTER TABLE dim_customer ADD COLUMN previous_segment VARCHAR(50);
+ALTER TABLE dim_customer ADD COLUMN segment_change_date DATE;
+
+UPDATE dim_customer
+SET previous_segment = customer_segment,
+    customer_segment = 'Enterprise',
+    segment_change_date = CURRENT_DATE
+WHERE customer_natural_key = 'CUST-12345';</code></pre>
+
+      <h3>Type 4 — History Table</h3>
+      <ul>
+        <li>Maintain a "current" dimension table and a separate "history" dimension table.</li>
+        <li>Current table stays small and fast; history table captures all versions.</li>
+        <li>Use for: very high-frequency changes where Type 2 would bloat the primary dimension.</li>
+        <li>Common at FAANG for user profile dimensions that change multiple times per day.</li>
+      </ul>
+      <pre><code class="language-sql">-- Type 4: Current table (fast lookups)
+CREATE TABLE dim_customer_current (
+  customer_sk       BIGINT PRIMARY KEY,
+  customer_natural_key VARCHAR(20),
+  customer_name     VARCHAR(200),
+  customer_segment  VARCHAR(50),
+  customer_city     VARCHAR(100),
+  updated_at        TIMESTAMP
+);
+
+-- Type 4: History table (full audit trail)
+CREATE TABLE dim_customer_history (
+  history_sk        BIGINT PRIMARY KEY,
+  customer_natural_key VARCHAR(20),
+  customer_name     VARCHAR(200),
+  customer_segment  VARCHAR(50),
+  customer_city     VARCHAR(100),
+  effective_from    DATE,
+  effective_to      DATE,
+  change_reason     VARCHAR(200),
+  created_at        TIMESTAMP
+);</code></pre>
+
+      <h3>Type 6 — Hybrid (1 + 2 + 3)</h3>
+      <ul>
+        <li>Combines Type 1 (current value column), Type 2 (versioned rows), and Type 3 (previous value column).</li>
+        <li>Every row has: current_value, historical_value (from that version), plus full row versioning.</li>
+        <li>Enables both "as-was" and "as-is" analysis without complex self-joins.</li>
+        <li>Use for: critical dimensions where analysts need both perspectives (revenue by current segment vs. segment at time of transaction).</li>
+      </ul>
+      <pre><code class="language-sql">-- Type 6: Hybrid approach
+CREATE TABLE dim_customer_type6 (
+  customer_sk           BIGINT PRIMARY KEY,
+  customer_natural_key  VARCHAR(20),
+  customer_name         VARCHAR(200),
+  -- Type 2 versioned value (historical)
+  historical_segment    VARCHAR(50),
+  -- Type 1 current value (always up-to-date)
+  current_segment       VARCHAR(50),
+  -- Type 3 previous value
+  previous_segment      VARCHAR(50),
+  effective_from        DATE,
+  effective_to          DATE,
+  is_current            BOOLEAN,
+  updated_at            TIMESTAMP
+);
+
+-- When segment changes: insert new row AND update all rows' current_segment
+-- Step 1: Close current row
+UPDATE dim_customer_type6
+SET effective_to = CURRENT_DATE - 1, is_current = FALSE
+WHERE customer_natural_key = 'CUST-12345' AND is_current = TRUE;
+
+-- Step 2: Insert new version
+INSERT INTO dim_customer_type6 VALUES (
+  NEW_SK(), 'CUST-12345', 'Jane Smith',
+  'Enterprise', 'Enterprise', 'Mid-Market',
+  CURRENT_DATE, '9999-12-31', TRUE, CURRENT_TIMESTAMP
+);
+
+-- Step 3: Update current_segment on ALL historical rows (Type 1 overwrite)
+UPDATE dim_customer_type6
+SET current_segment = 'Enterprise'
+WHERE customer_natural_key = 'CUST-12345';</code></pre>
+
+      <h3>Implementation Patterns at Scale</h3>
+      <ul>
+        <li><strong>MERGE/UPSERT</strong> — Use <code>MERGE INTO</code> statements to atomically handle inserts and updates in a single pass.</li>
+        <li><strong>Hash-based change detection</strong> — Compute MD5/SHA of all tracked columns to detect actual changes vs. no-op updates.</li>
+        <li><strong>Batch windows</strong> — Process SCD updates in daily or hourly batches to amortize the cost of full-table scans on large dimensions.</li>
+        <li><strong>Late-arriving dimensions</strong> — Insert placeholder "unknown" rows with surrogate key -1; backfill when the actual dimension data arrives.</li>
+        <li><strong>Partition-level updates</strong> — In BigQuery/Snowflake, use partition overwrite to efficiently update Type 2 dimensions without scanning the entire table.</li>
+      </ul>
+    </section>
+
+    <!-- Section 6: Fact Table Types -->
+    <section id="fact-types">
+      <h2>Fact Table Types</h2>
+      <p>Different business processes require different fact table structures. Choosing the wrong type leads to incorrect metrics, expensive queries, and confused stakeholders.</p>
+
+      <h3>Transactional Fact Tables</h3>
+      <ul>
+        <li><strong>Grain:</strong> One row per atomic business event (one click, one purchase, one API call).</li>
+        <li><strong>Characteristics:</strong> Append-only, immutable, highest volume, most granular.</li>
+        <li><strong>Measures:</strong> Fully additive (quantity, revenue, duration).</li>
+        <li><strong>Volume:</strong> At FAANG scale, these tables commonly reach billions of rows per day.</li>
+        <li><strong>Example:</strong> <code>fact_clicks</code> — one row per user click with timestamp, page_key, user_key, device_key, session_id.</li>
+      </ul>
+      <pre><code class="language-sql">CREATE TABLE fact_orders (
+  order_line_sk     BIGINT,
+  order_date_key    INT REFERENCES dim_date(date_key),
+  customer_key      BIGINT REFERENCES dim_customer(customer_sk),
+  product_key       BIGINT REFERENCES dim_product(product_sk),
+  store_key         INT REFERENCES dim_store(store_key),
+  promotion_key     INT REFERENCES dim_promotion(promotion_key),
+  -- Degenerate dimension
+  order_number      VARCHAR(30),
+  -- Measures
+  quantity          INT,
+  unit_price        DECIMAL(12,2),
+  discount_amount   DECIMAL(12,2),
+  net_revenue       DECIMAL(12,2),
+  tax_amount        DECIMAL(12,2),
+  -- Metadata
+  etl_batch_id      BIGINT,
+  loaded_at         TIMESTAMP
+)
+PARTITION BY RANGE (order_date_key)
+CLUSTER BY (customer_key, product_key);</code></pre>
+
+      <h3>Periodic Snapshot Fact Tables</h3>
+      <ul>
+        <li><strong>Grain:</strong> One row per entity per time period (daily, weekly, monthly).</li>
+        <li><strong>Characteristics:</strong> Captures cumulative state at regular intervals; rows are dense (one per period even if no activity).</li>
+        <li><strong>Measures:</strong> Semi-additive (balance, inventory level — cannot sum across time).</li>
+        <li><strong>Use cases:</strong> Account balances, inventory levels, subscription counts, pipeline stages.</li>
+        <li><strong>Example:</strong> <code>fact_daily_inventory</code> — one row per product per warehouse per day.</li>
+      </ul>
+      <pre><code class="language-sql">CREATE TABLE fact_daily_inventory (
+  snapshot_date_key   INT REFERENCES dim_date(date_key),
+  product_key         BIGINT REFERENCES dim_product(product_sk),
+  warehouse_key       INT REFERENCES dim_warehouse(warehouse_key),
+  -- Semi-additive measures (additive across product/warehouse, NOT across time)
+  quantity_on_hand    INT,
+  quantity_on_order   INT,
+  quantity_reserved   INT,
+  days_of_supply      DECIMAL(8,2),
+  inventory_value     DECIMAL(14,2),
+  -- Metadata
+  loaded_at           TIMESTAMP
+)
+PARTITION BY RANGE (snapshot_date_key);</code></pre>
+
+      <h3>Accumulating Snapshot Fact Tables</h3>
+      <ul>
+        <li><strong>Grain:</strong> One row per lifecycle instance (one order, one claim, one application).</li>
+        <li><strong>Characteristics:</strong> Rows are updated as the entity progresses through milestones; multiple date keys per row.</li>
+        <li><strong>Measures:</strong> Lag metrics between milestones (days_to_ship, days_to_deliver).</li>
+        <li><strong>Use cases:</strong> Order fulfillment, insurance claims, loan applications, hiring pipelines.</li>
+        <li><strong>Example:</strong> <code>fact_order_fulfillment</code> — one row per order tracking through placed → picked → shipped → delivered.</li>
+      </ul>
+      <pre><code class="language-sql">CREATE TABLE fact_order_fulfillment (
+  order_key               BIGINT PRIMARY KEY,
+  customer_key            BIGINT,
+  -- Multiple date role-playing dimensions
+  order_placed_date_key   INT,
+  order_picked_date_key   INT,      -- NULL until picked
+  order_shipped_date_key  INT,      -- NULL until shipped
+  order_delivered_date_key INT,     -- NULL until delivered
+  order_returned_date_key INT,      -- NULL unless returned
+  -- Lag measures (computed on update)
+  days_to_pick            INT,
+  days_to_ship            INT,
+  days_to_deliver         INT,
+  total_fulfillment_days  INT,
+  -- Status
+  current_status          VARCHAR(20),
+  -- Measures
+  order_amount            DECIMAL(12,2),
+  shipping_cost           DECIMAL(8,2),
+  loaded_at               TIMESTAMP,
+  updated_at              TIMESTAMP
+);</code></pre>
+
+      <h3>Factless Fact Tables</h3>
+      <ul>
+        <li><strong>Grain:</strong> Records the occurrence (or non-occurrence) of a relationship between dimensions.</li>
+        <li><strong>Characteristics:</strong> No numeric measures — the row itself is the fact. May include a count column of 1 for aggregation convenience.</li>
+        <li><strong>Use cases:</strong>
+          <ul>
+            <li><strong>Coverage/eligibility:</strong> Which promotions were available to which customers on which dates (even if not used).</li>
+            <li><strong>Event tracking:</strong> Student attendance (who attended which class on which day).</li>
+            <li><strong>Negative analysis:</strong> "Which customers were eligible for the promotion but did NOT purchase?" — answered by subtracting the transactional fact from the factless coverage fact.</li>
+          </ul>
+        </li>
+      </ul>
+      <pre><code class="language-sql">-- Factless fact: promotion coverage
+CREATE TABLE fact_promotion_coverage (
+  date_key        INT REFERENCES dim_date(date_key),
+  customer_key    BIGINT REFERENCES dim_customer(customer_sk),
+  promotion_key   INT REFERENCES dim_promotion(promotion_key),
+  product_key     BIGINT REFERENCES dim_product(product_sk),
+  -- Optional: convenience column for counting
+  event_count     INT DEFAULT 1
+)
+PARTITION BY RANGE (date_key);
+
+-- Query: Customers eligible but did NOT purchase
+SELECT pc.customer_key, pc.promotion_key
+FROM fact_promotion_coverage pc
+LEFT JOIN fact_orders fo
+  ON pc.customer_key = fo.customer_key
+  AND pc.promotion_key = fo.promotion_key
+  AND pc.date_key = fo.order_date_key
+WHERE fo.order_line_sk IS NULL;</code></pre>
+    </section>
+
+    <!-- Section 7: Partitioning & Clustering -->
+    <section id="partitioning-clustering">
+      <h2>Partitioning &amp; Clustering</h2>
+      <p>At petabyte scale, partitioning and clustering are not optional optimizations — they are architectural requirements. Without them, every query scans the entire dataset, resulting in unacceptable latency and cost.</p>
+
+      <h3>Time Partitioning</h3>
+      <p>The most common and effective partitioning strategy for fact tables:</p>
+      <ul>
+        <li><strong>Daily partitions</strong> — Standard for most transactional facts. One partition per day, typically on the event timestamp or date key.</li>
+        <li><strong>Hourly partitions</strong> — For very high-volume streaming facts (clickstream, IoT telemetry) where daily partitions exceed optimal size (1-10 GB per partition).</li>
+        <li><strong>Monthly partitions</strong> — For slowly-growing dimensions or periodic snapshots where daily would create too many small files.</li>
+      </ul>
+      <pre><code class="language-sql">-- BigQuery: Time-partitioned table
+CREATE TABLE `project.dataset.fact_events`
+(
+  event_id        STRING,
+  event_timestamp TIMESTAMP,
+  user_id         STRING,
+  event_type      STRING,
+  properties      JSON,
+  revenue         NUMERIC
+)
+PARTITION BY DATE(event_timestamp)
+OPTIONS (
+  partition_expiration_days = 730,  -- Auto-delete after 2 years
+  require_partition_filter = TRUE    -- Force partition pruning
+);
+
+-- Snowflake: Automatic clustering (time-based)
+CREATE TABLE fact_events (
+  event_id        VARCHAR(36),
+  event_timestamp TIMESTAMP_NTZ,
+  user_id         VARCHAR(50),
+  event_type      VARCHAR(100),
+  properties      VARIANT,
+  revenue         NUMBER(12,2)
+)
+CLUSTER BY (TO_DATE(event_timestamp), event_type);</code></pre>
+
+      <h3>Hash Partitioning</h3>
+      <p>Distributes data evenly across partitions based on a hash of one or more columns:</p>
+      <ul>
+        <li>Eliminates data skew when no natural time dimension exists.</li>
+        <li>Enables parallel processing — each partition can be scanned independently.</li>
+        <li>Common in Redshift (DISTKEY) and traditional MPP systems.</li>
+        <li>Less common in BigQuery/Snowflake which handle distribution automatically.</li>
+      </ul>
+      <pre><code class="language-sql">-- Redshift: Hash distribution on customer_id for co-located joins
+CREATE TABLE fact_orders (
+  order_id        BIGINT,
+  customer_id     BIGINT,
+  order_date      DATE,
+  amount          DECIMAL(12,2)
+)
+DISTKEY(customer_id)
+SORTKEY(order_date);
+
+-- The dim_customer table uses the same DISTKEY for co-located joins
+CREATE TABLE dim_customer (
+  customer_id     BIGINT,
+  customer_name   VARCHAR(200),
+  segment         VARCHAR(50)
+)
+DISTKEY(customer_id)
+SORTKEY(customer_id);</code></pre>
+
+      <h3>Clustering Keys</h3>
+      <p>Clustering organizes data within partitions to improve filter performance:</p>
+      <ul>
+        <li><strong>Column order matters</strong> — Place the most frequently filtered column first. The clustering is applied left-to-right.</li>
+        <li><strong>High-cardinality columns benefit most</strong> — user_id, product_id, region provide better pruning than boolean flags.</li>
+        <li><strong>Complementary to partitioning</strong> — Partition on time (coarse), cluster on entity keys (fine-grained).</li>
+        <li><strong>Limit to 4 columns</strong> — Diminishing returns beyond 4 clustering columns in most engines.</li>
+      </ul>
+      <pre><code class="language-sql">-- BigQuery: Clustering within time partitions
+CREATE TABLE `project.dataset.fact_page_views`
+(
+  view_timestamp  TIMESTAMP,
+  user_id         STRING,
+  page_path       STRING,
+  country_code    STRING,
+  device_type     STRING,
+  session_id      STRING,
+  duration_ms     INT64
+)
+PARTITION BY DATE(view_timestamp)
+CLUSTER BY user_id, country_code, page_path;
+
+-- Query that benefits from both partition pruning AND cluster pruning:
+SELECT user_id, COUNT(*) as views, AVG(duration_ms) as avg_duration
+FROM `project.dataset.fact_page_views`
+WHERE DATE(view_timestamp) BETWEEN '2025-01-01' AND '2025-01-31'  -- partition pruning
+  AND country_code = 'US'                                          -- cluster pruning
+  AND user_id = 'user-abc-123'                                     -- cluster pruning
+GROUP BY user_id;</code></pre>
+
+      <h3>BigQuery Clustering Deep Dive</h3>
+      <ul>
+        <li>BigQuery automatically re-clusters data in the background — no manual maintenance required.</li>
+        <li>Clustering reduces bytes scanned (and therefore cost) by up to 10-100x for selective queries.</li>
+        <li>Cluster columns must be top-level, non-repeated fields (STRING, INT64, NUMERIC, DATE, TIMESTAMP, BOOL).</li>
+        <li>Use <code>INFORMATION_SCHEMA.TABLE_STORAGE</code> to monitor clustering effectiveness.</li>
+      </ul>
+      <pre><code class="language-sql">-- Monitor clustering ratio in BigQuery
+SELECT
+  table_name,
+  total_rows,
+  total_logical_bytes / POW(1024, 3) AS logical_gb,
+  total_physical_bytes / POW(1024, 3) AS physical_gb,
+FROM `project.dataset.INFORMATION_SCHEMA.TABLE_STORAGE`
+WHERE table_name = 'fact_page_views';</code></pre>
+
+      <h3>Snowflake Micro-Partitions</h3>
+      <p>Snowflake takes a unique approach — all tables are automatically divided into immutable micro-partitions (50-500 MB compressed):</p>
+      <ul>
+        <li><strong>Automatic</strong> — No explicit partition DDL needed. Snowflake manages partitioning internally.</li>
+        <li><strong>Clustering</strong> — Defined via <code>CLUSTER BY</code> to control the physical ordering within micro-partitions.</li>
+        <li><strong>Pruning metadata</strong> — Each micro-partition stores min/max statistics per column, enabling partition elimination without reading data.</li>
+        <li><strong>Reclustering</strong> — Background process that re-organizes micro-partitions when data becomes fragmented from many DML operations.</li>
+      </ul>
+      <pre><code class="language-sql">-- Snowflake: Monitor clustering depth
+SELECT SYSTEM$CLUSTERING_INFORMATION('fact_orders', '(order_date, customer_id)');
+
+-- Snowflake: Check clustering effectiveness
+SELECT
+  table_name,
+  clustering_key,
+  total_constant_partition_count,
+  total_partition_count,
+  average_overlaps,
+  average_depth
+FROM TABLE(INFORMATION_SCHEMA.AUTOMATIC_CLUSTERING_HISTORY(
+  DATE_RANGE_START => DATEADD('day', -7, CURRENT_DATE()),
+  TABLE_NAME => 'fact_orders'
+));</code></pre>
+
+      <h3>Partitioning Strategy Decision Framework</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Factor</th>
+            <th>Recommendation</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Table &lt; 1 GB</td>
+            <td>No partitioning needed — full scan is fast enough</td>
+          </tr>
+          <tr>
+            <td>Table 1-100 GB</td>
+            <td>Single partition key (usually date) + clustering</td>
+          </tr>
+          <tr>
+            <td>Table 100 GB - 10 TB</td>
+            <td>Date partition + 2-3 clustering keys + partition expiration</td>
+          </tr>
+          <tr>
+            <td>Table &gt; 10 TB</td>
+            <td>Date partition + aggressive clustering + materialized views for hot paths + mandatory partition filters</td>
+          </tr>
+          <tr>
+            <td>Queries always filter by time</td>
+            <td>Time-based partitioning (95% of cases)</td>
+          </tr>
+          <tr>
+            <td>Queries filter by tenant/customer</td>
+            <td>Hash partition by tenant + time-based clustering OR composite</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Section 8: Materialized Views & Aggregation Tables -->
+    <section id="materialized-views">
+      <h2>Materialized Views &amp; Aggregation Tables</h2>
+      <p>When queries repeatedly aggregate petabytes of raw data into the same summaries, pre-computation becomes essential. Materialized views and aggregation tables trade storage and freshness for dramatic query performance improvements.</p>
+
+      <h3>Pre-Computation Strategy</h3>
+      <ul>
+        <li><strong>Identify hot paths</strong> — Use query logs to find the top 20 most expensive/frequent queries. These are candidates for materialized views.</li>
+        <li><strong>Aggregate at business-meaningful grains</strong> — Daily revenue by region, hourly active users by platform, weekly retention cohorts.</li>
+        <li><strong>Layer aggregations</strong> — Raw (grain) → hourly → daily → weekly → monthly. Each layer is 10-100x smaller than the previous.</li>
+        <li><strong>Cost-benefit threshold</strong> — Materialize when: (query frequency × query cost) > (storage cost + refresh cost).</li>
+      </ul>
+
+      <h3>Materialized Views in Practice</h3>
+      <pre><code class="language-sql">-- BigQuery: Materialized view with automatic refresh
+CREATE MATERIALIZED VIEW `project.dataset.mv_daily_revenue`
+OPTIONS (
+  enable_refresh = TRUE,
+  refresh_interval_minutes = 30
+)
+AS
+SELECT
+  DATE(order_timestamp) AS order_date,
+  region,
+  product_category,
+  COUNT(*) AS order_count,
+  SUM(revenue) AS total_revenue,
+  AVG(revenue) AS avg_order_value,
+  COUNT(DISTINCT customer_id) AS unique_customers
+FROM `project.dataset.fact_orders`
+GROUP BY 1, 2, 3;
+
+-- Snowflake: Materialized view
+CREATE MATERIALIZED VIEW mv_daily_revenue AS
+SELECT
+  order_date,
+  region,
+  product_category,
+  COUNT(*) AS order_count,
+  SUM(revenue) AS total_revenue,
+  AVG(revenue) AS avg_order_value,
+  COUNT(DISTINCT customer_id) AS unique_customers
+FROM fact_orders
+GROUP BY 1, 2, 3;</code></pre>
+
+      <h3>Refresh Strategies</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Freshness</th>
+            <th>Cost</th>
+            <th>Use Case</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Full refresh</td>
+            <td>Depends on schedule</td>
+            <td>High — recomputes everything</td>
+            <td>Small aggregation tables, complex logic</td>
+          </tr>
+          <tr>
+            <td>Incremental refresh</td>
+            <td>Near real-time (minutes)</td>
+            <td>Low — only processes new data</td>
+            <td>Append-only fact tables, simple aggregations</td>
+          </tr>
+          <tr>
+            <td>Automatic (engine-managed)</td>
+            <td>Engine decides</td>
+            <td>Moderate — optimized by engine</td>
+            <td>BigQuery/Snowflake native materialized views</td>
+          </tr>
+          <tr>
+            <td>Partition-aware refresh</td>
+            <td>Partition-level</td>
+            <td>Medium — refreshes affected partitions</td>
+            <td>Large tables with time-partitioned data</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Incremental Refresh Pattern</h3>
+      <pre><code class="language-sql">-- Incremental aggregation: only process new partitions
+-- Step 1: Find the last processed watermark
+DECLARE last_processed DATE;
+SET last_processed = (
+  SELECT MAX(order_date) FROM agg_daily_revenue
+);
+
+-- Step 2: Aggregate only new data
+INSERT INTO agg_daily_revenue
+SELECT
+  DATE(order_timestamp) AS order_date,
+  region,
+  product_category,
+  COUNT(*) AS order_count,
+  SUM(revenue) AS total_revenue,
+  AVG(revenue) AS avg_order_value,
+  COUNT(DISTINCT customer_id) AS unique_customers
+FROM fact_orders
+WHERE DATE(order_timestamp) > last_processed
+GROUP BY 1, 2, 3;
+
+-- Step 3: Handle late-arriving data by re-processing recent window
+MERGE INTO agg_daily_revenue target
+USING (
+  SELECT
+    DATE(order_timestamp) AS order_date,
+    region,
+    product_category,
+    COUNT(*) AS order_count,
+    SUM(revenue) AS total_revenue,
+    AVG(revenue) AS avg_order_value,
+    COUNT(DISTINCT customer_id) AS unique_customers
+  FROM fact_orders
+  WHERE DATE(order_timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)
+  GROUP BY 1, 2, 3
+) source
+ON target.order_date = source.order_date
+  AND target.region = source.region
+  AND target.product_category = source.product_category
+WHEN MATCHED THEN UPDATE SET
+  order_count = source.order_count,
+  total_revenue = source.total_revenue,
+  avg_order_value = source.avg_order_value,
+  unique_customers = source.unique_customers
+WHEN NOT MATCHED THEN INSERT VALUES (
+  source.order_date, source.region, source.product_category,
+  source.order_count, source.total_revenue,
+  source.avg_order_value, source.unique_customers
+);</code></pre>
+
+      <h3>Aggregation Table Design Patterns</h3>
+      <ul>
+        <li><strong>Rollup hierarchy</strong> — Create aggregates at each level of a dimension hierarchy (city → state → country → global) as separate tables or views.</li>
+        <li><strong>Cube tables</strong> — Pre-compute all combinations of a small set of dimensions (region × category × channel) for dashboard backing tables.</li>
+        <li><strong>Approximate aggregates</strong> — Use HyperLogLog for distinct counts, T-Digest for percentiles when exact values are not required.</li>
+        <li><strong>Semantic layer</strong> — Tools like dbt metrics, Looker derived tables, or Cube.js abstract aggregation logic from physical storage.</li>
+      </ul>
+      <pre><code class="language-sql">-- Approximate distinct count using HyperLogLog (BigQuery)
+CREATE MATERIALIZED VIEW mv_approx_users AS
+SELECT
+  DATE(event_timestamp) AS event_date,
+  platform,
+  country,
+  HLL_COUNT.INIT(user_id) AS hll_users  -- Stored as BYTES
+FROM fact_events
+GROUP BY 1, 2, 3;
+
+-- Query: Merge HLL sketches across platforms
+SELECT
+  event_date,
+  country,
+  HLL_COUNT.MERGE(hll_users) AS estimated_unique_users
+FROM mv_approx_users
+GROUP BY 1, 2;</code></pre>
+    </section>
+
+    <!-- Section 9: Medallion Architecture -->
+    <section id="medallion">
+      <h2>Medallion Architecture</h2>
+      <p>The Medallion (or Multi-Hop) architecture organizes data into progressively refined layers. Originally popularized by Databricks, it has become a standard pattern across cloud data platforms.</p>
+
+      <h3>Bronze Layer (Raw)</h3>
+      <ul>
+        <li><strong>Purpose:</strong> Land raw data exactly as received from sources — no transformations, no deduplication.</li>
+        <li><strong>Format:</strong> Often stored as JSON, Avro, or raw Parquet reflecting the source schema.</li>
+        <li><strong>Properties:</strong> Append-only, immutable, full-fidelity copy of source data.</li>
+        <li><strong>Retention:</strong> Long retention (1-7 years) for replay capability and auditing.</li>
+        <li><strong>Schema:</strong> Schema-on-read; may include a metadata envelope (source_system, ingestion_timestamp, batch_id).</li>
+      </ul>
+      <pre><code class="language-sql">-- Bronze table: raw events as ingested
+CREATE TABLE bronze.raw_events (
+  ingestion_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  source_system       VARCHAR(50),
+  source_table        VARCHAR(100),
+  batch_id            VARCHAR(36),
+  raw_payload         VARIANT,  -- JSON as received
+  file_name           VARCHAR(500),
+  file_row_number     INT
+)
+PARTITION BY (TO_DATE(ingestion_timestamp));</code></pre>
+
+      <h3>Silver Layer (Cleaned/Conformed)</h3>
+      <ul>
+        <li><strong>Purpose:</strong> Clean, deduplicate, validate, and conform data to enterprise standards.</li>
+        <li><strong>Transformations:</strong> Type casting, null handling, deduplication, schema enforcement, join enrichment.</li>
+        <li><strong>Properties:</strong> Typed schemas, validated constraints, conformed naming conventions.</li>
+        <li><strong>Organization:</strong> Tables mirror business entities (customers, orders, products) not source systems.</li>
+        <li><strong>SCD handling:</strong> Type 2 dimensions are typically built at this layer.</li>
+      </ul>
+      <pre><code class="language-sql">-- Silver table: cleaned and conformed orders
+CREATE TABLE silver.orders (
+  order_id            VARCHAR(36) NOT NULL,
+  customer_id         VARCHAR(36) NOT NULL,
+  order_timestamp     TIMESTAMP_NTZ NOT NULL,
+  order_status        VARCHAR(20) NOT NULL,
+  currency_code       VARCHAR(3) DEFAULT 'USD',
+  subtotal            NUMBER(12,2),
+  tax_amount          NUMBER(12,2),
+  shipping_amount     NUMBER(12,2),
+  total_amount        NUMBER(12,2),
+  -- Data quality metadata
+  dq_score            NUMBER(3,2),  -- 0.00 to 1.00
+  dq_flags            ARRAY,
+  -- Lineage
+  source_system       VARCHAR(50),
+  bronze_batch_id     VARCHAR(36),
+  processed_at        TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (TO_DATE(order_timestamp), customer_id);</code></pre>
+
+      <h3>Gold Layer (Business-Ready)</h3>
+      <ul>
+        <li><strong>Purpose:</strong> Business-logic-enriched, consumption-ready datasets optimized for specific use cases.</li>
+        <li><strong>Structure:</strong> Dimensional models (star schemas), aggregation tables, feature stores, metric tables.</li>
+        <li><strong>Properties:</strong> Documented business logic, SLAs on freshness, governed access controls.</li>
+        <li><strong>Consumers:</strong> BI dashboards, ML feature pipelines, executive reports, data products.</li>
+        <li><strong>Ownership:</strong> Typically owned by analytics engineering teams or domain teams.</li>
+      </ul>
+      <pre><code class="language-sql">-- Gold table: dimensional model for analytics
+CREATE TABLE gold.fact_revenue (
+  revenue_date_key    INT,
+  customer_key        BIGINT,
+  product_key         BIGINT,
+  channel_key         INT,
+  -- Measures
+  gross_revenue       NUMBER(14,2),
+  discount_amount     NUMBER(12,2),
+  net_revenue         NUMBER(14,2),
+  quantity            INT,
+  -- Pre-computed metrics
+  customer_ltv_at_order NUMBER(14,2),
+  days_since_last_order INT,
+  is_first_order      BOOLEAN,
+  -- Governance
+  data_classification VARCHAR(20) DEFAULT 'INTERNAL',
+  refreshed_at        TIMESTAMP_NTZ
+)
+PARTITION BY (revenue_date_key)
+CLUSTER BY (customer_key, product_key);</code></pre>
+
+      <h3>When to Use Medallion Architecture</h3>
+      <ul>
+        <li><strong>Good fit:</strong> Large organizations with multiple data sources, need for data lineage, regulatory compliance requirements, teams at different maturity levels consuming different layers.</li>
+        <li><strong>Overkill:</strong> Small teams with &lt;5 data sources, single-use-case warehouses, real-time-only workloads.</li>
+        <li><strong>Alternative:</strong> ELT with staging → warehouse → marts (dbt-style) — essentially the same concept with different naming.</li>
+      </ul>
+
+      <h3>Criticisms and Pitfalls</h3>
+      <ul>
+        <li><strong>Over-engineering:</strong> Teams create bronze/silver/gold for every table regardless of complexity, adding latency and cost without value.</li>
+        <li><strong>Naming confusion:</strong> "Silver" means different things to different teams — is it cleaned? conformed? enriched? All three?</li>
+        <li><strong>Duplication waste:</strong> Storing 3 copies of every dataset triples storage costs. Apply selectively.</li>
+        <li><strong>Latency accumulation:</strong> Each layer adds processing time. A 3-layer pipeline with hourly refreshes means 3-hour end-to-end latency minimum.</li>
+        <li><strong>Organizational boundaries:</strong> Layer ownership disputes — who owns Silver? Platform team or domain teams?</li>
+        <li><strong>Not a substitute for data contracts:</strong> Layers don't prevent schema breaking changes from upstream. You still need explicit contracts.</li>
+      </ul>
+    </section>
+
+    <!-- Section 10: Cost Optimization -->
+    <section id="cost-optimization">
+      <h2>Cost Optimization</h2>
+      <p>At petabyte scale, warehouse costs can easily reach six or seven figures monthly. Cost optimization is not a one-time exercise — it requires continuous monitoring, governance, and architectural decisions that compound over time.</p>
+
+      <h3>Storage Tiering</h3>
+      <ul>
+        <li><strong>Hot storage:</strong> Frequently accessed data (last 30-90 days). Full performance, highest cost. Keep fact tables and active dimensions here.</li>
+        <li><strong>Warm storage:</strong> Occasionally accessed (90 days - 1 year). Reduced cost, slightly higher latency. Historical aggregates, reference data.</li>
+        <li><strong>Cold storage:</strong> Rarely accessed (1+ years). Lowest cost, highest latency. Compliance data, raw archives, audit trails.</li>
+        <li><strong>BigQuery:</strong> Automatic long-term storage pricing (50% reduction after 90 days of no edits).</li>
+        <li><strong>Snowflake:</strong> Time travel storage costs separate from active storage; Fail-safe adds 7 additional days of non-queryable backup.</li>
+      </ul>
+      <pre><code class="language-sql">-- BigQuery: Check storage billing breakdown
+SELECT
+  table_name,
+  ROUND(active_logical_bytes / POW(1024, 4), 4) AS active_tb,
+  ROUND(long_term_logical_bytes / POW(1024, 4), 4) AS long_term_tb,
+  ROUND((active_logical_bytes * 0.02 +
+         long_term_logical_bytes * 0.01) / POW(1024, 4), 2) AS est_monthly_cost_usd
+FROM `project.region-us.INFORMATION_SCHEMA.TABLE_STORAGE`
+WHERE total_logical_bytes > 0
+ORDER BY total_logical_bytes DESC
+LIMIT 20;</code></pre>
+
+      <h3>Compression</h3>
+      <ul>
+        <li><strong>Columnar formats</strong> — Parquet and ORC achieve 3-10x compression over row-based formats through dictionary encoding, run-length encoding, and delta encoding.</li>
+        <li><strong>Column data types</strong> — Use the smallest type that fits: INT32 vs INT64, DATE vs TIMESTAMP, STRING vs fixed-width CHAR.</li>
+        <li><strong>Sort order</strong> — Sorting data before writing improves compression by increasing value locality (run-length encoding becomes effective).</li>
+        <li><strong>Dictionary encoding</strong> — Low-cardinality columns (status, country_code, category) compress 50-100x with dictionary encoding.</li>
+      </ul>
+      <pre><code class="language-python"># PySpark: Optimize Parquet compression
+df.repartition(200) \
+  .sortWithinPartitions("event_date", "user_id") \
+  .write \
+  .partitionBy("event_date") \
+  .option("compression", "zstd") \
+  .option("parquet.page.size", "1048576") \
+  .parquet("s3://warehouse/gold/fact_events/")</code></pre>
+
+      <h3>Lifecycle Policies</h3>
+      <ul>
+        <li><strong>Partition expiration:</strong> Automatically delete old partitions after retention period (BigQuery: <code>partition_expiration_days</code>).</li>
+        <li><strong>Table cloning:</strong> Use zero-copy clones for development/testing instead of full copies.</li>
+        <li><strong>Time travel reduction:</strong> Reduce time travel retention from default (e.g., Snowflake 90 days → 14 days for non-critical tables).</li>
+        <li><strong>Archive and drop:</strong> Export cold data to object storage (GCS/S3) before dropping from the warehouse.</li>
+      </ul>
+      <pre><code class="language-sql">-- Snowflake: Reduce time travel for large staging tables
+ALTER TABLE bronze.raw_events SET DATA_RETENTION_TIME_IN_DAYS = 7;
+
+-- BigQuery: Set partition expiration
+ALTER TABLE `project.dataset.fact_clickstream`
+SET OPTIONS (partition_expiration_days = 365);
+
+-- Snowflake: Archive to external stage then drop
+COPY INTO @archive_stage/fact_events_2022/
+FROM (SELECT * FROM fact_events WHERE event_date < '2023-01-01')
+FILE_FORMAT = (TYPE = PARQUET COMPRESSION = SNAPPY);
+
+-- After verification
+DELETE FROM fact_events WHERE event_date < '2023-01-01';</code></pre>
+
+      <h3>Query Slots vs. On-Demand</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th>Pricing</th>
+            <th>Best For</th>
+            <th>Risk</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>On-demand (BigQuery)</td>
+            <td>$6.25/TB scanned</td>
+            <td>Unpredictable workloads, exploration</td>
+            <td>Runaway queries can spike costs</td>
+          </tr>
+          <tr>
+            <td>Flat-rate slots (BigQuery)</td>
+            <td>$2,400/month per 100 slots</td>
+            <td>Predictable workloads, &gt;$10K/month spend</td>
+            <td>Under-utilization wastes money</td>
+          </tr>
+          <tr>
+            <td>Editions (BigQuery)</td>
+            <td>Autoscaling slots with commitment</td>
+            <td>Variable but growing workloads</td>
+            <td>Commitment lock-in</td>
+          </tr>
+          <tr>
+            <td>Standard warehouse (Snowflake)</td>
+            <td>Credits/hour per warehouse size</td>
+            <td>Diverse workloads, multi-cluster</td>
+            <td>Always-on warehouses burn credits</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Cost Governance Practices</h3>
+      <ul>
+        <li><strong>Query budgets:</strong> Set per-query byte limits (BigQuery: <code>maximum_bytes_billed</code>) to prevent accidental full-table scans.</li>
+        <li><strong>Department chargebacks:</strong> Tag queries by team/project; allocate costs proportionally to drive accountability.</li>
+        <li><strong>Scheduled scaling:</strong> Auto-suspend Snowflake warehouses after 60 seconds of inactivity; scale down BigQuery slots during off-hours.</li>
+        <li><strong>Query review:</strong> Require peer review for queries scanning &gt; 1 TB; automated alerts for queries exceeding cost thresholds.</li>
+        <li><strong>Materialization ROI:</strong> Track cost savings from materialized views vs. their refresh costs; deprecate under-utilized MVs.</li>
+      </ul>
+      <pre><code class="language-sql">-- BigQuery: Set query cost limit
+-- In client configuration or project-level settings:
+-- maximum_bytes_billed = 10 * 1024^4  (10 TB limit)
+
+-- Snowflake: Auto-suspend and resource monitor
+ALTER WAREHOUSE analytics_wh SET
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE;
+
+CREATE RESOURCE MONITOR monthly_budget
+  WITH CREDIT_QUOTA = 5000
+  TRIGGERS
+    ON 75 PERCENT DO NOTIFY
+    ON 90 PERCENT DO NOTIFY
+    ON 100 PERCENT DO SUSPEND;</code></pre>
+    </section>
+
+    <!-- Section 11: Production Incident -->
+    <section id="production-incident">
+      <h2>Production Incident: $5K to $80K/Month Query Cost Explosion</h2>
+      <p class="incident-label"><strong>Scenario:</strong> A 50TB fact table in BigQuery saw warehouse query costs grow from $5,000/month to $80,000/month over 6 weeks due to missing partitioning.</p>
+
+      <h3>Timeline</h3>
+      <ol>
+        <li><strong>Week 0:</strong> A new <code>fact_user_interactions</code> table was created by a product analytics team. The table was created without partitioning or clustering — a simple <code>CREATE TABLE</code> with no physical optimization.</li>
+        <li><strong>Weeks 1-2:</strong> Table grew from 500 GB to 5 TB as user interaction data loaded daily. Queries were fast initially because data was small. Monthly cost: ~$5,000 (on-demand billing).</li>
+        <li><strong>Weeks 3-4:</strong> Table reached 20 TB. Every dashboard query and ad-hoc analysis performed full-table scans. Latency increased from 5 seconds to 45 seconds. Cost jumped to $35,000.</li>
+        <li><strong>Weeks 5-6:</strong> Table hit 50 TB. Analysts created additional queries to work around slow dashboards (caching copies, redundant aggregations). Cost exploded to $80,000. SLA breaches triggered incident.</li>
+      </ol>
+
+      <h3>Root Cause Analysis</h3>
+      <ul>
+        <li><strong>No partition filter requirement:</strong> The table was created without <code>require_partition_filter = TRUE</code>, so every query scanned all 50 TB.</li>
+        <li><strong>No partitioning at all:</strong> The table lacked any <code>PARTITION BY</code> clause — even time-based queries scanned everything.</li>
+        <li><strong>No clustering:</strong> Common filter columns (user_id, event_type, platform) were not clustered, preventing any scan reduction.</li>
+        <li><strong>No cost alerts:</strong> Billing alerts were set at the project level ($100K) not the dataset level, so the incremental growth wasn't caught early.</li>
+        <li><strong>Self-serve culture without guardrails:</strong> The team had full DDL permissions without mandatory schema review.</li>
+      </ul>
+
+      <h3>Resolution</h3>
+      <pre><code class="language-sql">-- Step 1: Create properly designed replacement table
+CREATE TABLE `project.dataset.fact_user_interactions_v2`
+(
+  interaction_id    STRING NOT NULL,
+  event_timestamp   TIMESTAMP NOT NULL,
+  user_id           STRING NOT NULL,
+  event_type        STRING,
+  platform          STRING,
+  page_path         STRING,
+  properties        JSON,
+  session_id        STRING,
+  duration_ms       INT64,
+  revenue           NUMERIC
+)
+PARTITION BY DATE(event_timestamp)
+CLUSTER BY user_id, event_type, platform
+OPTIONS (
+  partition_expiration_days = 730,
+  require_partition_filter = TRUE,
+  description = 'Partitioned user interactions - migrated from unpartitioned table'
+);
+
+-- Step 2: Backfill data (partition by partition to avoid memory issues)
+DECLARE process_date DATE DEFAULT DATE('2024-01-01');
+DECLARE end_date DATE DEFAULT CURRENT_DATE();
+
+WHILE process_date <= end_date DO
+  INSERT INTO `project.dataset.fact_user_interactions_v2`
+  SELECT *
+  FROM `project.dataset.fact_user_interactions`
+  WHERE DATE(event_timestamp) = process_date;
+
+  SET process_date = DATE_ADD(process_date, INTERVAL 1 DAY);
+END WHILE;
+
+-- Step 3: Validate counts match
+SELECT 'original' AS source, COUNT(*) AS cnt
+FROM `project.dataset.fact_user_interactions`
+UNION ALL
+SELECT 'migrated' AS source, COUNT(*) AS cnt
+FROM `project.dataset.fact_user_interactions_v2`;
+
+-- Step 4: Swap table names
+ALTER TABLE `project.dataset.fact_user_interactions`
+  RENAME TO `project.dataset.fact_user_interactions_deprecated`;
+ALTER TABLE `project.dataset.fact_user_interactions_v2`
+  RENAME TO `project.dataset.fact_user_interactions`;</code></pre>
+
+      <h3>Impact After Fix</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Before</th>
+            <th>After</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Monthly query cost</td>
+            <td>$80,000</td>
+            <td>$3,200 (96% reduction)</td>
+          </tr>
+          <tr>
+            <td>Average query latency</td>
+            <td>45 seconds</td>
+            <td>2.8 seconds</td>
+          </tr>
+          <tr>
+            <td>Bytes scanned per query (avg)</td>
+            <td>50 TB</td>
+            <td>~200 GB</td>
+          </tr>
+          <tr>
+            <td>Dashboard SLA compliance</td>
+            <td>62%</td>
+            <td>99.2%</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Preventive Measures Implemented</h3>
+      <ul>
+        <li><strong>Policy:</strong> All fact tables &gt; 10 GB must have partitioning. Enforced via Terraform/IaC that rejects unpartitioned table definitions.</li>
+        <li><strong>Alerts:</strong> Dataset-level cost alerts at 50%, 80%, and 100% of monthly budget.</li>
+        <li><strong>Automated scanning:</strong> Weekly job that identifies unpartitioned tables exceeding 1 TB and creates tickets.</li>
+        <li><strong>Query governance:</strong> <code>maximum_bytes_billed</code> set at 5 TB for all service accounts; analysts capped at 1 TB per query.</li>
+        <li><strong>Schema review:</strong> All new table DDL requires review from the data platform team before deployment to production datasets.</li>
+      </ul>
+    </section>
+
+    <!-- Section 12: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+
+      <h3>Complete Star Schema DDL</h3>
+      <pre><code class="language-sql">-- ============================================
+-- STAR SCHEMA: E-Commerce Analytics Warehouse
+-- ============================================
+
+-- Date Dimension (conformed, shared across all stars)
+CREATE TABLE dim_date (
+  date_key          INT PRIMARY KEY,          -- YYYYMMDD format
+  full_date         DATE NOT NULL,
+  day_of_week       SMALLINT,
+  day_name          VARCHAR(10),
+  day_of_month      SMALLINT,
+  day_of_year       SMALLINT,
+  week_of_year      SMALLINT,
+  month_number      SMALLINT,
+  month_name        VARCHAR(10),
+  quarter_number    SMALLINT,
+  quarter_name      VARCHAR(6),               -- Q1-2025
+  year_number       INT,
+  fiscal_quarter    SMALLINT,
+  fiscal_year       INT,
+  is_weekend        BOOLEAN,
+  is_holiday        BOOLEAN,
+  holiday_name      VARCHAR(50)
+);
+
+-- Customer Dimension (SCD Type 2)
+CREATE TABLE dim_customer (
+  customer_sk           BIGINT PRIMARY KEY,   -- Surrogate key
+  customer_natural_key  VARCHAR(36) NOT NULL,  -- Source system ID
+  customer_name         VARCHAR(200),
+  email_domain          VARCHAR(100),          -- No PII: domain only
+  signup_date           DATE,
+  customer_segment      VARCHAR(50),
+  lifetime_order_count  INT,
+  lifetime_revenue      DECIMAL(14,2),
+  acquisition_channel   VARCHAR(50),
+  country_code          VARCHAR(3),
+  state_province        VARCHAR(100),
+  city                  VARCHAR(100),
+  postal_code           VARCHAR(20),
+  -- SCD Type 2 fields
+  effective_from        DATE NOT NULL,
+  effective_to          DATE NOT NULL DEFAULT '9999-12-31',
+  is_current            BOOLEAN NOT NULL DEFAULT TRUE,
+  -- Metadata
+  source_system         VARCHAR(50),
+  created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Product Dimension
+CREATE TABLE dim_product (
+  product_sk            BIGINT PRIMARY KEY,
+  product_natural_key   VARCHAR(36) NOT NULL,
+  product_name          VARCHAR(300),
+  product_description   TEXT,
+  brand_name            VARCHAR(100),
+  category_l1           VARCHAR(100),         -- Top level
+  category_l2           VARCHAR(100),         -- Sub-category
+  category_l3           VARCHAR(100),         -- Leaf category
+  unit_cost             DECIMAL(10,2),
+  unit_price            DECIMAL(10,2),
+  weight_kg             DECIMAL(8,3),
+  is_active             BOOLEAN DEFAULT TRUE,
+  launch_date           DATE,
+  discontinue_date      DATE,
+  supplier_name         VARCHAR(200),
+  -- SCD Type 2 fields
+  effective_from        DATE NOT NULL,
+  effective_to          DATE NOT NULL DEFAULT '9999-12-31',
+  is_current            BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Channel Dimension (Type 1 - rarely changes)
+CREATE TABLE dim_channel (
+  channel_key           INT PRIMARY KEY,
+  channel_name          VARCHAR(50),    -- Web, Mobile App, In-Store, Marketplace
+  channel_category      VARCHAR(50),    -- Digital, Physical, Third-Party
+  is_owned              BOOLEAN,
+  launch_date           DATE
+);
+
+-- Fact Table: Orders (Transaction grain)
+CREATE TABLE fact_orders (
+  -- Keys
+  order_date_key        INT NOT NULL REFERENCES dim_date(date_key),
+  customer_key          BIGINT NOT NULL REFERENCES dim_customer(customer_sk),
+  product_key           BIGINT NOT NULL REFERENCES dim_product(product_sk),
+  channel_key           INT NOT NULL REFERENCES dim_channel(channel_key),
+  -- Degenerate dimensions
+  order_number          VARCHAR(30),
+  order_line_number     SMALLINT,
+  -- Additive measures
+  quantity              INT NOT NULL,
+  unit_price            DECIMAL(10,2),
+  gross_revenue         DECIMAL(12,2),
+  discount_amount       DECIMAL(10,2),
+  net_revenue           DECIMAL(12,2),
+  tax_amount            DECIMAL(10,2),
+  shipping_revenue      DECIMAL(10,2),
+  cost_of_goods         DECIMAL(10,2),
+  gross_profit          DECIMAL(12,2),
+  -- Metadata
+  etl_batch_id          BIGINT,
+  loaded_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+PARTITION BY RANGE (order_date_key)
+CLUSTER BY (customer_key, product_key);</code></pre>
+
+      <h3>SCD Type 2 — Full MERGE Implementation</h3>
+      <pre><code class="language-sql">-- ============================================
+-- SCD TYPE 2: MERGE pattern for dim_customer
+-- Source: staging.stg_customers (daily extract)
+-- Target: warehouse.dim_customer
+-- ============================================
+
+-- Step 1: Detect changes using hash comparison
+CREATE TEMP TABLE customer_changes AS
+WITH source AS (
+  SELECT
+    customer_id AS customer_natural_key,
+    customer_name,
+    email_domain,
+    signup_date,
+    customer_segment,
+    acquisition_channel,
+    country_code,
+    state_province,
+    city,
+    postal_code,
+    -- Hash of all tracked columns for change detection
+    MD5(CONCAT(
+      COALESCE(customer_name, ''),
+      COALESCE(customer_segment, ''),
+      COALESCE(country_code, ''),
+      COALESCE(state_province, ''),
+      COALESCE(city, ''),
+      COALESCE(postal_code, '')
+    )) AS row_hash
+  FROM staging.stg_customers
+),
+target AS (
+  SELECT
+    customer_natural_key,
+    MD5(CONCAT(
+      COALESCE(customer_name, ''),
+      COALESCE(customer_segment, ''),
+      COALESCE(country_code, ''),
+      COALESCE(state_province, ''),
+      COALESCE(city, ''),
+      COALESCE(postal_code, '')
+    )) AS row_hash
+  FROM warehouse.dim_customer
+  WHERE is_current = TRUE
+)
+SELECT s.*
+FROM source s
+LEFT JOIN target t ON s.customer_natural_key = t.customer_natural_key
+WHERE t.customer_natural_key IS NULL        -- New customers
+   OR s.row_hash != t.row_hash;             -- Changed customers
+
+-- Step 2: Close existing current rows for changed customers
+UPDATE warehouse.dim_customer
+SET effective_to = CURRENT_DATE - INTERVAL '1 day',
+    is_current = FALSE,
+    updated_at = CURRENT_TIMESTAMP
+WHERE customer_natural_key IN (
+  SELECT customer_natural_key FROM customer_changes
+)
+AND is_current = TRUE;
+
+-- Step 3: Insert new versions
+INSERT INTO warehouse.dim_customer (
+  customer_sk, customer_natural_key, customer_name,
+  email_domain, signup_date, customer_segment,
+  acquisition_channel, country_code, state_province,
+  city, postal_code, effective_from, effective_to,
+  is_current, source_system, created_at, updated_at
+)
+SELECT
+  -- Deterministic surrogate key
+  ABS(FARM_FINGERPRINT(CONCAT(customer_natural_key, CAST(CURRENT_DATE AS STRING)))),
+  customer_natural_key,
+  customer_name,
+  email_domain,
+  signup_date,
+  customer_segment,
+  acquisition_channel,
+  country_code,
+  state_province,
+  city,
+  postal_code,
+  CURRENT_DATE,           -- effective_from
+  '9999-12-31',           -- effective_to
+  TRUE,                   -- is_current
+  'crm_system',           -- source_system
+  CURRENT_TIMESTAMP,      -- created_at
+  CURRENT_TIMESTAMP       -- updated_at
+FROM customer_changes;</code></pre>
+
+      <h3>BigQuery Partitioned Table with Best Practices</h3>
+      <pre><code class="language-sql">-- ============================================
+-- BIGQUERY: Production-grade partitioned fact table
+-- ============================================
+
+CREATE TABLE `analytics_prod.core.fact_page_views`
+(
+  -- Primary identifiers
+  page_view_id      STRING NOT NULL OPTIONS(description="UUID for each page view"),
+  session_id        STRING NOT NULL,
+  user_id           STRING,
+  anonymous_id      STRING,
+
+  -- Timestamp (partition column)
+  event_timestamp   TIMESTAMP NOT NULL OPTIONS(description="When the page view occurred"),
+
+  -- Dimensions
+  page_path         STRING,
+  page_title        STRING,
+  referrer_path     STRING,
+  utm_source        STRING,
+  utm_medium        STRING,
+  utm_campaign      STRING,
+  device_type       STRING,  -- mobile, desktop, tablet
+  browser_family    STRING,
+  os_family         STRING,
+  country_code      STRING,
+  region            STRING,
+  city              STRING,
+
+  -- Measures
+  time_on_page_ms   INT64,
+  scroll_depth_pct  FLOAT64,
+  is_bounce         BOOL,
+  is_exit           BOOL,
+  is_entrance       BOOL,
+
+  -- Metadata
+  ingestion_time    TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  etl_version       STRING DEFAULT '2.1.0'
+)
+PARTITION BY DATE(event_timestamp)
+CLUSTER BY user_id, country_code, device_type
+OPTIONS (
+  partition_expiration_days = 730,
+  require_partition_filter = TRUE,
+  friendly_name = 'Page Views Fact Table',
+  description = 'Grain: one row per page view. Partitioned by day, clustered by user/geo/device.',
+  labels = [("team", "analytics"), ("tier", "gold"), ("pii", "pseudonymized")]
+);
+
+-- Create a view that enforces access patterns
+CREATE VIEW `analytics_prod.core.v_page_views_last_90d` AS
+SELECT * FROM `analytics_prod.core.fact_page_views`
+WHERE DATE(event_timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY);</code></pre>
+
+      <h3>Snowflake Clustering and Optimization</h3>
+      <pre><code class="language-sql">-- ============================================
+-- SNOWFLAKE: Optimized warehouse table design
+-- ============================================
+
+-- Create the table with clustering
+CREATE OR REPLACE TABLE analytics.gold.fact_transactions (
+  transaction_id      VARCHAR(36) NOT NULL,
+  transaction_ts      TIMESTAMP_NTZ NOT NULL,
+  customer_id         VARCHAR(36) NOT NULL,
+  merchant_id         VARCHAR(36),
+  category_code       VARCHAR(10),
+  amount              NUMBER(12,2),
+  currency            VARCHAR(3) DEFAULT 'USD',
+  country_code        VARCHAR(3),
+  channel             VARCHAR(20),
+  is_fraud            BOOLEAN DEFAULT FALSE,
+  fraud_score         NUMBER(5,4),
+  loaded_at           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (TO_DATE(transaction_ts), country_code, category_code)
+DATA_RETENTION_TIME_IN_DAYS = 30
+COMMENT = 'Transaction fact table. Grain: one row per transaction.';
+
+-- Add search optimization for point lookups
+ALTER TABLE analytics.gold.fact_transactions
+  ADD SEARCH OPTIMIZATION ON EQUALITY(transaction_id, customer_id);
+
+-- Create a zero-copy clone for development
+CREATE TABLE analytics.dev.fact_transactions
+  CLONE analytics.gold.fact_transactions;
+
+-- Monitor clustering health
+SELECT SYSTEM$CLUSTERING_INFORMATION(
+  'analytics.gold.fact_transactions',
+  '(TO_DATE(transaction_ts), country_code, category_code)'
+) AS clustering_info;
+
+-- Verify pruning effectiveness for a sample query
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY())
+WHERE query_text ILIKE '%fact_transactions%'
+  AND start_time > DATEADD('hour', -1, CURRENT_TIMESTAMP())
+ORDER BY total_elapsed_time DESC
+LIMIT 10;</code></pre>
+
+      <h3>dbt Model for Gold Layer</h3>
+      <pre><code class="language-sql">-- models/gold/fact_revenue.sql
+-- dbt model with incremental materialization
+
+{{
+  config(
+    materialized='incremental',
+    partition_by={
+      "field": "order_date",
+      "data_type": "date",
+      "granularity": "day"
+    },
+    cluster_by=["customer_key", "product_key"],
+    unique_key="order_line_sk",
+    incremental_strategy="merge"
+  )
+}}
+
+WITH orders AS (
+  SELECT * FROM {{ ref('stg_orders') }}
+  {% if is_incremental() %}
+  WHERE order_date >= DATE_SUB(
+    (SELECT MAX(order_date) FROM {{ this }}),
+    INTERVAL 3 DAY  -- Reprocess 3-day window for late arrivals
+  )
+  {% endif %}
+),
+
+customers AS (
+  SELECT * FROM {{ ref('dim_customer') }}
+  WHERE is_current = TRUE
+),
+
+products AS (
+  SELECT * FROM {{ ref('dim_product') }}
+  WHERE is_current = TRUE
+)
+
+SELECT
+  {{ dbt_utils.generate_surrogate_key(['o.order_id', 'o.line_number']) }} AS order_line_sk,
+  d.date_key AS order_date_key,
+  o.order_date,
+  c.customer_sk AS customer_key,
+  p.product_sk AS product_key,
+  o.order_number,
+  o.line_number AS order_line_number,
+  o.quantity,
+  o.unit_price,
+  o.quantity * o.unit_price AS gross_revenue,
+  o.discount_amount,
+  (o.quantity * o.unit_price) - o.discount_amount AS net_revenue,
+  o.tax_amount,
+  p.unit_cost * o.quantity AS cost_of_goods,
+  ((o.quantity * o.unit_price) - o.discount_amount) - (p.unit_cost * o.quantity) AS gross_profit,
+  CURRENT_TIMESTAMP() AS loaded_at
+
+FROM orders o
+INNER JOIN {{ ref('dim_date') }} d ON o.order_date = d.full_date
+INNER JOIN customers c ON o.customer_id = c.customer_natural_key
+INNER JOIN products p ON o.product_id = p.product_natural_key</code></pre>
+    </section>
+
+    <!-- Section 13: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <ul>
+        <li>
+          <strong>Mixed grain in a single fact table</strong>
+          <p>Storing header-level and line-level data in the same table. Revenue gets double-counted when aggregating at the header level. Always declare grain explicitly and keep one grain per table.</p>
+        </li>
+        <li>
+          <strong>Using natural keys for joins instead of surrogates</strong>
+          <p>Natural keys change (company merges, system migrations). Fact tables joined on natural keys break when source systems change. Surrogate keys insulate the warehouse from upstream volatility.</p>
+        </li>
+        <li>
+          <strong>Over-normalizing the Gold layer</strong>
+          <p>Applying 3NF to analytical tables forces excessive joins that kill query performance. Analysts should never need more than 3-4 joins for a standard report. Denormalize for consumption.</p>
+        </li>
+        <li>
+          <strong>No partition filter enforcement</strong>
+          <p>Without <code>require_partition_filter = TRUE</code> (BigQuery) or equivalent guardrails, a single SELECT * without a WHERE clause scans petabytes and costs thousands of dollars.</p>
+        </li>
+        <li>
+          <strong>Treating all dimensions as SCD Type 2</strong>
+          <p>Not every change needs history. A customer's typo-corrected name doesn't warrant a new dimension row. Over-applying Type 2 bloats dimensions 10-50x and slows joins.</p>
+        </li>
+        <li>
+          <strong>Ignoring late-arriving facts and dimensions</strong>
+          <p>Data arrives out of order. Without a strategy (placeholder rows, reprocessing windows, partition overwrite), late data either gets lost or corrupts existing aggregations.</p>
+        </li>
+        <li>
+          <strong>No conformed dimensions</strong>
+          <p>Each team creates their own customer table with different keys and definitions. Cross-functional reporting becomes impossible. Invest in conformed dimensions early — they're the backbone of an enterprise warehouse.</p>
+        </li>
+        <li>
+          <strong>Clustering on low-cardinality columns</strong>
+          <p>Clustering on a boolean or a column with 5 distinct values provides minimal benefit. Cluster on columns with thousands to millions of distinct values that appear frequently in WHERE clauses.</p>
+        </li>
+        <li>
+          <strong>No data quality checks between layers</strong>
+          <p>Data flows from Bronze to Gold without validation. Null keys, orphan foreign keys, and duplicate rows propagate to dashboards. Implement checks (dbt tests, Great Expectations) at each layer boundary.</p>
+        </li>
+        <li>
+          <strong>Building the warehouse before understanding the business process</strong>
+          <p>Starting with technology (let's use Snowflake!) instead of business requirements (what decisions does this warehouse support?). The Kimball approach starts with business processes, not tables.</p>
+        </li>
+      </ul>
+    </section>
+
+    <!-- Section 14: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+
+      <h3>Normalization vs. Denormalization</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Aspect</th>
+            <th>Normalized (3NF/Snowflake)</th>
+            <th>Denormalized (Star)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Query performance</td>
+            <td>Slower — multiple joins required</td>
+            <td>Faster — fewer, wider tables</td>
+          </tr>
+          <tr>
+            <td>Storage</td>
+            <td>Less redundancy</td>
+            <td>More redundancy (but storage is cheap)</td>
+          </tr>
+          <tr>
+            <td>ETL complexity</td>
+            <td>More dependencies, ordering matters</td>
+            <td>Simpler loads, parallel possible</td>
+          </tr>
+          <tr>
+            <td>Update anomalies</td>
+            <td>Fewer — single point of truth</td>
+            <td>More — must update multiple locations</td>
+          </tr>
+          <tr>
+            <td>Analyst productivity</td>
+            <td>Lower — requires deep schema knowledge</td>
+            <td>Higher — intuitive, self-service friendly</td>
+          </tr>
+          <tr>
+            <td>Modern engine optimization</td>
+            <td>Less effective — join-heavy plans</td>
+            <td>More effective — scan + filter optimized</td>
+          </tr>
+        </tbody>
+      </table>
+      <p><strong>Decision framework:</strong> Use normalized models in staging/silver for correctness. Use denormalized stars in gold/consumption for performance. The cost of storage is negligible compared to the cost of slow analyst queries at FAANG scale.</p>
+
+      <h3>Query Performance vs. Storage</h3>
+      <ul>
+        <li><strong>More materialized views</strong> = faster queries, more storage, more refresh compute, more staleness risk.</li>
+        <li><strong>Fewer wide columns</strong> = less storage, but queries need more joins or post-processing.</li>
+        <li><strong>Pre-computed aggregates</strong> = instant dashboards, but rigid (new dimensions require new aggregates).</li>
+        <li><strong>Rule of thumb:</strong> If a query runs &gt;100 times/day and scans &gt;100 GB, materialize it. If it runs &lt;5 times/day, the full scan is cheaper than maintaining the materialized view.</li>
+      </ul>
+
+      <h3>Freshness vs. Cost</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Freshness Target</th>
+            <th>Architecture</th>
+            <th>Relative Cost</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Real-time (&lt;1 min)</td>
+            <td>Streaming ingestion + incremental MVs</td>
+            <td>$$$$$ (5x baseline)</td>
+          </tr>
+          <tr>
+            <td>Near real-time (1-15 min)</td>
+            <td>Micro-batch + streaming buffer tables</td>
+            <td>$$$ (3x baseline)</td>
+          </tr>
+          <tr>
+            <td>Hourly</td>
+            <td>Scheduled batch + partition overwrite</td>
+            <td>$$ (1.5x baseline)</td>
+          </tr>
+          <tr>
+            <td>Daily</td>
+            <td>Nightly batch ETL</td>
+            <td>$ (baseline)</td>
+          </tr>
+          <tr>
+            <td>Weekly/Monthly</td>
+            <td>Scheduled aggregation jobs</td>
+            <td>$ (0.5x baseline)</td>
+          </tr>
+        </tbody>
+      </table>
+      <p><strong>Decision framework:</strong> Start with daily freshness. Upgrade to near-real-time only for use cases that demonstrably lose business value with stale data (fraud detection, dynamic pricing, real-time personalization). Most dashboard consumers don't actually need real-time — they need "fresh enough to make today's decisions."</p>
+
+      <h3>Build vs. Buy</h3>
+      <ul>
+        <li><strong>Build (custom warehouse on Spark/Iceberg):</strong> Maximum flexibility, no vendor lock-in, but requires significant engineering investment (5-10 senior engineers minimum).</li>
+        <li><strong>Buy (BigQuery/Snowflake/Redshift):</strong> Faster time-to-value, managed infrastructure, but vendor lock-in, less control over performance tuning, and potentially higher costs at extreme scale.</li>
+        <li><strong>FAANG pattern:</strong> Most FAANG companies run custom internal systems (Mesa, Dremel, Hive) for core workloads but increasingly adopt managed services for satellite teams and new initiatives.</li>
+      </ul>
+    </section>
+
+    <!-- Section 15: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <p>Expect these follow-up questions in a FAANG interview after your initial answer:</p>
+
+      <h3>Architecture &amp; Modeling</h3>
+      <ul>
+        <li>"How would you handle a many-to-many relationship between customers and accounts in a star schema?" <em>(Bridge table with weighting factors)</em></li>
+        <li>"Your fact table has 200 columns. How do you decide which columns become dimensions vs. degenerate dimensions vs. junk dimensions?" <em>(Cardinality analysis, query patterns, business meaning)</em></li>
+        <li>"How do you model a business process that has multiple simultaneous grains — e.g., a shipment with header, line item, and package levels?" <em>(Separate fact tables per grain, linked by degenerate dimensions)</em></li>
+        <li>"Walk me through how you'd migrate from a monolithic fact table to a medallion architecture without downtime." <em>(Shadow pipeline, dual-write period, consumer migration waves)</em></li>
+      </ul>
+
+      <h3>Scale &amp; Performance</h3>
+      <ul>
+        <li>"Your 50 TB fact table has a hot partition (today's data) that receives 1M inserts/minute. How do you prevent it from degrading query performance?" <em>(Streaming buffer, separate hot/cold tables, merge on schedule)</em></li>
+        <li>"How would you design the warehouse to support both low-latency dashboard queries (&lt;2s) and heavy ad-hoc analytical queries (minutes)?" <em>(Workload isolation: separate compute/warehouses, priority queues, materialized views for dashboards)</em></li>
+        <li>"Your clustering is degrading over time due to heavy DML. What's your maintenance strategy?" <em>(Scheduled reclustering, partition compaction, monitoring clustering depth)</em></li>
+      </ul>
+
+      <h3>Operations &amp; Cost</h3>
+      <ul>
+        <li>"A business user wants to add a new dimension to an existing fact table with 3 years of history. Walk me through the process." <em>(Backfill strategy, partition-by-partition update, validation, consumer communication)</em></li>
+        <li>"How do you handle schema evolution when upstream sources add/remove columns?" <em>(Schema registry, backward/forward compatibility, column deprecation policy)</em></li>
+        <li>"Your warehouse costs doubled last quarter. Walk me through your investigation and remediation process." <em>(Query audit logs, bytes scanned analysis, user attribution, materialization candidates, partition enforcement)</em></li>
+        <li>"How would you implement row-level security in a shared warehouse serving multiple business units?" <em>(Column/row-level policies, authorized views, tag-based access control)</em></li>
+      </ul>
+
+      <h3>Advanced Topics</h3>
+      <ul>
+        <li>"Compare Kimball dimensional modeling vs. Data Vault 2.0 for a large enterprise. When would you choose each?" <em>(Kimball for analytics-first, DV2 for integration-first with many sources and audit requirements)</em></li>
+        <li>"How would you implement a universal semantic layer that serves both SQL analysts and ML engineers from the same warehouse?" <em>(Feature store integration, metric layer, shared definitions, multiple consumption interfaces)</em></li>
+        <li>"Describe how you'd handle a warehouse migration from on-prem (Teradata/Netezza) to cloud (BigQuery/Snowflake) for a 500 TB warehouse." <em>(Phased migration, dual-run validation, lift-and-shift then optimize, workload comparison testing)</em></li>
+      </ul>
+    </section>
+
+    <!-- Section 16: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <p>Designing a warehouse for petabyte-scale analytics requires mastery across three domains:</p>
+
+      <h3>Logical Design</h3>
+      <ul>
+        <li>Star schemas with clearly defined grain per fact table remain the gold standard for analytical performance.</li>
+        <li>Conformed dimensions enable enterprise-wide consistency; SCD Type 2 preserves history for critical business attributes.</li>
+        <li>Choose fact table types deliberately: transactional for events, periodic snapshot for state, accumulating for lifecycle processes.</li>
+      </ul>
+
+      <h3>Physical Design</h3>
+      <ul>
+        <li>Partition on time (95% of cases); cluster on high-cardinality filter columns; enforce partition filters to prevent cost disasters.</li>
+        <li>Materialized views and aggregation tables trade storage for performance — measure ROI continuously.</li>
+        <li>Compression, columnar formats, and sort order compound to reduce storage and scan costs 10-100x.</li>
+      </ul>
+
+      <h3>Operational Design</h3>
+      <ul>
+        <li>Medallion architecture (Bronze/Silver/Gold) provides clear data quality progression — apply it where complexity warrants the overhead.</li>
+        <li>Cost governance requires multi-layered controls: partition enforcement, query budgets, resource monitors, and chargeback visibility.</li>
+        <li>Schema evolution, late-arriving data, and dimension versioning are ongoing operational challenges that need automated solutions.</li>
+      </ul>
+
+      <p><strong>The senior-level signal:</strong> You don't just know these patterns — you can articulate when each is appropriate, what trade-offs it introduces, and how you've operated it at scale in production. The best answer demonstrates that you've felt the pain of petabyte-scale data and developed judgment about which optimizations matter most for the specific business context.</p>
+    </section>
+
+    <!-- Chapter Navigation (bottom) -->
+    <nav class="chapter-nav">
+      <a href="ch08-query-suddenly-slow.html" class="prev">&larr; Previous: Ch 8</a>
+      <a href="ch10-bigquery-internals.html" class="next">Next: Ch 10 &rarr;</a>
+    </nav>
+
+  </main>
+
+  <!-- Scripts -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

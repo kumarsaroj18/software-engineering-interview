@@ -1,0 +1,2082 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ch 16 — ETL Pipeline Slow | Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/main.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="brand">DE Interview Handbook</a>
+      <button class="sidebar-close" id="sidebar-close" aria-label="Close sidebar">✕</button>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-number">Ch 16</span>
+      <span class="chapter-title">ETL Pipeline Slow</span>
+    </div>
+    <nav class="sidebar-nav">
+      <a href="#interviewer-intent">Interviewer Intent</a>
+      <a href="#quick-answer">Quick Answer</a>
+      <a href="#data-volume-growth">Data Volume Growth</a>
+      <a href="#shuffle-bottleneck">Shuffle Bottleneck</a>
+      <a href="#data-skew">Data Skew</a>
+      <a href="#executor-failures">Executor Failures &amp; Retries</a>
+      <a href="#small-files">Small Files Problem</a>
+      <a href="#metadata-overhead">Metadata &amp; Planning Overhead</a>
+      <a href="#query-plan-regression">Query Plan Regression</a>
+      <a href="#infrastructure">Infrastructure Issues</a>
+      <a href="#production-incident">Production Incident</a>
+      <a href="#debugging-workflow">Debugging Workflow</a>
+      <a href="#code-examples">Code Examples</a>
+      <a href="#common-mistakes">Common Mistakes</a>
+      <a href="#trade-offs">Trade-offs</a>
+      <a href="#follow-up-questions">Follow-up Questions</a>
+      <a href="#summary">Summary</a>
+    </nav>
+    <div class="sidebar-actions">
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">☀️</button>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="content">
+    <button class="menu-toggle" id="menu-toggle" aria-label="Open sidebar">☰</button>
+
+    <!-- Breadcrumb -->
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../../index.html">Home</a> &gt;
+      <a href="../index.html#part-vi">Part VI — Production Data Engineering</a> &gt;
+      <span>Chapter 16</span>
+    </nav>
+
+    <!-- Chapter Header -->
+    <header class="chapter-header">
+      <span class="badge badge-hard">Hard</span>
+      <h1>A Daily ETL Pipeline Suddenly Takes Three Times Longer. How Do You Investigate?</h1>
+      <div class="chapter-topics">
+        <span class="topic">ETL</span>
+        <span class="topic">Debugging</span>
+      </div>
+    </header>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch15-exactly-once-streaming.html" class="prev">&larr; Previous</a>
+      <a href="ch17-incorrect-dashboard-metrics.html" class="next">Next &rarr;</a>
+    </nav>
+
+    <!-- Section 1: Interviewer Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <p>When an interviewer asks this question, they are evaluating several critical competencies:</p>
+      <ul>
+        <li><strong>Systematic debugging mindset</strong> — Can you approach a production issue methodically rather than guessing?</li>
+        <li><strong>Breadth of knowledge</strong> — Do you understand the full stack from infrastructure to application logic?</li>
+        <li><strong>Data platform expertise</strong> — Are you familiar with Spark internals, distributed system failure modes, and data lake operations?</li>
+        <li><strong>Production ownership</strong> — Have you actually been on-call and resolved incidents like this?</li>
+        <li><strong>Communication under pressure</strong> — Can you articulate a clear investigation plan to stakeholders while the pipeline is burning?</li>
+        <li><strong>Root cause vs. symptom</strong> — Do you fix the underlying issue or just restart the job and hope for the best?</li>
+      </ul>
+      <p>This is a <em>behavioral + technical hybrid</em> question. The interviewer wants to see you walk through a realistic debugging workflow, mention specific tools and metrics, and demonstrate that you have solved similar problems in production environments at scale.</p>
+      <p>A senior candidate should cover at least 4–5 distinct root causes, explain how to differentiate between them using observability data, and describe both immediate mitigation and long-term prevention strategies.</p>
+    </section>
+
+    <!-- Section 2: Quick Answer -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <div class="callout callout-tip">
+        <p><strong>30-second framework for the interview:</strong></p>
+        <ol>
+          <li><strong>Check data volume</strong> — Did input size grow? New sources added? Backfill injected?</li>
+          <li><strong>Examine the Spark UI</strong> — Look for shuffle spill, skewed partitions, failed tasks, and stage duration anomalies.</li>
+          <li><strong>Profile the data</strong> — Check for skew in join keys, null explosion, or cardinality changes.</li>
+          <li><strong>Review infrastructure</strong> — Spot instance preemption, storage throttling, noisy neighbors, autoscaling delays.</li>
+          <li><strong>Compare query plans</strong> — Statistics staleness, AQE behavior changes, broadcast threshold violations.</li>
+          <li><strong>Check metadata layer</strong> — Hive metastore latency, S3 file listing overhead, partition pruning effectiveness.</li>
+        </ol>
+      </div>
+      <p>The key insight: a 3x slowdown is rarely a single cause. It is typically a <strong>compounding effect</strong> — for example, data volume grew 50%, which caused shuffle spill, which triggered disk I/O contention, which cascaded into task retries. Your investigation must trace the causal chain.</p>
+      <pre><code class="language-bash"># First 60 seconds of investigation
+# 1. Check if data volume changed
+aws s3 ls s3://data-lake/raw/events/dt=2024-01-15/ --summarize --recursive
+# Compare with previous day
+aws s3 ls s3://data-lake/raw/events/dt=2024-01-14/ --summarize --recursive
+
+# 2. Check Airflow task duration
+airflow tasks states-for-dag-run daily_etl 2024-01-15
+
+# 3. Pull Spark application ID from Airflow logs
+grep "application_" /var/log/airflow/daily_etl/2024-01-15.log</code></pre>
+    </section>
+
+    <!-- Section 3: Data Volume Growth -->
+    <section id="data-volume-growth">
+      <h2>Data Volume Growth</h2>
+      <p>The most common — and most overlooked — cause of ETL slowdowns is simply that the input data grew. This can happen silently when upstream teams make changes without notifying downstream consumers.</p>
+
+      <h3>Upstream Table Grew</h3>
+      <p>A source table that historically produced 50GB/day suddenly emits 150GB/day. Common triggers:</p>
+      <ul>
+        <li>Product launch in a new market (3x user events)</li>
+        <li>Logging verbosity increased (debug-level events in production)</li>
+        <li>Schema change added nested arrays that explode row count during flattening</li>
+        <li>CDC (Change Data Capture) replay after a source system migration</li>
+      </ul>
+
+      <h3>New Sources Added</h3>
+      <p>A data producer starts writing to a shared landing zone without coordinating with the ETL team:</p>
+      <pre><code class="language-bash"># Check partition sizes over time
+aws s3api list-objects-v2 \
+  --bucket data-lake \
+  --prefix raw/events/dt=2024-01-15/ \
+  --query "sum(Contents[].Size)" \
+  --output text
+
+# Compare with historical baseline
+for i in $(seq 1 7); do
+  dt=$(date -d "-${i} days" +%Y-%m-%d)
+  size=$(aws s3 ls s3://data-lake/raw/events/dt=${dt}/ --summarize --recursive | grep "Total Size" | awk '{print $3}')
+  echo "${dt}: ${size} bytes"
+done</code></pre>
+
+      <h3>Backfill Injected</h3>
+      <p>Someone ran a historical backfill that landed in today's partition:</p>
+      <pre><code class="language-sql">-- Check for unexpected date ranges in today's partition
+SELECT
+  MIN(event_timestamp) AS earliest_event,
+  MAX(event_timestamp) AS latest_event,
+  COUNT(*) AS total_rows,
+  COUNT(DISTINCT DATE(event_timestamp)) AS distinct_dates
+FROM raw.events
+WHERE dt = '2024-01-15';
+
+-- If earliest_event is from weeks ago, a backfill landed here
+-- Expected: all events from 2024-01-15
+-- Actual: events spanning 2023-12-01 to 2024-01-15</code></pre>
+
+      <h3>Detection Strategy</h3>
+      <pre><code class="language-python">from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+
+spark = SparkSession.builder.getOrCreate()
+
+# Compare input sizes across recent runs
+def check_volume_growth(table_path, lookback_days=7):
+    """Detect unexpected volume growth in source data."""
+    volumes = []
+    for i in range(lookback_days):
+        dt = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        try:
+            df = spark.read.parquet(f"{table_path}/dt={dt}")
+            count = df.count()
+            size_mb = sum(
+                f.length
+                for f in dbutils.fs.ls(f"{table_path}/dt={dt}")
+            ) / (1024 * 1024)
+            volumes.append({"date": dt, "rows": count, "size_mb": size_mb})
+        except Exception:
+            continue
+
+    # Alert if today is > 2x the 7-day average
+    if len(volumes) > 1:
+        avg_size = sum(v["size_mb"] for v in volumes[1:]) / (len(volumes) - 1)
+        today_size = volumes[0]["size_mb"]
+        if today_size > 2 * avg_size:
+            print(f"⚠️  Volume spike: today={today_size:.0f}MB, "
+                  f"avg={avg_size:.0f}MB, ratio={today_size/avg_size:.1f}x")
+    return volumes</code></pre>
+
+      <h3>Mitigation</h3>
+      <ul>
+        <li><strong>Data contracts</strong> — Enforce schema and volume SLAs with tools like Great Expectations or Soda</li>
+        <li><strong>Circuit breakers</strong> — Abort or alert if input exceeds 2x historical p95</li>
+        <li><strong>Partition-level monitoring</strong> — Track bytes/rows per partition in a metrics system</li>
+        <li><strong>Autoscaling</strong> — Configure dynamic executor allocation to handle volume spikes</li>
+      </ul>
+    </section>
+
+    <!-- Section 4: Shuffle Bottleneck -->
+    <section id="shuffle-bottleneck">
+      <h2>Shuffle Bottleneck</h2>
+      <p>Shuffle is the most expensive operation in distributed data processing. When a pipeline suddenly slows down, shuffle spill is often the smoking gun — data that cannot fit in memory spills to disk, turning a memory-speed operation into a disk I/O-bound one.</p>
+
+      <h3>How Shuffle Works</h3>
+      <p>During a shuffle (triggered by <code>groupBy</code>, <code>join</code>, <code>repartition</code>, <code>distinct</code>), each mapper writes shuffle files partitioned by the reduce key. Reducers then fetch their partitions over the network. The cost scales as O(M × R) where M = mappers and R = reducers.</p>
+
+      <h3>Spark Shuffle Spill</h3>
+      <p>When shuffle data exceeds available execution memory, Spark spills to disk:</p>
+      <pre><code class="language-python"># Check shuffle metrics from Spark UI (programmatically via REST API)
+import requests
+
+spark_ui = "http://spark-history:18080"
+app_id = "application_1705312800_0042"
+
+# Get stage metrics
+stages = requests.get(
+    f"{spark_ui}/api/v1/applications/{app_id}/stages"
+).json()
+
+for stage in stages:
+    shuffle_read = stage.get("shuffleReadBytes", 0)
+    shuffle_write = stage.get("shuffleWriteBytes", 0)
+    spill_memory = stage.get("memoryBytesSpilled", 0)
+    spill_disk = stage.get("diskBytesSpilled", 0)
+
+    if spill_disk > 0:
+        spill_ratio = spill_disk / shuffle_read if shuffle_read > 0 else 0
+        print(f"Stage {stage['stageId']}: "
+              f"shuffle_read={shuffle_read/1e9:.1f}GB, "
+              f"spill_disk={spill_disk/1e9:.1f}GB, "
+              f"spill_ratio={spill_ratio:.2f}")
+        if spill_ratio > 0.5:
+            print("  ⚠️  CRITICAL: >50% of shuffle data spilling to disk")</code></pre>
+
+      <h3>Disk I/O Saturation</h3>
+      <p>When shuffle spills to disk, the local SSDs become the bottleneck. Indicators:</p>
+      <ul>
+        <li><code>iowait</code> > 20% on executor nodes</li>
+        <li>Disk throughput at device maximum (NVMe: ~3.5 GB/s, EBS gp3: 1 GB/s)</li>
+        <li>Spark <code>shuffle.spill.diskBytesSpilled</code> metric climbing</li>
+        <li>GC pressure increasing as memory is contested between shuffle buffers and execution</li>
+      </ul>
+      <pre><code class="language-bash"># Check disk I/O on executor nodes
+iostat -x 1 5 | grep -E "^(Device|nvme)"
+
+# Check for shuffle service bottleneck
+# High fetchWaitTime indicates network or disk contention on shuffle service
+curl -s "${SPARK_UI}/api/v1/applications/${APP_ID}/stages/5/0/taskList" | \
+  jq '[.[].taskMetrics.shuffleReadMetrics.fetchWaitTime] | add / length'</code></pre>
+
+      <h3>Network Saturation</h3>
+      <p>All-to-all shuffle traffic can saturate network links, especially in cloud environments with shared network bandwidth:</p>
+      <ul>
+        <li>AWS: instance network bandwidth is shared with EBS I/O</li>
+        <li>Cross-AZ shuffle traffic adds latency and cost</li>
+        <li>Kubernetes pods may have network policies throttling inter-pod traffic</li>
+      </ul>
+
+      <h3>Solutions</h3>
+      <pre><code class="language-python"># 1. Increase shuffle partitions to reduce per-partition memory pressure
+spark.conf.set("spark.sql.shuffle.partitions", 2000)  # default is 200
+
+# 2. Increase executor memory fraction for shuffle
+spark.conf.set("spark.memory.storageFraction", 0.3)  # reduce storage, more execution
+
+# 3. Use larger instances with more memory per core
+# m5.4xlarge (64GB) → r5.4xlarge (128GB) = 2x shuffle buffer
+
+# 4. Enable push-based shuffle (Spark 3.2+)
+spark.conf.set("spark.shuffle.push.enabled", "true")
+spark.conf.set("spark.shuffle.push.maxBlockSizeToPush", "64m")
+
+# 5. Pre-aggregate before shuffle to reduce data movement
+# BAD: shuffle all raw events then aggregate
+df.groupBy("user_id", "event_date").agg(F.count("*"))
+
+# BETTER: local pre-aggregation with mapPartitions
+def pre_aggregate(partition):
+    from collections import Counter
+    counts = Counter()
+    for row in partition:
+        counts[(row.user_id, row.event_date)] += 1
+    for (uid, dt), cnt in counts.items():
+        yield (uid, dt, cnt)
+
+pre_agg = df.rdd.mapPartitions(pre_aggregate).toDF(["user_id", "event_date", "cnt"])
+result = pre_agg.groupBy("user_id", "event_date").agg(F.sum("cnt"))</code></pre>
+
+      <h3>Key Metrics to Monitor</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Healthy</th>
+            <th>Warning</th>
+            <th>Critical</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Shuffle spill ratio</td>
+            <td>&lt; 0.1</td>
+            <td>0.1 – 0.5</td>
+            <td>&gt; 0.5</td>
+          </tr>
+          <tr>
+            <td>Shuffle read time / task time</td>
+            <td>&lt; 20%</td>
+            <td>20 – 50%</td>
+            <td>&gt; 50%</td>
+          </tr>
+          <tr>
+            <td>Fetch wait time (p99)</td>
+            <td>&lt; 5s</td>
+            <td>5 – 30s</td>
+            <td>&gt; 30s</td>
+          </tr>
+          <tr>
+            <td>Disk I/O wait</td>
+            <td>&lt; 5%</td>
+            <td>5 – 20%</td>
+            <td>&gt; 20%</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Section 5: Data Skew -->
+    <section id="data-skew">
+      <h2>Data Skew</h2>
+      <p>Data skew is the silent killer of distributed processing performance. When one partition holds 100x more data than others, that single task becomes the bottleneck — the entire stage waits for one straggler while other executors sit idle.</p>
+
+      <h3>Identifying Skew in Spark UI</h3>
+      <p>The telltale sign: in the Stage detail view, look at task duration distribution. If median task time is 10 seconds but max is 20 minutes, you have severe skew.</p>
+      <pre><code class="language-python"># Programmatic skew detection
+def detect_skew(df, key_columns, threshold=10):
+    """
+    Detect partition skew by analyzing key distribution.
+    threshold: ratio of max/median that indicates skew
+    """
+    from pyspark.sql import functions as F
+
+    key_counts = df.groupBy(*key_columns).agg(
+        F.count("*").alias("row_count")
+    )
+
+    stats = key_counts.agg(
+        F.expr("percentile_approx(row_count, 0.5)").alias("median"),
+        F.max("row_count").alias("max_count"),
+        F.min("row_count").alias("min_count"),
+        F.avg("row_count").alias("avg_count"),
+        F.stddev("row_count").alias("stddev_count")
+    ).collect()[0]
+
+    skew_ratio = stats["max_count"] / stats["median"] if stats["median"] > 0 else float("inf")
+
+    print(f"Key distribution for {key_columns}:")
+    print(f"  Median: {stats['median']:,.0f}")
+    print(f"  Max: {stats['max_count']:,.0f}")
+    print(f"  Min: {stats['min_count']:,.0f}")
+    print(f"  Skew ratio (max/median): {skew_ratio:.1f}x")
+
+    if skew_ratio > threshold:
+        print(f"  ⚠️  SKEW DETECTED: ratio {skew_ratio:.1f}x exceeds threshold {threshold}x")
+
+        # Show top skewed keys
+        top_keys = key_counts.orderBy(F.desc("row_count")).limit(10)
+        print("  Top 10 hottest keys:")
+        top_keys.show(truncate=False)
+
+    return skew_ratio</code></pre>
+
+      <h3>Common Skew Patterns</h3>
+      <ul>
+        <li><strong>Null key skew</strong> — Null values all hash to the same partition. A single <code>null</code> user_id can accumulate millions of bot/anonymous events.</li>
+        <li><strong>Power-law distribution</strong> — Top 1% of users generate 50% of events (celebrity accounts, bots, internal test accounts).</li>
+        <li><strong>Temporal skew</strong> — Events from a specific hour or region spike due to an incident or campaign.</li>
+        <li><strong>Join key explosion</strong> — A many-to-many join where one key on the left matches millions of rows on the right.</li>
+      </ul>
+
+      <h3>Solution: Salting</h3>
+      <p>Salting breaks a hot key into N sub-keys, distributing its data across N partitions:</p>
+      <pre><code class="language-python">from pyspark.sql import functions as F
+import random
+
+# Salted join to handle skewed keys
+SALT_BUCKETS = 20
+
+# Salt the skewed (left) side
+df_left_salted = df_left.withColumn(
+    "salt", (F.rand() * SALT_BUCKETS).cast("int")
+).withColumn(
+    "salted_key", F.concat(F.col("join_key"), F.lit("_"), F.col("salt"))
+)
+
+# Explode the right side to match all salt values
+df_right_exploded = df_right.crossJoin(
+    spark.range(SALT_BUCKETS).withColumnRenamed("id", "salt")
+).withColumn(
+    "salted_key", F.concat(F.col("join_key"), F.lit("_"), F.col("salt"))
+)
+
+# Join on salted key — now evenly distributed
+result = df_left_salted.join(
+    df_right_exploded,
+    on="salted_key",
+    how="inner"
+).drop("salt", "salted_key")</code></pre>
+
+      <h3>Solution: Adaptive Query Execution (AQE)</h3>
+      <p>Spark 3.0+ includes AQE which can automatically handle skew at runtime:</p>
+      <pre><code class="language-python"># Enable AQE with skew join optimization
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+
+# Tune skew detection thresholds
+# A partition is skewed if it's > 5x the median AND > 256MB
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", 5)
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256m")
+
+# AQE will automatically split skewed partitions and replicate the
+# corresponding partition from the other side of the join</code></pre>
+
+      <h3>Solution: Isolate Hot Keys</h3>
+      <pre><code class="language-python"># For extreme skew: process hot keys separately
+HOT_KEY_THRESHOLD = 1_000_000
+
+# Identify hot keys
+key_counts = df_left.groupBy("join_key").count()
+hot_keys = key_counts.filter(F.col("count") > HOT_KEY_THRESHOLD)
+hot_key_list = [row.join_key for row in hot_keys.collect()]
+
+# Split into hot and cold paths
+df_hot = df_left.filter(F.col("join_key").isin(hot_key_list))
+df_cold = df_left.filter(~F.col("join_key").isin(hot_key_list))
+
+# Cold path: normal shuffle join
+result_cold = df_cold.join(df_right, "join_key")
+
+# Hot path: broadcast join (right side filtered to hot keys is small)
+df_right_hot = df_right.filter(F.col("join_key").isin(hot_key_list))
+result_hot = df_hot.join(F.broadcast(df_right_hot), "join_key")
+
+# Union results
+result = result_cold.union(result_hot)</code></pre>
+
+      <h3>Skew in Aggregations</h3>
+      <pre><code class="language-python"># Two-phase aggregation for skewed groupBy
+# Phase 1: partial aggregation with salt
+df_with_salt = df.withColumn("salt", (F.rand() * 100).cast("int"))
+
+partial_agg = df_with_salt.groupBy("category", "salt").agg(
+    F.sum("amount").alias("partial_sum"),
+    F.count("*").alias("partial_count")
+)
+
+# Phase 2: final aggregation without salt
+final_agg = partial_agg.groupBy("category").agg(
+    F.sum("partial_sum").alias("total_amount"),
+    F.sum("partial_count").alias("total_count")
+)</code></pre>
+    </section>
+
+    <!-- Section 6: Executor Failures & Retries -->
+    <section id="executor-failures">
+      <h2>Executor Failures &amp; Retries</h2>
+      <p>Task and executor failures cause hidden time loss. A task that fails and retries 3 times before succeeding adds 3x its execution time to the stage duration — plus the overhead of recomputing lost shuffle data.</p>
+
+      <h3>Out of Memory (OOM) Failures</h3>
+      <p>The most common executor failure mode. Triggers include:</p>
+      <ul>
+        <li>Large broadcast variables exceeding driver memory</li>
+        <li>Skewed partitions that exceed <code>spark.executor.memory</code></li>
+        <li>User-defined functions (UDFs) that buffer entire partitions</li>
+        <li>Accumulator or broadcast variable memory leaks across stages</li>
+        <li>Container memory overhead exceeded (off-heap allocations)</li>
+      </ul>
+      <pre><code class="language-python"># Detect OOM patterns in executor logs
+import subprocess
+import re
+
+def analyze_executor_failures(app_id, yarn_log_dir="/var/log/hadoop-yarn"):
+    """Parse YARN logs for executor failure patterns."""
+    # Fetch aggregated logs
+    result = subprocess.run(
+        ["yarn", "logs", "-applicationId", app_id],
+        capture_output=True, text=True
+    )
+    logs = result.stdout
+
+    # Count failure types
+    oom_count = len(re.findall(r"java\.lang\.OutOfMemoryError", logs))
+    killed_count = len(re.findall(r"Container killed by YARN for exceeding memory", logs))
+    fetch_fail = len(re.findall(r"FetchFailedException", logs))
+    heartbeat_lost = len(re.findall(r"Lost executor.*heartbeat", logs))
+
+    print(f"Executor failure analysis for {app_id}:")
+    print(f"  OOM errors: {oom_count}")
+    print(f"  YARN memory kills: {killed_count}")
+    print(f"  Shuffle fetch failures: {fetch_fail}")
+    print(f"  Lost heartbeat: {heartbeat_lost}")
+
+    if oom_count > 0:
+        print("\n  Recommendations:")
+        print("  - Increase spark.executor.memory")
+        print("  - Increase spark.executor.memoryOverhead (for off-heap)")
+        print("  - Check for data skew causing oversized partitions")
+        print("  - Review UDFs for memory leaks")</code></pre>
+
+      <h3>Spot Instance Preemption</h3>
+      <p>Running on spot/preemptible instances saves 60–90% on cost but introduces preemption risk. When an executor is preempted mid-task:</p>
+      <ul>
+        <li>All tasks on that executor must be restarted on a new node</li>
+        <li>Shuffle data written by that executor is lost — downstream stages that depend on it must re-fetch (causing <code>FetchFailedException</code>)</li>
+        <li>If External Shuffle Service is not configured, the entire stage may need to restart</li>
+      </ul>
+      <pre><code class="language-python"># Spark configuration for spot-instance resilience
+# Use external shuffle service to preserve shuffle data across preemptions
+spark.conf.set("spark.shuffle.service.enabled", "true")
+
+# Increase max task failures before stage abort
+spark.conf.set("spark.task.maxFailures", 8)  # default is 4
+
+# Enable decommissioning to gracefully migrate tasks before preemption
+spark.conf.set("spark.decommission.enabled", "true")
+spark.conf.set("spark.storage.decommission.shuffleBlocks.enabled", "true")
+
+# Use on-demand instances for the driver
+# EMR example:
+# Master: on-demand (m5.xlarge)
+# Core: on-demand (r5.2xlarge) — holds HDFS shuffle data
+# Task: spot (r5.4xlarge) — compute only, preemptible</code></pre>
+
+      <h3>Task Retry Overhead</h3>
+      <p>Even when retries succeed, they have a compounding cost:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Scenario</th>
+            <th>Effective Time</th>
+            <th>Overhead</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Task succeeds on 1st attempt (5 min)</td>
+            <td>5 min</td>
+            <td>0%</td>
+          </tr>
+          <tr>
+            <td>Task fails once, succeeds on retry</td>
+            <td>10 min</td>
+            <td>100%</td>
+          </tr>
+          <tr>
+            <td>Task fails twice, succeeds on 3rd attempt</td>
+            <td>15 min</td>
+            <td>200%</td>
+          </tr>
+          <tr>
+            <td>Executor lost → 10 tasks retry + shuffle re-fetch</td>
+            <td>50+ min</td>
+            <td>varies</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Speculative Execution</h3>
+      <pre><code class="language-python"># Enable speculation to handle stragglers (not failures)
+spark.conf.set("spark.speculation", "true")
+spark.conf.set("spark.speculation.multiplier", 1.5)  # launch copy if 1.5x median
+spark.conf.set("spark.speculation.quantile", 0.9)  # after 90% of tasks complete
+
+# WARNING: speculation + non-idempotent writes = data corruption
+# Only enable for read-heavy or idempotent stages
+# Disable for stages that write to external systems without deduplication</code></pre>
+
+      <h3>Monitoring Retries</h3>
+      <pre><code class="language-bash"># Check task attempt counts from Spark History Server
+curl -s "http://spark-history:18080/api/v1/applications/${APP_ID}/stages" | \
+  jq '.[] | select(.numFailedTasks > 0) |
+    {stageId, name: .name[:50], failed: .numFailedTasks,
+     succeeded: .numCompleteTasks, failRatio: (.numFailedTasks / .numCompleteTasks)}'
+
+# Alert if fail ratio exceeds threshold
+# failRatio > 0.1 means >10% of tasks needed retries</code></pre>
+    </section>
+
+    <!-- Section 7: Small Files Problem -->
+    <section id="small-files">
+      <h2>Small Files Problem</h2>
+      <p>The small files problem is a data lake anti-pattern where thousands or millions of tiny files (< 1MB each) replace a smaller number of optimally-sized files (128MB–1GB). This destroys read performance through excessive metadata operations and poor I/O utilization.</p>
+
+      <h3>Why Small Files Appear</h3>
+      <ul>
+        <li><strong>Streaming micro-batches</strong> — Spark Structured Streaming with short trigger intervals writes one file per partition per micro-batch</li>
+        <li><strong>High-cardinality partitioning</strong> — Partitioning by <code>user_id</code> or <code>session_id</code> creates millions of directories with tiny files</li>
+        <li><strong>Frequent appends</strong> — Multiple small Airflow tasks writing to the same table hourly</li>
+        <li><strong>Failed compaction</strong> — Delta Lake / Iceberg OPTIMIZE jobs that stopped running</li>
+        <li><strong>Over-partitioned writes</strong> — <code>repartition(10000)</code> when output is only 5GB total</li>
+      </ul>
+
+      <h3>Impact on Read Performance</h3>
+      <pre><code class="language-python"># Demonstrate the small files overhead
+# Scenario: 100GB of data in different file layouts
+
+# Layout A: 100 files × 1GB each
+# - S3 ListObjects: 1 API call
+# - File open overhead: 100 × 50ms = 5s
+# - Sequential read throughput: full bandwidth utilization
+
+# Layout B: 1,000,000 files × 100KB each
+# - S3 ListObjects: 1000 API calls (1000 keys per page) = 10-30s
+# - File open overhead: 1M × 50ms = 50,000s (if sequential!)
+# - Spark parallelizes, but each task processes tiny data
+# - Parquet footer reads dominate: 1M × 20ms = 20,000s of metadata I/O
+
+# Measure file sizes in a partition
+def analyze_file_sizes(path):
+    """Analyze file size distribution in a data lake path."""
+    import subprocess
+    import json
+
+    files = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+        spark._jsc.hadoopConfiguration()
+    ).listStatus(
+        spark._jvm.org.apache.hadoop.fs.Path(path)
+    )
+
+    sizes = [f.getLen() for f in files if f.getPath().getName().endswith(".parquet")]
+
+    if not sizes:
+        print("No parquet files found")
+        return
+
+    sizes_mb = [s / (1024 * 1024) for s in sizes]
+    print(f"File count: {len(sizes)}")
+    print(f"Total size: {sum(sizes_mb):.0f} MB")
+    print(f"Avg file size: {sum(sizes_mb)/len(sizes_mb):.2f} MB")
+    print(f"Min file size: {min(sizes_mb):.4f} MB")
+    print(f"Max file size: {max(sizes_mb):.2f} MB")
+    print(f"Median file size: {sorted(sizes_mb)[len(sizes_mb)//2]:.2f} MB")
+
+    small_count = sum(1 for s in sizes_mb if s < 1)
+    print(f"Files < 1MB: {small_count} ({100*small_count/len(sizes):.1f}%)")
+
+    if small_count > len(sizes) * 0.5:
+        print("⚠️  SMALL FILES PROBLEM: >50% of files are under 1MB")
+        print(f"   Recommended: compact to ~{max(128, int(sum(sizes_mb)/100))}MB target")</code></pre>
+
+      <h3>Coalesce vs. Repartition</h3>
+      <pre><code class="language-python"># coalesce(N): Narrows partitions WITHOUT a full shuffle
+# - Fast: just combines existing partitions on the same executor
+# - Caveat: can create uneven partitions if input is skewed
+# - Use when: reducing partitions for write (200 → 10)
+
+# repartition(N): Full shuffle to create exactly N even partitions
+# - Expensive: triggers a shuffle stage
+# - Benefit: guarantees even partition sizes
+# - Use when: partition sizes are very uneven
+
+# Best practice: calculate target file count from data size
+def write_with_optimal_files(df, path, target_file_size_mb=256):
+    """Write DataFrame with optimal file sizes."""
+    # Estimate data size (cached DataFrame)
+    df.cache()
+    row_count = df.count()
+
+    # Approximate: sample 1% and extrapolate
+    sample_path = f"/tmp/size_estimate_{id(df)}"
+    df.limit(max(1000, row_count // 100)).write.mode("overwrite").parquet(sample_path)
+
+    sample_size = sum(
+        f.size for f in dbutils.fs.ls(sample_path)
+        if f.name.endswith(".parquet")
+    )
+    sample_rows = max(1000, row_count // 100)
+    estimated_total_mb = (sample_size / sample_rows * row_count) / (1024 * 1024)
+
+    target_files = max(1, int(estimated_total_mb / target_file_size_mb))
+
+    print(f"Estimated output: {estimated_total_mb:.0f}MB → {target_files} files "
+          f"(~{target_file_size_mb}MB each)")
+
+    # Use coalesce if reducing (no shuffle), repartition if increasing
+    current_partitions = df.rdd.getNumPartitions()
+    if target_files <= current_partitions:
+        df.coalesce(target_files).write.mode("overwrite").parquet(path)
+    else:
+        df.repartition(target_files).write.mode("overwrite").parquet(path)
+
+    df.unpersist()</code></pre>
+
+      <h3>Compaction Strategies</h3>
+      <pre><code class="language-python"># Delta Lake: OPTIMIZE with Z-ORDER
+spark.sql("""
+  OPTIMIZE events.user_activity
+  WHERE dt = '2024-01-15'
+  ZORDER BY (user_id)
+""")
+
+# Iceberg: rewrite_data_files
+spark.sql("""
+  CALL system.rewrite_data_files(
+    table => 'catalog.events.user_activity',
+    strategy => 'sort',
+    sort_order => 'user_id ASC',
+    options => map('target-file-size-bytes', '268435456',
+                   'min-input-files', '5')
+  )
+""")
+
+# Hive table: manual compaction job
+def compact_partition(table_path, partition, target_size_mb=256):
+    """Compact small files in a Hive partition."""
+    partition_path = f"{table_path}/{partition}"
+    df = spark.read.parquet(partition_path)
+    row_count = df.count()
+
+    # Calculate optimal file count
+    size_bytes = sum(f.size for f in dbutils.fs.ls(partition_path)
+                     if f.name.endswith(".parquet"))
+    target_files = max(1, int(size_bytes / (target_size_mb * 1024 * 1024)))
+
+    # Write compacted files to temp location, then swap
+    temp_path = f"{partition_path}__compacting"
+    df.coalesce(target_files).write.mode("overwrite").parquet(temp_path)
+
+    # Atomic swap (rename)
+    dbutils.fs.rm(partition_path, recurse=True)
+    dbutils.fs.mv(temp_path, partition_path)
+    print(f"Compacted {partition}: {size_bytes/(1024*1024):.0f}MB → {target_files} files")</code></pre>
+
+      <h3>Prevention</h3>
+      <ul>
+        <li>Set <code>spark.sql.files.maxRecordsPerFile</code> to prevent oversized files</li>
+        <li>Configure streaming sinks with <code>maxFilesPerTrigger</code> and periodic compaction</li>
+        <li>Use table formats (Delta, Iceberg) with auto-compaction enabled</li>
+        <li>Monitor file count per partition and alert when it exceeds thresholds</li>
+      </ul>
+    </section>
+
+    <!-- Section 8: Metadata & Planning Overhead -->
+    <section id="metadata-overhead">
+      <h2>Metadata &amp; Planning Overhead</h2>
+      <p>Before a single byte of data is processed, Spark must plan the query: discover partitions, list files, read footers, and build the execution plan. When metadata operations become slow, the pipeline spends minutes in planning before computation begins.</p>
+
+      <h3>Hive Metastore Latency</h3>
+      <p>The Hive Metastore (HMS) is often a MySQL/PostgreSQL database that becomes a bottleneck:</p>
+      <ul>
+        <li>Tables with 100K+ partitions → slow <code>getPartitions</code> calls</li>
+        <li>Concurrent DDL operations blocking reads</li>
+        <li>HMS database connection pool exhaustion during peak hours</li>
+        <li>Lock contention from multiple writers (Hive ACID tables)</li>
+      </ul>
+      <pre><code class="language-sql">-- Check Hive Metastore partition count
+SELECT
+  t.TBL_NAME,
+  COUNT(p.PART_ID) AS partition_count
+FROM TBLS t
+JOIN PARTITIONS p ON t.TBL_ID = p.TBL_ID
+JOIN DBS d ON t.DB_ID = d.DB_ID
+WHERE d.NAME = 'production'
+GROUP BY t.TBL_NAME
+HAVING COUNT(p.PART_ID) > 10000
+ORDER BY partition_count DESC;</code></pre>
+
+      <pre><code class="language-python"># Measure metastore call latency
+import time
+
+def measure_metastore_latency(database, table):
+    """Measure time spent in metastore operations."""
+    timings = {}
+
+    # Partition listing
+    start = time.time()
+    partitions = spark.sql(f"SHOW PARTITIONS {database}.{table}").count()
+    timings["list_partitions"] = time.time() - start
+
+    # Table metadata
+    start = time.time()
+    spark.sql(f"DESCRIBE EXTENDED {database}.{table}").collect()
+    timings["describe_table"] = time.time() - start
+
+    # Partition pruning with predicate
+    start = time.time()
+    spark.sql(f"""
+      SELECT COUNT(*) FROM {database}.{table}
+      WHERE dt = '2024-01-15'
+    """).collect()
+    timings["query_with_pruning"] = time.time() - start
+
+    print(f"Metastore latency for {database}.{table} ({partitions} partitions):")
+    for op, duration in timings.items():
+        status = "⚠️" if duration > 10 else "✓"
+        print(f"  {status} {op}: {duration:.2f}s")
+
+    return timings</code></pre>
+
+      <h3>S3 File Listing Overhead</h3>
+      <p>S3 <code>ListObjectsV2</code> returns max 1000 keys per request. For tables with millions of files:</p>
+      <ul>
+        <li>10M files = 10,000 API calls just to list them</li>
+        <li>At 50ms per call = 8+ minutes of listing time</li>
+        <li>S3 rate limits: 5,500 GET requests/sec per prefix</li>
+        <li>Listing is sequential by default — not parallelized</li>
+      </ul>
+      <pre><code class="language-python"># Optimize S3 file listing
+# 1. Use InMemoryFileIndex with partition inference disabled
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+spark.conf.set("spark.sql.hive.metastorePartitionPruning", "true")
+
+# 2. Use Spark's parallel file listing (Spark 3.1+)
+spark.conf.set("spark.sql.sources.parallelPartitionDiscovery.threshold", 32)
+spark.conf.set("spark.sql.sources.parallelPartitionDiscovery.parallelism", 256)
+
+# 3. Use manifest files instead of file listing
+# Generate manifest for downstream consumers
+df = spark.read.parquet("s3://data-lake/events/")
+file_list = df.inputFiles()
+
+manifest_df = spark.createDataFrame(
+    [(f,) for f in file_list], ["file_path"]
+)
+manifest_df.write.mode("overwrite").text("s3://data-lake/manifests/events/latest.txt")</code></pre>
+
+      <h3>Iceberg Manifest Pruning</h3>
+      <p>Apache Iceberg solves the metadata problem with manifest files that enable efficient pruning:</p>
+      <pre><code class="language-python"># Iceberg metadata hierarchy:
+# Catalog → Table metadata file → Manifest list → Manifests → Data files
+#
+# Key advantage: manifest files contain min/max statistics per column
+# Spark can skip entire manifest files without listing S3
+
+# Check Iceberg table metadata health
+spark.sql("""
+  SELECT
+    snapshot_id,
+    committed_at,
+    operation,
+    summary['total-data-files'] AS data_files,
+    summary['total-records'] AS total_records,
+    summary['added-data-files'] AS added_files
+  FROM catalog.events.user_activity.snapshots
+  ORDER BY committed_at DESC
+  LIMIT 10
+""").show(truncate=False)
+
+# Expire old snapshots to reduce manifest overhead
+spark.sql("""
+  CALL catalog.system.expire_snapshots(
+    table => 'events.user_activity',
+    older_than => TIMESTAMP '2024-01-08 00:00:00',
+    retain_last => 5
+  )
+""")
+
+# Rewrite manifests for optimal pruning
+spark.sql("""
+  CALL catalog.system.rewrite_manifests(
+    table => 'events.user_activity'
+  )
+""")</code></pre>
+
+      <h3>Planning Phase Optimization</h3>
+      <pre><code class="language-python"># Measure time spent in planning vs execution
+import time
+from pyspark.sql import DataFrame
+
+def measure_planning_overhead(query_func):
+    """Separate planning time from execution time."""
+    # Planning phase
+    start = time.time()
+    df = query_func()  # Returns unexecuted DataFrame
+    df.explain(mode="cost")  # Force plan generation
+    planning_time = time.time() - start
+
+    # Execution phase
+    start = time.time()
+    df.write.format("noop").mode("overwrite").save()
+    execution_time = time.time() - start
+
+    total = planning_time + execution_time
+    print(f"Planning: {planning_time:.1f}s ({100*planning_time/total:.0f}%)")
+    print(f"Execution: {execution_time:.1f}s ({100*execution_time/total:.0f}%)")
+
+    if planning_time > execution_time * 0.2:
+        print("⚠️  Planning overhead is >20% of total time")
+        print("   Consider: Iceberg/Delta, pre-computed manifests, "
+              "partition pruning, ANALYZE TABLE")
+
+# Reduce planning overhead
+spark.conf.set("spark.sql.files.maxPartitionBytes", "256m")  # fewer tasks
+spark.conf.set("spark.sql.adaptive.enabled", "true")  # defer decisions to runtime</code></pre>
+    </section>
+
+    <!-- Section 9: Query Plan Regression -->
+    <section id="query-plan-regression">
+      <h2>Query Plan Regression</h2>
+      <p>A query plan regression occurs when the optimizer chooses a worse execution strategy than before, even if the query itself hasn't changed. This is one of the hardest issues to diagnose because the code is identical — only the plan changed.</p>
+
+      <h3>Stale Statistics After Schema Change</h3>
+      <p>When table statistics are outdated, the optimizer makes poor decisions:</p>
+      <ul>
+        <li>Table grew from 1GB to 100GB but statistics still say 1GB → optimizer chooses broadcast join</li>
+        <li>New column added → column statistics missing → optimizer can't estimate selectivity</li>
+        <li>Partition pruning disabled because new partitions aren't registered in the metastore</li>
+      </ul>
+      <pre><code class="language-sql">-- Check table statistics freshness
+DESCRIBE EXTENDED production.user_events;
+-- Look for: Statistics: 1234567 bytes, 100000 rows
+-- If missing or outdated:
+
+-- Refresh table-level statistics
+ANALYZE TABLE production.user_events COMPUTE STATISTICS;
+
+-- Refresh column-level statistics (critical for join optimization)
+ANALYZE TABLE production.user_events
+COMPUTE STATISTICS FOR COLUMNS
+  user_id, event_type, event_timestamp, region;
+
+-- Check column statistics
+DESCRIBE EXTENDED production.user_events user_id;
+-- Shows: distinct_count, min, max, null_count, avg_len, max_len</code></pre>
+
+      <h3>AQE Disabled or Misconfigured</h3>
+      <p>Adaptive Query Execution can mask plan issues — but if it's accidentally disabled, previously-working queries regress:</p>
+      <pre><code class="language-python"># Common AQE misconfigurations that cause regressions
+# Check if AQE is actually enabled
+print(spark.conf.get("spark.sql.adaptive.enabled"))  # should be "true"
+
+# These settings interact with AQE behavior:
+critical_settings = {
+    "spark.sql.adaptive.enabled": "true",
+    "spark.sql.adaptive.coalescePartitions.enabled": "true",
+    "spark.sql.adaptive.skewJoin.enabled": "true",
+    "spark.sql.adaptive.localShuffleReader.enabled": "true",
+    # This was renamed in Spark 3.2 — old config silently ignored!
+    "spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled": "true",
+}
+
+for key, expected in critical_settings.items():
+    actual = spark.conf.get(key, "NOT SET")
+    status = "✓" if actual == expected else "⚠️"
+    print(f"  {status} {key} = {actual} (expected: {expected})")</code></pre>
+
+      <h3>Broadcast Threshold Crossed</h3>
+      <p>The most dramatic plan regression: a table that was small enough to broadcast grows past the threshold, converting a broadcast hash join into a sort-merge join:</p>
+      <pre><code class="language-python"># Broadcast join: O(N) — stream large table, probe small hash table
+# Sort-merge join: O(N log N) — shuffle both sides, sort, merge
+#
+# When a dimension table grows past spark.sql.autoBroadcastJoinThreshold:
+# - Before: 10s (broadcast)
+# - After: 300s (sort-merge with full shuffle)
+
+# Check current threshold
+threshold = spark.conf.get("spark.sql.autoBroadcastJoinThreshold")
+print(f"Broadcast threshold: {threshold}")  # default: 10MB
+
+# Check actual table size vs threshold
+table_size = spark.sql("""
+  SELECT SUM(file_size_in_bytes) AS total_bytes
+  FROM catalog.events.dim_products.files
+""").collect()[0]["total_bytes"]
+
+print(f"Table size: {table_size / (1024*1024):.1f}MB")
+print(f"Threshold: {int(threshold) / (1024*1024):.1f}MB")
+
+if table_size > int(threshold):
+    print("⚠️  Table exceeds broadcast threshold!")
+    print("   Options:")
+    print("   1. Increase threshold: spark.sql.autoBroadcastJoinThreshold = 100m")
+    print("   2. Force broadcast: F.broadcast(dim_df)")
+    print("   3. Filter dimension table before join")
+    print("   4. Use bucket join instead")</code></pre>
+
+      <h3>Comparing Query Plans</h3>
+      <pre><code class="language-python"># Save and compare query plans between runs
+def save_query_plan(df, plan_name):
+    """Save physical plan for later comparison."""
+    plan = df._jdf.queryExecution().executedPlan().toString()
+    with open(f"/tmp/plans/{plan_name}.txt", "w") as f:
+        f.write(plan)
+    return plan
+
+def compare_plans(plan_a_path, plan_b_path):
+    """Compare two query plans to find regressions."""
+    with open(plan_a_path) as f:
+        plan_a = f.read()
+    with open(plan_b_path) as f:
+        plan_b = f.read()
+
+    # Check for join strategy changes
+    joins_a = re.findall(r"(BroadcastHashJoin|SortMergeJoin|ShuffledHashJoin)", plan_a)
+    joins_b = re.findall(r"(BroadcastHashJoin|SortMergeJoin|ShuffledHashJoin)", plan_b)
+
+    if joins_a != joins_b:
+        print(f"⚠️  JOIN STRATEGY CHANGED:")
+        print(f"   Before: {joins_a}")
+        print(f"   After: {joins_b}")
+
+    # Check for sort operations
+    sorts_a = plan_a.count("Sort ")
+    sorts_b = plan_b.count("Sort ")
+    if sorts_b > sorts_a:
+        print(f"⚠️  Additional sorts detected: {sorts_a} → {sorts_b}")
+
+    # Check partition counts
+    exchanges_a = re.findall(r"Exchange.*numPartitions=(\d+)", plan_a)
+    exchanges_b = re.findall(r"Exchange.*numPartitions=(\d+)", plan_b)
+    print(f"   Shuffle partitions before: {exchanges_a}")
+    print(f"   Shuffle partitions after: {exchanges_b}")</code></pre>
+
+      <h3>Prevention</h3>
+      <ul>
+        <li>Schedule <code>ANALYZE TABLE</code> after every significant write</li>
+        <li>Pin broadcast hints for known dimension tables: <code>df.join(F.broadcast(dim), ...)</code></li>
+        <li>Version query plans in CI and alert on strategy changes</li>
+        <li>Use Cost-Based Optimization (CBO) with fresh statistics</li>
+        <li>Test plan stability when upgrading Spark versions</li>
+      </ul>
+    </section>
+
+    <!-- Section 10: Infrastructure Issues -->
+    <section id="infrastructure">
+      <h2>Infrastructure Issues</h2>
+      <p>Infrastructure problems are particularly insidious because they cause slowdowns without any code or data changes. The same pipeline, same data, same configuration — just slower because the underlying platform is degraded.</p>
+
+      <h3>Noisy Neighbors</h3>
+      <p>In multi-tenant environments (shared Kubernetes clusters, cloud VMs with shared hypervisors), other workloads can steal resources:</p>
+      <ul>
+        <li><strong>CPU steal time</strong> — Hypervisor allocating your CPU cycles to other VMs (check <code>%steal</code> in <code>top</code>)</li>
+        <li><strong>Memory pressure</strong> — Host-level swapping affects all containers on the node</li>
+        <li><strong>Network bandwidth</strong> — Competing workloads saturating the NIC</li>
+        <li><strong>Disk I/O contention</strong> — Local SSD shared between containers</li>
+      </ul>
+      <pre><code class="language-bash"># Check for noisy neighbor indicators
+# CPU steal time (should be < 5%)
+mpstat 1 5 | grep "all" | awk '{print "steal: " $9 "%"}'
+
+# Memory pressure
+cat /proc/pressure/memory
+# "full avg10=0.00 avg60=0.00 avg300=0.00" = healthy
+# "full avg10=45.00 ..." = severe contention
+
+# Network throughput
+sar -n DEV 1 5 | grep eth0
+
+# EBS volume throughput (AWS)
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/EBS \
+  --metric-name VolumeReadOps \
+  --dimensions Name=VolumeId,Value=vol-0123456789abcdef0 \
+  --start-time $(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 300 \
+  --statistics Average</code></pre>
+
+      <h3>Storage Throttling</h3>
+      <p>Cloud storage services impose rate limits that can suddenly become the bottleneck:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Service</th>
+            <th>Limit</th>
+            <th>Impact</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>S3 per-prefix</td>
+            <td>5,500 GET/s, 3,500 PUT/s</td>
+            <td>HTTP 503 SlowDown errors</td>
+          </tr>
+          <tr>
+            <td>EBS gp3</td>
+            <td>16,000 IOPS, 1,000 MB/s</td>
+            <td>I/O queue depth spikes</td>
+          </tr>
+          <tr>
+            <td>GCS</td>
+            <td>5,000 reads/s per object</td>
+            <td>429 rate limit responses</td>
+          </tr>
+          <tr>
+            <td>ADLS Gen2</td>
+            <td>20,000 requests/s per account</td>
+            <td>HTTP 429 throttling</td>
+          </tr>
+        </tbody>
+      </table>
+      <pre><code class="language-python"># Detect S3 throttling from Spark logs
+# Look for retry patterns indicating 503 SlowDown
+import re
+
+def check_s3_throttling(spark_log_path):
+    """Detect S3 throttling from driver/executor logs."""
+    throttle_count = 0
+    retry_count = 0
+
+    with open(spark_log_path) as f:
+        for line in f:
+            if "503 SlowDown" in line or "Retrying request" in line:
+                throttle_count += 1
+            if "AmazonS3Exception" in line and "reduce your request rate" in line:
+                retry_count += 1
+
+    if throttle_count > 0:
+        print(f"⚠️  S3 throttling detected: {throttle_count} events")
+        print("   Remediation:")
+        print("   - Add random prefix to S3 keys for better partitioning")
+        print("   - Use S3 Express One Zone for hot paths")
+        print("   - Implement exponential backoff in custom readers")
+        print("   - Reduce parallelism: spark.sql.shuffle.partitions")
+
+# S3 key layout optimization for throughput
+# BAD:  s3://bucket/events/dt=2024-01-15/part-00001.parquet
+#       (all reads hit same prefix, single partition)
+# GOOD: s3://bucket/a3f2/events/dt=2024-01-15/part-00001.parquet
+#       (random prefix distributes across S3 partitions)</code></pre>
+
+      <h3>Network Partition &amp; Degradation</h3>
+      <ul>
+        <li><strong>Cross-AZ traffic</strong> — Executors in different AZs add 1-2ms latency per request; at millions of shuffle fetches, this adds up to minutes</li>
+        <li><strong>DNS resolution delays</strong> — Stale DNS cache pointing to decommissioned nodes</li>
+        <li><strong>VPC flow log throttling</strong> — In monitored environments, flow logs can create backpressure</li>
+        <li><strong>Security group changes</strong> — New rules blocking shuffle service ports (7337)</li>
+      </ul>
+
+      <h3>Cluster Autoscaling Lag</h3>
+      <pre><code class="language-python"># Autoscaling issues that cause slowdowns:
+# 1. Scale-up too slow: cluster starts with 10 nodes, needs 50
+#    Time to provision new nodes: 3-5 min on AWS, longer with custom AMIs
+#
+# 2. Scale-down too aggressive: nodes removed mid-shuffle
+#    Lost shuffle data → FetchFailedException → task retry
+#
+# 3. Scaling policy mismatch: scales on CPU but bottleneck is memory
+
+# EMR managed scaling configuration
+# aws emr modify-cluster --cluster-id j-XXXXX --managed-scaling-policy '{
+#   "ComputeLimits": {
+#     "UnitType": "InstanceFleetUnits",
+#     "MinimumCapacityUnits": 10,
+#     "MaximumCapacityUnits": 100,
+#     "MaximumOnDemandCapacityUnits": 20,
+#     "MaximumCoreCapacityUnits": 30
+#   }
+# }'
+
+# Kubernetes autoscaler lag diagnostic
+# kubectl describe hpa spark-executor-pool
+# Look for:
+#   Conditions:
+#     ScalingLimited: True (hit max replicas)
+#     AbleToScale: False (can't find suitable nodes)
+
+# Mitigation: pre-warm cluster before critical pipelines
+# Schedule a lightweight job 10 minutes before the main ETL
+# that forces the cluster to scale up</code></pre>
+
+      <h3>Infrastructure Diagnostic Checklist</h3>
+      <pre><code class="language-bash"># Quick infrastructure health check script
+#!/bin/bash
+echo "=== Infrastructure Diagnostics ==="
+
+echo -e "\n--- CPU Steal ---"
+mpstat 1 1 | tail -1 | awk '{printf "steal: %.1f%%\n", $9}'
+
+echo -e "\n--- Memory Pressure ---"
+free -h | grep Mem | awk '{printf "Used: %s / %s (%.0f%%)\n", $3, $2, $3/$2*100}'
+
+echo -e "\n--- Disk I/O ---"
+iostat -x 1 1 | grep -E "(nvme|xvd)" | awk '{printf "%s: util=%.1f%% await=%.1fms\n", $1, $NF, $10}'
+
+echo -e "\n--- Network ---"
+ss -s | grep "TCP:"
+
+echo -e "\n--- S3 Connectivity ---"
+time aws s3 ls s3://data-lake/raw/events/ --max-items 1 2>/dev/null
+
+echo -e "\n--- DNS Resolution ---"
+time nslookup s3.us-east-1.amazonaws.com 2>/dev/null | tail -2</code></pre>
+    </section>
+
+    <!-- Section 11: Production Incident -->
+    <section id="production-incident">
+      <h2>Production Incident: 500x Partition Explosion</h2>
+      <div class="callout callout-warning">
+        <p><strong>Real incident:</strong> A daily pipeline that ran in 45 minutes suddenly took 3.5 hours. Root cause: an upstream team added a new high-cardinality column that caused a 500x partition explosion during a <code>groupBy</code> operation.</p>
+      </div>
+
+      <h3>Timeline</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Event</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>02:00 UTC</td>
+            <td>Daily ETL triggered by Airflow (cron: <code>0 2 * * *</code>)</td>
+          </tr>
+          <tr>
+            <td>02:05</td>
+            <td>Pipeline starts processing. First 3 stages complete normally (5 min total, as expected).</td>
+          </tr>
+          <tr>
+            <td>02:15</td>
+            <td>Stage 4 (<code>groupBy</code> aggregation) begins. Usually takes 20 min.</td>
+          </tr>
+          <tr>
+            <td>03:00</td>
+            <td>Stage 4 still running. Spark UI shows 200 tasks complete, 1,800 pending.</td>
+          </tr>
+          <tr>
+            <td>03:30</td>
+            <td>PagerDuty alert: pipeline SLA breach (expected completion: 02:50).</td>
+          </tr>
+          <tr>
+            <td>04:00</td>
+            <td>On-call engineer begins investigation.</td>
+          </tr>
+          <tr>
+            <td>04:15</td>
+            <td>Root cause identified: <code>spark.sql.shuffle.partitions</code> was 200, but the new column created 100K distinct key combinations → 100K output partitions → shuffle explosion.</td>
+          </tr>
+          <tr>
+            <td>04:30</td>
+            <td>Hotfix deployed: removed new column from <code>groupBy</code>, added as post-aggregation join.</td>
+          </tr>
+          <tr>
+            <td>05:30</td>
+            <td>Pipeline completed (3.5 hours total).</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Root Cause Analysis</h3>
+      <pre><code class="language-python"># Original pipeline code (worked fine for months)
+daily_agg = (
+    events_df
+    .groupBy("user_id", "event_type", "region")
+    .agg(
+        F.count("*").alias("event_count"),
+        F.sum("revenue").alias("total_revenue"),
+    )
+)
+# Key cardinality: ~50K users × 10 event_types × 5 regions = ~2.5M groups
+# With 200 shuffle partitions → ~12,500 groups per partition (manageable)
+
+# After upstream change (new column added to schema):
+# The upstream team added 'sub_event_type' with 200 distinct values
+# An analyst updated the pipeline to include it without impact analysis:
+daily_agg = (
+    events_df
+    .groupBy("user_id", "event_type", "sub_event_type", "region")  # ← NEW COLUMN
+    .agg(
+        F.count("*").alias("event_count"),
+        F.sum("revenue").alias("total_revenue"),
+    )
+)
+# New key cardinality: 50K × 10 × 200 × 5 = 500M groups!
+# With 200 shuffle partitions → 2.5M groups per partition
+# Each partition now processes 500x more data → shuffle spill → disk I/O → 3x slowdown</code></pre>
+
+      <h3>Investigation Steps (What We Checked)</h3>
+      <ol>
+        <li><strong>Data volume</strong> — Input size was unchanged (50GB). Ruled out volume growth.</li>
+        <li><strong>Spark UI Stage view</strong> — Stage 4 showed 200 tasks with extreme variation:
+          <ul>
+            <li>Median task: 2 min (vs. usual 5 sec)</li>
+            <li>Max task: 45 min (vs. usual 30 sec)</li>
+            <li>Shuffle write: 800GB (vs. usual 1.5GB)</li>
+          </ul>
+        </li>
+        <li><strong>Shuffle metrics</strong> — Massive spill: 600GB spilled to disk (previously 0)</li>
+        <li><strong>Data profiling</strong> — Ran cardinality analysis on groupBy keys:
+          <pre><code class="language-python"># This revealed the explosion
+events_df.select(
+    F.approx_count_distinct("user_id").alias("users"),
+    F.approx_count_distinct("event_type").alias("event_types"),
+    F.approx_count_distinct("sub_event_type").alias("sub_event_types"),
+    F.approx_count_distinct("region").alias("regions"),
+).show()
+# +-------+-----------+----------------+-------+
+# | users | event_types| sub_event_types| regions|
+# +-------+-----------+----------------+-------+
+# | 52341 |     10    |      203       |   5   |
+# +-------+-----------+----------------+-------+
+# Cross product: 52K × 10 × 203 × 5 ≈ 530M potential groups</code></pre>
+        </li>
+        <li><strong>Git blame</strong> — Found the commit that added <code>sub_event_type</code> to the groupBy (merged 2 days ago, first ran on this date's data)</li>
+      </ol>
+
+      <h3>Resolution</h3>
+      <pre><code class="language-python"># Immediate fix: remove sub_event_type from groupBy
+# Instead, compute it as a separate aggregation and join back
+
+# Step 1: Core aggregation (fast, low cardinality)
+core_agg = (
+    events_df
+    .groupBy("user_id", "event_type", "region")
+    .agg(
+        F.count("*").alias("event_count"),
+        F.sum("revenue").alias("total_revenue"),
+    )
+)
+
+# Step 2: Sub-event breakdown (separate, narrow aggregation)
+sub_event_agg = (
+    events_df
+    .groupBy("user_id", "event_type", "region", "sub_event_type")
+    .agg(F.count("*").alias("sub_event_count"))
+)
+
+# Step 3: Pivot sub_event_type into columns (bounded width)
+sub_event_pivot = (
+    sub_event_agg
+    .groupBy("user_id", "event_type", "region")
+    .pivot("sub_event_type")
+    .agg(F.sum("sub_event_count"))
+)
+
+# Step 4: Join results (broadcast join since core_agg is small)
+result = core_agg.join(
+    F.broadcast(sub_event_pivot),
+    on=["user_id", "event_type", "region"],
+    how="left"
+)</code></pre>
+
+      <h3>Prevention Measures Implemented</h3>
+      <ul>
+        <li><strong>Cardinality guard</strong> — Pre-check that rejects groupBy keys with combined cardinality > 10M</li>
+        <li><strong>Schema change alerts</strong> — Notify downstream pipeline owners when upstream schemas change</li>
+        <li><strong>PR review checklist</strong> — Any change to <code>groupBy</code>/<code>join</code> keys requires cardinality impact analysis</li>
+        <li><strong>Automated plan comparison</strong> — CI compares query plans between PR and main branch</li>
+        <li><strong>SLA monitors</strong> — Alert after 50% of expected runtime, not 100%</li>
+      </ul>
+    </section>
+
+    <!-- Section 12: Debugging Workflow -->
+    <section id="debugging-workflow">
+      <h2>Systematic Debugging Workflow</h2>
+      <p>A senior engineer follows a structured runbook rather than random guessing. Here is the systematic approach from alert to resolution:</p>
+
+      <h3>Step 1: Airflow Logs (First 2 Minutes)</h3>
+      <pre><code class="language-bash"># Check DAG run status and task durations
+airflow dags list-runs -d daily_etl --state running
+airflow tasks states-for-dag-run daily_etl 2024-01-15T02:00:00
+
+# Compare with historical durations
+airflow tasks list daily_etl --tree | head -20
+
+# Get the Spark application ID from task logs
+airflow tasks log daily_etl transform_events 2024-01-15T02:00:00 | grep "application_"
+
+# Check for upstream task delays (dependencies that ran late)
+airflow dags list-runs -d upstream_ingestion --limit 5</code></pre>
+
+      <h3>Step 2: Spark UI (Minutes 2–10)</h3>
+      <pre><code class="language-bash"># Access Spark History Server
+# URL: http://spark-history:18080/history/${APP_ID}/stages/
+
+# Key things to check:
+# 1. Which stage is slow? (Sort by duration)
+# 2. Task duration distribution (look for stragglers)
+# 3. Shuffle read/write bytes (comparison with historical)
+# 4. Spill metrics (memory and disk)
+# 5. Task failure count and error messages
+
+# Programmatic access via REST API
+APP_ID="application_1705312800_0042"
+SPARK_UI="http://spark-history:18080"
+
+# Get all stages sorted by duration
+curl -s "${SPARK_UI}/api/v1/applications/${APP_ID}/stages" | \
+  jq 'sort_by(.submissionTime) |
+    .[] | {
+      stageId,
+      name: .name[:60],
+      duration_sec: (.executorRunTime / 1000),
+      input_gb: (.inputBytes / 1073741824),
+      shuffle_read_gb: (.shuffleReadBytes / 1073741824),
+      shuffle_write_gb: (.shuffleWriteBytes / 1073741824),
+      spill_gb: (.diskBytesSpilled / 1073741824),
+      failed_tasks: .numFailedTasks
+    }'</code></pre>
+
+      <h3>Step 3: Executor Metrics (Minutes 10–15)</h3>
+      <pre><code class="language-python"># Pull executor-level metrics
+import requests
+
+def get_executor_health(spark_ui, app_id):
+    """Analyze executor health and resource usage."""
+    executors = requests.get(
+        f"{spark_ui}/api/v1/applications/{app_id}/executors"
+    ).json()
+
+    print(f"{'Executor':<12} {'Cores':<6} {'Memory':<10} {'Tasks':<8} "
+          f"{'Failed':<8} {'GC Time':<10} {'Shuffle':<12}")
+    print("-" * 80)
+
+    total_gc = 0
+    total_runtime = 0
+
+    for ex in executors:
+        if ex["id"] == "driver":
+            continue
+        gc_pct = (ex["totalGCTime"] / max(ex["totalDuration"], 1)) * 100
+        total_gc += ex["totalGCTime"]
+        total_runtime += ex["totalDuration"]
+
+        print(f"{ex['id']:<12} {ex['totalCores']:<6} "
+              f"{ex['memoryUsed']/1e9:.1f}GB    "
+              f"{ex['totalTasks']:<8} {ex['failedTasks']:<8} "
+              f"{gc_pct:.1f}%      "
+              f"{ex['totalShuffleRead']/1e9:.1f}GB")
+
+    avg_gc = (total_gc / max(total_runtime, 1)) * 100
+    print(f"\nAverage GC overhead: {avg_gc:.1f}%")
+    if avg_gc > 10:
+        print("⚠️  High GC pressure — consider increasing executor memory")
+
+    # Check for executor loss
+    lost = [e for e in executors if not e["isActive"] and e["id"] != "driver"]
+    if lost:
+        print(f"\n⚠️  {len(lost)} executors lost during execution!")
+        for e in lost:
+            print(f"   Executor {e['id']}: removed at {e.get('removeTime', 'unknown')}")
+            print(f"   Reason: {e.get('removeReason', 'unknown')}")</code></pre>
+
+      <h3>Step 4: Data Profiling (Minutes 15–25)</h3>
+      <pre><code class="language-python"># Profile the input data to identify anomalies
+def profile_pipeline_inputs(input_path, date, baseline_date):
+    """Compare today's input data with a known-good baseline."""
+    today = spark.read.parquet(f"{input_path}/dt={date}")
+    baseline = spark.read.parquet(f"{input_path}/dt={baseline_date}")
+
+    # Volume comparison
+    today_count = today.count()
+    baseline_count = baseline.count()
+    volume_ratio = today_count / max(baseline_count, 1)
+    print(f"Volume: today={today_count:,} baseline={baseline_count:,} "
+          f"ratio={volume_ratio:.2f}x")
+
+    # Schema comparison
+    today_cols = set(today.columns)
+    baseline_cols = set(baseline.columns)
+    new_cols = today_cols - baseline_cols
+    if new_cols:
+        print(f"⚠️  New columns detected: {new_cols}")
+
+    # Cardinality comparison for key columns
+    key_cols = ["user_id", "event_type", "region"]
+    for col in key_cols:
+        if col in today.columns:
+            today_card = today.select(F.approx_count_distinct(col)).collect()[0][0]
+            baseline_card = baseline.select(F.approx_count_distinct(col)).collect()[0][0]
+            ratio = today_card / max(baseline_card, 1)
+            status = "⚠️" if ratio > 2 else "✓"
+            print(f"  {status} {col}: today={today_card:,} "
+                  f"baseline={baseline_card:,} ratio={ratio:.2f}x")
+
+    # Null rate comparison
+    print("\nNull rates:")
+    for col in key_cols:
+        if col in today.columns:
+            today_nulls = today.filter(F.col(col).isNull()).count() / today_count
+            baseline_nulls = baseline.filter(F.col(col).isNull()).count() / baseline_count
+            if today_nulls > baseline_nulls * 2:
+                print(f"  ⚠️  {col}: nulls jumped {baseline_nulls:.4f} → {today_nulls:.4f}")</code></pre>
+
+      <h3>Step 5: Root Cause Determination</h3>
+      <div class="callout callout-info">
+        <p><strong>Decision tree for root cause:</strong></p>
+        <ul>
+          <li>Input volume grew &gt; 2x → <strong>Data Volume Growth</strong></li>
+          <li>One stage slow, all others normal → Check that stage's operations:
+            <ul>
+              <li>Shuffle spill &gt; 0 → <strong>Shuffle Bottleneck</strong> or <strong>Data Skew</strong></li>
+              <li>Task duration highly variable → <strong>Data Skew</strong></li>
+              <li>Many failed tasks → <strong>Executor Failures</strong></li>
+            </ul>
+          </li>
+          <li>Planning phase slow → <strong>Metadata Overhead</strong></li>
+          <li>All stages uniformly slow → <strong>Infrastructure Issue</strong></li>
+          <li>Join became sort-merge from broadcast → <strong>Query Plan Regression</strong></li>
+          <li>Input file count exploded → <strong>Small Files Problem</strong></li>
+        </ul>
+      </div>
+
+      <h3>Step 6: Mitigation &amp; Communication</h3>
+      <pre><code class="language-json">{
+  "incident_id": "INC-2024-0115",
+  "severity": "P2",
+  "title": "Daily ETL pipeline SLA breach (3.5h vs 45min expected)",
+  "root_cause": "Upstream schema change added high-cardinality column to groupBy",
+  "impact": "Downstream dashboards delayed by 2.5 hours",
+  "mitigation": "Removed sub_event_type from groupBy, restructured as post-join",
+  "prevention": [
+    "Schema change notification system",
+    "Cardinality guards in pipeline code",
+    "Query plan comparison in CI"
+  ],
+  "timeline": {
+    "detected": "2024-01-15T03:30Z",
+    "investigated": "2024-01-15T04:00Z",
+    "root_caused": "2024-01-15T04:15Z",
+    "mitigated": "2024-01-15T04:30Z",
+    "resolved": "2024-01-15T05:30Z"
+  }
+}</code></pre>
+    </section>
+
+    <!-- Section 13: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+
+      <h3>PySpark Debugging Utilities</h3>
+      <pre><code class="language-python">"""
+ETL Pipeline Debugging Toolkit
+Reusable utilities for investigating slow pipelines.
+"""
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from datetime import datetime, timedelta
+import time
+import json
+
+
+class PipelineDebugger:
+    """Comprehensive debugging toolkit for Spark ETL pipelines."""
+
+    def __init__(self, spark: SparkSession):
+        self.spark = spark
+        self.findings = []
+
+    def profile_stage_timing(self, df: DataFrame, stage_name: str):
+        """Measure and report stage execution time."""
+        start = time.time()
+        count = df.count()  # Force evaluation
+        duration = time.time() - start
+
+        finding = {
+            "stage": stage_name,
+            "duration_sec": round(duration, 2),
+            "row_count": count,
+            "rows_per_sec": int(count / max(duration, 0.001)),
+        }
+        self.findings.append(finding)
+        print(f"[{stage_name}] {duration:.1f}s | {count:,} rows | "
+              f"{finding['rows_per_sec']:,} rows/sec")
+        return df
+
+    def detect_skew(self, df: DataFrame, key_columns: list,
+                    threshold: float = 10.0):
+        """Detect partition skew in key columns."""
+        key_counts = df.groupBy(*key_columns).agg(
+            F.count("*").alias("cnt")
+        ).cache()
+
+        stats = key_counts.agg(
+            F.expr("percentile_approx(cnt, 0.5)").alias("p50"),
+            F.expr("percentile_approx(cnt, 0.95)").alias("p95"),
+            F.expr("percentile_approx(cnt, 0.99)").alias("p99"),
+            F.max("cnt").alias("max_cnt"),
+            F.count("*").alias("distinct_keys"),
+        ).collect()[0]
+
+        skew_ratio = stats["max_cnt"] / max(stats["p50"], 1)
+
+        print(f"\n[Skew Analysis] Keys: {key_columns}")
+        print(f"  Distinct keys: {stats['distinct_keys']:,}")
+        print(f"  P50: {stats['p50']:,} | P95: {stats['p95']:,} | "
+              f"P99: {stats['p99']:,} | Max: {stats['max_cnt']:,}")
+        print(f"  Skew ratio (max/p50): {skew_ratio:.1f}x")
+
+        if skew_ratio > threshold:
+            print(f"  ⚠️  SKEWED! Ratio {skew_ratio:.1f}x > threshold {threshold}x")
+            print(f"  Top 5 hottest keys:")
+            key_counts.orderBy(F.desc("cnt")).show(5, truncate=False)
+
+        key_counts.unpersist()
+        return skew_ratio
+
+    def compare_runs(self, current_metrics: dict, baseline_metrics: dict):
+        """Compare current run metrics against baseline."""
+        print("\n[Run Comparison]")
+        print(f"{'Metric':<30} {'Baseline':<15} {'Current':<15} {'Ratio':<10}")
+        print("-" * 70)
+
+        alerts = []
+        for key in current_metrics:
+            if key in baseline_metrics:
+                baseline_val = baseline_metrics[key]
+                current_val = current_metrics[key]
+                ratio = current_val / max(baseline_val, 1)
+                status = "⚠️" if ratio > 2 else "✓ "
+                print(f"{status} {key:<28} {baseline_val:<15,} "
+                      f"{current_val:<15,} {ratio:.2f}x")
+                if ratio > 2:
+                    alerts.append(f"{key}: {ratio:.1f}x increase")
+
+        return alerts
+
+    def generate_report(self) -> str:
+        """Generate JSON debugging report."""
+        report = {
+            "timestamp": datetime.now().isoformat(),
+            "spark_version": self.spark.version,
+            "findings": self.findings,
+            "spark_config": {
+                "shuffle_partitions": self.spark.conf.get(
+                    "spark.sql.shuffle.partitions"),
+                "aqe_enabled": self.spark.conf.get(
+                    "spark.sql.adaptive.enabled"),
+                "broadcast_threshold": self.spark.conf.get(
+                    "spark.sql.autoBroadcastJoinThreshold"),
+            }
+        }
+        return json.dumps(report, indent=2, default=str)</code></pre>
+
+      <h3>Data Profiling for Pipeline Inputs</h3>
+      <pre><code class="language-python">def profile_pipeline_data(spark, table_path, date, lookback=7):
+    """
+    Comprehensive data profiling to detect anomalies
+    that could cause pipeline slowdowns.
+    """
+    print(f"=== Data Profile: {table_path} (dt={date}) ===\n")
+
+    # Load current and baseline data
+    current = spark.read.parquet(f"{table_path}/dt={date}")
+    current.cache()
+
+    # Volume trend
+    print("[Volume Trend]")
+    volumes = []
+    for i in range(lookback + 1):
+        dt = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=i)).strftime("%Y-%m-%d")
+        try:
+            count = spark.read.parquet(f"{table_path}/dt={dt}").count()
+            volumes.append({"date": dt, "count": count})
+            marker = " ← TODAY" if i == 0 else ""
+            print(f"  {dt}: {count:>12,} rows{marker}")
+        except Exception:
+            print(f"  {dt}: MISSING")
+
+    if len(volumes) > 1:
+        avg_baseline = sum(v["count"] for v in volumes[1:]) / len(volumes[1:])
+        today_count = volumes[0]["count"]
+        if today_count > 2 * avg_baseline:
+            print(f"  ⚠️  Volume spike: {today_count/avg_baseline:.1f}x average")
+
+    # Column-level profiling
+    print(f"\n[Column Profiling] ({len(current.columns)} columns)")
+    for col_name in current.columns[:20]:  # Limit to first 20 columns
+        col_type = dict(current.dtypes)[col_name]
+        null_rate = current.filter(F.col(col_name).isNull()).count() / max(today_count, 1)
+
+        if col_type == "string":
+            distinct = current.select(
+                F.approx_count_distinct(col_name)
+            ).collect()[0][0]
+            print(f"  {col_name} ({col_type}): "
+                  f"distinct={distinct:,} null_rate={null_rate:.4f}")
+        else:
+            stats = current.select(
+                F.min(col_name).alias("min_val"),
+                F.max(col_name).alias("max_val"),
+            ).collect()[0]
+            print(f"  {col_name} ({col_type}): "
+                  f"min={stats['min_val']} max={stats['max_val']} "
+                  f"null_rate={null_rate:.4f}")
+
+    current.unpersist()</code></pre>
+
+      <h3>Partition Analysis</h3>
+      <pre><code class="language-python">def analyze_partitions(spark, df: DataFrame, partition_col: str):
+    """
+    Analyze partition distribution to detect imbalance
+    that could cause shuffle issues.
+    """
+    # Get row counts per partition
+    partition_stats = df.groupBy(partition_col).agg(
+        F.count("*").alias("row_count"),
+        F.sum(F.length(F.to_json(F.struct("*")))).alias("approx_bytes"),
+    ).cache()
+
+    summary = partition_stats.agg(
+        F.count("*").alias("num_partitions"),
+        F.sum("row_count").alias("total_rows"),
+        F.min("row_count").alias("min_rows"),
+        F.max("row_count").alias("max_rows"),
+        F.avg("row_count").alias("avg_rows"),
+        F.stddev("row_count").alias("stddev_rows"),
+        F.expr("percentile_approx(row_count, 0.5)").alias("p50_rows"),
+        F.expr("percentile_approx(row_count, 0.99)").alias("p99_rows"),
+    ).collect()[0]
+
+    print(f"=== Partition Analysis: {partition_col} ===")
+    print(f"  Partitions: {summary['num_partitions']:,}")
+    print(f"  Total rows: {summary['total_rows']:,}")
+    print(f"  Min/Max rows: {summary['min_rows']:,} / {summary['max_rows']:,}")
+    print(f"  Avg rows: {summary['avg_rows']:,.0f}")
+    print(f"  P50/P99 rows: {summary['p50_rows']:,} / {summary['p99_rows']:,}")
+    print(f"  Stddev: {summary['stddev_rows']:,.0f}")
+
+    # Coefficient of variation (CV) > 1.0 indicates high skew
+    cv = summary["stddev_rows"] / max(summary["avg_rows"], 1)
+    print(f"  CV (stddev/mean): {cv:.2f} {'⚠️ HIGH SKEW' if cv > 1.0 else '✓'}")
+
+    # Show emptiest and fullest partitions
+    print(f"\n  Top 5 largest partitions:")
+    partition_stats.orderBy(F.desc("row_count")).show(5, truncate=False)
+
+    print(f"  Top 5 smallest partitions:")
+    partition_stats.orderBy(F.asc("row_count")).show(5, truncate=False)
+
+    # Recommendation
+    if summary["max_rows"] > 10 * summary["p50_rows"]:
+        print("  💡 Recommendation: Use salting or repartition by hash")
+        print(f"     Max partition is {summary['max_rows']/summary['p50_rows']:.0f}x "
+              f"the median")
+
+    partition_stats.unpersist()
+    return summary</code></pre>
+
+      <h3>AQE Configuration &amp; Validation</h3>
+      <pre><code class="language-python">def configure_aqe_for_pipeline(spark, data_size_gb: float,
+                                has_skew: bool = False,
+                                has_small_partitions: bool = False):
+    """
+    Configure Adaptive Query Execution based on pipeline characteristics.
+    """
+    print("=== AQE Configuration ===\n")
+
+    # Core AQE settings
+    spark.conf.set("spark.sql.adaptive.enabled", "true")
+    print("✓ AQE enabled")
+
+    # Coalesce partitions (reduces small partitions after filter/join)
+    if has_small_partitions:
+        spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        spark.conf.set("spark.sql.adaptive.coalescePartitions.minPartitionSize", "64m")
+        # Target partition size after coalescing
+        target_size = min(256, max(64, int(data_size_gb * 1024 / 200)))
+        spark.conf.set(
+            "spark.sql.adaptive.advisoryPartitionSizeInBytes",
+            f"{target_size}m"
+        )
+        print(f"✓ Partition coalescing: target {target_size}MB")
+
+    # Skew join handling
+    if has_skew:
+        spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+        spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
+        spark.conf.set(
+            "spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256m"
+        )
+        print("✓ Skew join optimization enabled (factor=5, threshold=256MB)")
+
+    # Dynamic partition count
+    target_partitions = max(200, int(data_size_gb * 1024 / 128))
+    spark.conf.set("spark.sql.shuffle.partitions", str(target_partitions))
+    spark.conf.set("spark.sql.adaptive.coalescePartitions.initialPartitionNum",
+                   str(target_partitions * 2))
+    print(f"✓ Shuffle partitions: {target_partitions} "
+          f"(initial: {target_partitions * 2})")
+
+    # Local shuffle reader (avoid unnecessary network shuffle)
+    spark.conf.set("spark.sql.adaptive.localShuffleReader.enabled", "true")
+    print("✓ Local shuffle reader enabled")
+
+    # Validate configuration
+    print("\n[Validation]")
+    critical_configs = [
+        "spark.sql.adaptive.enabled",
+        "spark.sql.adaptive.coalescePartitions.enabled",
+        "spark.sql.adaptive.skewJoin.enabled",
+        "spark.sql.shuffle.partitions",
+        "spark.sql.adaptive.advisoryPartitionSizeInBytes",
+        "spark.sql.autoBroadcastJoinThreshold",
+    ]
+    for config in critical_configs:
+        value = spark.conf.get(config, "NOT SET")
+        print(f"  {config} = {value}")
+
+    return target_partitions</code></pre>
+
+      <h3>End-to-End Pipeline Monitoring</h3>
+      <pre><code class="language-python">class PipelineMonitor:
+    """
+    Attach to a pipeline to collect real-time metrics
+    and detect anomalies during execution.
+    """
+
+    def __init__(self, spark, pipeline_name: str, sla_minutes: int):
+        self.spark = spark
+        self.pipeline_name = pipeline_name
+        self.sla_minutes = sla_minutes
+        self.start_time = time.time()
+        self.stage_timings = []
+        self.alerts = []
+
+    def checkpoint(self, stage_name: str, df: DataFrame = None):
+        """Record a timing checkpoint between pipeline stages."""
+        elapsed = time.time() - self.start_time
+        self.stage_timings.append({
+            "stage": stage_name,
+            "elapsed_sec": round(elapsed, 1),
+            "timestamp": datetime.now().isoformat(),
+        })
+
+        # SLA check
+        pct_elapsed = elapsed / (self.sla_minutes * 60)
+        if pct_elapsed > 0.7:
+            self.alerts.append(
+                f"SLA WARNING: {pct_elapsed:.0%} of SLA used at stage '{stage_name}'"
+            )
+            print(f"⚠️  SLA WARNING: {elapsed/60:.1f}min elapsed "
+                  f"({pct_elapsed:.0%} of {self.sla_minutes}min SLA)")
+
+        # Optional: check DataFrame health
+        if df is not None:
+            partitions = df.rdd.getNumPartitions()
+            if partitions > 10000:
+                self.alerts.append(
+                    f"High partition count at '{stage_name}': {partitions}"
+                )
+                print(f"⚠️  High partition count: {partitions}")
+
+        return elapsed
+
+    def report(self):
+        """Generate final pipeline execution report."""
+        total_time = time.time() - self.start_time
+        print(f"\n{'='*60}")
+        print(f"Pipeline: {self.pipeline_name}")
+        print(f"Total duration: {total_time/60:.1f} minutes")
+        print(f"SLA: {self.sla_minutes} minutes "
+              f"({'✓ MET' if total_time < self.sla_minutes * 60 else '✗ BREACHED'})")
+        print(f"\nStage timings:")
+        for i, stage in enumerate(self.stage_timings):
+            prev_time = self.stage_timings[i-1]["elapsed_sec"] if i > 0 else 0
+            stage_duration = stage["elapsed_sec"] - prev_time
+            print(f"  {stage['stage']:<30} +{stage_duration:.1f}s "
+                  f"(cumulative: {stage['elapsed_sec']:.1f}s)")
+
+        if self.alerts:
+            print(f"\nAlerts ({len(self.alerts)}):")
+            for alert in self.alerts:
+                print(f"  ⚠️  {alert}")
+
+        return {
+            "pipeline": self.pipeline_name,
+            "duration_sec": round(total_time, 1),
+            "sla_met": total_time < self.sla_minutes * 60,
+            "stages": self.stage_timings,
+            "alerts": self.alerts,
+        }</code></pre>
+    </section>
+
+    <!-- Section 14: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <p>Senior candidates often lose points in interviews by making these errors when discussing ETL pipeline debugging:</p>
+
+      <h3>Mistake 1: Jumping to Solutions Without Diagnosis</h3>
+      <div class="callout callout-warning">
+        <p><strong>❌ Wrong:</strong> "I'd increase the cluster size and add more executors."</p>
+        <p><strong>✓ Right:</strong> "First, I'd check Airflow logs to identify which stage is slow, then examine the Spark UI for that stage's metrics before deciding on a fix."</p>
+      </div>
+      <p>Throwing hardware at the problem without understanding the root cause is expensive and often ineffective. A data skew issue won't improve with more executors — the bottleneck is a single partition.</p>
+
+      <h3>Mistake 2: Ignoring Data Changes</h3>
+      <div class="callout callout-warning">
+        <p><strong>❌ Wrong:</strong> "The code hasn't changed, so it must be an infrastructure issue."</p>
+        <p><strong>✓ Right:</strong> "Code didn't change, but data might have. I'd check input volume, schema changes, cardinality shifts, and data quality (nulls, duplicates)."</p>
+      </div>
+      <p>In production data pipelines, data changes far more frequently than code. Upstream teams add columns, volumes spike during campaigns, and backfills land unexpectedly.</p>
+
+      <h3>Mistake 3: Not Comparing with Baseline</h3>
+      <div class="callout callout-warning">
+        <p><strong>❌ Wrong:</strong> "The shuffle read is 50GB, which seems high."</p>
+        <p><strong>✓ Right:</strong> "The shuffle read is 50GB, compared to yesterday's 1.5GB — a 33x increase that correlates with the new groupBy key."</p>
+      </div>
+      <p>Absolute numbers mean nothing without context. Always compare with a recent successful run to identify what changed.</p>
+
+      <h3>Mistake 4: Conflating Correlation with Causation</h3>
+      <div class="callout callout-warning">
+        <p><strong>❌ Wrong:</strong> "GC time is high, so GC is the root cause."</p>
+        <p><strong>✓ Right:</strong> "GC time is high because data skew is causing one partition to hold 50GB in memory. The root cause is skew; GC is a symptom."</p>
+      </div>
+      <p>High GC, disk spill, and network wait are usually symptoms of upstream problems (skew, volume growth). Fix the cause, not the symptom.</p>
+
+      <h3>Mistake 5: Forgetting the Human Element</h3>
+      <div class="callout callout-warning">
+        <p><strong>❌ Wrong:</strong> Only discussing technical debugging steps.</p>
+        <p><strong>✓ Right:</strong> "While investigating, I'd communicate the SLA breach to stakeholders, provide an ETA, and check if any upstream teams made recent changes."</p>
+      </div>
+      <p>Production incidents require communication: updating status pages, notifying downstream consumers, coordinating with upstream teams, and writing postmortems.</p>
+
+      <h3>Mistake 6: Not Considering Compounding Effects</h3>
+      <div class="callout callout-warning">
+        <p><strong>❌ Wrong:</strong> "The root cause is X."</p>
+        <p><strong>✓ Right:</strong> "The primary trigger was data volume growth (1.5x), which caused shuffle spill, which triggered excessive GC, which led to task timeouts and retries — compounding into a 3x total slowdown."</p>
+      </div>
+      <p>Real-world slowdowns are rarely single-cause. A 3x slowdown is often 1.5x from volume × 1.3x from spill × 1.5x from retries. Explain the cascade.</p>
+
+      <h3>Mistake 7: Proposing Non-Reproducible Fixes</h3>
+      <div class="callout callout-warning">
+        <p><strong>❌ Wrong:</strong> "I'd just restart the cluster and rerun."</p>
+        <p><strong>✓ Right:</strong> "For immediate mitigation, I'd [specific fix]. For prevention, I'd implement [monitoring/guard/automation] to detect this before it impacts SLA."</p>
+      </div>
+      <p>Restarting works once but doesn't prevent recurrence. Senior engineers implement lasting solutions: circuit breakers, data contracts, automated scaling policies, and monitoring.</p>
+    </section>
+
+    <!-- Section 15: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <p>Every optimization involves trade-offs. A senior engineer articulates these clearly:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Optimization</th>
+            <th>Benefit</th>
+            <th>Cost / Risk</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Increase shuffle partitions</td>
+            <td>Reduces per-partition memory, avoids spill</td>
+            <td>More tasks = more scheduling overhead; too many partitions = small files on output</td>
+          </tr>
+          <tr>
+            <td>Broadcast join hint</td>
+            <td>Eliminates shuffle for dimension joins</td>
+            <td>Driver OOM if table grows; stale broadcast if table updates mid-job</td>
+          </tr>
+          <tr>
+            <td>Salting for skew</td>
+            <td>Distributes hot keys evenly</td>
+            <td>Requires exploding the right side (memory + compute); complex code</td>
+          </tr>
+          <tr>
+            <td>More executors / larger instances</td>
+            <td>More parallelism, more memory</td>
+            <td>Higher cost; diminishing returns past optimal parallelism; spot preemption risk</td>
+          </tr>
+          <tr>
+            <td>File compaction</td>
+            <td>Faster reads, less metadata overhead</td>
+            <td>Write amplification; concurrent read conflicts; compute cost of compaction job</td>
+          </tr>
+          <tr>
+            <td>AQE (Adaptive Query Execution)</td>
+            <td>Runtime plan optimization</td>
+            <td>Less predictable performance; harder to reproduce issues; slight planning overhead</td>
+          </tr>
+          <tr>
+            <td>Partition pruning via Iceberg</td>
+            <td>Skip irrelevant data at planning time</td>
+            <td>Migration cost from Hive; learning curve; additional metadata management</td>
+          </tr>
+          <tr>
+            <td>Circuit breaker (abort on volume spike)</td>
+            <td>Prevents SLA breach from cascading</td>
+            <td>May abort legitimate spikes (new market launch); requires manual intervention</td>
+          </tr>
+          <tr>
+            <td>Speculative execution</td>
+            <td>Handles stragglers automatically</td>
+            <td>Wastes resources on duplicate work; dangerous with non-idempotent sinks</td>
+          </tr>
+          <tr>
+            <td>Pre-warm cluster</td>
+            <td>Eliminates autoscaling lag</td>
+            <td>Paying for idle resources; wasted spend if pipeline fails early</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Cost vs. Performance vs. Reliability Triangle</h3>
+      <ul>
+        <li><strong>Cost-optimized</strong> — Spot instances, aggressive autoscaling down, shared clusters → risk: preemption, contention</li>
+        <li><strong>Performance-optimized</strong> — Dedicated on-demand instances, over-provisioned → risk: high cloud bill</li>
+        <li><strong>Reliability-optimized</strong> — Redundant executors, checkpointing, external shuffle service → risk: complexity, slower steady-state</li>
+      </ul>
+      <p>The right balance depends on the pipeline's SLA tier. A revenue-critical daily report justifies over-provisioning; an experimental analytics job can tolerate occasional delays.</p>
+    </section>
+
+    <!-- Section 16: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <p>Interviewers often follow up with deeper probes. Prepare for these:</p>
+
+      <h3>Architecture &amp; Design</h3>
+      <ul>
+        <li><strong>"How would you design the pipeline to be resilient to this class of issues?"</strong>
+          <p>Implement data contracts with volume/schema guards, dynamic executor allocation based on input size, partition-aware processing with automatic salting for detected skew, and multi-tier SLA monitoring (50%/80%/100% of expected duration).</p>
+        </li>
+        <li><strong>"How do you prevent this from happening again?"</strong>
+          <p>Automated schema change detection alerts, cardinality analysis in CI for groupBy/join key changes, query plan regression tests, and runbook automation that triggers investigation within 5 minutes of SLA warning.</p>
+        </li>
+        <li><strong>"What observability would you add?"</strong>
+          <p>Per-stage execution metrics emitted to Datadog/Prometheus, input data profiling (volume, cardinality, null rates) before processing begins, Spark event listener that captures plan changes, and automated comparison with rolling 7-day baseline.</p>
+        </li>
+      </ul>
+
+      <h3>Deep Technical</h3>
+      <ul>
+        <li><strong>"Explain exactly what happens during a Spark shuffle."</strong>
+          <p>Map tasks write shuffle data to local disk sorted by partition ID. The shuffle manager tracks file locations. Reduce tasks fetch their partition data via BlockTransferService. With push-based shuffle (Spark 3.2+), mappers push data to a shuffle service, reducing random reads.</p>
+        </li>
+        <li><strong>"How does AQE decide to split a skewed partition?"</strong>
+          <p>After shuffle write completes, AQE reads shuffle partition sizes from MapOutputTracker. If a partition exceeds <code>skewedPartitionFactor × median</code> AND exceeds <code>skewedPartitionThresholdInBytes</code>, it splits that partition into sub-partitions and replicates the matching data from the other join side.</p>
+        </li>
+        <li><strong>"What's the difference between sort-merge join and shuffle hash join?"</strong>
+          <p>Sort-merge requires sorting both sides (expensive but handles any size). Shuffle hash builds a hash table from the smaller side (faster but requires the build side to fit in memory). Spark prefers sort-merge for safety but AQE can switch to hash join at runtime if the build side is small enough.</p>
+        </li>
+      </ul>
+
+      <h3>Behavioral</h3>
+      <ul>
+        <li><strong>"Tell me about a time you debugged a production pipeline issue."</strong>
+          <p>Use the STAR method: Situation (pipeline SLA breach), Task (root cause and fix within SLA window), Action (systematic investigation steps), Result (resolution time, prevention measures). The production incident in this chapter is a template for this answer.</p>
+        </li>
+        <li><strong>"How do you communicate with stakeholders during an incident?"</strong>
+          <p>Immediate acknowledgment, ETA for investigation, regular updates every 15 minutes, clear impact statement, and post-incident summary with prevention plan. Use incident channels (Slack #incidents) and status page updates.</p>
+        </li>
+        <li><strong>"How do you prioritize which root cause to investigate first?"</strong>
+          <p>Start with the highest-signal, lowest-cost checks: input volume (30 seconds), Spark UI stage overview (1 minute), failed task count (30 seconds). Then drill into the specific slow stage. Don't spend 20 minutes checking infrastructure if the Spark UI clearly shows one skewed partition.</p>
+        </li>
+      </ul>
+    </section>
+
+    <!-- Section 17: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <div class="callout callout-tip">
+        <p><strong>Key takeaways for the interview:</strong></p>
+      </div>
+      <ol>
+        <li><strong>Follow a systematic debugging workflow</strong> — Airflow logs → Spark UI → executor metrics → data profiling → infrastructure check. Don't guess randomly.</li>
+        <li><strong>Always compare with baseline</strong> — Absolute numbers mean nothing. Compare today's shuffle bytes, task counts, and stage durations with a recent successful run.</li>
+        <li><strong>Data changes more than code</strong> — Volume growth, schema changes, cardinality explosions, and backfills are the most common triggers for sudden slowdowns.</li>
+        <li><strong>Understand the cascade</strong> — A 3x slowdown is usually multiple factors compounding: volume growth → shuffle spill → disk I/O → task retries → 3x total.</li>
+        <li><strong>Know your Spark internals</strong> — Shuffle mechanics, AQE behavior, broadcast thresholds, and partition dynamics. These are the levers you pull to fix issues.</li>
+        <li><strong>Differentiate root cause from symptom</strong> — High GC, disk spill, and fetch wait are symptoms. Skew, volume growth, and plan regression are causes.</li>
+        <li><strong>Communicate and prevent</strong> — Debugging is half the job. The other half is communicating impact to stakeholders and implementing prevention (data contracts, monitoring, circuit breakers).</li>
+        <li><strong>Trade-offs are expected</strong> — Every fix has a cost. Articulate the trade-off: salting adds complexity, more instances add cost, compaction adds write amplification.</li>
+      </ol>
+
+      <h3>One-Sentence Answer</h3>
+      <p>"I systematically investigate by checking data volume changes, examining Spark UI stage metrics for shuffle spill and skew, profiling input data for cardinality explosions, reviewing infrastructure health, and comparing query plans — then fix the root cause and implement monitoring to prevent recurrence."</p>
+    </section>
+
+    <!-- Chapter Navigation (Bottom) -->
+    <nav class="chapter-nav">
+      <a href="ch15-exactly-once-streaming.html" class="prev">&larr; Previous</a>
+      <a href="ch17-incorrect-dashboard-metrics.html" class="next">Next &rarr;</a>
+    </nav>
+
+  </main>
+
+  <!-- Scripts -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

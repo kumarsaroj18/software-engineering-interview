@@ -1,0 +1,2506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ch 5 — Predicate Pushdown, Projection Pushdown & Nested Pruning | Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark/light theme">☀️</button>
+  <button class="mobile-menu-toggle" id="mobile-menu-toggle" aria-label="Toggle sidebar menu">☰</button>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="brand">DE Interview Handbook</a>
+    </div>
+    <div class="sidebar-chapter">Ch 5 / Predicate &amp; Projection Pushdown</div>
+    <nav class="sidebar-nav">
+      <a href="#interviewer-intent">Interviewer Intent</a>
+      <a href="#quick-answer">Quick Answer</a>
+      <a href="#predicate-pushdown">Predicate Pushdown</a>
+      <a href="#projection-pushdown">Projection Pushdown</a>
+      <a href="#nested-pruning">Nested Pruning</a>
+      <a href="#columnar-formats">Columnar Formats</a>
+      <a href="#partition-pruning">Partition Pruning</a>
+      <a href="#runtime-filters">Runtime Filters</a>
+      <a href="#cost-impact">Cost Impact</a>
+      <a href="#production-incident">Production Incident</a>
+      <a href="#debugging-workflow">Debugging Workflow</a>
+      <a href="#code-examples">Code Examples</a>
+      <a href="#common-mistakes">Common Mistakes</a>
+      <a href="#trade-offs">Trade-offs</a>
+      <a href="#follow-up-questions">Follow-up Questions</a>
+      <a href="#summary">Summary</a>
+    </nav>
+    <div class="sidebar-actions">
+      <a href="ch04-small-joins-big.html" class="btn">← Ch 4</a>
+      <a href="ch06-mvcc.html" class="btn">Ch 6 →</a>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <a href="../index.html#part-i">Part I</a> &gt;
+      <span>Chapter 5</span>
+    </nav>
+
+    <header class="chapter-header">
+      <span class="badge badge-hard">Hard</span>
+      <h1>Predicate Pushdown, Projection Pushdown &amp; Nested Pruning</h1>
+      <div class="topics">
+        <span class="topic-tag">Pushdown</span>
+        <span class="topic-tag">Columnar</span>
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="search" id="chapter-search" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+
+    <!-- ============================================================
+         SECTION 1: INTERVIEWER INTENT
+         ============================================================ -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>Why interviewers ask this question</summary>
+        <p>
+          This question separates senior engineers who understand <em>physical execution</em> from
+          those who only write logical SQL. The interviewer wants to verify:
+        </p>
+        <ul>
+          <li><strong>Cost awareness</strong> — Can you explain why a query costs $0.05 vs $50 on the same table?</li>
+          <li><strong>I/O minimization instinct</strong> — Do you reflexively think about bytes scanned, not just row counts?</li>
+          <li><strong>Columnar format internals</strong> — Can you explain Parquet row groups, column chunks, and page-level statistics?</li>
+          <li><strong>Optimizer mechanics</strong> — Do you understand how the query planner decides to push predicates below joins or into storage?</li>
+          <li><strong>Nested data expertise</strong> — BigQuery, Dremel, and Protocol Buffers are FAANG staples; can you prune nested fields?</li>
+          <li><strong>Production debugging</strong> — Can you diagnose why a query isn't benefiting from pushdown using EXPLAIN plans?</li>
+          <li><strong>Incident response</strong> — Have you seen real cost explosions from missing pushdowns?</li>
+        </ul>
+        <p>
+          At senior+ levels, the interviewer expects you to connect these optimizations to
+          <strong>dollar cost</strong>, <strong>SLA compliance</strong>, and <strong>cluster sizing</strong>.
+        </p>
+      </details>
+      <details>
+        <summary>What a strong answer demonstrates</summary>
+        <ul>
+          <li>Precise definitions with physical-layer reasoning (not just "it filters early")</li>
+          <li>Concrete numbers: bytes scanned before/after, cost reduction percentages</li>
+          <li>Cross-engine knowledge: Spark, BigQuery, Snowflake, PostgreSQL, Trino</li>
+          <li>Awareness of when pushdown <em>cannot</em> happen (UDFs, complex expressions, certain joins)</li>
+          <li>Connection to file formats: Parquet, ORC, Delta, Iceberg metadata layers</li>
+          <li>Real production war stories with quantified business impact</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 2: QUICK ANSWER
+         ============================================================ -->
+    <section id="quick-answer">
+      <h2>Quick Answer (60-Second Version)</h2>
+      <details>
+        <summary>Elevator pitch</summary>
+        <p>
+          <strong>Predicate pushdown</strong> moves filter conditions (WHERE clauses) as close to
+          the storage layer as possible — skipping entire files, row groups, or partitions before
+          data reaches the compute engine. <strong>Projection pushdown</strong> reads only the
+          columns referenced in the query, exploiting columnar storage formats where each column
+          is stored independently. <strong>Nested pruning</strong> extends projection pushdown
+          into struct/record types, reading only the specific sub-fields needed from deeply
+          nested Protocol Buffer or JSON columns.
+        </p>
+        <p>
+          Together, these three optimizations routinely reduce bytes scanned by <strong>90–99%</strong>,
+          directly cutting cloud costs and query latency.
+        </p>
+      </details>
+      <details>
+        <summary>ASCII overview — with vs without pushdown</summary>
+<pre><code class="language-bash">
+# WITHOUT pushdown — full table scan
+┌─────────────────────────────────────────────────────────────────┐
+│  Storage (10 TB, 200 columns, nested protos)                    │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Read ALL 10 TB → Network → Compute Engine               │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│       ↓                                                         │
+│  Compute: Filter rows → Project columns → Return 50 MB         │
+│  Cost: $50/query (BigQuery on-demand @ $5/TB)                   │
+└─────────────────────────────────────────────────────────────────┘
+
+# WITH pushdown — minimal I/O
+┌─────────────────────────────────────────────────────────────────┐
+│  Storage (10 TB, 200 columns, nested protos)                    │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  1. Partition pruning: skip 95% of files (500 GB left)   │   │
+│  │  2. Predicate pushdown: skip row groups via stats (50 GB)│   │
+│  │  3. Projection pushdown: read 3/200 columns (750 MB)     │   │
+│  │  4. Nested pruning: read 2/15 sub-fields (100 MB)        │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│       ↓                                                         │
+│  Compute: receives 100 MB pre-filtered → Return 50 MB          │
+│  Cost: $0.0005/query                                            │
+└─────────────────────────────────────────────────────────────────┘
+
+# Reduction: 10 TB → 100 MB = 99.999% I/O savings
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 3: PREDICATE PUSHDOWN
+         ============================================================ -->
+    <section id="predicate-pushdown">
+      <h2>Predicate Pushdown</h2>
+      <details>
+        <summary>Definition &amp; mechanism</summary>
+        <p>
+          <strong>Predicate pushdown</strong> (also called <em>filter pushdown</em>) is a query
+          optimization where filter predicates (WHERE conditions) are evaluated at the storage/scan
+          layer rather than after data reaches the compute engine. The optimizer "pushes" the
+          predicate down through the logical plan — below joins, aggregations, and projections —
+          until it sits directly above the table scan operator.
+        </p>
+<pre><code class="language-sql">
+-- Logical plan BEFORE predicate pushdown:
+--   Project(user_id, amount)
+--     Filter(region = 'us-east-1')
+--       Join(orders ⋈ users)
+--         Scan(orders)   ← reads ALL rows
+--         Scan(users)    ← reads ALL rows
+
+-- Logical plan AFTER predicate pushdown:
+--   Project(user_id, amount)
+--     Join(orders ⋈ users)
+--       Filter(region = 'us-east-1')
+--         Scan(orders)   ← predicate pushed to scan
+--       Scan(users)
+</code></pre>
+        <p>
+          At the physical layer, pushdown manifests differently depending on the engine:
+        </p>
+        <ul>
+          <li><strong>Parquet/ORC:</strong> min/max statistics in column chunk headers allow entire row groups to be skipped</li>
+          <li><strong>BigQuery:</strong> storage API evaluates predicates server-side, returning only matching rows</li>
+          <li><strong>PostgreSQL:</strong> index scans replace sequential scans when predicates match indexed columns</li>
+          <li><strong>Spark:</strong> Data source V2 API passes Filter objects to the connector</li>
+        </ul>
+      </details>
+      <details>
+        <summary>How it works in Parquet (row group skipping)</summary>
+<pre><code class="language-bash">
+# Parquet file internal structure with statistics
+┌─────────────────────────────────────────────────────────┐
+│  Parquet File (1 GB)                                    │
+├─────────────────────────────────────────────────────────┤
+│  Row Group 0 (128 MB)                                   │
+│    Column: order_date  min=2024-01-01  max=2024-01-31   │
+│    Column: amount      min=1.00        max=9999.00      │
+│    Column: region      min='ap-south'  max='eu-west'    │
+├─────────────────────────────────────────────────────────┤
+│  Row Group 1 (128 MB)                                   │
+│    Column: order_date  min=2024-02-01  max=2024-02-28   │
+│    Column: amount      min=5.00        max=50000.00     │
+│    Column: region      min='us-east'   max='us-west'    │
+├─────────────────────────────────────────────────────────┤
+│  Row Group 2 (128 MB)                                   │
+│    Column: order_date  min=2024-03-01  max=2024-03-31   │
+│    Column: amount      min=0.50        max=15000.00     │
+│    Column: region      min='ap-south'  max='us-west'    │
+├─────────────────────────────────────────────────────────┤
+│  Footer: schema + row group metadata + column stats     │
+└─────────────────────────────────────────────────────────┘
+
+# Query: WHERE region = 'us-east-1' AND order_date = '2024-02-15'
+#
+# Row Group 0: region max='eu-west' → 'us-east-1' > max → SKIP ✓
+# Row Group 1: region min='us-east' ≤ 'us-east-1' ≤ max='us-west' → READ
+#              order_date min='2024-02-01' ≤ '2024-02-15' ≤ max → READ
+# Row Group 2: order_date min='2024-03-01' > '2024-02-15' → SKIP ✓
+#
+# Result: Read 128 MB instead of 384 MB (67% reduction)
+</code></pre>
+      </details>
+      <details>
+        <summary>PostgreSQL — predicate pushdown via index scans</summary>
+<pre><code class="language-sql">
+-- Without pushdown (sequential scan):
+EXPLAIN ANALYZE
+SELECT user_id, amount
+FROM orders
+WHERE region = 'us-east-1' AND created_at > '2024-01-01';
+
+-- Seq Scan on orders  (cost=0.00..1850000.00 rows=50000000)
+--   Filter: (region = 'us-east-1' AND created_at > '2024-01-01')
+--   Rows Removed by Filter: 49500000
+--   Execution Time: 45000 ms
+
+-- With proper index (predicate pushed to index scan):
+CREATE INDEX idx_orders_region_date ON orders(region, created_at);
+
+EXPLAIN ANALYZE
+SELECT user_id, amount
+FROM orders
+WHERE region = 'us-east-1' AND created_at > '2024-01-01';
+
+-- Index Scan using idx_orders_region_date on orders
+--   Index Cond: (region = 'us-east-1' AND created_at > '2024-01-01')
+--   Execution Time: 120 ms   ← 375x faster
+</code></pre>
+      </details>
+      <details>
+        <summary>Spark — predicate pushdown to Parquet</summary>
+<pre><code class="language-python">
+# Spark reads Parquet and pushes predicates to the data source
+df = spark.read.parquet("s3://warehouse/orders/")
+
+# This filter gets pushed down to Parquet reader
+result = df.filter(
+    (df.region == "us-east-1") &
+    (df.order_date == "2024-02-15")
+).select("user_id", "amount")
+
+# Verify pushdown in physical plan:
+result.explain(True)
+# == Physical Plan ==
+# *(1) Project [user_id, amount]
+# +- *(1) Filter (isnotnull(region) AND isnotnull(order_date))
+#    +- *(1) ColumnarToRow
+#       +- FileScan parquet [user_id,amount,region,order_date]
+#             PushedFilters: [IsNotNull(region), IsNotNull(order_date),
+#                            EqualTo(region,us-east-1),
+#                            EqualTo(order_date,2024-02-15)]
+#             ReadSchema: struct&lt;user_id:string,amount:decimal(10,2)&gt;
+</code></pre>
+      </details>
+      <details>
+        <summary>BigQuery — predicate pushdown in distributed storage</summary>
+<pre><code class="language-sql">
+-- BigQuery pushes predicates into the Capacitor storage layer
+-- Check bytes processed in execution details
+
+-- Without predicate (full table scan):
+SELECT user_id, amount
+FROM `project.dataset.orders`;
+-- Bytes processed: 2.1 TB
+-- Slot time: 4500 slot-seconds
+
+-- With predicate pushdown:
+SELECT user_id, amount
+FROM `project.dataset.orders`
+WHERE region = 'us-east-1'
+  AND DATE(created_at) = '2024-02-15';
+-- Bytes processed: 45 GB (predicate on partitioned + clustered columns)
+-- Slot time: 120 slot-seconds
+
+-- BigQuery clustering enables predicate pushdown on non-partition columns
+-- Clustering by (region, created_at) sorts data blocks, enabling block skipping
+</code></pre>
+      </details>
+      <details>
+        <summary>When predicate pushdown CANNOT happen</summary>
+        <ul>
+          <li><strong>UDFs in predicates:</strong> <code>WHERE my_udf(col) = 'value'</code> — opaque to optimizer</li>
+          <li><strong>Implicit type casts:</strong> <code>WHERE string_col = 123</code> — prevents index/stats usage</li>
+          <li><strong>Non-deterministic functions:</strong> <code>WHERE col > RANDOM()</code></li>
+          <li><strong>Predicates on derived columns:</strong> <code>WHERE YEAR(date_col) = 2024</code> vs <code>WHERE date_col BETWEEN '2024-01-01' AND '2024-12-31'</code></li>
+          <li><strong>After OUTER JOINs:</strong> Predicates on the nullable side can't always be pushed below the join</li>
+          <li><strong>LIKE with leading wildcard:</strong> <code>WHERE col LIKE '%suffix'</code> — can't use sorted statistics</li>
+          <li><strong>OR conditions across columns:</strong> <code>WHERE col_a = 1 OR col_b = 2</code> — limits row group skipping</li>
+        </ul>
+<pre><code class="language-sql">
+-- WRONG: prevents pushdown
+SELECT * FROM orders WHERE YEAR(order_date) = 2024;
+
+-- RIGHT: enables pushdown
+SELECT * FROM orders
+WHERE order_date >= '2024-01-01' AND order_date < '2025-01-01';
+
+-- WRONG: UDF blocks pushdown
+SELECT * FROM orders WHERE normalize_region(region) = 'US_EAST';
+
+-- RIGHT: push raw predicate, transform after
+SELECT * FROM orders WHERE region IN ('us-east-1', 'us-east-2');
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 4: PROJECTION PUSHDOWN
+         ============================================================ -->
+    <section id="projection-pushdown">
+      <h2>Projection Pushdown</h2>
+      <details>
+        <summary>Definition &amp; why columnar storage makes this critical</summary>
+        <p>
+          <strong>Projection pushdown</strong> ensures the storage layer reads only the columns
+          referenced in the query's SELECT, WHERE, JOIN, and GROUP BY clauses. In row-oriented
+          storage this saves minimal I/O (entire rows are read regardless). In <em>columnar</em>
+          storage — Parquet, ORC, BigQuery Capacitor — each column is stored in separate byte
+          ranges, so skipping unreferenced columns eliminates entire I/O operations.
+        </p>
+<pre><code class="language-bash">
+# Row-oriented storage (PostgreSQL heap, CSV)
+# Reading 3 columns still reads the full row tuple
+┌────────────────────────────────────────────────┐
+│ Row 1: [col1|col2|col3|...|col200]  ← all 200 │
+│ Row 2: [col1|col2|col3|...|col200]             │
+│ ...                                            │
+└────────────────────────────────────────────────┘
+# Even SELECT col1, col2, col3 reads all 200 columns per row
+
+# Columnar storage (Parquet, ORC, BigQuery)
+# Each column stored independently
+┌──────────┐ ┌──────────┐ ┌──────────┐     ┌──────────────┐
+│ col1     │ │ col2     │ │ col3     │ ... │ col200       │
+│ chunk    │ │ chunk    │ │ chunk    │     │ chunk        │
+│ (5 MB)   │ │ (5 MB)   │ │ (5 MB)   │     │ (5 MB)       │
+└──────────┘ └──────────┘ └──────────┘     └──────────────┘
+# SELECT col1, col2, col3 reads only 15 MB out of 1000 MB
+# Projection pushdown: 98.5% I/O reduction
+</code></pre>
+      </details>
+      <details>
+        <summary>Parquet column chunk architecture</summary>
+<pre><code class="language-bash">
+# Parquet file physical layout — projection pushdown in action
+┌─────────────────────────────────────────────────────────────────┐
+│  Parquet File: orders.parquet (1 GB)                            │
+├─────────────────────────────────────────────────────────────────┤
+│  Row Group 0 (128 MB total)                                     │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Column Chunk: user_id      offset=0      size=8 MB     │    │
+│  │  Column Chunk: order_date   offset=8MB    size=4 MB     │    │
+│  │  Column Chunk: amount       offset=12MB   size=6 MB     │    │
+│  │  Column Chunk: region       offset=18MB   size=3 MB     │    │
+│  │  Column Chunk: items[]      offset=21MB   size=45 MB    │    │
+│  │  Column Chunk: metadata     offset=66MB   size=62 MB    │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│  ...more row groups...                                          │
+├─────────────────────────────────────────────────────────────────┤
+│  Footer: FileMetaData                                           │
+│    - Schema (column names, types, nested structure)              │
+│    - Row Group metadata (offsets, sizes, statistics per column)  │
+│    - Key-value metadata                                         │
+└─────────────────────────────────────────────────────────────────┘
+
+# Query: SELECT user_id, amount FROM orders WHERE region = 'us-east-1'
+# Columns needed: user_id (8 MB) + amount (6 MB) + region (3 MB) = 17 MB
+# Columns skipped: order_date + items[] + metadata = 111 MB
+# Per row group savings: 111/128 = 87% I/O eliminated
+</code></pre>
+      </details>
+      <details>
+        <summary>BigQuery Capacitor — projection at the storage server</summary>
+        <p>
+          BigQuery's Capacitor format stores each column (and nested sub-column) in separate
+          <em>column stripes</em>. When a query references only 5 of 200 columns, the storage
+          servers never read the other 195 columns from disk. This is why BigQuery charges by
+          <strong>bytes scanned</strong> — projection pushdown directly reduces your bill.
+        </p>
+<pre><code class="language-sql">
+-- Table: events (200 columns, 50 TB total)
+-- Columns: event_id (2%), timestamp (1%), user_id (3%), 
+--          payload (STRUCT with 50 sub-fields, 60% of storage)
+
+-- BAD: reads all 200 columns
+SELECT * FROM `project.dataset.events`
+WHERE DATE(timestamp) = '2024-02-15';
+-- Bytes processed: 140 GB (full day partition, all columns)
+-- Cost: $0.70
+
+-- GOOD: projection pushdown
+SELECT event_id, user_id, timestamp
+FROM `project.dataset.events`
+WHERE DATE(timestamp) = '2024-02-15';
+-- Bytes processed: 8.4 GB (only 3 columns from day partition)
+-- Cost: $0.042  ← 94% cost reduction
+</code></pre>
+      </details>
+      <details>
+        <summary>Spark — verifying projection in physical plan</summary>
+<pre><code class="language-python">
+# Spark automatically applies projection pushdown to Parquet
+df = spark.read.parquet("s3://warehouse/events/")
+
+# Only these columns will be read from Parquet files
+result = df.select("event_id", "user_id", "timestamp") \
+           .filter(df.timestamp > "2024-02-15")
+
+result.explain(True)
+# == Physical Plan ==
+# FileScan parquet [event_id,user_id,timestamp]
+#       ReadSchema: struct&lt;event_id:string,user_id:string,timestamp:timestamp&gt;
+#       PartitionFilters: []
+#       PushedFilters: [GreaterThan(timestamp,2024-02-15)]
+#
+# Note: ReadSchema shows ONLY 3 columns — projection pushed down
+# The 197 other columns are never read from S3
+
+# Common mistake that breaks projection pushdown:
+df_all = spark.read.parquet("s3://warehouse/events/")
+df_all.cache()  # Caches ALL columns in memory
+df_all.select("event_id", "user_id").show()  # Too late — already cached everything
+</code></pre>
+      </details>
+      <details>
+        <summary>SELECT * is the enemy of projection pushdown</summary>
+        <p>
+          The single most common anti-pattern in data engineering is <code>SELECT *</code> in
+          production pipelines. It defeats projection pushdown entirely and causes:
+        </p>
+        <ul>
+          <li>10–100x more bytes scanned (especially with nested columns)</li>
+          <li>Proportionally higher cloud costs</li>
+          <li>Larger shuffle sizes in distributed engines</li>
+          <li>OOM errors from materializing unused wide columns</li>
+          <li>Schema coupling — downstream breaks when upstream adds columns</li>
+        </ul>
+<pre><code class="language-sql">
+-- Anti-pattern: CTEs with SELECT *
+WITH base AS (
+  SELECT * FROM events  -- reads ALL 200 columns
+)
+SELECT user_id, COUNT(*) 
+FROM base 
+GROUP BY user_id;
+-- Even though only user_id is needed, all 200 columns are scanned
+
+-- Fixed: explicit column list
+WITH base AS (
+  SELECT user_id FROM events  -- projection pushdown: reads 1 column
+)
+SELECT user_id, COUNT(*) 
+FROM base 
+GROUP BY user_id;
+-- 98% fewer bytes scanned
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 5: NESTED / STRUCT PRUNING
+         ============================================================ -->
+    <section id="nested-pruning">
+      <h2>Nested / Struct Pruning</h2>
+      <details>
+        <summary>Why nested pruning matters at FAANG scale</summary>
+        <p>
+          FAANG companies store events as deeply nested Protocol Buffers or JSON structures
+          serialized into columnar formats. A single <code>event_payload</code> column might
+          contain 50+ sub-fields, each stored as a separate leaf column in Parquet/Capacitor.
+          <strong>Nested pruning</strong> reads only the specific sub-fields referenced in the query,
+          skipping the rest of the nested structure.
+        </p>
+<pre><code class="language-bash">
+# Nested structure example — e-commerce event proto
+# message Event {
+#   string event_id = 1;
+#   int64 timestamp = 2;
+#   UserInfo user = 3;           ← STRUCT with 10 fields
+#   DeviceInfo device = 4;       ← STRUCT with 8 fields
+#   PageView page_view = 5;      ← STRUCT with 12 fields
+#   Purchase purchase = 6;       ← STRUCT with 15 fields (items[], payment, shipping)
+#   repeated Experiment experiments = 7;  ← ARRAY of STRUCTs
+# }
+#
+# Total leaf columns when flattened: 60+
+# Storage per day: 500 GB
+#   - event_id + timestamp: 10 GB (2%)
+#   - user.*: 50 GB (10%)
+#   - device.*: 40 GB (8%)
+#   - page_view.*: 80 GB (16%)
+#   - purchase.*: 200 GB (40%)
+#   - experiments[]: 120 GB (24%)
+</code></pre>
+      </details>
+      <details>
+        <summary>Nested pruning visualization</summary>
+<pre><code class="language-bash">
+# Query: SELECT event_id, user.country, purchase.total_amount
+#         FROM events WHERE user.country = 'US'
+
+# WITHOUT nested pruning — reads entire structs:
+┌─────────────────────────────────────────────────────────────┐
+│  Read: event_id (5 GB)                                      │
+│  Read: user.* (ALL 10 sub-fields = 50 GB) ← WASTEFUL       │
+│  Read: purchase.* (ALL 15 sub-fields = 200 GB) ← WASTEFUL  │
+│  Total I/O: 255 GB                                          │
+└─────────────────────────────────────────────────────────────┘
+
+# WITH nested pruning — reads only referenced leaf columns:
+┌─────────────────────────────────────────────────────────────┐
+│  Read: event_id (5 GB)                                      │
+│  Read: user.country (5 GB)      ← only 1 of 10 sub-fields  │
+│  Read: purchase.total_amount (8 GB) ← only 1 of 15 fields  │
+│  Total I/O: 18 GB                                           │
+└─────────────────────────────────────────────────────────────┘
+
+# Reduction: 255 GB → 18 GB = 93% less I/O
+# At $5/TB: $1.27 → $0.09 per query
+</code></pre>
+      </details>
+      <details>
+        <summary>BigQuery nested column storage (Dremel encoding)</summary>
+        <p>
+          BigQuery uses <em>Dremel encoding</em> (repetition + definition levels) to store
+          nested and repeated fields. Each leaf field in a nested structure is stored as an
+          independent column stripe with its own repetition/definition level vectors.
+        </p>
+<pre><code class="language-sql">
+-- BigQuery table with nested STRUCT
+CREATE TABLE `project.dataset.events` (
+  event_id STRING,
+  timestamp TIMESTAMP,
+  user STRUCT&lt;
+    user_id STRING,
+    country STRING,
+    device_type STRING,
+    session_id STRING,
+    experiments ARRAY&lt;STRUCT&lt;
+      experiment_id STRING,
+      variant STRING,
+      enrolled_at TIMESTAMP
+    &gt;&gt;
+  &gt;,
+  purchase STRUCT&lt;
+    order_id STRING,
+    total_amount NUMERIC,
+    currency STRING,
+    items ARRAY&lt;STRUCT&lt;
+      sku STRING,
+      quantity INT64,
+      price NUMERIC,
+      category STRING
+    &gt;&gt;,
+    payment STRUCT&lt;
+      method STRING,
+      card_last4 STRING,
+      processor_response STRING
+    &gt;&gt;
+  &gt;
+);
+
+-- Nested pruning in action:
+SELECT
+  event_id,
+  user.country,
+  purchase.total_amount
+FROM `project.dataset.events`
+WHERE user.country = 'US'
+  AND DATE(timestamp) = '2024-02-15';
+
+-- BigQuery reads ONLY these leaf columns from Capacitor:
+--   event_id, user.country, purchase.total_amount, timestamp
+-- All other nested sub-fields (user.device_type, purchase.items[], 
+-- purchase.payment.*, user.experiments[]) are NOT read.
+-- Bytes processed: 18 GB vs 255 GB without pruning
+</code></pre>
+      </details>
+      <details>
+        <summary>Parquet nested types (repetition &amp; definition levels)</summary>
+<pre><code class="language-bash">
+# Parquet stores nested fields using Dremel-style encoding
+# Each leaf column gets:
+#   - Values (the actual data)
+#   - Definition levels (how many optional fields are defined)
+#   - Repetition levels (which repeated field level is repeating)
+
+# Schema:
+# message Event {
+#   required binary event_id;
+#   optional group user {
+#     optional binary country;
+#     optional binary device_type;
+#     repeated group experiments {
+#       optional binary experiment_id;
+#       optional binary variant;
+#     }
+#   }
+# }
+
+# Physical column layout in Parquet:
+# event_id                        → column chunk at offset 0
+# user.country                    → column chunk at offset X
+# user.device_type                → column chunk at offset Y
+# user.experiments.experiment_id  → column chunk at offset Z
+# user.experiments.variant        → column chunk at offset W
+
+# Query: SELECT event_id, user.country FROM events
+# Reads: event_id chunk + user.country chunk
+# Skips: user.device_type + user.experiments.* chunks
+</code></pre>
+      </details>
+      <details>
+        <summary>Protocol Buffers &amp; nested pruning</summary>
+        <p>
+          At Google/Meta/Netflix, event data is often stored as serialized Protocol Buffers
+          in columnar storage. The proto schema defines the nested structure; the storage
+          layer (Capacitor, Parquet) decomposes it into leaf columns.
+        </p>
+<pre><code class="language-python">
+# PySpark reading nested Parquet with struct pruning
+
+# Schema (from Proto):
+# root
+#  |-- event_id: string
+#  |-- user: struct
+#  |    |-- user_id: string
+#  |    |-- country: string
+#  |    |-- preferences: struct
+#  |         |-- language: string
+#  |         |-- currency: string
+#  |         |-- notifications: array
+#  |              |-- element: struct
+#  |                   |-- channel: string
+#  |                   |-- enabled: boolean
+#  |-- purchase: struct
+#       |-- total: decimal
+#       |-- items: array
+#            |-- element: struct
+#                 |-- sku: string
+#                 |-- qty: integer
+#                 |-- price: decimal
+
+# GOOD: nested pruning — only reads user.country leaf column
+df = spark.read.parquet("s3://data-lake/events/")
+result = df.select(
+    "event_id",
+    "user.country",          # Reads only user.country chunk
+    "purchase.total"         # Reads only purchase.total chunk
+).filter(col("user.country") == "US")
+
+result.explain(True)
+# ReadSchema: struct&lt;event_id:string,
+#   user:struct&lt;country:string&gt;,
+#   purchase:struct&lt;total:decimal(10,2)&gt;&gt;
+# Note: Only referenced nested fields appear in ReadSchema
+
+# BAD: reads entire struct
+result_bad = df.select(
+    "event_id",
+    "user",          # Reads ALL of user.* (10 sub-fields)
+    "purchase"       # Reads ALL of purchase.* (15 sub-fields)
+)
+# ReadSchema includes all nested fields — no pruning
+</code></pre>
+      </details>
+      <details>
+        <summary>Spark nested pruning configuration</summary>
+<pre><code class="language-python">
+# Spark 3.x nested pruning settings
+spark.conf.set("spark.sql.optimizer.nestedSchemaPruning.enabled", "true")  # default: true
+spark.conf.set("spark.sql.optimizer.nestedPredicatePushdown.enabled", "true")  # Spark 3.3+
+
+# Verify nested pruning is working:
+df = spark.read.parquet("s3://data-lake/events/")
+pruned = df.select("event_id", "user.country", "purchase.total")
+
+# Check the scan node's ReadSchema
+pruned.explain(True)
+# Expected: ReadSchema shows ONLY the referenced leaf fields
+# If you see the full struct, nested pruning is disabled or blocked
+
+# Common blockers for nested pruning in Spark:
+# 1. Using map-type columns (not struct) — maps can't be pruned
+# 2. UDFs that take the entire struct as input
+# 3. Older Spark versions (&lt; 2.4) lack nested pruning
+# 4. Certain data source connectors don't support it
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 6: COLUMNAR STORAGE FORMATS
+         ============================================================ -->
+    <section id="columnar-formats">
+      <h2>Columnar Storage Formats</h2>
+      <details>
+        <summary>Parquet — row groups, column chunks, page-level stats</summary>
+<pre><code class="language-bash">
+# Apache Parquet File Structure (detailed)
+┌─────────────────────────────────────────────────────────────────────┐
+│  MAGIC: "PAR1" (4 bytes)                                            │
+├─────────────────────────────────────────────────────────────────────┤
+│  ROW GROUP 0 (target: 128 MB, configurable)                         │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Column Chunk: user_id (dictionary + data pages)              │  │
+│  │  ┌─────────────────────────────────────────────────────────┐  │  │
+│  │  │  Page 0 (data page, ~1 MB)                              │  │  │
+│  │  │    Header: num_values, encoding, compressed_size         │  │  │
+│  │  │    Statistics: min="aaa001" max="aaa999" null_count=0    │  │  │
+│  │  │    Data: [encoded + compressed values]                   │  │  │
+│  │  ├─────────────────────────────────────────────────────────┤  │  │
+│  │  │  Page 1 (data page, ~1 MB)                              │  │  │
+│  │  │    Statistics: min="bbb001" max="bbb999" null_count=2    │  │  │
+│  │  │    Data: [encoded + compressed values]                   │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  │  Column Chunk: order_date (plain encoding)                    │  │
+│  │  Column Chunk: amount (plain encoding)                        │  │
+│  │  Column Chunk: region (dictionary encoding)                   │  │
+│  │  Column Chunk: items (nested, repetition/definition levels)   │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+├─────────────────────────────────────────────────────────────────────┤
+│  ROW GROUP 1 (128 MB)                                               │
+│  └── ... same structure ...                                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  ROW GROUP N                                                        │
+├─────────────────────────────────────────────────────────────────────┤
+│  FOOTER (FileMetaData - Thrift encoded)                             │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  version: 2                                                   │  │
+│  │  schema: [root, user_id, order_date, amount, region, items]   │  │
+│  │  num_rows: 50000000                                           │  │
+│  │  row_groups: [                                                │  │
+│  │    { file_offset, total_byte_size, num_rows,                  │  │
+│  │      columns: [                                               │  │
+│  │        { file_offset, type, encodings, path_in_schema,        │  │
+│  │          codec, num_values, total_uncompressed_size,          │  │
+│  │          total_compressed_size,                                │  │
+│  │          statistics: {min, max, null_count, distinct_count}   │  │
+│  │        }, ...                                                 │  │
+│  │      ]                                                        │  │
+│  │    }, ...                                                     │  │
+│  │  ]                                                            │  │
+│  │  key_value_metadata: [{"spark.sql.sources.schema": "..."}]    │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│  FOOTER LENGTH (4 bytes)                                            │
+│  MAGIC: "PAR1" (4 bytes)                                            │
+└─────────────────────────────────────────────────────────────────────┘
+
+# Reading strategy:
+# 1. Read footer (last bytes) → get schema + row group metadata
+# 2. Use column stats to skip row groups (predicate pushdown)
+# 3. Seek to only needed column chunk offsets (projection pushdown)
+# 4. Within column chunks, use page-level stats for fine-grained skipping
+</code></pre>
+        <p><strong>Key Parquet features for pushdown:</strong></p>
+        <ul>
+          <li><strong>Dictionary encoding:</strong> Low-cardinality columns (region, status) get dictionary-encoded, enabling fast predicate evaluation on dictionary indices</li>
+          <li><strong>Page-level column index (Parquet 2.0):</strong> Fine-grained min/max per page allows skipping within a column chunk</li>
+          <li><strong>Bloom filters (Parquet 1.12+):</strong> Probabilistic filter for high-cardinality equality predicates</li>
+          <li><strong>Sorted row groups:</strong> If data is sorted by a column, min/max ranges don't overlap → maximum skip rate</li>
+        </ul>
+      </details>
+      <details>
+        <summary>ORC — stripes, bloom filters, ACID support</summary>
+<pre><code class="language-bash">
+# Apache ORC File Structure
+┌─────────────────────────────────────────────────────────────────┐
+│  ORC File                                                       │
+├─────────────────────────────────────────────────────────────────┤
+│  STRIPE 0 (target: 64 MB default, max 250 MB)                  │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  INDEX DATA (per column)                                │    │
+│  │    - Row group index (every 10,000 rows)                │    │
+│  │    - min/max/sum/count statistics                       │    │
+│  │    - Bloom filter data (if enabled)                     │    │
+│  │    - Positions for row group navigation                 │    │
+│  ├─────────────────────────────────────────────────────────┤    │
+│  │  ROW DATA                                               │    │
+│  │    - Column streams (data, length, dictionary)          │    │
+│  │    - Encoded with RLE, dictionary, delta encoding       │    │
+│  ├─────────────────────────────────────────────────────────┤    │
+│  │  STRIPE FOOTER                                          │    │
+│  │    - Column encodings, stream positions                 │    │
+│  └─────────────────────────────────────────────────────────┘    │
+├─────────────────────────────────────────────────────────────────┤
+│  STRIPE 1...N                                                   │
+├─────────────────────────────────────────────────────────────────┤
+│  FILE FOOTER                                                    │
+│    - Type schema (Hive schema)                                  │
+│    - Stripe statistics (aggregate per stripe)                   │
+│    - Number of rows                                             │
+│    - Column statistics (file-level min/max/count)               │
+├─────────────────────────────────────────────────────────────────┤
+│  POSTSCRIPT                                                     │
+│    - Compression type (ZLIB, SNAPPY, LZ4, ZSTD)                │
+│    - Footer/metadata lengths                                    │
+│    - Version                                                    │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre>
+        <p><strong>ORC advantages for predicate pushdown:</strong></p>
+        <ul>
+          <li><strong>3-level statistics:</strong> File → Stripe → Row group (every 10K rows) — finer granularity than Parquet's row-group level</li>
+          <li><strong>Built-in bloom filters:</strong> Configurable per column, excellent for high-cardinality equality predicates (user_id, session_id)</li>
+          <li><strong>ACID support:</strong> ORC + Hive ACID enables UPDATE/DELETE while maintaining predicate pushdown through delta files</li>
+          <li><strong>Predicate evaluation in reader:</strong> ORC's SearchArgument (SARG) evaluates predicates during stripe/row-group selection</li>
+        </ul>
+<pre><code class="language-sql">
+-- Hive ORC with bloom filters for predicate pushdown
+CREATE TABLE events_orc (
+  event_id STRING,
+  user_id STRING,
+  event_type STRING,
+  timestamp BIGINT,
+  payload STRING
+)
+STORED AS ORC
+TBLPROPERTIES (
+  'orc.bloom.filter.columns' = 'user_id,event_id',
+  'orc.bloom.filter.fpp' = '0.01',
+  'orc.stripe.size' = '67108864',
+  'orc.row.index.stride' = '10000'
+);
+
+-- Query uses bloom filter to skip stripes without matching user_id
+SELECT * FROM events_orc WHERE user_id = 'usr_abc123';
+-- Without bloom filter: reads all stripes, filters after decompression
+-- With bloom filter: skips ~95% of stripes at index level
+</code></pre>
+      </details>
+      <details>
+        <summary>BigQuery Capacitor — nested columnar with Dremel encoding</summary>
+        <p>
+          Capacitor is Google's proprietary columnar format used by BigQuery. It extends the
+          Dremel paper's concepts with additional optimizations:
+        </p>
+        <ul>
+          <li><strong>Nested columnar:</strong> Each leaf field (even deeply nested) is a separate column stripe</li>
+          <li><strong>Repetition &amp; definition levels:</strong> Encode nested/repeated structure without duplicating parent values</li>
+          <li><strong>Capacitor encoding:</strong> Adaptive encoding per column (dictionary, run-length, delta, direct)</li>
+          <li><strong>Column-level encryption:</strong> Different columns can have different encryption keys</li>
+          <li><strong>Automatic re-clustering:</strong> Background process sorts data for better predicate pushdown</li>
+        </ul>
+<pre><code class="language-bash">
+# Dremel encoding example for nested repeated field:
+# 
+# message Document {
+#   required string doc_id;
+#   repeated group links {
+#     optional string url;
+#     optional string text;
+#   }
+# }
+#
+# Record 1: doc_id="d1", links=[{url="a.com",text="A"},{url="b.com",text="B"}]
+# Record 2: doc_id="d2", links=[] (empty)
+# Record 3: doc_id="d3", links=[{url="c.com",text=NULL}]
+#
+# Stored as independent columns:
+#   doc_id:     ["d1", "d2", "d3"]     rep=[0,0,0] def=[0,0,0]
+#   links.url:  ["a.com","b.com",NULL,"c.com"]  rep=[0,1,0,0] def=[2,2,0,2]
+#   links.text: ["A","B",NULL,NULL]    rep=[0,1,0,0] def=[2,2,0,1]
+#
+# Query: SELECT doc_id, links.url FROM documents
+# Reads: doc_id column + links.url column (with rep/def levels)
+# Skips: links.text column entirely → nested pruning
+</code></pre>
+      </details>
+      <details>
+        <summary>Delta Lake / Iceberg — file-level statistics &amp; manifest pruning</summary>
+<pre><code class="language-bash">
+# Delta Lake / Iceberg add a METADATA LAYER on top of Parquet files
+# This enables file-level predicate pushdown (before opening any Parquet file)
+
+# Delta Lake structure:
+# s3://warehouse/orders/
+#   _delta_log/
+#     00000000000000000001.json   ← transaction log entry
+#     00000000000000000002.json
+#     00000000000000000010.checkpoint.parquet  ← checkpoint
+#   part-00001-xxx.snappy.parquet
+#   part-00002-xxx.snappy.parquet
+#   ...
+
+# Delta log entry contains per-file statistics:
+# {
+#   "add": {
+#     "path": "part-00001-xxx.snappy.parquet",
+#     "size": 134217728,
+#     "partitionValues": {"date": "2024-02-15"},
+#     "stats": "{
+#       \"numRecords\": 1000000,
+#       \"minValues\": {\"amount\": 0.5, \"region\": \"ap-south\"},
+#       \"maxValues\": {\"amount\": 9999.0, \"region\": \"eu-west\"},
+#       \"nullCount\": {\"amount\": 0, \"region\": 12}
+#     }"
+#   }
+# }
+
+# Iceberg manifest structure:
+# metadata/
+#   v1.metadata.json         ← current table metadata
+#   snap-001.avro            ← snapshot
+#   manifest-list-001.avro   ← list of manifest files
+#   manifest-001.avro        ← file-level metadata
+#
+# manifest-001.avro contains per-file:
+#   - file_path
+#   - partition values
+#   - column stats (lower_bound, upper_bound, null_count, value_count)
+#   - file_size_in_bytes
+#
+# Query planning hierarchy (predicate pushdown at each level):
+#   1. Partition pruning → eliminate manifest files
+#   2. Manifest-level stats → eliminate data files
+#   3. Parquet row-group stats → eliminate row groups
+#   4. Page-level stats → eliminate pages
+</code></pre>
+<pre><code class="language-python">
+# Iceberg predicate pushdown in Spark
+spark.sql("""
+  SELECT user_id, amount
+  FROM catalog.db.orders
+  WHERE order_date = '2024-02-15'
+    AND region = 'us-east-1'
+    AND amount > 100
+""")
+
+# Iceberg planning phases:
+# 1. Partition pruning: order_date='2024-02-15' → eliminates 364/365 partitions
+# 2. Manifest pruning: region stats → skips files where max(region) < 'us-east-1'
+# 3. Data file pruning: amount stats → skips files where max(amount) ≤ 100
+# 4. Parquet row-group pruning: fine-grained min/max within surviving files
+#
+# Result: reads 3 files out of 10,000+ total data files
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 7: PARTITION PRUNING
+         ============================================================ -->
+    <section id="partition-pruning">
+      <h2>Partition Pruning</h2>
+      <details>
+        <summary>Hive-style partitioning — directory-based elimination</summary>
+<pre><code class="language-bash">
+# Hive-style partitioning stores data in directory hierarchy
+# s3://warehouse/events/
+#   year=2024/month=01/day=01/part-001.parquet
+#   year=2024/month=01/day=02/part-001.parquet
+#   ...
+#   year=2024/month=12/day=31/part-001.parquet
+
+# Partition elimination diagram:
+#
+# Query: WHERE year=2024 AND month=02 AND day=15
+#
+# ┌─────────────────────────────────────────────────────┐
+# │  File System Listing                                 │
+# │  year=2023/ ────── SKIP (year ≠ 2024)               │
+# │  year=2024/                                          │
+# │    month=01/ ──── SKIP (month ≠ 02)                 │
+# │    month=02/                                         │
+# │      day=01/ ──── SKIP (day ≠ 15)                   │
+# │      ...                                             │
+# │      day=15/ ──── READ ✓                            │
+# │      day=16/ ──── SKIP (day ≠ 15)                   │
+# │      ...                                             │
+# │    month=03/ ──── SKIP (month ≠ 02)                 │
+# │    ...                                               │
+# │  year=2025/ ────── SKIP (year ≠ 2024)               │
+# └─────────────────────────────────────────────────────┘
+#
+# Result: reads 1 directory out of 1095+ (3 years × 365 days)
+# Reduction: 99.9% of files never opened
+</code></pre>
+<pre><code class="language-python">
+# Spark partition pruning with Hive-style partitions
+df = spark.read.parquet("s3://warehouse/events/")
+
+# This filter triggers partition pruning — no file listing needed
+# for non-matching partitions
+result = df.filter(
+    (df.year == 2024) & (df.month == 2) & (df.day == 15)
+).select("event_id", "user_id")
+
+result.explain(True)
+# PartitionFilters: [isnotnull(year), isnotnull(month), isnotnull(day),
+#                    (year = 2024), (month = 2), (day = 15)]
+# PartitionCount: 1  ← out of 1095 total partitions
+</code></pre>
+      </details>
+      <details>
+        <summary>BigQuery partitioned tables</summary>
+<pre><code class="language-sql">
+-- BigQuery time-based partitioning
+CREATE TABLE `project.dataset.events`
+(
+  event_id STRING,
+  user_id STRING,
+  event_type STRING,
+  payload STRUCT&lt;...&gt;,
+  created_at TIMESTAMP
+)
+PARTITION BY DATE(created_at)
+CLUSTER BY event_type, user_id;
+
+-- Partition pruning + clustering:
+SELECT event_id, user_id
+FROM `project.dataset.events`
+WHERE DATE(created_at) = '2024-02-15'  -- partition pruning
+  AND event_type = 'purchase';          -- cluster block elimination
+
+-- Execution details:
+-- Total bytes processed: 2.3 GB
+-- Total bytes in table: 50 TB
+-- Partitions scanned: 1 of 730
+-- Blocks scanned: 45 of 12000 (clustering)
+
+-- Integer range partitioning (for non-time data):
+CREATE TABLE `project.dataset.users`
+(
+  user_id INT64,
+  name STRING,
+  country STRING
+)
+PARTITION BY RANGE_BUCKET(user_id, GENERATE_ARRAY(0, 1000000000, 1000000))
+CLUSTER BY country;
+
+-- Ingestion-time partitioning (automatic):
+CREATE TABLE `project.dataset.raw_events`
+(
+  data STRING
+)
+PARTITION BY _PARTITIONDATE;
+-- Automatically partitions by ingestion date
+-- Queries MUST reference _PARTITIONDATE for pruning:
+SELECT * FROM `project.dataset.raw_events`
+WHERE _PARTITIONDATE = '2024-02-15';
+</code></pre>
+      </details>
+      <details>
+        <summary>Snowflake micro-partition pruning</summary>
+        <p>
+          Snowflake doesn't use traditional partitioning. Instead, it automatically divides
+          tables into <strong>micro-partitions</strong> (50-500 MB compressed) and maintains
+          metadata about min/max values per column per micro-partition.
+        </p>
+<pre><code class="language-sql">
+-- Snowflake automatic micro-partition pruning
+-- No explicit partitioning needed — it's automatic
+
+-- Check pruning effectiveness:
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY())
+WHERE query_text LIKE '%events%'
+ORDER BY start_time DESC
+LIMIT 1;
+-- Shows: partitions_scanned vs partitions_total
+
+-- Example query:
+SELECT user_id, event_type, created_at
+FROM events
+WHERE created_at BETWEEN '2024-02-15' AND '2024-02-16'
+  AND event_type = 'purchase';
+
+-- Profile output:
+-- Partitions scanned: 24
+-- Partitions total: 15,000
+-- Pruning ratio: 99.84%
+
+-- Clustering keys improve pruning (like BigQuery clustering):
+ALTER TABLE events CLUSTER BY (created_at, event_type);
+
+-- After re-clustering:
+-- Partitions scanned: 4
+-- Partitions total: 15,000
+-- Pruning ratio: 99.97%
+
+-- SYSTEM$CLUSTERING_INFORMATION shows overlap:
+SELECT SYSTEM$CLUSTERING_INFORMATION('events', '(created_at, event_type)');
+-- {
+--   "cluster_by_keys": "LINEAR(created_at, event_type)",
+--   "total_partition_count": 15000,
+--   "average_overlaps": 2.1,    ← lower is better
+--   "average_depth": 1.8        ← lower is better
+-- }
+</code></pre>
+      </details>
+      <details>
+        <summary>Iceberg manifest-level pruning</summary>
+<pre><code class="language-bash">
+# Apache Iceberg uses a 3-layer metadata tree for partition pruning:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Table Metadata (v3.metadata.json)                              │
+# │    - Current snapshot ID                                         │
+# │    - Partition spec: [date, region]                              │
+# │    - Sort order                                                  │
+# ├─────────────────────────────────────────────────────────────────┤
+# │  Snapshot → Manifest List (snap-003.avro)                       │
+# │    Lists manifest files with partition range summaries:          │
+# │    ┌─────────────────────────────────────────────────────────┐  │
+# │    │ manifest-001.avro: date in [2024-01-01, 2024-01-31]     │  │
+# │    │ manifest-002.avro: date in [2024-02-01, 2024-02-28]     │  │
+# │    │ manifest-003.avro: date in [2024-03-01, 2024-03-31]     │  │
+# │    └─────────────────────────────────────────────────────────┘  │
+# ├─────────────────────────────────────────────────────────────────┤
+# │  Manifest File (manifest-002.avro) — per-file metadata          │
+# │    ┌─────────────────────────────────────────────────────────┐  │
+# │    │ file-001.parquet: date=2024-02-15, region=us-east-1     │  │
+# │    │   amount: lower=10.0, upper=5000.0, null_count=0        │  │
+# │    │ file-002.parquet: date=2024-02-15, region=eu-west-1     │  │
+# │    │   amount: lower=5.0, upper=20000.0, null_count=3        │  │
+# │    │ file-003.parquet: date=2024-02-16, region=us-east-1     │  │
+# │    │   amount: lower=1.0, upper=800.0, null_count=0          │  │
+# │    └─────────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# Query: WHERE date='2024-02-15' AND region='us-east-1' AND amount > 1000
+#
+# Step 1: Manifest list pruning → only manifest-002 covers Feb dates
+# Step 2: Manifest file pruning → only file-001 matches region + date
+#          file-003 has max(amount)=800 < 1000 → SKIP
+# Step 3: Open file-001.parquet, apply row-group predicate pushdown
+#
+# Files read: 1 out of potentially millions
+</code></pre>
+<pre><code class="language-python">
+# Iceberg partition transforms enable flexible pruning
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .config("spark.sql.catalog.iceberg", "org.apache.iceberg.spark.SparkCatalog") \
+    .getOrCreate()
+
+# Create table with hidden partitioning (Iceberg feature)
+spark.sql("""
+  CREATE TABLE iceberg.db.events (
+    event_id STRING,
+    user_id STRING,
+    event_type STRING,
+    created_at TIMESTAMP,
+    amount DECIMAL(10,2)
+  )
+  USING iceberg
+  PARTITIONED BY (days(created_at), bucket(16, user_id))
+""")
+
+# Iceberg transforms:
+# - days(ts) → partitions by day without exposing partition column
+# - bucket(N, col) → hash-based partitioning for high-cardinality columns
+# - truncate(L, col) → prefix-based partitioning for strings
+# - hours(ts), months(ts), years(ts) → time-based transforms
+
+# Query automatically benefits from hidden partitioning:
+spark.sql("""
+  SELECT event_id, amount
+  FROM iceberg.db.events
+  WHERE created_at BETWEEN '2024-02-15' AND '2024-02-16'
+    AND user_id = 'usr_abc123'
+""")
+# Iceberg: days(created_at) prunes to 2 day-partitions
+# Iceberg: bucket(16, user_id) prunes to 1 of 16 buckets
+# Combined: reads 2/16 = 0.8% of table data
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 8: RUNTIME FILTERS / DYNAMIC PRUNING
+         ============================================================ -->
+    <section id="runtime-filters">
+      <h2>Runtime Filters / Dynamic Pruning</h2>
+      <details>
+        <summary>What are runtime filters?</summary>
+        <p>
+          <strong>Runtime filters</strong> (also called <em>dynamic partition pruning</em> or
+          <em>dynamic filtering</em>) are predicates generated <em>during query execution</em>
+          based on the results of one side of a join. Unlike static predicate pushdown (known
+          at planning time), runtime filters are discovered at execution time and propagated
+          back to the scan operators.
+        </p>
+<pre><code class="language-bash">
+# Static vs Dynamic Predicate Pushdown
+#
+# STATIC (compile-time):
+#   Query: SELECT * FROM orders WHERE region = 'us-east-1'
+#   Optimizer knows 'us-east-1' at plan time → pushes to scan
+#
+# DYNAMIC (runtime):
+#   Query: SELECT * FROM orders o
+#          JOIN regions r ON o.region_id = r.id
+#          WHERE r.name = 'US East'
+#
+#   At plan time: optimizer doesn't know which region_ids match 'US East'
+#   At runtime:
+#     1. Scan regions WHERE name='US East' → finds id=42
+#     2. Build runtime filter: orders.region_id IN (42)
+#     3. Push filter back to orders scan → skip partitions/row-groups
+#
+# ┌──────────────────────────────────────────────────────────────┐
+# │  Without runtime filter:                                      │
+# │    Scan orders (ALL partitions) ─┐                           │
+# │                                   ├─ Hash Join ─→ result     │
+# │    Scan regions (filtered) ──────┘                           │
+# │    Shuffle: 500 GB                                           │
+# ├──────────────────────────────────────────────────────────────┤
+# │  With runtime filter:                                         │
+# │    Scan regions (filtered) → build filter {id=42}            │
+# │         │                                                     │
+# │         ↓ propagate filter                                   │
+# │    Scan orders (region_id=42 only) ─┐                        │
+# │                                      ├─ Hash Join ─→ result  │
+# │    Scan regions (filtered) ─────────┘                        │
+# │    Shuffle: 5 GB  (100x reduction)                           │
+# └──────────────────────────────────────────────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>Spark Dynamic Partition Pruning (DPP)</summary>
+<pre><code class="language-python">
+# Spark 3.0+ Dynamic Partition Pruning
+# Enabled by default: spark.sql.optimizer.dynamicPartitionPruning.enabled=true
+
+# Example: fact-dimension join with partition pruning
+spark.sql("""
+  SELECT o.order_id, o.amount, d.date_name
+  FROM orders o
+  JOIN dim_date d ON o.order_date = d.date_key
+  WHERE d.is_holiday = true AND d.year = 2024
+""")
+
+# Physical plan shows DPP:
+# *(2) BroadcastHashJoin [order_date], [date_key]
+# :- *(2) Filter isnotnull(order_date)
+# :  +- *(2) FileScan parquet [order_id,amount,order_date]
+# :        PartitionFilters: [isnotnull(order_date),
+# :          dynamicpruningexpression(order_date IN
+# :            subquery#1 [date_key FROM dim_date WHERE is_holiday=true])]
+# +- BroadcastExchange
+#    +- *(1) Filter (is_holiday = true AND year = 2024)
+#       +- *(1) FileScan parquet [date_key,date_name,is_holiday,year]
+
+# Without DPP: scans all 365 date partitions
+# With DPP: scans only ~10 holiday partitions (97% reduction)
+
+# DPP requirements:
+# 1. One side must be broadcastable (small dimension table)
+# 2. Join key must be a partition column of the large table
+# 3. spark.sql.optimizer.dynamicPartitionPruning.enabled = true
+# 4. spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly = true (default)
+
+# Configuration:
+spark.conf.set("spark.sql.optimizer.dynamicPartitionPruning.enabled", "true")
+spark.conf.set("spark.sql.optimizer.dynamicPartitionPruning.useStats", "true")
+spark.conf.set("spark.sql.optimizer.dynamicPartitionPruning.fallbackFilterRatio", "0.5")
+</code></pre>
+      </details>
+      <details>
+        <summary>BigQuery runtime filters</summary>
+<pre><code class="language-sql">
+-- BigQuery applies runtime filters automatically
+-- Visible in execution plan as "runtime filter" stages
+
+-- Example: join with filtering dimension
+SELECT
+  f.transaction_id,
+  f.amount,
+  d.store_name
+FROM `project.dataset.fact_transactions` f
+JOIN `project.dataset.dim_stores` d
+  ON f.store_id = d.store_id
+WHERE d.country = 'US' AND d.state = 'CA';
+
+-- BigQuery execution:
+-- Stage 1: Scan dim_stores, filter country='US' AND state='CA'
+--          → produces runtime filter on store_id (e.g., 500 store_ids)
+-- Stage 2: Scan fact_transactions with runtime filter on store_id
+--          → skips storage blocks where store_id not in filter set
+-- Stage 3: Hash join remaining rows
+
+-- Without runtime filter: fact table bytes scanned = 2 TB
+-- With runtime filter: fact table bytes scanned = 50 GB
+-- Slot time reduction: 4000 → 200 slot-seconds
+</code></pre>
+      </details>
+      <details>
+        <summary>Semi-join reduction</summary>
+        <p>
+          Semi-join reduction is a generalization of runtime filters. The optimizer converts
+          certain join patterns into semi-joins that produce a filter set, then pushes that
+          filter to the opposite side of the join.
+        </p>
+<pre><code class="language-sql">
+-- Semi-join reduction example
+-- Original query:
+SELECT o.order_id, o.amount
+FROM orders o
+WHERE o.customer_id IN (
+  SELECT c.customer_id
+  FROM customers c
+  WHERE c.segment = 'enterprise'
+);
+
+-- Optimizer rewrites as:
+-- 1. Scan customers WHERE segment='enterprise' → collect customer_ids
+-- 2. Build bloom filter / hash set from customer_ids
+-- 3. Push bloom filter to orders scan
+-- 4. Scan orders, applying bloom filter at storage layer
+
+-- Trino/Presto dynamic filtering:
+-- SET SESSION enable_dynamic_filtering = true;
+-- Trino builds a bloom filter from the build side of a join
+-- and pushes it to the probe side's table scan connector
+</code></pre>
+<pre><code class="language-python">
+# Spark semi-join reduction with broadcast
+from pyspark.sql.functions import broadcast
+
+# Small dimension table (enterprise customers)
+enterprise_customers = spark.sql("""
+  SELECT customer_id FROM customers WHERE segment = 'enterprise'
+""")
+
+# Large fact table
+orders = spark.read.parquet("s3://warehouse/orders/")
+
+# Spark applies runtime filter when broadcasting the small side
+result = orders.join(
+    broadcast(enterprise_customers),
+    "customer_id"
+).select("order_id", "amount", "customer_id")
+
+# Physical plan shows broadcast + filter pushdown:
+# BroadcastHashJoin [customer_id]
+# :- FileScan parquet orders [order_id, amount, customer_id]
+# :     PushedFilters: [IsNotNull(customer_id)]
+# :     RuntimeFilter: BloomFilter(customer_id) from broadcast
+# +- BroadcastExchange
+#    +- Filter (segment = 'enterprise')
+#       +- FileScan parquet customers
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 9: QUANTIFYING PERFORMANCE IMPACT
+         ============================================================ -->
+    <section id="cost-impact">
+      <h2>Quantifying Performance Impact</h2>
+      <details>
+        <summary>Bytes scanned reduction — the primary metric</summary>
+<pre><code class="language-bash">
+# Cost model for BigQuery on-demand pricing:
+# $5.00 per TB scanned (first 1 TB/month free)
+#
+# Pushdown Impact Calculation:
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Table: events (50 TB, 200 columns, nested protos)              │
+# │  Query frequency: 10,000 queries/month                          │
+# ├──────────────────────┬──────────────────┬───────────────────────┤
+# │  Optimization        │  Bytes/Query     │  Monthly Cost         │
+# ├──────────────────────┼──────────────────┼───────────────────────┤
+# │  No optimization     │  50 TB           │  $2,500,000           │
+# │  + Partition pruning │  140 GB (1 day)  │  $7,000               │
+# │  + Predicate push    │  45 GB           │  $2,250               │
+# │  + Projection push   │  5 GB (3 cols)   │  $250                 │
+# │  + Nested pruning    │  800 MB          │  $40                  │
+# ├──────────────────────┼──────────────────┼───────────────────────┤
+# │  TOTAL SAVINGS       │  99.998%         │  $2,499,960/month     │
+# └──────────────────────┴──────────────────┴───────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>Spark shuffle &amp; compute reduction</summary>
+<pre><code class="language-bash">
+# Spark performance impact (EMR/Dataproc cluster):
+#
+# Without pushdown:
+#   - Read from S3: 10 TB (network I/O)
+#   - Shuffle after join: 8 TB (disk + network)
+#   - Peak memory per executor: 32 GB
+#   - Cluster: 100 x r5.4xlarge = $126/hour
+#   - Job duration: 4 hours
+#   - Cost per run: $504
+#
+# With predicate + projection + partition pushdown:
+#   - Read from S3: 50 GB (99.5% reduction)
+#   - Shuffle after join: 40 GB (99.5% reduction)
+#   - Peak memory per executor: 4 GB
+#   - Cluster: 10 x r5.2xlarge = $6.30/hour
+#   - Job duration: 15 minutes
+#   - Cost per run: $1.58
+#
+# Savings: $502.42 per run (99.7%)
+# Weekly pipeline (7 runs): $3,517/week saved
+
+# Key metrics to track:
+# 1. Bytes read (input size at scan)
+# 2. Rows output at scan vs rows after filter
+# 3. Shuffle read/write size
+# 4. Task serialization time
+# 5. GC time (indicator of memory pressure from over-reading)
+</code></pre>
+      </details>
+      <details>
+        <summary>Real-world benchmarks by optimization layer</summary>
+<pre><code class="language-bash">
+# Typical reduction percentages by optimization layer:
+#
+# ┌────────────────────────────────┬──────────────────────────────┐
+# │  Optimization Layer            │  Typical Bytes Reduction     │
+# ├────────────────────────────────┼──────────────────────────────┤
+# │  Partition pruning             │  90-99% (time-series data)   │
+# │  File/manifest pruning (Delta) │  60-95% (within partition)   │
+# │  Predicate pushdown (row grps) │  40-80% (sorted data)        │
+# │  Projection pushdown           │  80-99% (wide tables)        │
+# │  Nested struct pruning         │  50-95% (proto/JSON cols)    │
+# │  Runtime filters               │  70-95% (filtered joins)     │
+# │  Bloom filters                 │  20-60% (equality on HCC)    │
+# ├────────────────────────────────┼──────────────────────────────┤
+# │  Combined (typical)            │  95-99.99%                   │
+# └────────────────────────────────┴──────────────────────────────┘
+#
+# HCC = High Cardinality Column (user_id, session_id)
+#
+# Note: These compound — if partition pruning removes 99% and
+# projection removes 95% of remaining, combined = 99.95% reduction
+</code></pre>
+      </details>
+      <details>
+        <summary>BigQuery slot time as a performance proxy</summary>
+<pre><code class="language-sql">
+-- BigQuery slot-time measures actual compute work
+-- Lower slot-time = less data processed = cheaper (for flat-rate)
+
+-- Query the INFORMATION_SCHEMA for slot analysis:
+SELECT
+  query,
+  total_bytes_processed,
+  total_slot_ms,
+  ROUND(total_bytes_processed / POW(1024, 3), 2) AS gb_processed,
+  ROUND(total_slot_ms / 1000.0, 1) AS slot_seconds,
+  ROUND(total_bytes_processed / NULLIF(total_slot_ms, 0), 0) AS bytes_per_slot_ms
+FROM `region-us`.INFORMATION_SCHEMA.JOBS
+WHERE creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+  AND job_type = 'QUERY'
+  AND state = 'DONE'
+ORDER BY total_bytes_processed DESC
+LIMIT 20;
+
+-- Pushdown effectiveness ratio:
+-- total_bytes_processed / table_total_bytes = pushdown efficiency
+-- Good: < 1% for partitioned + clustered + narrow queries
+-- Bad: > 50% suggests missing partitioning or SELECT *
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 10: PRODUCTION INCIDENT
+         ============================================================ -->
+    <section id="production-incident">
+      <h2>Production Incident: $50K/Month Nested Proto Explosion</h2>
+      <details>
+        <summary>Incident timeline</summary>
+<pre><code class="language-bash">
+# INCIDENT REPORT: BigQuery Cost Explosion
+# Severity: P2 (financial impact)
+# Duration: 6 weeks before detection
+# Cost Impact: $50,000/month ($300K total before fix)
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  TIMELINE                                                       │
+# ├─────────────────────────────────────────────────────────────────┤
+# │  Week 0: Engineer creates new dashboard pipeline                │
+# │    - Query: SELECT * FROM events WHERE date = CURRENT_DATE()    │
+# │    - Scheduled: every 15 minutes                                │
+# │    - Table: 200 columns, deeply nested Proto (event_payload)    │
+# │    - Daily partition size: 500 GB                               │
+# │                                                                 │
+# │  Week 1: Pipeline runs 96x/day × 500 GB = 48 TB/day scanned   │
+# │    - Monthly: 48 TB × 30 = 1,440 TB                            │
+# │    - Cost: 1,440 × $5 = $7,200/month (just this one query!)    │
+# │                                                                 │
+# │  Week 2: Engineer adds 6 more similar queries for other teams   │
+# │    - Total: 7 queries × $7,200 = $50,400/month                 │
+# │                                                                 │
+# │  Week 8: Finance flags BigQuery bill increase                   │
+# │    - Previous month: $25,000 total                              │
+# │    - Current month: $75,000 total                               │
+# │    - Delta: +$50,000 from 7 new pipelines                      │
+# └─────────────────────────────────────────────────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>Root cause analysis</summary>
+<pre><code class="language-sql">
+-- ROOT CAUSE: SELECT * on table with massive nested Proto column
+--
+-- Table schema:
+-- events (
+--   event_id STRING,                    -- 2 GB/day
+--   timestamp TIMESTAMP,                -- 1 GB/day
+--   user_id STRING,                     -- 3 GB/day
+--   event_type STRING,                  -- 1 GB/day
+--   event_payload STRUCT&lt;               -- 490 GB/day (98% of storage!)
+--     page_view STRUCT&lt;15 fields&gt;,
+--     purchase STRUCT&lt;25 fields&gt;,
+--     experiment_assignments ARRAY&lt;STRUCT&lt;8 fields&gt;&gt;,
+--     device_fingerprint STRUCT&lt;30 fields&gt;,
+--     ad_attribution STRUCT&lt;20 fields&gt;,
+--     content_interaction STRUCT&lt;18 fields&gt;,
+--     ... 50+ more sub-structs
+--   &gt;,
+--   _PARTITIONDATE DATE                 -- partition column
+-- )
+-- Total per daily partition: 500 GB
+-- event_payload alone: 490 GB (98%)
+
+-- PROBLEMATIC QUERY (ran every 15 minutes):
+SELECT *
+FROM `project.dataset.events`
+WHERE _PARTITIONDATE = CURRENT_DATE();
+-- Bytes scanned per execution: 500 GB
+-- The dashboard only used: event_id, timestamp, user_id, event_type
+-- Needed bytes: 7 GB (1.4% of what was scanned)
+
+-- WASTE: 493 GB × 96 runs/day × 30 days = 1,420 TB/month WASTED
+</code></pre>
+      </details>
+      <details>
+        <summary>Fix and prevention measures</summary>
+<pre><code class="language-sql">
+-- FIX 1: Replace SELECT * with explicit columns + nested pruning
+-- Before: SELECT * FROM events WHERE _PARTITIONDATE = CURRENT_DATE()
+-- After:
+SELECT
+  event_id,
+  timestamp,
+  user_id,
+  event_type,
+  event_payload.purchase.total_amount  -- nested pruning: 1 sub-field
+FROM `project.dataset.events`
+WHERE _PARTITIONDATE = CURRENT_DATE();
+-- Bytes scanned: 8 GB (from 500 GB) = 98.4% reduction
+-- Monthly cost: $115 (from $7,200) per pipeline
+
+-- FIX 2: Create materialized view for dashboard queries
+CREATE MATERIALIZED VIEW `project.dataset.events_dashboard_mv`
+PARTITION BY _PARTITIONDATE
+CLUSTER BY event_type
+AS
+SELECT
+  event_id,
+  timestamp,
+  user_id,
+  event_type,
+  event_payload.purchase.total_amount AS purchase_amount
+FROM `project.dataset.events`;
+-- MV is automatically refreshed, queries scan MV (much smaller)
+
+-- FIX 3: Implement BigQuery cost controls
+-- Set per-user byte limits:
+ALTER PROJECT `my-project`
+SET OPTIONS (
+  `default_query_bytes_limit` = 1099511627776  -- 1 TB max per query
+);
+</code></pre>
+<pre><code class="language-python">
+# FIX 4: Automated governance — detect SELECT * in scheduled queries
+# BigQuery audit log scanner (Cloud Function)
+import json
+from google.cloud import bigquery
+
+client = bigquery.Client()
+
+def check_expensive_queries(event, context):
+    """Cloud Function triggered by BigQuery audit logs."""
+    query = """
+      SELECT
+        user_email,
+        query,
+        total_bytes_processed,
+        ROUND(total_bytes_processed / POW(1024, 4), 3) AS tb_processed,
+        ROUND(total_bytes_processed / POW(1024, 4) * 5, 2) AS estimated_cost_usd
+      FROM `region-us`.INFORMATION_SCHEMA.JOBS
+      WHERE creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+        AND total_bytes_processed > 1099511627776  -- > 1 TB
+        AND state = 'DONE'
+        AND (
+          REGEXP_CONTAINS(query, r'SELECT\\s+\\*')
+          OR total_bytes_processed > 5 * POW(1024, 4)  -- > 5 TB
+        )
+      ORDER BY total_bytes_processed DESC
+    """
+    results = client.query(query).result()
+    for row in results:
+        alert_slack(
+            f"🚨 Expensive query detected!\n"
+            f"User: {row.user_email}\n"
+            f"TB processed: {row.tb_processed}\n"
+            f"Estimated cost: ${row.estimated_cost_usd}\n"
+            f"Query: {row.query[:200]}..."
+        )
+
+# Prevention: CI/CD check for SELECT * in scheduled queries
+def lint_bigquery_sql(sql_file_path):
+    """Pre-commit hook to reject SELECT * in production queries."""
+    with open(sql_file_path) as f:
+        sql = f.read()
+    if re.search(r'SELECT\s+\*', sql, re.IGNORECASE):
+        raise ValueError(
+            f"SELECT * detected in {sql_file_path}. "
+            f"Explicit column lists required for production queries."
+        )
+</code></pre>
+      </details>
+      <details>
+        <summary>Lessons learned</summary>
+        <ul>
+          <li><strong>Never use SELECT * in production pipelines</strong> — especially on tables with nested Proto/STRUCT columns</li>
+          <li><strong>Set byte scan limits</strong> — BigQuery supports per-user and per-project byte limits</li>
+          <li><strong>Monitor bytes_processed trends</strong> — alert on week-over-week increases > 20%</li>
+          <li><strong>Separate nested columns into their own tables</strong> — if only 5% of queries need the full Proto, move it to a separate table joined by event_id</li>
+          <li><strong>Code review SQL changes</strong> — treat scheduled query changes like production code deployments</li>
+          <li><strong>Tag queries with labels</strong> — use BigQuery job labels to attribute costs to teams/pipelines</li>
+          <li><strong>Use INFORMATION_SCHEMA.JOBS for cost observability</strong> — build dashboards showing per-pipeline costs</li>
+        </ul>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 11: DEBUGGING WORKFLOW
+         ============================================================ -->
+    <section id="debugging-workflow">
+      <h2>Debugging Workflow: Verifying Pushdown</h2>
+      <details>
+        <summary>PostgreSQL EXPLAIN — filter vs index condition</summary>
+<pre><code class="language-sql">
+-- PostgreSQL: verify predicate pushdown via EXPLAIN ANALYZE
+
+-- CASE 1: Predicate NOT pushed down (sequential scan + filter)
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT user_id, amount FROM orders
+WHERE UPPER(region) = 'US-EAST-1';  -- function prevents pushdown
+
+-- Output:
+-- Seq Scan on orders  (cost=0.00..2135000.00 rows=250000 actual time=0.015..35000.000)
+--   Filter: (upper(region) = 'US-EAST-1')
+--   Rows Removed by Filter: 49750000     ← BAD: reading all rows
+--   Buffers: shared hit=150000 read=850000  ← lots of I/O
+--   Planning Time: 0.5 ms
+--   Execution Time: 35142 ms
+
+-- CASE 2: Predicate pushed down (index scan)
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT user_id, amount FROM orders
+WHERE region = 'us-east-1';  -- exact match, uses index
+
+-- Output:
+-- Index Scan using idx_orders_region on orders (cost=0.56..1250.00 rows=250000)
+--   Index Cond: (region = 'us-east-1')     ← GOOD: predicate in index
+--   Buffers: shared hit=1200 read=50       ← minimal I/O
+--   Planning Time: 0.3 ms
+--   Execution Time: 85 ms                  ← 400x faster
+
+-- KEY INDICATORS:
+-- "Filter:" line = NOT pushed down (post-scan filtering)
+-- "Index Cond:" line = pushed down to index
+-- "Rows Removed by Filter:" = wasted work (higher = worse)
+-- Buffers read count = actual disk I/O
+</code></pre>
+      </details>
+      <details>
+        <summary>Spark physical plan — PushedFilters &amp; ReadSchema</summary>
+<pre><code class="language-python">
+# Spark: verify pushdown via explain(True) or Spark UI
+
+# Step 1: Check physical plan
+df = spark.read.parquet("s3://warehouse/events/")
+result = df.filter(
+    (df.event_type == "purchase") &
+    (df.user.country == "US")
+).select("event_id", "user.country", "purchase.total")
+
+result.explain(True)
+
+# LOOK FOR THESE IN THE PHYSICAL PLAN:
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  == Physical Plan ==                                            │
+# │  *(1) Project [event_id, user.country, purchase.total]          │
+# │  +- *(1) Filter (isnotnull(event_type) AND isnotnull(user))     │
+# │     +- *(1) ColumnarToRow                                       │
+# │        +- FileScan parquet [event_id, user, purchase, ...]      │
+# │              Location: InMemoryFileIndex[s3://warehouse/events]  │
+# │              PushedFilters: [EqualTo(event_type,purchase),       │
+# │                             IsNotNull(event_type)]              │
+# │              ReadSchema: struct&lt;event_id:string,                │
+# │                user:struct&lt;country:string&gt;,                     │ ← nested pruning!
+# │                purchase:struct&lt;total:decimal(10,2)&gt;&gt;            │ ← nested pruning!
+# └─────────────────────────────────────────────────────────────────┘
+#
+# KEY INDICATORS:
+# 1. "PushedFilters:" — predicates sent to storage connector
+# 2. "ReadSchema:" — columns actually read (projection pushdown)
+#    - If you see full struct, nested pruning FAILED
+#    - If you see only leaf fields, nested pruning SUCCEEDED
+# 3. "PartitionFilters:" — partition-level predicates (best pushdown)
+# 4. "DataFilters:" — applied after file read (less ideal)
+
+# Step 2: Check Spark UI metrics
+# Navigate to: Spark UI > SQL > Query Details > Scan node
+# Look for:
+#   - "number of files read" (lower = better partition pruning)
+#   - "size of files read" (lower = better projection pushdown)
+#   - "number of output rows" vs "number of rows in files"
+#     (big difference = predicate pushdown working)
+
+# Step 3: Compare input bytes
+print(f"Input bytes: {result.inputFiles()}")
+# Compare against total table size to measure effectiveness
+</code></pre>
+      </details>
+      <details>
+        <summary>BigQuery execution details — bytes processed analysis</summary>
+<pre><code class="language-sql">
+-- BigQuery: verify pushdown via execution details and INFORMATION_SCHEMA
+
+-- Method 1: Query execution details (in BigQuery Console)
+-- After running a query, click "Execution details" tab:
+-- - "Bytes shuffled" — join/aggregation data movement
+-- - "Bytes spilled" — data that overflowed to disk
+-- - "Slot time" — total CPU time
+-- - "Bytes read" per stage — shows actual storage I/O
+
+-- Method 2: INFORMATION_SCHEMA.JOBS_BY_PROJECT
+SELECT
+  job_id,
+  query,
+  total_bytes_processed,
+  total_bytes_billed,
+  -- Compare these two to see pushdown effectiveness:
+  referenced_tables,
+  timeline  -- per-stage timing
+FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+WHERE creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+  AND job_type = 'QUERY'
+ORDER BY total_bytes_processed DESC;
+
+-- Method 3: Dry run to estimate without executing
+-- In BigQuery Console: click "More" > "Query Settings" > check "Dry run"
+-- Or via CLI:
+-- bq query --dry_run 'SELECT user_id FROM events WHERE date = "2024-02-15"'
+-- Returns: "Query successfully validated. Job statistics: totalBytesProcessed: 3145728"
+
+-- Method 4: Compare bytes_processed for pushdown verification
+-- Run same logical query two ways:
+
+-- Version A (with pushdown):
+SELECT event_id, user.country
+FROM events
+WHERE _PARTITIONDATE = '2024-02-15'
+  AND event_type = 'purchase';
+-- Bytes processed: 1.2 GB  ✓ partition + column + nested pruning
+
+-- Version B (without pushdown):
+SELECT *
+FROM events
+WHERE _PARTITIONDATE = '2024-02-15'
+  AND event_type = 'purchase';
+-- Bytes processed: 500 GB  ✗ full partition scan, all columns
+
+-- Pushdown effectiveness: (500 - 1.2) / 500 = 99.76% bytes saved
+</code></pre>
+      </details>
+      <details>
+        <summary>Trino/Presto EXPLAIN — connector pushdown</summary>
+<pre><code class="language-sql">
+-- Trino: verify pushdown via EXPLAIN (TYPE DISTRIBUTED)
+EXPLAIN (TYPE DISTRIBUTED)
+SELECT user_id, amount
+FROM hive.warehouse.orders
+WHERE order_date = DATE '2024-02-15'
+  AND region = 'us-east-1'
+  AND amount > 100;
+
+-- Look for in the output:
+-- Fragment 0:
+--   TableScan[hive:warehouse.orders]
+--     constraint: {order_date=[2024-02-15], region=[us-east-1]}
+--     pushdown: amount > 100 applied at connector
+--     columns: [user_id, amount]  ← projection pushdown
+--
+-- If you see "constraint" and "pushdown" in the TableScan node,
+-- predicates are being pushed to the Hive connector.
+--
+-- If predicates appear only in a separate "Filter" node above
+-- the TableScan, they are NOT pushed down.
+
+-- Trino dynamic filtering verification:
+EXPLAIN (TYPE DISTRIBUTED)
+SELECT o.order_id, o.amount
+FROM orders o
+JOIN dim_stores s ON o.store_id = s.store_id
+WHERE s.country = 'US';
+
+-- Look for: "dynamicFilter" in the TableScan for orders
+-- Fragment 1:
+--   TableScan[orders]
+--     dynamicFilter: {store_id = #df_123}
+-- This means Trino will build a filter from dim_stores
+-- and push it to the orders scan at runtime.
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 12: CODE EXAMPLES
+         ============================================================ -->
+    <section id="code-examples">
+      <h2>Code Examples: Before &amp; After</h2>
+      <details>
+        <summary>Example 1: BigQuery — SELECT * vs explicit columns on nested table</summary>
+<pre><code class="language-sql">
+-- TABLE: user_events (partitioned by DATE(event_time), clustered by event_type)
+-- Size: 80 TB total, 220 GB/day, 200+ columns including nested protos
+-- Schema includes: event_payload STRUCT with 60 leaf fields
+
+-- ═══════════════════════════════════════════════════════════════
+-- BEFORE: No pushdown optimization
+-- ═══════════════════════════════════════════════════════════════
+SELECT *
+FROM `analytics.user_events`
+WHERE DATE(event_time) BETWEEN '2024-02-01' AND '2024-02-28';
+
+-- Execution stats:
+--   Bytes processed: 6.2 TB (28 days × 220 GB/day)
+--   Slot time: 18,000 slot-seconds
+--   Estimated cost: $31.00 per run
+--   Rows scanned: 12 billion
+--   Rows returned: 12 billion (no row filtering beyond partition)
+
+-- ═══════════════════════════════════════════════════════════════
+-- AFTER: All pushdowns applied
+-- ═══════════════════════════════════════════════════════════════
+SELECT
+  event_id,
+  event_time,
+  user_id,
+  event_type,
+  event_payload.purchase.total_amount,     -- nested pruning
+  event_payload.purchase.currency           -- nested pruning
+FROM `analytics.user_events`
+WHERE DATE(event_time) = '2024-02-15'      -- partition pruning (1 day)
+  AND event_type = 'purchase'               -- cluster pruning
+  AND event_payload.purchase.total_amount > 100;  -- predicate pushdown
+
+-- Execution stats:
+--   Bytes processed: 2.8 GB
+--   Slot time: 45 slot-seconds (400x reduction)
+--   Estimated cost: $0.014 per run
+--   Rows scanned: 5 million (from 12 billion)
+--   Rows returned: 800,000
+--
+-- TOTAL SAVINGS: 99.95% bytes, 99.75% slot time, 99.95% cost
+</code></pre>
+      </details>
+      <details>
+        <summary>Example 2: Spark — optimized pipeline with partition + projection</summary>
+<pre><code class="language-python">
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, date_format, sum as spark_sum
+
+spark = SparkSession.builder \
+    .appName("OptimizedRevenuePipeline") \
+    .config("spark.sql.parquet.filterPushdown", "true") \
+    .config("spark.sql.optimizer.nestedSchemaPruning.enabled", "true") \
+    .config("spark.sql.optimizer.dynamicPartitionPruning.enabled", "true") \
+    .getOrCreate()
+
+# ═══════════════════════════════════════════════════════════════
+# BEFORE: Unoptimized pipeline
+# ═══════════════════════════════════════════════════════════════
+def bad_revenue_pipeline(date_str):
+    """Reads entire table, filters late — massive I/O waste."""
+    # Problem 1: SELECT * (no projection pushdown)
+    events = spark.read.parquet("s3://data-lake/events/")
+
+    # Problem 2: Filter after full scan (predicate not pushed to partition)
+    daily = events.filter(
+        date_format(col("event_time"), "yyyy-MM-dd") == date_str
+    )
+
+    # Problem 3: Reads entire nested struct
+    purchases = daily.filter(col("event_type") == "purchase")
+
+    # Problem 4: Only now selecting needed columns (too late!)
+    result = purchases.select(
+        "user_id",
+        "event_payload.purchase.total_amount",
+        "event_payload.purchase.currency"
+    ).groupBy("currency").agg(spark_sum("total_amount").alias("revenue"))
+
+    return result
+
+# Spark metrics for bad pipeline:
+#   Input size: 2.4 TB (reads ALL columns, ALL partitions)
+#   Shuffle write: 800 GB
+#   Duration: 45 minutes on 50-node cluster
+#   Cost: ~$95/run
+
+# ═══════════════════════════════════════════════════════════════
+# AFTER: Fully optimized pipeline
+# ═══════════════════════════════════════════════════════════════
+def good_revenue_pipeline(date_str):
+    """Pushdown-optimized: minimal I/O at every layer."""
+    # Projection + nested pruning: only read needed leaf columns
+    # Partition pruning: use partition column directly
+    result = spark.read.parquet("s3://data-lake/events/") \
+        .filter(
+            (col("date") == date_str) &          # partition pruning (Hive partition col)
+            (col("event_type") == "purchase")     # predicate pushdown (in row group stats)
+        ) \
+        .select(
+            "user_id",
+            col("event_payload.purchase.total_amount").alias("total_amount"),
+            col("event_payload.purchase.currency").alias("currency")
+        ) \
+        .groupBy("currency") \
+        .agg(spark_sum("total_amount").alias("revenue"))
+
+    return result
+
+# Verify optimization in physical plan:
+good_revenue_pipeline("2024-02-15").explain(True)
+# == Physical Plan ==
+# *(2) HashAggregate(keys=[currency], functions=[sum(total_amount)])
+# +- Exchange hashpartitioning(currency, 200)
+#    +- *(1) HashAggregate(keys=[currency], functions=[partial_sum(total_amount)])
+#       +- *(1) Project [total_amount, currency]
+#          +- *(1) Filter (event_type = 'purchase')
+#             +- *(1) ColumnarToRow
+#                +- FileScan parquet [event_type,event_payload,user_id,date]
+#                     PartitionFilters: [date = 2024-02-15]          ← partition pruning
+#                     PushedFilters: [EqualTo(event_type,purchase)]  ← predicate pushdown
+#                     ReadSchema: struct&lt;user_id:string,             ← projection + nested
+#                       event_payload:struct&lt;purchase:struct&lt;
+#                         total_amount:decimal,currency:string&gt;&gt;&gt;
+
+# Spark metrics for good pipeline:
+#   Input size: 1.8 GB (from 2.4 TB — 99.93% reduction)
+#   Shuffle write: 2 MB
+#   Duration: 35 seconds on 5-node cluster
+#   Cost: ~$0.08/run (1,187x cheaper)
+</code></pre>
+      </details>
+      <details>
+        <summary>Example 3: Delta Lake — file skipping with Z-ORDER</summary>
+<pre><code class="language-python">
+# Delta Lake Z-ORDER clustering for multi-column predicate pushdown
+
+# Problem: queries filter on both region AND product_category
+# Standard sorting (by region) gives good skipping for region
+# but poor skipping for product_category (values spread across all files)
+
+# Solution: Z-ORDER interleaves both columns for balanced skipping
+spark.sql("""
+  OPTIMIZE delta.`s3://warehouse/transactions/`
+  ZORDER BY (region, product_category)
+""")
+
+# Before Z-ORDER:
+# ┌────────────────────────────────────────────────────────────┐
+# │  File 1: region=[ap-south..eu-west], category=[A..Z]       │
+# │  File 2: region=[eu-west..us-east], category=[A..Z]        │
+# │  File 3: region=[us-east..us-west], category=[A..Z]        │
+# └────────────────────────────────────────────────────────────┘
+# Query: region='us-east-1' AND category='electronics'
+# Files read: 2 of 3 (region helps, category doesn't)
+
+# After Z-ORDER:
+# ┌────────────────────────────────────────────────────────────┐
+# │  File 1: region=[ap-south..eu-west], category=[A..M]       │
+# │  File 2: region=[ap-south..eu-west], category=[N..Z]       │
+# │  File 3: region=[us-east..us-west], category=[A..L]        │
+# │  File 4: region=[us-east..us-west], category=[electronics] │ ← HIT
+# │  File 5: region=[us-east..us-west], category=[M..Z]        │
+# └────────────────────────────────────────────────────────────┘
+# Query: region='us-east-1' AND category='electronics'
+# Files read: 1 of 5 (both dimensions help)
+
+# Verify file skipping:
+spark.sql("""
+  SELECT event_id, amount
+  FROM delta.`s3://warehouse/transactions/`
+  WHERE region = 'us-east-1'
+    AND product_category = 'electronics'
+""").explain(True)
+
+# Check Delta Lake metrics:
+from delta.tables import DeltaTable
+dt = DeltaTable.forPath(spark, "s3://warehouse/transactions/")
+history = dt.history(5)
+history.select("operationMetrics").show(truncate=False)
+# operationMetrics: {
+#   "numFilesAdded": "120",
+#   "numFilesRemoved": "5000",
+#   "numOutputBytes": "45000000000",
+#   "zOrderBy": "[region,product_category]"
+# }
+</code></pre>
+      </details>
+      <details>
+        <summary>Example 4: Iceberg — time-travel query with manifest pruning</summary>
+<pre><code class="language-sql">
+-- Iceberg: verify manifest-level pruning via query planning metrics
+
+-- Check how many files were pruned during planning:
+SELECT
+  snapshot_id,
+  summary['total-data-files'] AS total_files,
+  summary['added-data-files'] AS added_files,
+  committed_at
+FROM prod.db.events.snapshots
+ORDER BY committed_at DESC
+LIMIT 5;
+
+-- Run query with Iceberg metrics:
+SET spark.sql.iceberg.planning.preserve-data-grouping = true;
+
+SELECT event_id, user_id, amount
+FROM prod.db.events
+WHERE event_date = '2024-02-15'
+  AND region = 'us-east-1'
+  AND amount > 1000;
+
+-- Spark UI > SQL > Scan node shows:
+--   "files read": 12
+--   "files pruned by manifest": 4,988
+--   "files pruned by row-group stats": 45
+--   "total planning time": 1.2s
+--
+-- Manifest pruning eliminated 99.76% of files before opening any Parquet
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 13: COMMON MISTAKES
+         ============================================================ -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Mistake 1: SELECT * in production pipelines</summary>
+        <p>
+          The #1 cost-inflating pattern. Even when using CTEs or views that later select
+          specific columns, most engines evaluate the innermost scan first. If that scan
+          is <code>SELECT *</code>, all columns are read from storage.
+        </p>
+<pre><code class="language-sql">
+-- BAD: CTE with SELECT * defeats projection pushdown
+WITH raw AS (
+  SELECT * FROM events WHERE date = '2024-02-15'
+)
+SELECT event_id, user_id FROM raw;
+-- BigQuery still reads ALL columns in the CTE scan
+
+-- GOOD: explicit columns from the start
+WITH raw AS (
+  SELECT event_id, user_id FROM events WHERE date = '2024-02-15'
+)
+SELECT event_id, user_id FROM raw;
+-- Only 2 columns read from storage
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 2: Functions on partition/filter columns</summary>
+<pre><code class="language-sql">
+-- BAD: function on partition column prevents partition pruning
+SELECT * FROM events
+WHERE YEAR(event_date) = 2024 AND MONTH(event_date) = 2;
+-- BigQuery/Spark cannot prune partitions — scans ALL partitions
+
+-- GOOD: direct comparison on partition column
+SELECT * FROM events
+WHERE event_date BETWEEN '2024-02-01' AND '2024-02-28';
+-- Partition pruning works: reads only 28 partitions
+
+-- BAD: CAST prevents predicate pushdown to Parquet stats
+SELECT * FROM orders WHERE CAST(amount AS STRING) = '100.00';
+-- Cannot use min/max statistics on numeric column
+
+-- GOOD: compare in native type
+SELECT * FROM orders WHERE amount = 100.00;
+-- Row group skipping via min/max statistics works
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 3: Reading entire struct when only one field is needed</summary>
+<pre><code class="language-python">
+# BAD: selecting the entire struct column breaks nested pruning
+df = spark.read.parquet("s3://data-lake/events/")
+result = df.select("event_id", "user")  # reads ALL user.* sub-fields
+user_country = result.select("event_id", "user.country")
+
+# GOOD: select leaf field directly for nested pruning
+df = spark.read.parquet("s3://data-lake/events/")
+result = df.select("event_id", "user.country")  # reads ONLY user.country
+# 90% less I/O if user struct has 10 fields
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 4: Caching before filtering</summary>
+<pre><code class="language-python">
+# BAD: cache entire dataset, then filter (negates all pushdown)
+df = spark.read.parquet("s3://warehouse/events/")
+df.cache()  # reads and caches ALL columns, ALL rows
+result = df.filter(col("region") == "us-east-1").select("user_id")
+# Already read 10 TB into memory — filter is too late
+
+# GOOD: filter and project BEFORE caching
+df = spark.read.parquet("s3://warehouse/events/")
+filtered = df.filter(col("region") == "us-east-1").select("user_id")
+filtered.cache()  # caches only 50 MB (filtered + projected)
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 5: Implicit type coercion breaking pushdown</summary>
+<pre><code class="language-sql">
+-- BAD: string compared to integer — implicit cast
+SELECT * FROM orders WHERE order_id = 12345;
+-- If order_id is STRING, this forces CAST(order_id AS INT) on every row
+-- Bloom filters and min/max stats cannot be used
+
+-- GOOD: match types exactly
+SELECT * FROM orders WHERE order_id = '12345';
+-- String comparison uses dictionary encoding and bloom filters
+
+-- BAD: timestamp precision mismatch
+SELECT * FROM events WHERE event_time = '2024-02-15';
+-- TIMESTAMP column compared to DATE string — may not use partition pruning
+
+-- GOOD: explicit type matching
+SELECT * FROM events WHERE DATE(event_time) = DATE '2024-02-15';
+-- Or use the partition column directly:
+SELECT * FROM events WHERE event_date = '2024-02-15';
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 6: OR conditions that prevent row group elimination</summary>
+<pre><code class="language-sql">
+-- BAD: OR across different columns limits skip potential
+SELECT * FROM orders
+WHERE region = 'us-east-1' OR amount > 10000;
+-- A row group with region=['eu-west'] but amount=[500..50000]
+-- CANNOT be skipped (amount range includes > 10000)
+-- Result: most row groups must be read
+
+-- BETTER: UNION ALL if possible (separate pushdowns per branch)
+SELECT * FROM orders WHERE region = 'us-east-1'
+UNION ALL
+SELECT * FROM orders WHERE amount > 10000 AND region != 'us-east-1';
+-- Each branch gets independent predicate pushdown
+
+-- BEST: redesign query to avoid cross-column OR
+-- Often the OR indicates a need for separate queries or views
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 7: Ignoring data sorting/clustering</summary>
+<pre><code class="language-bash">
+# Predicate pushdown with min/max statistics ONLY works well
+# when data is sorted by the filter column.
+
+# UNSORTED data — poor row group skipping:
+# Row Group 0: region = [ap-south, us-west]   ← wide range, can't skip
+# Row Group 1: region = [eu-central, us-east] ← wide range, can't skip
+# Row Group 2: region = [ap-east, us-west]    ← wide range, can't skip
+# Query: WHERE region = 'us-east-1'
+# Result: must read ALL row groups (ranges overlap)
+
+# SORTED data — excellent row group skipping:
+# Row Group 0: region = [ap-east, ap-south]   ← skip (max < us-east-1)
+# Row Group 1: region = [eu-central, eu-west] ← skip (max < us-east-1)
+# Row Group 2: region = [us-east-1, us-east-2] ← READ (contains target)
+# Row Group 3: region = [us-west-1, us-west-2] ← skip (min > us-east-1)
+# Query: WHERE region = 'us-east-1'
+# Result: read 1 of 4 row groups (75% skip rate)
+
+# FIX: sort data on write by common filter columns
+# Spark:
+df.sort("region", "event_date").write.parquet("s3://output/")
+# Delta Lake:
+# OPTIMIZE table ZORDER BY (region, event_date)
+# BigQuery:
+# CREATE TABLE ... CLUSTER BY region, event_date
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 14: TRADE-OFFS
+         ============================================================ -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Sorting for predicate pushdown vs write amplification</summary>
+        <ul>
+          <li><strong>Pro:</strong> Sorted data maximizes row-group skipping (non-overlapping min/max ranges)</li>
+          <li><strong>Con:</strong> Global sorting requires full shuffle on write (expensive for streaming)</li>
+          <li><strong>Con:</strong> Z-ORDER / clustering requires periodic OPTIMIZE jobs (write amplification)</li>
+          <li><strong>Trade-off:</strong> Sort by most-queried column first; accept suboptimal skipping for secondary columns</li>
+          <li><strong>Mitigation:</strong> Use Iceberg's sort-on-write + automatic compaction for incremental sorting</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Small row groups vs large row groups</summary>
+        <ul>
+          <li><strong>Small row groups (16-32 MB):</strong> More granular statistics, better skip rates, but more metadata overhead and less compression efficiency</li>
+          <li><strong>Large row groups (128-256 MB):</strong> Better compression, less metadata, but coarser predicate evaluation (skip or read large chunks)</li>
+          <li><strong>Default:</strong> 128 MB is the sweet spot for most workloads</li>
+          <li><strong>Exception:</strong> Point-lookup workloads benefit from smaller row groups (8-32 MB)</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Nested columns vs flattened schema</summary>
+        <ul>
+          <li><strong>Nested (Proto/STRUCT):</strong> Natural schema evolution, single table, nested pruning reduces I/O — but SELECT * is catastrophic</li>
+          <li><strong>Flattened:</strong> Simpler queries, obvious column projection, no nested pruning needed — but 200-column tables are unwieldy, schema changes require migrations</li>
+          <li><strong>Hybrid:</strong> Top-level columns for frequently queried fields + nested STRUCT for rarely-accessed payload (best of both worlds)</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Partition granularity: too few vs too many partitions</summary>
+        <ul>
+          <li><strong>Too few partitions (yearly):</strong> Large partition sizes reduce pruning effectiveness; still reading months of data for daily queries</li>
+          <li><strong>Too many partitions (per-minute):</strong> "Small files problem" — millions of tiny files, slow planning, poor compression, metadata overhead</li>
+          <li><strong>Sweet spot:</strong> Daily partitions for event data (100 MB - 10 GB per partition file)</li>
+          <li><strong>Rule of thumb:</strong> Each partition should contain at least 100 MB of data after compression</li>
+        </ul>
+<pre><code class="language-bash">
+# Partition sizing guide:
+# ┌───────────────────────────────────────────────────────────────┐
+# │  Data Volume/Day  │  Partition By    │  Expected File Size    │
+# ├───────────────────┼──────────────────┼────────────────────────┤
+# │  < 100 MB         │  monthly/weekly  │  ~500 MB - 2 GB        │
+# │  100 MB - 10 GB   │  daily           │  ~100 MB - 10 GB       │
+# │  10 GB - 1 TB     │  daily + cluster │  ~128 MB row groups    │
+# │  > 1 TB           │  hourly + cluster│  ~128 MB row groups    │
+# └───────────────────┴──────────────────┴────────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>Bloom filters: memory cost vs skip rate</summary>
+        <ul>
+          <li><strong>Pro:</strong> Enable equality predicate pushdown on high-cardinality columns (user_id, session_id) where min/max stats are useless</li>
+          <li><strong>Con:</strong> Adds storage overhead (1-5% per column), loaded into memory during scans</li>
+          <li><strong>Con:</strong> Only useful for equality predicates, not range queries</li>
+          <li><strong>When to use:</strong> High-cardinality columns frequently filtered with <code>=</code> or <code>IN</code></li>
+          <li><strong>When to skip:</strong> Range predicates, low-cardinality (min/max stats suffice), rarely-filtered columns</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Materialized views vs pushdown optimization</summary>
+        <ul>
+          <li><strong>Materialized views:</strong> Pre-compute common queries, fastest reads, but storage cost + staleness + maintenance overhead</li>
+          <li><strong>Pushdown optimization:</strong> No extra storage, always fresh, but limited by data layout and query patterns</li>
+          <li><strong>Decision framework:</strong> If pushdown brings scan under 1 GB, pushdown wins. If queries repeatedly scan 100+ GB despite pushdown, consider MVs or summary tables.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 15: FOLLOW-UP QUESTIONS
+         ============================================================ -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Q1: How does predicate pushdown interact with JOIN ordering?</summary>
+        <p>
+          The optimizer must decide whether to push a predicate below a join. For INNER JOINs,
+          predicates on either table can be pushed below freely. For LEFT OUTER JOINs, predicates
+          on the <em>preserved</em> (left) table can be pushed below the join, but predicates
+          on the <em>nullable</em> (right) table cannot — they would change the join semantics
+          from "keep unmatched lefts with NULLs" to "only keep matching lefts."
+        </p>
+<pre><code class="language-sql">
+-- LEFT JOIN: predicate on right table CANNOT be pushed below join
+SELECT o.*, c.name
+FROM orders o
+LEFT JOIN customers c ON o.customer_id = c.id
+WHERE c.country = 'US';  -- This converts LEFT JOIN to INNER JOIN!
+
+-- To preserve LEFT JOIN semantics, move predicate to ON clause:
+SELECT o.*, c.name
+FROM orders o
+LEFT JOIN customers c ON o.customer_id = c.id AND c.country = 'US';
+-- Now unmatched orders get NULL customer fields (LEFT JOIN preserved)
+</code></pre>
+      </details>
+      <details>
+        <summary>Q2: Can you push predicates through UNION ALL / window functions?</summary>
+        <p>
+          <strong>UNION ALL:</strong> Predicates can be pushed through if the predicate column
+          exists in all branches with compatible types. Most optimizers do this automatically.
+        </p>
+        <p>
+          <strong>Window functions:</strong> Predicates CANNOT be pushed below a window function
+          because the window needs all rows in its frame to compute correctly. However, predicates
+          on partition keys that are also window PARTITION BY columns can sometimes be pushed.
+        </p>
+<pre><code class="language-sql">
+-- Predicate pushdown through UNION ALL (works):
+SELECT * FROM (
+  SELECT id, region, amount FROM orders_2023
+  UNION ALL
+  SELECT id, region, amount FROM orders_2024
+) WHERE region = 'us-east-1';
+-- Optimizer pushes region='us-east-1' to BOTH branches
+
+-- Predicate BLOCKED by window function:
+SELECT * FROM (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY ts) AS rn
+  FROM events
+) WHERE rn = 1 AND region = 'us-east-1';
+-- rn=1 CANNOT be pushed (window needs all rows)
+-- region='us-east-1' CAN be pushed in some optimizers (same partition key)
+</code></pre>
+      </details>
+      <details>
+        <summary>Q3: How do you handle predicate pushdown with late-arriving data?</summary>
+        <p>
+          Late-arriving data (events with old timestamps arriving after their partition was written)
+          creates a tension: new data goes to old partitions, requiring either:
+        </p>
+        <ul>
+          <li><strong>Append to existing partitions:</strong> Maintains pushdown but may create small files</li>
+          <li><strong>Dual partitioning:</strong> Partition by both event_time and processing_time; queries on event_time still prune correctly</li>
+          <li><strong>Compaction jobs:</strong> Periodically merge small files in old partitions to restore optimal row-group sizes</li>
+          <li><strong>Iceberg approach:</strong> Append to snapshot, metadata tracks which files contain which time ranges; planning still prunes correctly via manifest stats</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Q4: What's the difference between predicate pushdown and data skipping?</summary>
+        <p>
+          <strong>Predicate pushdown:</strong> The query optimizer pushes filter expressions to the
+          scan operator, which evaluates them during I/O. Broad term covering all push-to-storage patterns.
+        </p>
+        <p>
+          <strong>Data skipping:</strong> A specific implementation technique where min/max statistics
+          (or bloom filters) at the file/row-group/page level allow entire data units to be skipped
+          without reading their contents. Data skipping is <em>one mechanism</em> through which
+          predicate pushdown achieves I/O reduction.
+        </p>
+        <p>
+          Other pushdown mechanisms include: index scans (PostgreSQL), partition elimination
+          (directory-based), storage-server-side filtering (BigQuery), and connector-level
+          filtering (Spark Data Source V2).
+        </p>
+      </details>
+      <details>
+        <summary>Q5: How does encryption interact with pushdown?</summary>
+        <p>
+          <strong>Column-level encryption</strong> (Parquet modular encryption, BigQuery column-level security):
+        </p>
+        <ul>
+          <li>Statistics in column headers may be encrypted → cannot evaluate predicates without decryption key</li>
+          <li>Parquet modular encryption supports encrypting data while keeping statistics in plaintext (configurable)</li>
+          <li>If stats are encrypted: predicate pushdown still works if the reader has the column key</li>
+          <li>If entire column is encrypted and reader lacks the key: column is skipped (treated as non-existent) — projection pushdown naturally excludes it</li>
+          <li>BigQuery column-level security: authorized users get pushdown; unauthorized users get permission errors</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Q6: Compare pushdown effectiveness: Parquet vs ORC vs Avro</summary>
+        <ul>
+          <li><strong>Parquet:</strong> Excellent predicate pushdown (row-group stats + page-level column index), excellent projection pushdown (columnar), good nested pruning (Dremel encoding)</li>
+          <li><strong>ORC:</strong> Excellent predicate pushdown (3-level stats + built-in bloom filters), excellent projection pushdown (columnar), decent nested pruning (struct support)</li>
+          <li><strong>Avro:</strong> NO predicate pushdown (row-oriented, no column stats), NO projection pushdown (must deserialize full row), NO nested pruning — avoid for analytical workloads</li>
+          <li><strong>Summary:</strong> Avro for streaming/message passing; Parquet/ORC for analytical storage. Parquet dominates in the cloud ecosystem (BigQuery, Snowflake, Databricks)</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 16: SUMMARY
+         ============================================================ -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Key takeaways</summary>
+        <ul>
+          <li><strong>Predicate pushdown</strong> moves WHERE filters to the storage layer, skipping files/row-groups/pages via min/max statistics. Enables 40-99% I/O reduction on sorted data.</li>
+          <li><strong>Projection pushdown</strong> reads only referenced columns from columnar storage. Eliminates 80-99% of bytes on wide tables (100+ columns).</li>
+          <li><strong>Nested pruning</strong> extends projection to struct sub-fields. Critical for Proto/JSON-heavy FAANG tables where payload columns dominate storage.</li>
+          <li><strong>Partition pruning</strong> eliminates entire directory trees before any file I/O. The coarsest and most effective optimization layer (90-99% reduction).</li>
+          <li><strong>Runtime filters</strong> generate pushdown predicates at execution time from join results. Bridges the gap between static optimization and dynamic data properties.</li>
+          <li><strong>Combined effect:</strong> These optimizations compound multiplicatively. A query touching 50 TB can be reduced to 100 MB (99.9998% reduction) with proper table design and query patterns.</li>
+          <li><strong>Cost impact:</strong> In pay-per-scan systems (BigQuery on-demand), pushdown directly equals dollar savings. A single SELECT * on a nested table can cost 100x more than an optimized query.</li>
+          <li><strong>Debugging:</strong> Always verify pushdown via EXPLAIN plans (Spark PushedFilters/ReadSchema, PostgreSQL Index Cond, BigQuery bytes_processed, Trino dynamicFilter).</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Decision framework cheat sheet</summary>
+<pre><code class="language-bash">
+# WHEN DESIGNING A TABLE:
+# ┌────────────────────────────────────────────────────────────────┐
+# │  1. Choose partition key(s): time-based for event data         │
+# │  2. Choose cluster/sort keys: most common WHERE columns        │
+# │  3. Use columnar format (Parquet/ORC, never Avro for analytics)│
+# │  4. Enable bloom filters on high-cardinality equality columns  │
+# │  5. Store nested protos as STRUCT (enables nested pruning)     │
+# │  6. Target 128 MB row groups, 100+ MB partition files          │
+# └────────────────────────────────────────────────────────────────┘
+#
+# WHEN WRITING QUERIES:
+# ┌────────────────────────────────────────────────────────────────┐
+# │  1. Never SELECT * — always explicit column list               │
+# │  2. Reference partition column directly (no functions on it)   │
+# │  3. Select nested sub-fields, not entire structs               │
+# │  4. Filter before join/cache/window operations                 │
+# │  5. Use native types in predicates (no implicit casts)         │
+# │  6. Prefer AND over OR for multi-column predicates             │
+# │  7. Verify with EXPLAIN: check PushedFilters + ReadSchema      │
+# └────────────────────────────────────────────────────────────────┘
+#
+# WHEN DEBUGGING COST ISSUES:
+# ┌────────────────────────────────────────────────────────────────┐
+# │  1. Check bytes_processed — is it proportional to result size? │
+# │  2. Check EXPLAIN plan for full table scans                    │
+# │  3. Verify partition pruning is happening (partition count)     │
+# │  4. Look for "Rows Removed by Filter" (post-scan waste)        │
+# │  5. Compare ReadSchema vs full table schema                    │
+# │  6. Check data sorting (overlapping row group ranges = bad)    │
+# └────────────────────────────────────────────────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>One-liner for interviews</summary>
+        <p>
+          "Predicate pushdown pushes WHERE clauses to storage to skip data blocks via statistics;
+          projection pushdown reads only needed columns from columnar storage; nested pruning
+          extends projection into struct sub-fields — together they routinely reduce I/O by
+          99%+, directly cutting cloud costs and query latency."
+        </p>
+      </details>
+    </section>
+
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav" aria-label="Chapter navigation">
+      <a href="ch04-small-joins-big.html" class="btn btn-prev">← Chapter 4: Small Joins Big</a>
+      <a href="ch06-mvcc.html" class="btn btn-next">Chapter 6: MVCC →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

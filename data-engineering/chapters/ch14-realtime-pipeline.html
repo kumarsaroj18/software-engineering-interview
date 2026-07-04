@@ -1,0 +1,1819 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ch 14 — Real-Time Event Processing Pipeline | Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <span class="brand"><a href="../index.html">DE Interview Handbook</a></span>
+      <button class="sidebar-close" id="sidebar-close" aria-label="Close sidebar">✕</button>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-number">Ch 14</span>
+      <span class="chapter-title">Real-Time Pipeline</span>
+    </div>
+    <nav class="sidebar-nav">
+      <a href="#interviewer-intent">Interviewer Intent</a>
+      <a href="#quick-answer">Quick Answer</a>
+      <a href="#event-time-vs-processing">Event Time vs Processing Time</a>
+      <a href="#windowing">Windowing Strategies</a>
+      <a href="#watermarks">Watermarks</a>
+      <a href="#state-management">State Management</a>
+      <a href="#kafka-architecture">Kafka as Event Backbone</a>
+      <a href="#flink-vs-spark">Flink vs Spark vs Kafka Streams</a>
+      <a href="#out-of-order">Out-of-Order Events</a>
+      <a href="#backpressure">Backpressure &amp; Flow Control</a>
+      <a href="#production-incident">Production Incident</a>
+      <a href="#code-examples">Code Examples</a>
+      <a href="#common-mistakes">Common Mistakes</a>
+      <a href="#trade-offs">Trade-offs</a>
+      <a href="#follow-up-questions">Follow-up Questions</a>
+      <a href="#summary">Summary</a>
+    </nav>
+    <div class="sidebar-actions">
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">☀️</button>
+    </div>
+  </aside>
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <button class="menu-toggle" id="menu-toggle" aria-label="Open sidebar">☰</button>
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <a href="../index.html#part-v">Part V — Streaming Systems</a> &gt;
+      <span>Chapter 14</span>
+    </nav>
+    <button class="theme-toggle" id="theme-toggle-mobile" aria-label="Toggle theme">☀️</button>
+  </header>
+
+  <main class="content">
+    <!-- Chapter Header -->
+    <div class="chapter-header">
+      <span class="badge badge-hard">Hard</span>
+      <h1>Design a Real-Time Event Processing Pipeline</h1>
+      <div class="chapter-topics">
+        <span class="topic-tag">Kafka</span>
+        <span class="topic-tag">Flink</span>
+      </div>
+    </div>
+
+
+    <!-- Section 1: Interviewer Intent -->
+    <section id="interviewer-intent" class="section">
+      <h2>Interviewer Intent</h2>
+      <p>When a FAANG interviewer asks you to design a real-time event processing pipeline, they are probing multiple dimensions simultaneously:</p>
+      <ul>
+        <li><strong>Temporal reasoning:</strong> Can you distinguish event time from processing time, and do you understand why this matters for correctness?</li>
+        <li><strong>Distributed systems intuition:</strong> How do you handle out-of-order data, late arrivals, and clock skew across thousands of producers?</li>
+        <li><strong>Framework depth:</strong> Do you know when to reach for Flink vs Kafka Streams vs Spark Structured Streaming — and why?</li>
+        <li><strong>Windowing semantics:</strong> Can you articulate tumbling, sliding, and session windows with their firing policies?</li>
+        <li><strong>State management at scale:</strong> How do you manage terabytes of operator state with exactly-once guarantees?</li>
+        <li><strong>Production readiness:</strong> Backpressure handling, monitoring, alerting, graceful degradation — the details that separate a whiteboard design from a production system.</li>
+        <li><strong>Trade-off articulation:</strong> Latency vs completeness, state size vs accuracy, throughput vs exactly-once — senior engineers must reason about these trade-offs explicitly.</li>
+      </ul>
+      <p>This is not a question about drawing boxes and arrows. The interviewer wants to see you reason through the hard parts — watermarks, state backends, checkpointing, reprocessing — with specificity and production experience.</p>
+    </section>
+
+    <!-- Section 2: Quick Answer -->
+    <section id="quick-answer" class="section">
+      <h2>Quick Answer</h2>
+      <div class="callout callout-summary">
+        <p>A production real-time event processing pipeline consists of:</p>
+        <ol>
+          <li><strong>Ingestion layer:</strong> Kafka (or Kinesis/Pulsar) as a durable, partitioned event log with configurable retention.</li>
+          <li><strong>Processing engine:</strong> Apache Flink for true record-at-a-time processing with event-time semantics, keyed state, and exactly-once via distributed snapshots (Chandy-Lamport).</li>
+          <li><strong>Windowing &amp; watermarks:</strong> Assign events to windows based on event time; use watermarks to track progress and trigger window computations; configure allowed lateness for stragglers.</li>
+          <li><strong>State management:</strong> RocksDB state backend for large state with incremental checkpointing; heap for low-latency small state.</li>
+          <li><strong>Sink layer:</strong> Write results to downstream systems (OLAP stores, caches, alerting) with idempotent writes for end-to-end exactly-once.</li>
+          <li><strong>Observability:</strong> Monitor consumer lag, checkpoint duration, watermark advancement, backpressure metrics, and state size growth.</li>
+        </ol>
+      </div>
+      <p>The key insight: <strong>completeness and latency are fundamentally at odds</strong>. A 5-minute watermark delay gives you more complete results but adds 5 minutes of latency. The art is choosing the right trade-off for your use case — and building mechanisms (late-firing, side outputs, reprocessing) to handle the edge cases.</p>
+    </section>
+
+
+    <!-- Section 3: Event Time vs Processing Time -->
+    <section id="event-time-vs-processing" class="section">
+      <h2>Event Time vs Processing Time</h2>
+
+      <h3>The Core Distinction</h3>
+      <p>Every event in a streaming system carries two timestamps that tell fundamentally different stories:</p>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Concept</th>
+            <th>Definition</th>
+            <th>Example</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Event Time</strong></td>
+            <td>When the event actually occurred at the source</td>
+            <td>User clicked "Buy" at 14:03:22 UTC</td>
+          </tr>
+          <tr>
+            <td><strong>Processing Time</strong></td>
+            <td>When the event is observed by the processing engine</td>
+            <td>Flink operator reads the record at 14:03:27 UTC</td>
+          </tr>
+          <tr>
+            <td><strong>Ingestion Time</strong></td>
+            <td>When the event enters the streaming platform (Kafka)</td>
+            <td>Kafka broker appends the record at 14:03:24 UTC</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Why This Matters</h3>
+      <p>If you window by processing time, your results are <em>non-deterministic</em> — they depend on network delays, consumer lag, and reprocessing speed. Consider this scenario:</p>
+      <ul>
+        <li>A mobile app generates a purchase event at 14:00:00 (event time).</li>
+        <li>The device is in a tunnel; the event reaches Kafka at 14:05:30 (ingestion time).</li>
+        <li>Your Flink job processes it at 14:05:32 (processing time).</li>
+      </ul>
+      <p>If you're computing "revenue per minute" and window by processing time, this purchase lands in the 14:05 bucket — <strong>5 minutes late</strong>. Your 14:00 revenue figure is permanently undercounted. Event-time processing fixes this by placing the event in the 14:00 window where it logically belongs.</p>
+
+      <h3>Clock Skew in Distributed Systems</h3>
+      <p>In practice, event times are not perfectly reliable either:</p>
+      <ul>
+        <li><strong>NTP drift:</strong> Server clocks can drift 10–100ms between NTP syncs. Across a fleet of 10,000 producers, you'll see meaningful skew.</li>
+        <li><strong>Mobile/IoT devices:</strong> Users can set their device clock incorrectly. A phone set to 2019 will produce events with timestamps 7 years in the past.</li>
+        <li><strong>Timezone confusion:</strong> Producers that embed local time without timezone info create ambiguous timestamps.</li>
+        <li><strong>Batch uploads:</strong> IoT devices that buffer events offline and upload in bulk create bursts of "old" events with valid event times.</li>
+      </ul>
+
+      <h3>Defensive Strategies</h3>
+      <pre><code class="language-python"># Strategy 1: Bounded event-time skew validation
+def validate_event_time(event, current_watermark):
+    """Reject events with clearly invalid timestamps."""
+    max_future_drift = timedelta(minutes=5)
+    max_past_drift = timedelta(hours=24)
+
+    now = datetime.utcnow()
+    event_time = event.timestamp
+
+    if event_time > now + max_future_drift:
+        # Future event — likely clock skew
+        route_to_dead_letter(event, reason="future_timestamp")
+        return None
+
+    if event_time < current_watermark - max_past_drift:
+        # Too old — beyond allowed lateness
+        route_to_dead_letter(event, reason="excessive_lateness")
+        return None
+
+    return event</code></pre>
+
+      <pre><code class="language-java">// Strategy 2: Flink timestamp assigner with bounded disorder
+public class BoundedEventTimeAssigner
+    implements WatermarkStrategy&lt;Event&gt; {
+
+  @Override
+  public WatermarkGenerator&lt;Event&gt; createWatermarkGenerator(
+      WatermarkGeneratorSupplier.Context context) {
+    return new BoundedOutOfOrdernessWatermarks&lt;&gt;(
+        Duration.ofSeconds(30)  // allow 30s of disorder
+    );
+  }
+
+  @Override
+  public TimestampAssigner&lt;Event&gt; createTimestampAssigner(
+      TimestampAssignerSupplier.Context context) {
+    return (event, recordTimestamp) -&gt; event.getEventTime();
+  }
+}</code></pre>
+
+      <h3>When to Use Processing Time</h3>
+      <p>Processing time is not always wrong. Use it when:</p>
+      <ul>
+        <li>You need the <em>lowest possible latency</em> and can tolerate approximation (e.g., real-time dashboards that will be corrected by batch).</li>
+        <li>The source has no reliable event timestamp (some legacy systems).</li>
+        <li>You're measuring system health (throughput, latency) rather than business metrics.</li>
+      </ul>
+    </section>
+
+
+    <!-- Section 4: Windowing Strategies -->
+    <section id="windowing" class="section">
+      <h2>Windowing Strategies</h2>
+
+      <h3>Why Windows?</h3>
+      <p>Unbounded streams have no natural "end." Windows impose finite boundaries on infinite data, enabling aggregations (count, sum, avg) that require a defined scope. The choice of window type directly impacts result semantics, latency, and resource consumption.</p>
+
+      <h3>Tumbling Windows</h3>
+      <p>Fixed-size, non-overlapping, aligned windows. Every event belongs to exactly one window.</p>
+      <pre><code class="language-java">// Flink: 1-minute tumbling window on event time
+DataStream&lt;Event&gt; events = ...;
+
+events
+    .keyBy(Event::getUserId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(1)))
+    .aggregate(new CountAggregator())
+    .addSink(new KafkaSink&lt;&gt;());</code></pre>
+
+      <table class="comparison-table">
+        <thead>
+          <tr><th>Property</th><th>Tumbling Window</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Overlap</td><td>None — windows are contiguous and non-overlapping</td></tr>
+          <tr><td>Event assignment</td><td>Each event belongs to exactly one window</td></tr>
+          <tr><td>Use cases</td><td>Hourly aggregations, daily reports, minute-level metrics</td></tr>
+          <tr><td>State cost</td><td>Low — only one active window per key at a time</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Sliding Windows</h3>
+      <p>Fixed-size windows that advance by a configurable slide interval. Windows overlap, so a single event may contribute to multiple windows.</p>
+      <pre><code class="language-java">// Flink: 5-minute window, sliding every 1 minute
+events
+    .keyBy(Event::getUserId)
+    .window(SlidingEventTimeWindows.of(
+        Time.minutes(5),  // window size
+        Time.minutes(1)   // slide interval
+    ))
+    .aggregate(new ClickRateAggregator());</code></pre>
+
+      <table class="comparison-table">
+        <thead>
+          <tr><th>Property</th><th>Sliding Window</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Overlap</td><td>Yes — window_size / slide_interval concurrent windows</td></tr>
+          <tr><td>Event assignment</td><td>Each event belongs to (window_size / slide) windows</td></tr>
+          <tr><td>Use cases</td><td>Moving averages, trending topics, rolling metrics</td></tr>
+          <tr><td>State cost</td><td>High — 5x state if size=5min, slide=1min</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Session Windows</h3>
+      <p>Dynamic windows defined by a gap of inactivity. No fixed size — a session ends when no events arrive within the gap duration. This models user sessions naturally.</p>
+      <pre><code class="language-java">// Flink: session window with 30-minute inactivity gap
+events
+    .keyBy(Event::getUserId)
+    .window(EventTimeSessionWindows.withGap(Time.minutes(30)))
+    .process(new SessionAnalyzer());
+
+// Dynamic gap based on event properties
+events
+    .keyBy(Event::getUserId)
+    .window(EventTimeSessionWindows.withDynamicGap(
+        new SessionWindowTimeGapExtractor&lt;Event&gt;() {
+          @Override
+          public long extract(Event event) {
+            // Premium users get longer sessions
+            return event.isPremium()
+                ? 45 * 60 * 1000L   // 45 minutes
+                : 30 * 60 * 1000L;  // 30 minutes
+          }
+        }
+    ))
+    .aggregate(new SessionMetrics());</code></pre>
+
+      <table class="comparison-table">
+        <thead>
+          <tr><th>Property</th><th>Session Window</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Size</td><td>Variable — determined by data</td></tr>
+          <tr><td>Merging</td><td>Yes — late events can merge previously separate sessions</td></tr>
+          <tr><td>Use cases</td><td>User session analysis, clickstream, activity tracking</td></tr>
+          <tr><td>State cost</td><td>Unpredictable — depends on session length and merge frequency</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Early and Late Firings</h3>
+      <p>Windows don't have to fire only once. A sophisticated pipeline uses multiple trigger strategies:</p>
+      <pre><code class="language-java">// Flink: custom trigger with early firings every 10 seconds
+events
+    .keyBy(Event::getCategory)
+    .window(TumblingEventTimeWindows.of(Time.hours(1)))
+    .trigger(ContinuousEventTimeTrigger.of(Time.seconds(10)))
+    .aggregate(new RevenueAggregator());
+
+// Accumulation modes:
+// ACCUMULATING: each firing includes all data seen so far
+// DISCARDING: each firing only includes new data since last fire</code></pre>
+      <ul>
+        <li><strong>Early firings:</strong> Emit partial/speculative results before the window closes — useful for dashboards that need "current hour so far" metrics.</li>
+        <li><strong>On-time firing:</strong> The main result when the watermark passes the window end.</li>
+        <li><strong>Late firings:</strong> Updates after the on-time result when late data arrives within the allowed lateness period.</li>
+      </ul>
+
+      <h3>Window Lifecycle</h3>
+      <pre><code class="language-bash"># Timeline of a 1-hour tumbling window [14:00, 15:00)
+#
+# 14:00:00  Window created (first event arrives)
+# 14:10:00  Early firing #1 (speculative result)
+# 14:20:00  Early firing #2 (speculative result)
+# ...
+# 15:00:00  Watermark passes 15:00 → ON-TIME firing
+# 15:00:01  Window enters "allowed lateness" period
+# 15:03:00  Late event arrives → LATE firing (updated result)
+# 15:05:00  Allowed lateness expires → window state purged
+# 15:05:01+ Any later events → dropped or routed to side output</code></pre>
+    </section>
+
+
+    <!-- Section 5: Watermarks -->
+    <section id="watermarks" class="section">
+      <h2>Watermarks</h2>
+
+      <h3>What is a Watermark?</h3>
+      <p>A watermark is a <strong>monotonically advancing assertion</strong> that says: "I believe no more events with event time ≤ W(t) will arrive." It's the mechanism by which a streaming engine tracks event-time progress and decides when to fire windows.</p>
+      <p>Crucially, watermarks are <em>heuristic</em> — they can be wrong. An event may arrive after its watermark has passed (a "late" event). The system must handle this gracefully.</p>
+
+      <h3>Watermark Generation Strategies</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>How It Works</th>
+            <th>Trade-off</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Bounded Out-of-Orderness</strong></td>
+            <td>W(t) = max_event_time_seen - max_delay</td>
+            <td>Simple but conservative; fixed delay regardless of actual disorder</td>
+          </tr>
+          <tr>
+            <td><strong>Per-Partition Watermarks</strong></td>
+            <td>Track watermark per Kafka partition; global = min(all partitions)</td>
+            <td>One slow partition holds back entire pipeline</td>
+          </tr>
+          <tr>
+            <td><strong>Idle Source Detection</strong></td>
+            <td>Mark idle partitions and exclude them from min-watermark calculation</td>
+            <td>Prevents idle partitions from stalling; must detect "idle" correctly</td>
+          </tr>
+          <tr>
+            <td><strong>Punctuation-Based</strong></td>
+            <td>Sources emit explicit watermark markers in the stream</td>
+            <td>Perfect watermarks possible; requires source cooperation</td>
+          </tr>
+          <tr>
+            <td><strong>Custom/ML-Based</strong></td>
+            <td>Learn the lateness distribution and adjust dynamically</td>
+            <td>Adaptive but complex; risk of model drift</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Flink Watermark Implementation</h3>
+      <pre><code class="language-java">// Per-partition watermark strategy with idle detection
+WatermarkStrategy&lt;Event&gt; strategy = WatermarkStrategy
+    .&lt;Event&gt;forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withTimestampAssigner((event, ts) -&gt; event.getEventTimeMs())
+    .withIdleness(Duration.ofMinutes(2));  // mark source idle after 2min
+
+DataStream&lt;Event&gt; stream = env
+    .fromSource(kafkaSource, strategy, "kafka-events");
+
+// Custom watermark generator for multi-modal lateness
+public class AdaptiveWatermarkGenerator
+    implements WatermarkGenerator&lt;Event&gt; {
+
+  private long maxTimestamp = Long.MIN_VALUE;
+  private final long maxOutOfOrderness;
+  private long lastEmittedWatermark = Long.MIN_VALUE;
+
+  public AdaptiveWatermarkGenerator(Duration maxDelay) {
+    this.maxOutOfOrderness = maxDelay.toMillis();
+  }
+
+  @Override
+  public void onEvent(Event event, long eventTimestamp,
+                      WatermarkOutput output) {
+    maxTimestamp = Math.max(maxTimestamp, eventTimestamp);
+  }
+
+  @Override
+  public void onPeriodicEmit(WatermarkOutput output) {
+    long newWatermark = maxTimestamp - maxOutOfOrderness;
+    if (newWatermark &gt; lastEmittedWatermark) {
+      lastEmittedWatermark = newWatermark;
+      output.emitWatermark(new Watermark(newWatermark));
+    }
+  }
+}</code></pre>
+
+      <h3>Allowed Lateness</h3>
+      <p>Even with watermarks, some events arrive late. Allowed lateness defines how long a window keeps its state after the watermark passes its end:</p>
+      <pre><code class="language-java">events
+    .keyBy(Event::getRegion)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .allowedLateness(Time.minutes(10))  // keep state 10 min after window closes
+    .sideOutputLateData(lateOutputTag)  // events beyond allowed lateness
+    .aggregate(new MetricsAggregator());</code></pre>
+
+      <h3>Watermark Propagation in a DAG</h3>
+      <pre><code class="language-bash"># Watermark flow in a multi-operator Flink job:
+#
+#  Source-1 (W=14:02:30)  ──┐
+#                            ├──► Union ──► Window (fires when W ≥ window_end)
+#  Source-2 (W=14:02:15)  ──┘       │
+#                                    └── Global W = min(14:02:30, 14:02:15)
+#                                                 = 14:02:15
+#
+# The slowest source dictates the global watermark.
+# If Source-2 goes idle, we must detect this to avoid stalling.</code></pre>
+
+      <h3>Monitoring Watermarks</h3>
+      <ul>
+        <li><strong>Watermark lag:</strong> current_processing_time - current_watermark. If this grows, your pipeline is falling behind.</li>
+        <li><strong>Late events ratio:</strong> late_events / total_events. If &gt; 5%, your watermark may be too aggressive.</li>
+        <li><strong>Watermark advancement rate:</strong> Should track real-time (1 second of watermark per 1 second of wall clock). If slower, you're building debt.</li>
+      </ul>
+    </section>
+
+
+    <!-- Section 6: State Management -->
+    <section id="state-management" class="section">
+      <h2>State Management</h2>
+
+      <h3>Why State Matters</h3>
+      <p>Streaming computations that go beyond stateless transformations (map, filter) require state. Aggregations, joins, deduplication, pattern detection — all require remembering something across events. In Flink, state can grow to terabytes per operator, making state management the single most critical production concern.</p>
+
+      <h3>Types of State</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr><th>State Type</th><th>Scope</th><th>Use Case</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Keyed State</strong></td>
+            <td>Per-key (partitioned by keyBy)</td>
+            <td>Per-user counters, per-session accumulators, windowed aggregations</td>
+          </tr>
+          <tr>
+            <td><strong>Operator State</strong></td>
+            <td>Per-operator instance (parallel subtask)</td>
+            <td>Kafka consumer offsets, source split assignments, broadcast state</td>
+          </tr>
+          <tr>
+            <td><strong>Broadcast State</strong></td>
+            <td>Replicated to all operator instances</td>
+            <td>Dynamic rules, configuration updates, feature flags</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>State Backends</h3>
+      <pre><code class="language-java">// RocksDB state backend — for large state (TB-scale)
+StreamExecutionEnvironment env = StreamExecutionEnvironment
+    .getExecutionEnvironment();
+
+env.setStateBackend(new EmbeddedRocksDBStateBackend(true));
+// true = enable incremental checkpointing
+
+// Configure RocksDB for production
+RocksDBOptionsFactory rocksOpts = new DefaultConfigurableOptionsFactory()
+    .setBlockCacheSize("512mb")
+    .setWriteBufferSize("128mb")
+    .setMaxWriteBufferNumber(4)
+    .setCompactionStyle(CompactionStyle.LEVEL);
+
+// HashMapStateBackend — for small state, low latency
+env.setStateBackend(new HashMapStateBackend());
+// State lives on JVM heap — fast but limited by memory</code></pre>
+
+      <table class="comparison-table">
+        <thead>
+          <tr><th>Characteristic</th><th>RocksDB Backend</th><th>Heap (HashMap) Backend</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Max state size</td><td>Disk-bound (TBs)</td><td>JVM heap (10s of GBs)</td></tr>
+          <tr><td>Access latency</td><td>~10–100μs (disk/SSD)</td><td>~100ns (memory)</td></tr>
+          <tr><td>Serialization</td><td>Every access (ser/deser overhead)</td><td>None (Java objects on heap)</td></tr>
+          <tr><td>Incremental checkpoints</td><td>Yes (only changed SST files)</td><td>No (full snapshot each time)</td></tr>
+          <tr><td>GC pressure</td><td>Minimal (off-heap)</td><td>High (large heap = long GC pauses)</td></tr>
+          <tr><td>Best for</td><td>Large state, production workloads</td><td>Small state, development/testing</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Checkpointing</h3>
+      <p>Checkpoints are Flink's mechanism for fault tolerance — periodic, consistent snapshots of all operator state and source positions:</p>
+      <pre><code class="language-java">// Production checkpoint configuration
+env.enableCheckpointing(60_000);  // every 60 seconds
+env.getCheckpointConfig().setCheckpointingMode(
+    CheckpointingMode.EXACTLY_ONCE);
+env.getCheckpointConfig().setMinPauseBetweenCheckpoints(30_000);
+env.getCheckpointConfig().setCheckpointTimeout(600_000);  // 10 min timeout
+env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+env.getCheckpointConfig().setTolerableCheckpointFailureNumber(3);
+
+// Incremental checkpoints with RocksDB
+env.getCheckpointConfig().setExternalizedCheckpointCleanup(
+    ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
+
+// Checkpoint storage
+env.getCheckpointConfig().setCheckpointStorage(
+    "s3://my-bucket/flink-checkpoints/");</code></pre>
+
+      <h3>State TTL (Time-to-Live)</h3>
+      <p>Without TTL, state grows unbounded. Configure TTL to automatically expire stale state:</p>
+      <pre><code class="language-java">// State with TTL — expire inactive keys after 24 hours
+StateTtlConfig ttlConfig = StateTtlConfig.newBuilder(Time.hours(24))
+    .setUpdateType(StateTtlConfig.UpdateType.OnReadAndWrite)
+    .setStateVisibility(
+        StateTtlConfig.StateVisibility.NeverReturnExpired)
+    .cleanupInRocksdbCompactFilter(1000)  // clean during compaction
+    .build();
+
+ValueStateDescriptor&lt;UserSession&gt; descriptor =
+    new ValueStateDescriptor&lt;&gt;("user-session", UserSession.class);
+descriptor.enableTimeToLive(ttlConfig);
+
+// Access in ProcessFunction
+ValueState&lt;UserSession&gt; sessionState =
+    getRuntimeContext().getState(descriptor);</code></pre>
+
+      <h3>State Size Monitoring</h3>
+      <pre><code class="language-bash"># Key metrics to monitor:
+# - flink.operator.state.size           → total state bytes
+# - flink.checkpoint.duration           → time to snapshot
+# - flink.checkpoint.size               → bytes written per checkpoint
+# - rocksdb.block-cache-hit-rate        → cache efficiency
+# - rocksdb.compaction-pending          → compaction backlog
+#
+# Alert thresholds:
+# - checkpoint_duration > 80% of checkpoint_interval → danger zone
+# - state_size growth > 20% day-over-day without traffic increase → leak</code></pre>
+    </section>
+
+
+    <!-- Section 7: Kafka as Event Backbone -->
+    <section id="kafka-architecture" class="section">
+      <h2>Kafka as Event Backbone</h2>
+
+      <h3>Core Architecture</h3>
+      <p>Apache Kafka serves as the durable, scalable, ordered event log at the center of most real-time architectures. Understanding its internals is essential for designing reliable pipelines.</p>
+
+      <pre><code class="language-bash"># Kafka topology overview:
+#
+# Producers ──► Topic: "user-events" ──► Consumer Groups
+#                  │
+#                  ├── Partition 0: [msg0, msg3, msg6, msg9, ...]
+#                  ├── Partition 1: [msg1, msg4, msg7, msg10, ...]
+#                  └── Partition 2: [msg2, msg5, msg8, msg11, ...]
+#
+# Key insight: ordering guaranteed WITHIN a partition, not across partitions.
+# Partition assignment: hash(key) % num_partitions</code></pre>
+
+      <h3>Topics and Partitions</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr><th>Concept</th><th>Role</th><th>Scaling Implication</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Topic</strong></td>
+            <td>Logical channel for a category of events</td>
+            <td>One topic per event type (user-clicks, orders, payments)</td>
+          </tr>
+          <tr>
+            <td><strong>Partition</strong></td>
+            <td>Unit of parallelism and ordering</td>
+            <td>Max consumer parallelism = number of partitions</td>
+          </tr>
+          <tr>
+            <td><strong>Segment</strong></td>
+            <td>Physical file on disk (within a partition)</td>
+            <td>Segment size controls retention granularity and compaction</td>
+          </tr>
+          <tr>
+            <td><strong>Replica</strong></td>
+            <td>Durability copy on another broker</td>
+            <td>RF=3 means 3 copies; ISR (in-sync replicas) must ack writes</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Consumer Groups and Offset Management</h3>
+      <pre><code class="language-java">// Kafka consumer configuration for exactly-once with Flink
+Properties kafkaProps = new Properties();
+kafkaProps.setProperty("bootstrap.servers", "kafka-1:9092,kafka-2:9092");
+kafkaProps.setProperty("group.id", "flink-event-processor");
+kafkaProps.setProperty("auto.offset.reset", "earliest");
+kafkaProps.setProperty("enable.auto.commit", "false");  // Flink manages offsets
+kafkaProps.setProperty("isolation.level", "read_committed");  // for EOS
+
+KafkaSource&lt;Event&gt; source = KafkaSource.&lt;Event&gt;builder()
+    .setProperties(kafkaProps)
+    .setTopics("user-events")
+    .setStartingOffsets(OffsetsInitializer.committedOffsets(
+        OffsetResetStrategy.EARLIEST))
+    .setDeserializer(new EventDeserializer())
+    .build();</code></pre>
+
+      <h3>Offset Management Strategies</h3>
+      <ul>
+        <li><strong>Auto-commit (at-most-once):</strong> Offsets committed on interval regardless of processing success. Data loss possible on crash.</li>
+        <li><strong>Manual commit after processing (at-least-once):</strong> Commit after successful processing. Duplicates possible on crash between process and commit.</li>
+        <li><strong>Flink checkpoint-based (exactly-once):</strong> Offsets stored in Flink's checkpoint alongside operator state. Atomically restored on failure.</li>
+        <li><strong>Transactional (exactly-once produce):</strong> Kafka transactions ensure atomic writes across multiple partitions/topics.</li>
+      </ul>
+
+      <h3>Log Compaction</h3>
+      <pre><code class="language-bash"># Compaction vs Deletion retention:
+#
+# DELETION (default): segments deleted after retention.ms
+#   Topic: user-clicks, retention: 7 days
+#   → Old segments deleted; full event history lost
+#
+# COMPACTION: keeps latest value per key forever
+#   Topic: user-profiles (compacted)
+#   Key=user-123: {v1} → {v2} → {v3}
+#   After compaction: only {v3} retained
+#   → Useful for changelogs, materialized views, state rebuilding
+#
+# Config:
+# cleanup.policy=compact
+# min.compaction.lag.ms=3600000  # don't compact last hour
+# delete.retention.ms=86400000  # tombstones kept 24h</code></pre>
+
+      <h3>Production Kafka Sizing</h3>
+      <pre><code class="language-bash"># Back-of-envelope calculation:
+#
+# Given:
+#   - 500K events/sec peak
+#   - Average event size: 1 KB
+#   - Retention: 7 days
+#   - Replication factor: 3
+#
+# Throughput: 500K * 1KB = 500 MB/s ingress
+# With replication: 500 MB/s * 3 = 1.5 GB/s disk write
+# Storage: 500 MB/s * 86400 * 7 = 302 TB raw * 3 replicas = 907 TB
+#
+# Partitions: aim for 10-30 MB/s per partition
+#   500 MB/s / 20 MB/s = 25 partitions minimum
+#   Round up to 32 for even distribution
+#
+# Brokers: 10-15 brokers with NVMe SSDs, 64GB RAM each</code></pre>
+    </section>
+
+
+    <!-- Section 8: Flink vs Spark Streaming vs Kafka Streams -->
+    <section id="flink-vs-spark" class="section">
+      <h2>Flink vs Spark Streaming vs Kafka Streams</h2>
+
+      <h3>Architecture Comparison</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Dimension</th>
+            <th>Apache Flink</th>
+            <th>Spark Structured Streaming</th>
+            <th>Kafka Streams</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Processing Model</strong></td>
+            <td>True record-at-a-time streaming</td>
+            <td>Micro-batch (continuous mode experimental)</td>
+            <td>Record-at-a-time (library, not framework)</td>
+          </tr>
+          <tr>
+            <td><strong>Latency</strong></td>
+            <td>Milliseconds (single-digit ms possible)</td>
+            <td>100ms–seconds (micro-batch interval)</td>
+            <td>Milliseconds (within JVM process)</td>
+          </tr>
+          <tr>
+            <td><strong>Event Time Support</strong></td>
+            <td>Native, first-class watermarks</td>
+            <td>Supported via withWatermark()</td>
+            <td>Supported via TimestampExtractor</td>
+          </tr>
+          <tr>
+            <td><strong>State Management</strong></td>
+            <td>RocksDB/Heap, incremental checkpoints</td>
+            <td>HDFS-backed state store</td>
+            <td>RocksDB (local), changelog topics for recovery</td>
+          </tr>
+          <tr>
+            <td><strong>Exactly-Once</strong></td>
+            <td>Distributed snapshots (Chandy-Lamport)</td>
+            <td>Micro-batch transactional writes</td>
+            <td>Kafka transactions (EOS)</td>
+          </tr>
+          <tr>
+            <td><strong>Deployment</strong></td>
+            <td>Standalone, YARN, K8s, managed (AWS KDA)</td>
+            <td>Standalone, YARN, K8s, Databricks</td>
+            <td>Any JVM process — no cluster needed</td>
+          </tr>
+          <tr>
+            <td><strong>Scalability</strong></td>
+            <td>Scales to millions of events/sec per job</td>
+            <td>Scales well but limited by micro-batch overhead</td>
+            <td>Scales with Kafka partition count</td>
+          </tr>
+          <tr>
+            <td><strong>Session Windows</strong></td>
+            <td>Native with merging</td>
+            <td>Not natively supported (workarounds exist)</td>
+            <td>Supported with SessionWindows</td>
+          </tr>
+          <tr>
+            <td><strong>Operational Complexity</strong></td>
+            <td>High (dedicated cluster, savepoints, tuning)</td>
+            <td>Medium (leverages Spark ecosystem)</td>
+            <td>Low (just a library in your app)</td>
+          </tr>
+          <tr>
+            <td><strong>Best For</strong></td>
+            <td>Complex event processing, large state, low latency</td>
+            <td>Teams already on Spark, batch+streaming unification</td>
+            <td>Simple transformations, microservice event processing</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>When to Choose Each</h3>
+      <div class="callout callout-info">
+        <p><strong>Choose Flink when:</strong></p>
+        <ul>
+          <li>You need sub-second latency with exactly-once guarantees</li>
+          <li>Your state is large (GBs–TBs per operator) and needs incremental checkpointing</li>
+          <li>You need complex event processing (CEP), session windows, or async I/O</li>
+          <li>You're building a dedicated streaming platform team</li>
+        </ul>
+      </div>
+      <div class="callout callout-info">
+        <p><strong>Choose Spark Structured Streaming when:</strong></p>
+        <ul>
+          <li>Your team already uses Spark for batch processing</li>
+          <li>100ms–1s latency is acceptable</li>
+          <li>You want unified batch and streaming APIs (Delta Lake, Iceberg)</li>
+          <li>You're on Databricks and want managed infrastructure</li>
+        </ul>
+      </div>
+      <div class="callout callout-info">
+        <p><strong>Choose Kafka Streams when:</strong></p>
+        <ul>
+          <li>Your processing is relatively simple (filter, map, aggregate)</li>
+          <li>You want to embed stream processing in a microservice</li>
+          <li>You don't want to manage a separate processing cluster</li>
+          <li>Your state fits on local disk of application instances</li>
+        </ul>
+      </div>
+
+      <h3>Micro-Batch vs True Streaming — The Latency Tax</h3>
+      <pre><code class="language-python"># Spark Structured Streaming — micro-batch model
+# Each "trigger" processes all events accumulated since last batch
+
+spark.readStream \
+    .format("kafka") \
+    .option("subscribe", "user-events") \
+    .load() \
+    .groupBy(
+        window(col("event_time"), "5 minutes"),
+        col("region")
+    ) \
+    .count() \
+    .writeStream \
+    .trigger(processingTime="10 seconds")  # micro-batch every 10s
+    .outputMode("update") \
+    .start()
+
+# Even with trigger=10s, actual end-to-end latency includes:
+# - Trigger scheduling overhead: ~50ms
+# - Batch planning: ~100ms
+# - Actual processing: variable
+# - Write commit: ~50ms
+# Total: 300ms–2s even for small batches</code></pre>
+    </section>
+
+
+    <!-- Section 9: Handling Out-of-Order Events -->
+    <section id="out-of-order" class="section">
+      <h2>Handling Out-of-Order Events</h2>
+
+      <h3>Why Out-of-Order is the Norm</h3>
+      <p>In distributed systems, out-of-order arrival is the <em>default</em>, not the exception. Causes include:</p>
+      <ul>
+        <li><strong>Multi-path routing:</strong> Events from the same user may traverse different network paths with different latencies.</li>
+        <li><strong>Partition rebalancing:</strong> Kafka consumer group rebalances can cause temporary ordering disruptions across partitions.</li>
+        <li><strong>Producer retries:</strong> A producer retrying a failed send may deliver event N+1 before event N's retry succeeds.</li>
+        <li><strong>Geographic distribution:</strong> Events from a user in Tokyo and another in NYC arrive at different times despite occurring simultaneously.</li>
+        <li><strong>Offline/batch upload:</strong> Mobile devices or IoT sensors that buffer events and upload in bursts.</li>
+      </ul>
+
+      <h3>The Three Lines of Defense</h3>
+
+      <h4>1. Watermarks — Primary Mechanism</h4>
+      <p>Watermarks define the boundary between "on-time" and "late." Events arriving before the watermark passes their window end are on-time; events arriving after are late.</p>
+      <pre><code class="language-java">// Configure watermark with 30-second tolerance for disorder
+WatermarkStrategy&lt;Event&gt; strategy = WatermarkStrategy
+    .&lt;Event&gt;forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withTimestampAssigner((event, ts) -&gt; event.getTimestamp());
+
+// This means: watermark = max_event_time - 30s
+// Events within 30s of the latest seen event are "on-time"</code></pre>
+
+      <h4>2. Allowed Lateness — Second Chance</h4>
+      <p>Even after the watermark passes a window's end, the window can remain open for additional time to accept late events:</p>
+      <pre><code class="language-java">events
+    .keyBy(Event::getSessionId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .allowedLateness(Time.minutes(10))
+    .aggregate(new SessionAggregator());
+
+// Timeline for window [14:00, 14:05):
+// watermark passes 14:05 → window fires (on-time result)
+// 14:05 to 14:15 → late events accepted, window re-fires
+// after 14:15 → events dropped (or routed to side output)</code></pre>
+
+      <h4>3. Side Outputs — Safety Net</h4>
+      <p>Events that arrive beyond the allowed lateness are routed to a side output for separate handling:</p>
+      <pre><code class="language-java">// Define a tag for late events
+final OutputTag&lt;Event&gt; lateEvents =
+    new OutputTag&lt;Event&gt;("late-events") {};
+
+SingleOutputStreamOperator&lt;Result&gt; mainStream = events
+    .keyBy(Event::getUserId)
+    .window(TumblingEventTimeWindows.of(Time.hours(1)))
+    .allowedLateness(Time.minutes(30))
+    .sideOutputLateData(lateEvents)
+    .process(new WindowProcessor());
+
+// Collect late events for reprocessing or alerting
+DataStream&lt;Event&gt; lateStream = mainStream.getSideOutput(lateEvents);
+
+lateStream
+    .addSink(new KafkaSink&lt;&gt;("late-events-topic"))  // dead letter queue
+    .name("late-events-sink");</code></pre>
+
+      <h3>Reprocessing Strategy for Late Data</h3>
+      <pre><code class="language-python"># Lambda architecture approach for late data:
+#
+# 1. Speed layer (Flink): processes events in real-time
+#    - Best-effort results with watermark-based completeness
+#    - Late events beyond allowed lateness go to DLQ
+#
+# 2. Batch layer (Spark): nightly recomputation
+#    - Reprocesses ALL events (including late arrivals)
+#    - Produces "corrected" results that overwrite speed layer
+#
+# 3. Serving layer: merges speed + batch results
+#    - Recent: speed layer results (approximate)
+#    - Historical: batch layer results (complete)
+
+# Alternative: Kappa architecture
+# - Single stream processing with long retention
+# - Reprocess by resetting consumer offsets
+# - Simpler but requires Kafka retention ≥ correction window</code></pre>
+
+      <h3>Measuring Disorder</h3>
+      <pre><code class="language-python"># Analyze your event stream's lateness distribution
+# to set appropriate watermark bounds
+
+from pyspark.sql import functions as F
+
+events_df = spark.read.format("kafka").load()
+
+lateness_stats = events_df.select(
+    (F.col("processing_time") - F.col("event_time")).alias("lateness")
+).agg(
+    F.percentile_approx("lateness", 0.50).alias("p50_lateness"),
+    F.percentile_approx("lateness", 0.95).alias("p95_lateness"),
+    F.percentile_approx("lateness", 0.99).alias("p99_lateness"),
+    F.percentile_approx("lateness", 0.999).alias("p999_lateness"),
+    F.max("lateness").alias("max_lateness")
+)
+
+# Example output:
+# p50=200ms, p95=2s, p99=30s, p999=5min, max=2hours
+#
+# Decision: set watermark to p99 (30s) and allowed lateness to p999 (5min)
+# Accept that 0.1% of events will be "late" → route to side output</code></pre>
+    </section>
+
+
+    <!-- Section 10: Backpressure & Flow Control -->
+    <section id="backpressure" class="section">
+      <h2>Backpressure &amp; Flow Control</h2>
+
+      <h3>What is Backpressure?</h3>
+      <p>Backpressure occurs when a downstream operator cannot process data as fast as the upstream operator produces it. Without flow control, this leads to unbounded buffer growth, OOM crashes, or data loss. A well-designed streaming system propagates backpressure gracefully.</p>
+
+      <h3>Flink's Credit-Based Flow Control</h3>
+      <p>Flink uses a credit-based system inspired by TCP flow control:</p>
+      <pre><code class="language-bash"># Flink network buffer flow:
+#
+# Upstream Task          Network           Downstream Task
+# ┌─────────────┐      ┌─────────┐      ┌─────────────────┐
+# │ Output Buffers │──►│ Netty   │──►│ Input Buffers     │
+# │ (per channel)  │    │ Channel │    │ (exclusive+floating)│
+# └─────────────┘      └─────────┘      └─────────────────┘
+#        ▲                                       │
+#        └──── Credits (available buffer count) ──┘
+#
+# 1. Downstream grants credits = number of available input buffers
+# 2. Upstream sends data only if credits &gt; 0
+# 3. When downstream processes a buffer, it sends new credit upstream
+# 4. If downstream is slow → no credits → upstream blocks → backpressure</code></pre>
+
+      <pre><code class="language-java">// Tuning Flink network buffers for backpressure handling
+Configuration config = new Configuration();
+
+// Buffers per channel (upstream → downstream link)
+config.setInteger(
+    "taskmanager.network.memory.buffers-per-channel", 2);
+
+// Floating buffers shared across channels (absorb bursts)
+config.setInteger(
+    "taskmanager.network.memory.floating-buffers-per-gate", 8);
+
+// Network memory fraction (of total task manager memory)
+config.setString(
+    "taskmanager.memory.network.fraction", "0.1");
+config.setString(
+    "taskmanager.memory.network.min", "128mb");
+config.setString(
+    "taskmanager.memory.network.max", "1gb");</code></pre>
+
+      <h3>Kafka Consumer Lag</h3>
+      <p>Consumer lag is the difference between the latest produced offset and the latest consumed offset. It's the primary indicator of whether your pipeline is keeping up:</p>
+      <pre><code class="language-bash"># Monitor consumer lag
+kafka-consumer-groups.sh \
+  --bootstrap-server kafka:9092 \
+  --group flink-event-processor \
+  --describe
+
+# Output:
+# TOPIC        PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+# user-events  0          14523890        14524102        212
+# user-events  1          14519003        14519450        447
+# user-events  2          14521567        14521567        0
+#
+# Total lag: 659 messages
+# At 1KB/msg: ~659 KB behind
+# At 100K msg/sec: ~6ms behind (healthy)</code></pre>
+
+      <pre><code class="language-python"># Consumer lag alerting thresholds
+ALERT_RULES = {
+    "warning": {
+        "lag_messages": 100_000,      # 100K messages behind
+        "lag_seconds": 60,            # 1 minute behind
+        "lag_growth_rate": 1000,      # gaining 1K msgs/sec
+    },
+    "critical": {
+        "lag_messages": 1_000_000,    # 1M messages behind
+        "lag_seconds": 300,           # 5 minutes behind
+        "lag_growth_rate": 10_000,    # gaining 10K msgs/sec
+    },
+    "page": {
+        "lag_messages": 10_000_000,   # 10M messages behind
+        "lag_seconds": 3600,          # 1 hour behind
+        "lag_growth_rate": 50_000,    # unsustainable growth
+    }
+}</code></pre>
+
+      <h3>Throttling Strategies</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr><th>Strategy</th><th>Mechanism</th><th>When to Use</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Source throttling</strong></td>
+            <td>Limit records read per second from source</td>
+            <td>Protecting downstream systems during catchup</td>
+          </tr>
+          <tr>
+            <td><strong>Rate limiting sinks</strong></td>
+            <td>Limit write rate to external databases</td>
+            <td>Preventing DB overload during traffic spikes</td>
+          </tr>
+          <tr>
+            <td><strong>Adaptive parallelism</strong></td>
+            <td>Auto-scale operator parallelism based on lag</td>
+            <td>Handling variable traffic (Flink reactive mode)</td>
+          </tr>
+          <tr>
+            <td><strong>Load shedding</strong></td>
+            <td>Drop low-priority events under extreme load</td>
+            <td>Last resort when backpressure threatens stability</td>
+          </tr>
+          <tr>
+            <td><strong>Async I/O</strong></td>
+            <td>Non-blocking external calls to avoid operator blocking</td>
+            <td>Enrichment lookups that would otherwise create bottlenecks</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Async I/O Pattern</h3>
+      <pre><code class="language-java">// Flink Async I/O — prevent external lookups from creating backpressure
+AsyncDataStream.unorderedWait(
+    inputStream,
+    new AsyncDatabaseLookup(),  // non-blocking DB call
+    30, TimeUnit.SECONDS,       // timeout
+    1000                        // max concurrent requests
+);
+
+public class AsyncDatabaseLookup
+    extends RichAsyncFunction&lt;Event, EnrichedEvent&gt; {
+
+  private transient AsyncHttpClient client;
+
+  @Override
+  public void open(Configuration params) {
+    client = AsyncHttpClient.create();
+  }
+
+  @Override
+  public void asyncInvoke(Event event,
+                          ResultFuture&lt;EnrichedEvent&gt; resultFuture) {
+    CompletableFuture&lt;UserProfile&gt; future =
+        client.get("/users/" + event.getUserId());
+
+    future.thenAccept(profile -&gt; {
+      resultFuture.complete(
+          Collections.singleton(new EnrichedEvent(event, profile)));
+    }).exceptionally(ex -&gt; {
+      resultFuture.complete(
+          Collections.singleton(new EnrichedEvent(event, null)));
+      return null;
+    });
+  }
+}</code></pre>
+
+      <h3>Diagnosing Backpressure</h3>
+      <pre><code class="language-bash"># Flink Web UI indicators:
+#
+# 1. Task status colors:
+#    - GREEN: healthy (buffers available)
+#    - YELLOW: backpressured (output buffers full)
+#    - RED: severely backpressured (sustained &gt; 10s)
+#
+# 2. Key metrics:
+#    - outPoolUsage &gt; 0.9 → output buffers full → downstream is slow
+#    - inPoolUsage &gt; 0.9 → input buffers full → this operator is slow
+#    - busyTimeMsPerSecond → how much time operator spends processing
+#    - backPressuredTimeMsPerSecond → time spent waiting for output buffers
+#
+# 3. Finding the bottleneck:
+#    - Walk downstream from first backpressured operator
+#    - The operator with high busyTime but LOW outPoolUsage is the bottleneck
+#    - It's consuming input fast but its downstream is slow</code></pre>
+    </section>
+
+
+    <!-- Section 11: Production Incident -->
+    <section id="production-incident" class="section">
+      <h2>Production Incident: Watermark Too Tight</h2>
+
+      <div class="callout callout-warning">
+        <p><strong>Real Incident:</strong> Streaming pipeline fell behind by 6 hours because the watermark was too tight, dropping 15% of late events during peak traffic.</p>
+      </div>
+
+      <h3>Context</h3>
+      <ul>
+        <li><strong>System:</strong> Flink job processing ad-impression events for billing reconciliation.</li>
+        <li><strong>Scale:</strong> 2M events/sec from mobile SDKs across 40 countries.</li>
+        <li><strong>Watermark config:</strong> BoundedOutOfOrderness = 10 seconds.</li>
+        <li><strong>Allowed lateness:</strong> 30 seconds.</li>
+        <li><strong>Window:</strong> 1-minute tumbling windows for impression counting.</li>
+      </ul>
+
+      <h3>The Trigger: Holiday Traffic Spike</h3>
+      <pre><code class="language-bash"># Black Friday traffic pattern:
+#
+# Normal day:  ~800K events/sec
+# Black Friday: ~2.5M events/sec (3x spike)
+#
+# What happened:
+# 1. Mobile SDK buffers events locally when network is congested
+# 2. During peak shopping hours, cellular networks were saturated
+# 3. Devices buffered 30-120 seconds of events
+# 4. When network recovered, buffered events arrived in bursts
+# 5. These events had event_times 30-120s in the past
+# 6. Watermark (10s tolerance) had already advanced past them
+# 7. Allowed lateness (30s) caught SOME but not all
+# 8. Events &gt; 40s late were DROPPED</code></pre>
+
+      <h3>Impact</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr><th>Metric</th><th>Normal</th><th>During Incident</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Late event ratio</td><td>0.3%</td><td>15.2%</td></tr>
+          <tr><td>Revenue undercounting</td><td>$0</td><td>$2.3M over 6 hours</td></tr>
+          <tr><td>Consumer lag</td><td>~500ms</td><td>6 hours (cascading)</td></tr>
+          <tr><td>Checkpoint duration</td><td>12s</td><td>Failed (timeout)</td></tr>
+          <tr><td>Alerts firing</td><td>0</td><td>47 (alert fatigue)</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Root Cause Analysis</h3>
+      <pre><code class="language-bash"># The cascade of failures:
+#
+# 1. INITIAL: Late events dropped → undercounting
+#    └─► Watermark too tight for actual disorder during peak
+#
+# 2. SECONDARY: Dropped events routed to DLQ → DLQ Kafka topic
+#    └─► DLQ consumer couldn't keep up → lag growing
+#
+# 3. TERTIARY: Operators buffering more state → checkpoint size grew
+#    └─► Checkpoint timeout (10 min) exceeded → checkpoints failing
+#
+# 4. QUATERNARY: Without successful checkpoints, no progress committed
+#    └─► If job crashed now, would replay from last checkpoint (6h ago)
+#
+# 5. OPERATIONAL: 47 alerts firing simultaneously
+#    └─► On-call engineer overwhelmed → delayed response</code></pre>
+
+      <h3>Resolution Steps</h3>
+      <ol>
+        <li><strong>Immediate (30 min):</strong> Increased allowed lateness to 5 minutes via Flink REST API + savepoint restart.</li>
+        <li><strong>Short-term (2 hours):</strong> Scaled up Flink parallelism from 32 to 64 TaskManagers to chew through backlog.</li>
+        <li><strong>Catchup (4 hours):</strong> Pipeline caught up to real-time after processing backlog at 2x speed.</li>
+        <li><strong>Reconciliation (next day):</strong> Batch job reprocessed the affected 6-hour window from Kafka (7-day retention) to produce corrected billing numbers.</li>
+      </ol>
+
+      <h3>Prevention Measures Implemented</h3>
+      <pre><code class="language-java">// 1. Adaptive watermark based on observed lateness distribution
+// Instead of fixed 10s, dynamically adjust based on p99 lateness
+public class AdaptiveWatermark implements WatermarkGenerator&lt;Event&gt; {
+  private final DescriptiveStatistics latencyStats =
+      new DescriptiveStatistics(10_000);  // sliding window of 10K samples
+  private long maxTimestamp = Long.MIN_VALUE;
+
+  @Override
+  public void onEvent(Event event, long eventTimestamp,
+                      WatermarkOutput output) {
+    long lateness = System.currentTimeMillis() - eventTimestamp;
+    latencyStats.addValue(lateness);
+    maxTimestamp = Math.max(maxTimestamp, eventTimestamp);
+  }
+
+  @Override
+  public void onPeriodicEmit(WatermarkOutput output) {
+    // Use p99 lateness as watermark delay, capped at 5 minutes
+    long p99Lateness = (long) Math.min(
+        latencyStats.getPercentile(99),
+        5 * 60 * 1000L
+    );
+    output.emitWatermark(new Watermark(maxTimestamp - p99Lateness));
+  }
+}
+
+// 2. Alert on late-event ratio, not just lag
+// If late_events / total_events &gt; 5% for 5 minutes → page
+
+// 3. Separate DLQ processing pipeline with independent scaling
+
+// 4. Checkpoint timeout scaled proportionally to state size</code></pre>
+
+      <h3>Lessons Learned</h3>
+      <ul>
+        <li><strong>Watermarks must account for worst-case, not average-case lateness.</strong> 10s works in steady state but fails during traffic spikes when network congestion causes buffering.</li>
+        <li><strong>Allowed lateness is your second line of defense — size it generously.</strong> The state cost of keeping windows open 5 minutes longer is trivial compared to data loss.</li>
+        <li><strong>Monitor the late-event ratio as a leading indicator.</strong> By the time consumer lag is hours, the damage is already done.</li>
+        <li><strong>Design for reprocessing from day one.</strong> The batch reconciliation job saved us because Kafka retention was sufficient and the sink was idempotent.</li>
+        <li><strong>Alerting must be actionable.</strong> 47 simultaneous alerts is noise. One alert that says "late-event ratio &gt; 5% — consider increasing watermark tolerance" is signal.</li>
+      </ul>
+    </section>
+
+
+    <!-- Section 12: Code Examples -->
+    <section id="code-examples" class="section">
+      <h2>Code Examples</h2>
+
+      <h3>Flink Windowed Aggregation (Java)</h3>
+      <pre><code class="language-java">import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+
+public class RealtimeRevenueJob {
+
+  public static void main(String[] args) throws Exception {
+    StreamExecutionEnvironment env =
+        StreamExecutionEnvironment.getExecutionEnvironment();
+
+    // Checkpoint config
+    env.enableCheckpointing(60_000);
+    env.setStateBackend(new EmbeddedRocksDBStateBackend(true));
+    env.getCheckpointConfig().setCheckpointStorage(
+        "s3://data-platform/checkpoints/revenue-job");
+
+    // Kafka source with watermarks
+    KafkaSource&lt;OrderEvent&gt; source = KafkaSource.&lt;OrderEvent&gt;builder()
+        .setBootstrapServers("kafka-prod:9092")
+        .setTopics("order-events")
+        .setGroupId("revenue-aggregator")
+        .setStartingOffsets(OffsetsInitializer.committedOffsets(
+            OffsetResetStrategy.EARLIEST))
+        .setDeserializer(new OrderEventDeserializer())
+        .build();
+
+    WatermarkStrategy&lt;OrderEvent&gt; watermark = WatermarkStrategy
+        .&lt;OrderEvent&gt;forBoundedOutOfOrderness(Duration.ofSeconds(30))
+        .withTimestampAssigner((event, ts) -&gt; event.getOrderTimestamp())
+        .withIdleness(Duration.ofMinutes(2));
+
+    // Late data side output
+    final OutputTag&lt;OrderEvent&gt; lateOrders =
+        new OutputTag&lt;OrderEvent&gt;("late-orders") {};
+
+    // Processing pipeline
+    SingleOutputStreamOperator&lt;RevenueMetric&gt; revenue = env
+        .fromSource(source, watermark, "kafka-orders")
+        .filter(order -&gt; order.getStatus() == OrderStatus.COMPLETED)
+        .keyBy(OrderEvent::getRegion)
+        .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+        .allowedLateness(Time.minutes(10))
+        .sideOutputLateData(lateOrders)
+        .aggregate(
+            new RevenueAggregator(),
+            new RevenueWindowFunction()
+        );
+
+    // Main output → OLAP store
+    revenue.addSink(new ClickHouseSink&lt;&gt;("revenue_5min"))
+        .name("clickhouse-sink");
+
+    // Late data → DLQ for reprocessing
+    revenue.getSideOutput(lateOrders)
+        .addSink(new KafkaSink&lt;&gt;("late-orders-dlq"))
+        .name("late-orders-dlq");
+
+    env.execute("Realtime Revenue Aggregation");
+  }
+}
+
+// Aggregate function: incremental aggregation for efficiency
+public class RevenueAggregator
+    implements AggregateFunction&lt;OrderEvent, RevenueAccumulator, RevenueAccumulator&gt; {
+
+  @Override
+  public RevenueAccumulator createAccumulator() {
+    return new RevenueAccumulator(0L, BigDecimal.ZERO, 0L);
+  }
+
+  @Override
+  public RevenueAccumulator add(OrderEvent event, RevenueAccumulator acc) {
+    return new RevenueAccumulator(
+        acc.getOrderCount() + 1,
+        acc.getTotalRevenue().add(event.getAmount()),
+        Math.max(acc.getMaxOrderValue(), event.getAmount().longValue())
+    );
+  }
+
+  @Override
+  public RevenueAccumulator getResult(RevenueAccumulator acc) {
+    return acc;
+  }
+
+  @Override
+  public RevenueAccumulator merge(RevenueAccumulator a, RevenueAccumulator b) {
+    return new RevenueAccumulator(
+        a.getOrderCount() + b.getOrderCount(),
+        a.getTotalRevenue().add(b.getTotalRevenue()),
+        Math.max(a.getMaxOrderValue(), b.getMaxOrderValue())
+    );
+  }
+}</code></pre>
+
+      <h3>Kafka Streams Topology (Java)</h3>
+      <pre><code class="language-java">import org.apache.kafka.streams.*;
+import org.apache.kafka.streams.kstream.*;
+import java.time.Duration;
+import java.util.Properties;
+
+public class ClickStreamTopology {
+
+  public static void main(String[] args) {
+    Properties props = new Properties();
+    props.put(StreamsConfig.APPLICATION_ID_CONFIG, "click-analytics");
+    props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+    props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, "exactly_once_v2");
+    props.put(StreamsConfig.STATE_DIR_CONFIG, "/data/kafka-streams/state");
+    props.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, 4);
+
+    StreamsBuilder builder = new StreamsBuilder();
+
+    // Source: user click events
+    KStream&lt;String, ClickEvent&gt; clicks = builder.stream(
+        "user-clicks",
+        Consumed.with(Serdes.String(), clickEventSerde)
+            .withTimestampExtractor(new ClickEventTimestampExtractor())
+    );
+
+    // Branch: separate page views from button clicks
+    KStream&lt;String, ClickEvent&gt;[] branches = clicks.branch(
+        (key, event) -&gt; event.getType() == ClickType.PAGE_VIEW,
+        (key, event) -&gt; event.getType() == ClickType.BUTTON_CLICK,
+        (key, event) -&gt; true  // catch-all
+    );
+
+    KStream&lt;String, ClickEvent&gt; pageViews = branches[0];
+    KStream&lt;String, ClickEvent&gt; buttonClicks = branches[1];
+
+    // Windowed aggregation: page views per URL per minute
+    KTable&lt;Windowed&lt;String&gt;, Long&gt; pageViewCounts = pageViews
+        .groupBy((key, event) -&gt; event.getUrl(),
+            Grouped.with(Serdes.String(), clickEventSerde))
+        .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(1)))
+        .count(Materialized.as("page-view-counts"));
+
+    // Session window: user sessions with 30-min inactivity gap
+    KTable&lt;Windowed&lt;String&gt;, SessionMetrics&gt; userSessions = clicks
+        .groupByKey()
+        .windowedBy(SessionWindows.ofInactivityGapWithNoGrace(
+            Duration.ofMinutes(30)))
+        .aggregate(
+            SessionMetrics::new,
+            (key, event, metrics) -&gt; metrics.addClick(event),
+            (key, left, right) -&gt; left.merge(right),
+            Materialized.with(Serdes.String(), sessionMetricsSerde)
+        );
+
+    // Output: write results to output topics
+    pageViewCounts.toStream()
+        .map((windowedKey, count) -&gt; KeyValue.pair(
+            windowedKey.key(),
+            new PageViewCount(windowedKey.key(), count,
+                windowedKey.window().start())))
+        .to("page-view-metrics",
+            Produced.with(Serdes.String(), pageViewCountSerde));
+
+    KafkaStreams streams = new KafkaStreams(builder.build(), props);
+    streams.start();
+
+    Runtime.getRuntime().addShutdownHook(
+        new Thread(streams::close));
+  }
+}</code></pre>
+
+      <h3>Spark Structured Streaming (Python)</h3>
+      <pre><code class="language-python">from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField, StringType,
+    LongType, DoubleType, TimestampType
+)
+
+spark = SparkSession.builder \
+    .appName("RealTimeEventProcessing") \
+    .config("spark.sql.shuffle.partitions", "64") \
+    .config("spark.streaming.backpressure.enabled", "true") \
+    .config("spark.sql.streaming.stateStore.providerClass",
+            "org.apache.spark.sql.execution.streaming.state."
+            "RocksDBStateStoreProvider") \
+    .getOrCreate()
+
+# Define schema for Kafka events
+event_schema = StructType([
+    StructField("user_id", StringType(), False),
+    StructField("event_type", StringType(), False),
+    StructField("event_time", TimestampType(), False),
+    StructField("amount", DoubleType(), True),
+    StructField("region", StringType(), False),
+    StructField("device_type", StringType(), True),
+])
+
+# Read from Kafka
+raw_stream = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", "kafka-prod:9092") \
+    .option("subscribe", "purchase-events") \
+    .option("startingOffsets", "latest") \
+    .option("maxOffsetsPerTrigger", 500000) \
+    .option("kafka.isolation.level", "read_committed") \
+    .load()
+
+# Parse and apply watermark
+events = raw_stream \
+    .select(
+        F.from_json(
+            F.col("value").cast("string"),
+            event_schema
+        ).alias("data")
+    ) \
+    .select("data.*") \
+    .withWatermark("event_time", "2 minutes")  # watermark threshold
+
+# Windowed aggregation: revenue per region per 5-minute window
+revenue_per_region = events \
+    .filter(F.col("event_type") == "purchase") \
+    .groupBy(
+        F.window("event_time", "5 minutes", "1 minute"),  # sliding window
+        F.col("region")
+    ) \
+    .agg(
+        F.sum("amount").alias("total_revenue"),
+        F.count("*").alias("order_count"),
+        F.avg("amount").alias("avg_order_value"),
+        F.approx_count_distinct("user_id").alias("unique_buyers")
+    )
+
+# Write to console (for development) or sink
+query = revenue_per_region.writeStream \
+    .outputMode("update") \
+    .format("delta") \
+    .option("checkpointLocation", "s3://data-lake/checkpoints/revenue") \
+    .option("path", "s3://data-lake/tables/revenue_5min") \
+    .trigger(processingTime="30 seconds") \
+    .start()
+
+query.awaitTermination()</code></pre>
+
+      <h3>Watermark Configuration Comparison</h3>
+      <pre><code class="language-json">{
+  "watermark_configs": {
+    "low_latency_dashboard": {
+      "framework": "flink",
+      "bounded_out_of_orderness": "5s",
+      "allowed_lateness": "30s",
+      "idle_timeout": "1m",
+      "rationale": "Dashboard can tolerate small inaccuracy; need fast results"
+    },
+    "billing_reconciliation": {
+      "framework": "flink",
+      "bounded_out_of_orderness": "2m",
+      "allowed_lateness": "30m",
+      "idle_timeout": "5m",
+      "rationale": "Correctness critical for billing; prefer completeness over speed"
+    },
+    "fraud_detection": {
+      "framework": "flink",
+      "bounded_out_of_orderness": "10s",
+      "allowed_lateness": "5m",
+      "idle_timeout": "30s",
+      "rationale": "Need to detect fraud quickly but can't miss events"
+    },
+    "iot_sensor_aggregation": {
+      "framework": "spark_structured_streaming",
+      "watermark_delay": "10m",
+      "trigger_interval": "1m",
+      "rationale": "IoT devices often offline; wide disorder expected"
+    }
+  }
+}</code></pre>
+    </section>
+
+
+    <!-- Section 13: Common Mistakes -->
+    <section id="common-mistakes" class="section">
+      <h2>Common Mistakes</h2>
+
+      <table class="comparison-table">
+        <thead>
+          <tr><th>Mistake</th><th>Why It's Wrong</th><th>Correct Approach</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Using processing time for business metrics</strong></td>
+            <td>Results are non-deterministic and change with reprocessing speed, consumer lag, or restarts</td>
+            <td>Use event time with proper watermarks; processing time only for system metrics</td>
+          </tr>
+          <tr>
+            <td><strong>Setting watermark too tight</strong></td>
+            <td>Drops legitimate late events during traffic spikes when network latency increases</td>
+            <td>Analyze p99/p999 lateness distribution; set watermark to p99 + safety margin</td>
+          </tr>
+          <tr>
+            <td><strong>No allowed lateness configured</strong></td>
+            <td>Events arriving even 1ms after watermark are immediately dropped</td>
+            <td>Configure allowed lateness based on business requirements; use side outputs for data beyond</td>
+          </tr>
+          <tr>
+            <td><strong>Unbounded state without TTL</strong></td>
+            <td>State grows forever → checkpoint size grows → eventually OOM or checkpoint timeout</td>
+            <td>Configure State TTL; use session windows with gap timeout; monitor state size growth</td>
+          </tr>
+          <tr>
+            <td><strong>Checkpoint interval too short</strong></td>
+            <td>Constant checkpointing creates I/O pressure and reduces throughput</td>
+            <td>Set interval to 1–5 minutes; min-pause-between-checkpoints = interval / 2</td>
+          </tr>
+          <tr>
+            <td><strong>Not handling idle partitions</strong></td>
+            <td>One idle Kafka partition holds back the global watermark → all windows stall</td>
+            <td>Configure withIdleness() in watermark strategy; detect and mark idle sources</td>
+          </tr>
+          <tr>
+            <td><strong>Synchronous external calls in operators</strong></td>
+            <td>One slow DB lookup blocks the entire operator chain → backpressure cascade</td>
+            <td>Use Flink Async I/O or batch lookups; cache frequently accessed data in state</td>
+          </tr>
+          <tr>
+            <td><strong>Ignoring Kafka partition count</strong></td>
+            <td>Max parallelism limited by partition count; can't add more consumers than partitions</td>
+            <td>Plan partition count for peak load (not current); over-partition rather than under</td>
+          </tr>
+          <tr>
+            <td><strong>Not testing with disordered data</strong></td>
+            <td>Pipeline works perfectly with ordered test data; fails in production with real disorder</td>
+            <td>Generate test data with realistic lateness distributions; chaos-test with clock skew</td>
+          </tr>
+          <tr>
+            <td><strong>Single-point-of-failure sinks</strong></td>
+            <td>If the sink is down, backpressure propagates all the way to the source</td>
+            <td>Buffer to Kafka before slow sinks; use circuit breakers; implement fallback paths</td>
+          </tr>
+          <tr>
+            <td><strong>Confusing at-least-once with exactly-once</strong></td>
+            <td>Flink's exactly-once only covers internal state; sinks need idempotent writes or transactions</td>
+            <td>End-to-end exactly-once requires: source replay + checkpoint + idempotent/transactional sink</td>
+          </tr>
+          <tr>
+            <td><strong>Over-engineering window types</strong></td>
+            <td>Using session windows when tumbling would suffice adds complexity and state</td>
+            <td>Start with the simplest window that meets requirements; upgrade only if needed</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Section 14: Trade-offs -->
+    <section id="trade-offs" class="section">
+      <h2>Trade-offs</h2>
+
+      <h3>Latency vs Completeness</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr><th>Choice</th><th>Latency</th><th>Completeness</th><th>Use Case</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Tight watermark (5s)</td>
+            <td>~5s end-to-end</td>
+            <td>~95% (many late events dropped)</td>
+            <td>Real-time dashboards with batch correction</td>
+          </tr>
+          <tr>
+            <td>Moderate watermark (30s)</td>
+            <td>~30s end-to-end</td>
+            <td>~99% (few late events)</td>
+            <td>Fraud detection, alerting</td>
+          </tr>
+          <tr>
+            <td>Conservative watermark (5min)</td>
+            <td>~5min end-to-end</td>
+            <td>~99.9% (very few late events)</td>
+            <td>Billing, financial reconciliation</td>
+          </tr>
+          <tr>
+            <td>Wait forever (no watermark advancement)</td>
+            <td>Unbounded (never fires)</td>
+            <td>100% (theoretically)</td>
+            <td>Never — this defeats the purpose of streaming</td>
+          </tr>
+        </tbody>
+      </table>
+      <p><strong>Key insight:</strong> You cannot have both zero latency and perfect completeness. The watermark delay is the knob that trades one for the other. Design your system with correction mechanisms (late firings, batch reconciliation) rather than trying to achieve perfect completeness in the streaming layer.</p>
+
+      <h3>State Size vs Accuracy</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr><th>Approach</th><th>State Size</th><th>Accuracy</th><th>Trade-off</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Exact count distinct (HashSet)</td>
+            <td>O(n) — grows with cardinality</td>
+            <td>100% accurate</td>
+            <td>Impractical for high-cardinality keys (100M+ users)</td>
+          </tr>
+          <tr>
+            <td>HyperLogLog (approximate)</td>
+            <td>~12 KB per counter</td>
+            <td>~98% (±2% error)</td>
+            <td>Fixed memory regardless of cardinality; mergeable</td>
+          </tr>
+          <tr>
+            <td>Count-Min Sketch (frequency)</td>
+            <td>O(width × depth)</td>
+            <td>Over-estimates possible</td>
+            <td>Good for "heavy hitters"; false positives but no false negatives</td>
+          </tr>
+          <tr>
+            <td>Bloom Filter (membership)</td>
+            <td>~10 bits per element</td>
+            <td>False positives ≤ 1%</td>
+            <td>Deduplication without storing all seen keys</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Exactly-Once vs Throughput</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr><th>Guarantee</th><th>Throughput Impact</th><th>Mechanism</th><th>When to Choose</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>At-most-once</strong></td>
+            <td>Highest throughput</td>
+            <td>Fire-and-forget; no acks</td>
+            <td>Metrics, logging, non-critical telemetry</td>
+          </tr>
+          <tr>
+            <td><strong>At-least-once</strong></td>
+            <td>Moderate overhead (~5-10%)</td>
+            <td>Retry on failure; possible duplicates</td>
+            <td>Most use cases where sink is idempotent</td>
+          </tr>
+          <tr>
+            <td><strong>Exactly-once (internal)</strong></td>
+            <td>~10-20% overhead</td>
+            <td>Distributed snapshots + barrier alignment</td>
+            <td>Stateful computations where duplicates corrupt results</td>
+          </tr>
+          <tr>
+            <td><strong>Exactly-once (end-to-end)</strong></td>
+            <td>~20-40% overhead</td>
+            <td>Checkpoints + transactional sinks (2PC)</td>
+            <td>Financial systems, billing, compliance-critical pipelines</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Framework Selection Trade-offs</h3>
+      <pre><code class="language-bash"># Decision matrix for framework selection:
+#
+# Need sub-10ms latency?
+#   └── YES → Flink or Kafka Streams
+#   └── NO  → Spark Structured Streaming is fine
+#
+# State > 100GB per operator?
+#   └── YES → Flink (RocksDB + incremental checkpoints)
+#   └── NO  → Any framework works
+#
+# Team already uses Spark for batch?
+#   └── YES → Spark Structured Streaming (unified stack)
+#   └── NO  → Evaluate Flink for streaming-first approach
+#
+# Processing is simple (filter/map/aggregate)?
+#   └── YES → Kafka Streams (no separate cluster)
+#   └── NO  → Flink for complex event processing
+#
+# Need session windows?
+#   └── YES → Flink (native merging) or Kafka Streams
+#   └── NO  → All frameworks support tumbling/sliding</code></pre>
+
+      <h3>The Fundamental Tension</h3>
+      <div class="callout callout-info">
+        <p>Every real-time pipeline design is a negotiation between three competing goals. You can optimize for two at the expense of the third:</p>
+        <ul>
+          <li><strong>Low Latency:</strong> Results available quickly after events occur.</li>
+          <li><strong>Completeness:</strong> All events (including late arrivals) are included in results.</li>
+          <li><strong>Low Resource Cost:</strong> Minimal state, compute, and storage overhead.</li>
+        </ul>
+        <p>Pick any two. Want low latency + completeness? Pay for large state and long allowed lateness. Want low cost + completeness? Accept batch processing with higher latency. Want low latency + low cost? Accept approximate/incomplete results.</p>
+      </div>
+    </section>
+
+
+    <!-- Section 15: Follow-up Questions -->
+    <section id="follow-up-questions" class="section">
+      <h2>Follow-up Questions</h2>
+
+      <p>Interviewers at FAANG companies will probe deeper with follow-ups. Be prepared for these:</p>
+
+      <h3>Watermarks &amp; Event Time</h3>
+      <ul>
+        <li>"How would you handle a source that goes offline for 2 hours and then replays all buffered events?"</li>
+        <li>"What happens to your watermark if one Kafka partition stops receiving data?"</li>
+        <li>"How do you set the watermark delay without historical data about your lateness distribution?"</li>
+        <li>"Can you implement a watermark that adapts dynamically to observed lateness?"</li>
+      </ul>
+
+      <h3>State &amp; Fault Tolerance</h3>
+      <ul>
+        <li>"Your checkpoint is taking 8 minutes but your interval is 5 minutes. What happens?"</li>
+        <li>"How do you handle schema evolution in your keyed state without losing existing state?"</li>
+        <li>"Your state is 2TB and growing. How do you reduce it without losing data?"</li>
+        <li>"Explain the difference between a savepoint and a checkpoint. When would you use each?"</li>
+        <li>"How does Flink achieve exactly-once with the Chandy-Lamport algorithm? Walk through the barrier alignment."</li>
+      </ul>
+
+      <h3>Kafka Deep-Dive</h3>
+      <ul>
+        <li>"You have 32 partitions but need to increase to 64. What are the implications for keyed state?"</li>
+        <li>"How do you guarantee ordering when a producer retries a failed send?"</li>
+        <li>"Explain how Kafka transactions work for exactly-once produce across multiple topics."</li>
+        <li>"Your consumer group has 10 members but only 8 partitions. What happens to the extra 2?"</li>
+      </ul>
+
+      <h3>Operational Scenarios</h3>
+      <ul>
+        <li>"Your pipeline is 4 hours behind. Walk me through your recovery plan."</li>
+        <li>"How do you deploy a new version of your Flink job without losing state?"</li>
+        <li>"The downstream database is experiencing high latency. How does your pipeline react?"</li>
+        <li>"You need to reprocess 7 days of data due to a bug. How do you do this without affecting the live pipeline?"</li>
+        <li>"How do you A/B test changes to your streaming logic?"</li>
+      </ul>
+
+      <h3>Architecture &amp; Design</h3>
+      <ul>
+        <li>"Why Flink over Spark for this use case? What would make you choose differently?"</li>
+        <li>"How do you handle exactly-once when your sink is a REST API that doesn't support transactions?"</li>
+        <li>"Design a streaming join between a fast-moving event stream and a slowly-changing dimension table."</li>
+        <li>"How would you implement deduplication in a streaming pipeline with 1 billion events per day?"</li>
+        <li>"Your pipeline needs to support both real-time alerts AND historical aggregations. How do you architect this?"</li>
+      </ul>
+
+      <h3>Sample Answer Framework</h3>
+      <pre><code class="language-bash"># For any follow-up, structure your answer:
+#
+# 1. ACKNOWLEDGE the constraint/challenge
+#    "That's tricky because..."
+#
+# 2. STATE your approach
+#    "I would handle this by..."
+#
+# 3. EXPLAIN the trade-off
+#    "This gives us X but costs us Y"
+#
+# 4. MENTION alternatives you considered
+#    "An alternative would be Z, but I chose this because..."
+#
+# 5. CITE production experience if possible
+#    "In my experience at [company], we found that..."</code></pre>
+    </section>
+
+    <!-- Section 16: Summary -->
+    <section id="summary" class="section">
+      <h2>Summary</h2>
+
+      <div class="callout callout-summary">
+        <h3>Key Takeaways for the Interview</h3>
+        <ol>
+          <li><strong>Event time is non-negotiable</strong> for correct business metrics. Processing time gives convenience but sacrifices determinism.</li>
+          <li><strong>Watermarks are heuristic assertions</strong> about event-time progress. They enable window firing but can be wrong — design for late data.</li>
+          <li><strong>Windows provide finite boundaries</strong> on infinite streams. Choose tumbling for simplicity, sliding for moving averages, session for user activity.</li>
+          <li><strong>State is your biggest operational challenge.</strong> Choose RocksDB for large state, configure TTL, monitor growth, and test checkpoint/restore.</li>
+          <li><strong>Kafka is the durable backbone.</strong> Understand partitions (ordering + parallelism), consumer groups, offset management, and compaction.</li>
+          <li><strong>Flink excels at complex streaming;</strong> Spark at batch/streaming unification; Kafka Streams at embedded simplicity.</li>
+          <li><strong>Backpressure is inevitable.</strong> Design for it with proper buffer sizing, async I/O, and graceful degradation strategies.</li>
+          <li><strong>The latency-completeness trade-off is fundamental.</strong> You cannot have both — choose based on business requirements and build correction mechanisms.</li>
+          <li><strong>End-to-end exactly-once requires cooperation</strong> between source (replay), engine (checkpoints), and sink (idempotent/transactional).</li>
+          <li><strong>Always design for reprocessing.</strong> Bugs happen. Retain source data, make sinks idempotent, and have a batch reconciliation path.</li>
+        </ol>
+      </div>
+
+      <h3>Architecture Cheat Sheet</h3>
+      <pre><code class="language-bash"># Production real-time pipeline architecture:
+#
+# ┌─────────────┐    ┌─────────┐    ┌──────────────┐    ┌──────────┐
+# │  Producers  │───►│  Kafka  │───►│  Flink Job   │───►│  Sinks   │
+# │  (Apps/IoT) │    │ (buffer)│    │ (processing) │    │ (OLAP/DB)│
+# └─────────────┘    └─────────┘    └──────────────┘    └──────────┘
+#                         │                 │                   │
+#                         │           ┌─────┴─────┐            │
+#                         │           │Checkpoints│            │
+#                         │           │   (S3)    │            │
+#                         │           └───────────┘            │
+#                         │                                    │
+#                    ┌────┴────┐                         ┌─────┴─────┐
+#                    │   DLQ   │                         │Monitoring │
+#                    │(late/err)│                         │(Prometheus)│
+#                    └─────────┘                         └───────────┘
+#
+# Key design decisions:
+# • Kafka retention ≥ max reprocessing window (7-30 days)
+# • Checkpoint interval: 1-5 min (balance durability vs throughput)
+# • Watermark: set to p99 lateness + safety margin
+# • Allowed lateness: 10-30x watermark delay
+# • Sinks: idempotent writes (upsert on primary key)
+# • DLQ: separate pipeline for late/failed events
+# • Monitoring: watermark lag, consumer lag, late-event ratio, state size</code></pre>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch13-spark-spill.html" class="prev">← Previous: Ch 13</a>
+      <a href="ch15-exactly-once-streaming.html" class="next">Next: Ch 15 →</a>
+    </nav>
+
+  </main>
+
+  <!-- Scripts -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

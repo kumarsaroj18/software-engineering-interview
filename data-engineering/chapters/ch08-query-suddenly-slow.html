@@ -1,0 +1,2687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ch 8 — Why Does a Query Suddenly Become Slow? | Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark/light theme">☀️</button>
+  <button class="mobile-menu-toggle" id="mobile-menu-toggle" aria-label="Toggle sidebar menu">☰</button>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="brand">DE Interview Handbook</a>
+    </div>
+    <div class="sidebar-chapter">Ch 8 / Query Suddenly Slow</div>
+    <nav class="sidebar-nav">
+      <a href="#interviewer-intent">Interviewer Intent</a>
+      <a href="#quick-answer">Quick Answer</a>
+      <a href="#statistics-drift">Statistics Drift</a>
+      <a href="#data-skew">Data Skew</a>
+      <a href="#parameter-sniffing">Parameter Sniffing</a>
+      <a href="#cardinality-errors">Cardinality Errors</a>
+      <a href="#index-issues">Index Degradation</a>
+      <a href="#vacuum-problems">Vacuum &amp; Bloat</a>
+      <a href="#spill-to-disk">Spill to Disk</a>
+      <a href="#external-factors">External Factors</a>
+      <a href="#production-incident">Production Incident</a>
+      <a href="#debugging-workflow">Debugging Workflow</a>
+      <a href="#code-examples">Code Examples</a>
+      <a href="#common-mistakes">Common Mistakes</a>
+      <a href="#trade-offs">Trade-offs</a>
+      <a href="#follow-up-questions">Follow-up Questions</a>
+      <a href="#summary">Summary</a>
+    </nav>
+    <div class="sidebar-actions">
+      <a href="ch07-locking-mechanisms.html" class="btn">← Ch 7</a>
+      <a href="ch09-warehouse-design.html" class="btn">Ch 9 →</a>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <a href="../index.html#part-ii">Part II</a> &gt;
+      <span>Chapter 8</span>
+    </nav>
+
+    <header class="chapter-header">
+      <span class="badge badge-hard">Hard</span>
+      <h1>Why Does a Query Suddenly Become Slow After Months of Working Correctly?</h1>
+      <div class="topics">
+        <span class="topic-tag">Statistics Drift</span>
+        <span class="topic-tag">Plan Cache</span>
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="search" id="chapter-search" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+
+    <!-- ============================================================
+         SECTION 1: INTERVIEWER INTENT
+         ============================================================ -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>Why interviewers ask this question</summary>
+        <p>
+          This question is a litmus test for <em>production maturity</em>. It separates engineers
+          who have lived through performance regressions from those who only write queries in
+          development. The interviewer wants to verify:
+        </p>
+        <ul>
+          <li><strong>Root-cause thinking</strong> — Can you enumerate the reasons a stable query degrades, rather than just saying "the data grew"?</li>
+          <li><strong>Optimizer internals</strong> — Do you understand how the planner chooses plans and why it might choose a <em>different</em> plan today than yesterday?</li>
+          <li><strong>Statistics awareness</strong> — Can you explain how stale statistics cause plan regressions and how autovacuum/auto-analyze interact?</li>
+          <li><strong>Systematic debugging</strong> — Do you have a structured investigation workflow, or do you thrash randomly?</li>
+          <li><strong>Cross-engine knowledge</strong> — Can you discuss this across PostgreSQL, SQL Server, MySQL, and distributed engines?</li>
+          <li><strong>Production war stories</strong> — Have you personally debugged a sudden slowdown and can you describe the timeline, root cause, and fix?</li>
+          <li><strong>Prevention mindset</strong> — Do you set up monitoring and guardrails to catch regressions early?</li>
+        </ul>
+        <p>
+          At FAANG senior+ levels, the interviewer expects you to connect query regressions to
+          <strong>SLA breaches</strong>, <strong>on-call incidents</strong>, and
+          <strong>data platform reliability</strong>.
+        </p>
+      </details>
+      <details>
+        <summary>What a strong answer demonstrates</summary>
+        <ul>
+          <li>A taxonomy of root causes (statistics, skew, plan cache, cardinality, indexes, bloat, resources)</li>
+          <li>Deep understanding of how query planners use statistics and when they become stale</li>
+          <li>Knowledge of parameter sniffing / prepared statement plan caching across engines</li>
+          <li>Concrete debugging steps using EXPLAIN ANALYZE, pg_stat_user_tables, auto_explain</li>
+          <li>Awareness that "the query didn't change" doesn't mean "the plan didn't change"</li>
+          <li>Real numbers: table growth thresholds, autovacuum timing, n_distinct cliff effects</li>
+          <li>Prevention strategies: monitoring plan changes, pg_stat_statements, query regression alerts</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 2: QUICK ANSWER
+         ============================================================ -->
+    <section id="quick-answer">
+      <h2>Quick Answer (60-Second Version)</h2>
+      <details>
+        <summary>Elevator pitch</summary>
+        <p>
+          A query becomes suddenly slow because the <strong>execution plan changed</strong>, even
+          though the SQL text remained identical. The most common triggers are:
+        </p>
+        <ol>
+          <li><strong>Statistics drift</strong> — table grew past a threshold but autovacuum hasn't
+            re-analyzed; the planner's row estimates are stale, causing it to pick an inferior plan.</li>
+          <li><strong>Data skew</strong> — a new hot key or seasonal pattern creates non-uniform
+            distribution that the planner doesn't account for.</li>
+          <li><strong>Plan cache poisoning</strong> — a cached plan was optimized for atypical
+            parameter values (parameter sniffing) and is now being reused for common values.</li>
+          <li><strong>Cardinality estimation errors</strong> — correlated columns or multi-column
+            filters cause the optimizer to drastically underestimate result sizes, choosing nested
+            loops where hash joins are needed.</li>
+          <li><strong>Index degradation</strong> — bloat, fragmentation, or missing indexes for
+            new access patterns force sequential scans.</li>
+          <li><strong>Vacuum falling behind</strong> — dead tuple accumulation forces index scans
+            to visit dead rows, or table bloat causes sequential scans to read far more pages.</li>
+          <li><strong>Resource exhaustion</strong> — work_mem exceeded causes hash/sort spills to
+            disk; noisy neighbors consume shared_buffers or I/O bandwidth.</li>
+        </ol>
+        <p>
+          The key insight: <strong>the query text is constant, but the plan is not</strong>. Plans
+          depend on statistics, parameter values, available memory, and data distribution — all of
+          which change over time.
+        </p>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 3: STATISTICS DRIFT
+         ============================================================ -->
+    <section id="statistics-drift">
+      <h2>Statistics Drift</h2>
+      <details>
+        <summary>How statistics become stale</summary>
+        <p>
+          The query planner relies on <strong>table statistics</strong> (row counts, column
+          histograms, n_distinct estimates, most-common-values lists) to estimate cardinality
+          at each plan node. When these statistics no longer reflect reality, the planner makes
+          wrong decisions.
+        </p>
+<pre><code class="language-bash">
+# PostgreSQL autovacuum/auto-analyze thresholds:
+#
+# Default trigger formula for auto-analyze:
+#   threshold = autovacuum_analyze_threshold + autovacuum_analyze_scale_factor × n_tuples
+#   Default:   50 + 0.10 × n_tuples
+#
+# Example with table growth:
+# ┌──────────────────┬──────────────┬─────────────────┬──────────────────────┐
+# │  Table Size      │  n_tuples    │  Analyze After   │  Staleness Window   │
+# ├──────────────────┼──────────────┼─────────────────┼──────────────────────┤
+# │  10K rows        │  10,000      │  1,050 changes   │  Minutes (fast)      │
+# │  1M rows         │  1,000,000   │  100,050 changes │  Hours               │
+# │  100M rows       │  100,000,000 │  10,000,050      │  Days to weeks!      │
+# │  1B rows         │  1,000,000,000│ 100,000,050     │  Weeks to months!    │
+# └──────────────────┴──────────────┴─────────────────┴──────────────────────┘
+#
+# The larger the table, the longer statistics remain stale.
+# A 100M-row table needs 10M row changes before auto-analyze triggers!
+</code></pre>
+      </details>
+      <details>
+        <summary>The n_distinct cliff effect</summary>
+        <p>
+          PostgreSQL estimates <code>n_distinct</code> during ANALYZE by sampling a fraction of
+          the table. For large tables, it may set <code>n_distinct = -1</code> (meaning "unique
+          per row") or a fixed estimate that becomes wrong as new distinct values appear.
+        </p>
+<pre><code class="language-sql">
+-- Check current statistics for a column:
+SELECT
+  schemaname, tablename, attname,
+  n_distinct,
+  most_common_vals,
+  most_common_freqs,
+  histogram_bounds
+FROM pg_stats
+WHERE tablename = 'orders' AND attname = 'customer_id';
+
+-- Example scenario:
+-- Month 1: 500K distinct customers, n_distinct estimated as 500000
+-- Month 6: 5M distinct customers, but n_distinct still says 500000
+-- Impact: planner thinks a customer_id filter returns 1/500K of rows
+--         but actually returns 1/5M → overestimates selectivity by 10x
+--         → chooses Seq Scan when Index Scan would be better
+
+-- n_distinct = -1 means "as many distinct values as rows"
+-- n_distinct = -0.5 means "half as many distinct values as rows"
+-- Positive values are absolute counts (can become stale)
+
+-- Fix: manually set n_distinct for problematic columns
+ALTER TABLE orders ALTER COLUMN customer_id SET (n_distinct = -1);
+ANALYZE orders;
+</code></pre>
+      </details>
+      <details>
+        <summary>Histogram staleness after data growth</summary>
+        <p>
+          PostgreSQL builds histograms with <code>default_statistics_target</code> buckets
+          (default: 100). When data distribution shifts — e.g., a new product category becomes
+          dominant, or timestamps move past the old histogram range — the planner's selectivity
+          estimates degrade.
+        </p>
+<pre><code class="language-sql">
+-- Scenario: orders table, amount column
+-- Old histogram (from 6 months ago):
+--   bounds: [0.01, 5.00, 10.00, 25.00, 50.00, 100.00, 250.00, 500.00, 1000.00]
+-- New reality: Black Friday introduced amounts up to $50,000
+-- Planner estimates WHERE amount > 1000 returns ~0 rows
+-- Actually returns 2M rows → nested loop chosen → disaster
+
+-- Increase statistics target for critical columns:
+ALTER TABLE orders ALTER COLUMN amount SET STATISTICS 1000;
+ANALYZE orders;
+-- Now 1000 histogram buckets capture the new distribution
+
+-- Verify histogram after analyze:
+SELECT histogram_bounds
+FROM pg_stats
+WHERE tablename = 'orders' AND attname = 'amount';
+-- Should now include ranges up to 50000
+</code></pre>
+      </details>
+      <details>
+        <summary>Autovacuum timing issues</summary>
+        <p>
+          Even when autovacuum is enabled, it can fall behind due to:
+        </p>
+        <ul>
+          <li><strong>Long-running transactions</strong> — prevent vacuuming of rows visible to old snapshots</li>
+          <li><strong>autovacuum_max_workers</strong> — default 3 workers shared across all databases; large clusters starve small tables</li>
+          <li><strong>I/O throttling</strong> — <code>autovacuum_vacuum_cost_limit</code> rate-limits vacuum to avoid I/O storms, but delays statistics refresh</li>
+          <li><strong>Table-level locks</strong> — DDL operations or ACCESS EXCLUSIVE locks block autovacuum on that table</li>
+          <li><strong>Partitioned tables</strong> — each partition is analyzed independently; parent statistics may lag</li>
+        </ul>
+<pre><code class="language-sql">
+-- Check when a table was last analyzed:
+SELECT
+  relname,
+  last_analyze,
+  last_autoanalyze,
+  n_live_tup,
+  n_dead_tup,
+  n_mod_since_analyze
+FROM pg_stat_user_tables
+WHERE relname = 'orders';
+
+-- If n_mod_since_analyze is high relative to n_live_tup,
+-- statistics are likely stale.
+
+-- Force immediate analyze on critical tables:
+ANALYZE VERBOSE orders;
+
+-- Tune per-table autovacuum for high-churn tables:
+ALTER TABLE orders SET (
+  autovacuum_analyze_threshold = 1000,
+  autovacuum_analyze_scale_factor = 0.02  -- 2% instead of 10%
+);
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 4: DATA SKEW
+         ============================================================ -->
+    <section id="data-skew">
+      <h2>Data Skew</h2>
+      <details>
+        <summary>How new skewed values cause plan regressions</summary>
+        <p>
+          A query plan is optimized for the <em>expected</em> data distribution. When a new
+          high-frequency value appears (a viral product, a bot account, a bulk import), the plan
+          that was optimal for uniform distribution becomes catastrophically slow for the skewed case.
+        </p>
+<pre><code class="language-sql">
+-- Example: e-commerce orders table
+-- Original distribution: each seller_id has ~1000 orders (uniform)
+-- Plan: Index Scan on idx_orders_seller → Nested Loop Join → fast (5ms)
+
+-- After onboarding a mega-seller (Amazon Marketplace scenario):
+-- seller_id = 'MEGA_CORP' now has 15M orders (other sellers still ~1000)
+-- Same plan: Index Scan returns 15M rows → Nested Loop does 15M iterations
+-- Result: 5ms → 180 seconds (36,000x slower)
+
+-- The planner estimated ~1000 rows based on avg frequency in MCV list
+-- But the actual value wasn't in the most_common_vals yet (stale stats)
+
+-- Check MCV list:
+SELECT most_common_vals, most_common_freqs
+FROM pg_stats
+WHERE tablename = 'orders' AND attname = 'seller_id';
+-- If MEGA_CORP isn't in most_common_vals, planner uses default estimate
+</code></pre>
+      </details>
+      <details>
+        <summary>Seasonal patterns and time-based skew</summary>
+        <p>
+          Queries filtered on time ranges can hit skew when certain time periods have drastically
+          different data volumes or distributions:
+        </p>
+<pre><code class="language-bash">
+# Seasonal skew examples:
+#
+# ┌────────────────────────────────────────────────────────────────┐
+# │  Pattern             │  Normal        │  Skewed Period          │
+# ├──────────────────────┼────────────────┼─────────────────────────┤
+# │  E-commerce orders   │  50K/day       │  Black Friday: 5M/day   │
+# │  Tax filing events   │  10K/day       │  April 15: 2M/day       │
+# │  Sports streaming    │  100K/hour     │  Super Bowl: 20M/hour   │
+# │  Social media posts  │  1M/day        │  Breaking news: 50M/day │
+# │  Payment txns        │  200K/hour     │  Month-end: 3M/hour     │
+# └──────────────────────┴────────────────┴─────────────────────────┘
+#
+# Impact on queries:
+# - A reporting query that processes "yesterday's data" works fine 
+#   for months, then suddenly times out on Nov 26 (Black Friday)
+# - The plan was optimized for 50K rows; getting 5M rows causes:
+#   * Hash table exceeds work_mem → spills to disk
+#   * Nested loops chosen for "small" result → processes 5M iterations
+#   * Bitmap heap scan exceeds effective_cache_size estimate
+</code></pre>
+      </details>
+      <details>
+        <summary>Hot keys in distributed systems</summary>
+        <p>
+          In distributed query engines (Spark, Presto, BigQuery), data skew causes
+          <strong>straggler tasks</strong> — one partition holds 1000x more data than others,
+          and the entire query waits for that single slow task.
+        </p>
+<pre><code class="language-python">
+# Spark: detecting and handling skewed joins
+from pyspark.sql import functions as F
+
+# Detect skew: check key distribution
+orders_df.groupBy("customer_id") \
+    .count() \
+    .orderBy(F.desc("count")) \
+    .show(20)
+# customer_id  | count
+# BOT_ACCOUNT  | 45,000,000   ← extreme skew!
+# NORMAL_USER1 | 1,200
+# NORMAL_USER2 | 980
+
+# Without skew handling:
+# - 200 tasks finish in 30 seconds
+# - 1 task (BOT_ACCOUNT) takes 45 minutes
+# - Total query time: 45 minutes (straggler)
+
+# Fix 1: Spark AQE skew join optimization (Spark 3.0+)
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256MB")
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
+
+# Fix 2: Salt the key for manual skew handling
+import random
+salt_range = 100  # split hot key across 100 partitions
+
+orders_salted = orders_df.withColumn(
+    "salt", F.when(
+        F.col("customer_id") == "BOT_ACCOUNT",
+        F.lit(random.randint(0, salt_range - 1))
+    ).otherwise(F.lit(0))
+).withColumn(
+    "join_key", F.concat("customer_id", F.lit("_"), "salt")
+)
+</code></pre>
+      </details>
+      <details>
+        <summary>Detecting skew before it causes incidents</summary>
+<pre><code class="language-sql">
+-- PostgreSQL: monitor for skew using pg_stats
+-- Check if most_common_freqs shows extreme values:
+SELECT
+  attname,
+  most_common_vals[1:5] AS top_values,
+  most_common_freqs[1:5] AS top_frequencies,
+  -- If top frequency > 5%, that value is a skew candidate
+  CASE WHEN most_common_freqs[1] > 0.05
+       THEN 'SKEW WARNING: top value has ' ||
+            round(most_common_freqs[1] * 100, 1) || '% of rows'
+       ELSE 'OK'
+  END AS skew_status
+FROM pg_stats
+WHERE tablename = 'orders'
+  AND most_common_freqs IS NOT NULL
+ORDER BY most_common_freqs[1] DESC NULLS LAST;
+
+-- Monitor for new hot keys appearing over time:
+-- Compare current distribution vs last week's baseline
+SELECT
+  customer_id,
+  COUNT(*) AS order_count,
+  COUNT(*) * 100.0 / SUM(COUNT(*)) OVER () AS pct_of_total
+FROM orders
+WHERE created_at > NOW() - INTERVAL '7 days'
+GROUP BY customer_id
+HAVING COUNT(*) > 10000  -- flag any customer with >10K orders/week
+ORDER BY order_count DESC
+LIMIT 20;
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 5: PARAMETER SNIFFING / PLAN CACHE
+         ============================================================ -->
+    <section id="parameter-sniffing">
+      <h2>Parameter Sniffing / Plan Cache</h2>
+      <details>
+        <summary>What is parameter sniffing?</summary>
+        <p>
+          When a parameterized query (prepared statement, stored procedure) is first executed,
+          the optimizer creates a plan based on the <em>first set of parameter values</em> it sees.
+          This plan is then <strong>cached and reused</strong> for all subsequent executions,
+          regardless of the parameter values. If the first call used atypical values, the cached
+          plan is suboptimal for the common case.
+        </p>
+<pre><code class="language-bash">
+# Parameter sniffing timeline:
+#
+# Day 1: Application starts, first call:
+#   EXECUTE get_orders($1) → $1 = 'RARE_CUSTOMER' (10 orders)
+#   Planner sees: estimated 10 rows → chooses Index Scan + Nested Loop
+#   Plan cached ✓
+#
+# Day 1-90: All subsequent calls reuse cached plan:
+#   $1 = 'NORMAL_CUSTOMER' (500 orders)  → Index Scan OK (500 loops, 50ms)
+#   $1 = 'ACTIVE_CUSTOMER' (5000 orders) → Index Scan OK (5000 loops, 400ms)
+#   Everyone happy, SLA met.
+#
+# Day 91: New mega-customer onboarded:
+#   $1 = 'MEGA_CORP' (2M orders) → Index Scan + Nested Loop (2M iterations!)
+#   Same cached plan → 2M random I/O reads → 180 seconds
+#   SLA breach! Pager fires!
+#
+# Root cause: plan was optimized for 10 rows, applied to 2M rows.
+</code></pre>
+      </details>
+      <details>
+        <summary>PostgreSQL prepared statements and generic plans</summary>
+        <p>
+          PostgreSQL has a unique behavior: after 5 executions of a prepared statement with
+          custom (parameter-specific) plans, it switches to a <strong>generic plan</strong>
+          if the generic plan's cost is not significantly worse. This transition can cause
+          sudden performance changes.
+        </p>
+<pre><code class="language-sql">
+-- PostgreSQL plan caching behavior:
+-- Executions 1-5: custom plan (uses actual parameter values)
+-- Execution 6+: generic plan (uses placeholder $1, $2, etc.)
+--   IF generic cost <= 1.1 × average custom cost → use generic
+--   ELSE → continue with custom plans
+
+-- Example: prepared statement
+PREPARE get_orders(text) AS
+  SELECT * FROM orders WHERE customer_id = $1;
+
+-- First 5 calls: custom plan each time (fast, parameter-specific)
+EXECUTE get_orders('RARE_CUSTOMER');    -- 10 rows, Index Scan
+EXECUTE get_orders('NORMAL_CUSTOMER');  -- 500 rows, Index Scan
+EXECUTE get_orders('ACTIVE_CUSTOMER'); -- 5000 rows, still Index Scan
+EXECUTE get_orders('NORMAL_CUSTOMER');  -- 500 rows, Index Scan
+EXECUTE get_orders('NORMAL_CUSTOMER');  -- 500 rows, Index Scan
+
+-- 6th call: PG evaluates generic plan
+-- Generic plan uses column statistics (average selectivity)
+-- If table has 50M rows and 1M distinct customers → avg 50 rows/customer
+-- Generic plan: Index Scan (good for most cases)
+-- BUT if n_distinct is wrong (stale stats say 10K distinct customers)
+-- → avg 5000 rows/customer → Seq Scan chosen for generic plan!
+
+-- Diagnose: check if generic plan is in use
+EXPLAIN (ANALYZE) EXECUTE get_orders('RARE_CUSTOMER');
+-- Look for "$1" in the plan output — indicates generic plan
+
+-- Force custom plans (PostgreSQL 12+):
+SET plan_cache_mode = 'force_custom_plan';
+-- Or per-statement:
+DEALLOCATE get_orders;
+-- And re-prepare to reset the counter
+</code></pre>
+      </details>
+      <details>
+        <summary>SQL Server parameter sniffing</summary>
+<pre><code class="language-sql">
+-- SQL Server: classic parameter sniffing scenario
+-- The plan is compiled on FIRST execution and cached in plan cache
+
+-- Stored procedure:
+CREATE PROCEDURE GetOrdersByStatus @status VARCHAR(20)
+AS
+  SELECT o.order_id, o.amount, c.name
+  FROM orders o
+  JOIN customers c ON o.customer_id = c.customer_id
+  WHERE o.status = @status;
+GO
+
+-- First call after server restart or plan eviction:
+EXEC GetOrdersByStatus @status = 'cancelled';  -- 0.1% of rows
+-- Plan: Nested Loop + Index Seek (optimized for tiny result set)
+-- Cached!
+
+-- Subsequent call with common value:
+EXEC GetOrdersByStatus @status = 'completed';  -- 85% of rows
+-- REUSES the Nested Loop plan → disaster on 85% of table
+-- Should use Hash Join + Clustered Index Scan for large sets
+
+-- FIXES:
+
+-- Fix 1: OPTION (RECOMPILE) — fresh plan every time (CPU cost)
+CREATE PROCEDURE GetOrdersByStatus @status VARCHAR(20)
+AS
+  SELECT o.order_id, o.amount, c.name
+  FROM orders o
+  JOIN customers c ON o.customer_id = c.customer_id
+  WHERE o.status = @status
+  OPTION (RECOMPILE);
+GO
+
+-- Fix 2: OPTIMIZE FOR UNKNOWN — uses average statistics
+CREATE PROCEDURE GetOrdersByStatus @status VARCHAR(20)
+AS
+  SELECT o.order_id, o.amount, c.name
+  FROM orders o
+  JOIN customers c ON o.customer_id = c.customer_id
+  WHERE o.status = @status
+  OPTION (OPTIMIZE FOR (@status UNKNOWN));
+GO
+
+-- Fix 3: Plan guides or query store forcing
+-- Force a known-good plan via Query Store:
+EXEC sp_query_store_force_plan @query_id = 42, @plan_id = 7;
+</code></pre>
+      </details>
+      <details>
+        <summary>When plan cache invalidation causes regressions</summary>
+        <p>
+          Plan caches are invalidated by various events. After invalidation, the next execution
+          compiles a fresh plan — which might be worse than the previous one if statistics have
+          drifted or data distribution has changed since the original plan was compiled.
+        </p>
+<pre><code class="language-bash">
+# Plan cache invalidation triggers:
+#
+# PostgreSQL:
+#   - ANALYZE (refreshes statistics → may change generic plan choice)
+#   - DDL changes (ALTER TABLE, CREATE INDEX, DROP INDEX)
+#   - DEALLOCATE statement
+#   - Server restart
+#   - shared_buffers pressure (plan eviction)
+#   - pg_stat_statements reset
+#
+# SQL Server:
+#   - UPDATE STATISTICS
+#   - Schema changes (any DDL on referenced objects)
+#   - sp_recompile
+#   - Memory pressure (plan eviction from cache)
+#   - Server restart
+#   - DBCC FREEPROCCACHE
+#   - Recompile hints
+#   - Statistics auto-update threshold crossed
+#
+# MySQL:
+#   - Table definition changes
+#   - FLUSH TABLES
+#   - Server restart
+#   - Optimizer hints change
+#
+# Irony: running ANALYZE to fix stale statistics can itself cause
+# a plan regression if the new statistics lead to a worse plan
+# choice than the "wrong but lucky" old plan.
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 6: CARDINALITY ESTIMATION ERRORS
+         ============================================================ -->
+    <section id="cardinality-errors">
+      <h2>Cardinality Estimation Errors</h2>
+      <details>
+        <summary>How underestimation causes nested loops on large sets</summary>
+        <p>
+          The most catastrophic plan regression pattern: the optimizer <em>underestimates</em>
+          the number of rows at a join node and chooses a <strong>nested loop join</strong>
+          (optimal for small outer sets) instead of a <strong>hash join</strong> (optimal for
+          large sets). A 1000x underestimate can turn a 200ms query into a 45-minute disaster.
+        </p>
+<pre><code class="language-sql">
+-- The planner's decision threshold (simplified):
+--
+-- Estimated outer rows < ~1000 → Nested Loop (O(n×m) but low startup)
+-- Estimated outer rows > ~10000 → Hash Join (O(n+m) but hash build cost)
+--
+-- When estimation is wrong:
+-- Estimated: 500 rows → NL chosen → cost model says 500 × index_seek = fast
+-- Actual: 2,000,000 rows → NL executes 2M index seeks → catastrophic
+
+-- Example EXPLAIN showing the mismatch:
+EXPLAIN (ANALYZE, BUFFERS) 
+SELECT o.order_id, p.product_name
+FROM orders o
+JOIN products p ON o.product_id = p.product_id
+WHERE o.created_at > '2024-01-01'
+  AND o.region = 'us-east-1'
+  AND o.status = 'pending';
+
+-- Output showing cardinality error:
+-- Nested Loop (cost=0.85..4521.30 rows=450 width=48)
+--              (actual time=0.05..185000.00 rows=2100000 loops=1)
+--                                    ^^^^^^^^^^^^^^^^^^^^^^^^
+--   → estimated 450 rows, actual 2.1M rows = 4667x underestimate!
+--   → Nested Loop doing 2.1M iterations instead of expected 450
+--
+--   -> Index Scan using idx_orders_composite on orders o
+--      (cost=0.43..2250.65 rows=450 width=16)
+--      (actual time=0.03..12000.00 rows=2100000 loops=1)
+--        Filter: (region = 'us-east-1' AND status = 'pending')
+--        Rows Removed by Filter: 8500000
+--
+--   -> Index Scan using products_pkey on products p
+--      (cost=0.42..5.04 rows=1 width=36)
+--      (actual time=0.02..0.03 rows=1 loops=2100000)
+--                                       ^^^^^^^^^^^^ 2.1M iterations!
+</code></pre>
+      </details>
+      <details>
+        <summary>Correlated columns problem</summary>
+        <p>
+          Standard query optimizers assume column values are <strong>independent</strong>. When
+          columns are correlated (e.g., city and zip_code, make and model, department and salary
+          band), the optimizer multiplies selectivities independently, producing drastically
+          wrong estimates.
+        </p>
+<pre><code class="language-sql">
+-- Correlated columns example:
+-- Table: employees (1M rows)
+-- department has 20 distinct values (selectivity = 1/20 = 5%)
+-- job_title has 200 distinct values (selectivity = 1/200 = 0.5%)
+--
+-- Query:
+SELECT * FROM employees
+WHERE department = 'Engineering' AND job_title = 'Senior SWE';
+--
+-- Optimizer's independence assumption:
+--   selectivity = 5% × 0.5% = 0.025%
+--   estimated rows = 1,000,000 × 0.025% = 250 rows
+--
+-- Reality (correlated: 'Senior SWE' only exists in Engineering):
+--   actual rows = 45,000 rows (180x underestimate!)
+--
+-- Impact: Nested Loop chosen for "250 rows" → processes 45K rows
+-- Should have been: Hash Join for 45K rows
+
+-- PostgreSQL fix: extended statistics (CREATE STATISTICS)
+CREATE STATISTICS emp_dept_title_stats (dependencies, ndistinct, mcv)
+ON department, job_title FROM employees;
+ANALYZE employees;
+
+-- Verify improved estimates:
+EXPLAIN SELECT * FROM employees
+WHERE department = 'Engineering' AND job_title = 'Senior SWE';
+-- Now shows ~45000 rows instead of 250
+</code></pre>
+      </details>
+      <details>
+        <summary>Multi-join amplification of estimation errors</summary>
+        <p>
+          Cardinality errors <em>compound</em> across joins. A 10x error at the first join
+          becomes 100x at the second join and 1000x at the third. This is why complex queries
+          (5+ joins) are most vulnerable to sudden plan regressions.
+        </p>
+<pre><code class="language-bash">
+# Error amplification across joins:
+#
+# ┌─────────┬──────────────┬──────────────┬─────────────────────────┐
+# │  Node   │  Estimated   │  Actual      │  Cumulative Error       │
+# ├─────────┼──────────────┼──────────────┼─────────────────────────┤
+# │  Scan A │  1,000       │  10,000      │  10x                    │
+# │  Join B │  500         │  50,000      │  100x (10x × 10x)       │
+# │  Join C │  100         │  100,000     │  1000x (error compounds)│
+# │  Join D │  50          │  500,000     │  10000x                 │
+# └─────────┴──────────────┴──────────────┴─────────────────────────┘
+#
+# At Join D, the planner thinks 50 rows → Nested Loop
+# Reality: 500K rows with Nested Loop = catastrophic
+#
+# This is why complex queries can run fine for months and then
+# suddenly break: a small statistics drift at one table cascades
+# through the join graph until it tips a join from Hash → NL.
+</code></pre>
+      </details>
+      <details>
+        <summary>Tipping points: when estimates cross plan boundaries</summary>
+        <p>
+          Query plans don't degrade linearly — they have <strong>tipping points</strong>
+          where the optimizer switches between fundamentally different strategies. A table
+          growing from 99K to 101K rows might cross a threshold that flips the plan from
+          Index Scan to Seq Scan, causing a 100x slowdown overnight.
+        </p>
+<pre><code class="language-sql">
+-- PostgreSQL cost-based tipping points:
+--
+-- Index Scan vs Seq Scan:
+--   When selectivity > ~5-15% of table, Seq Scan becomes cheaper
+--   (depends on random_page_cost vs seq_page_cost ratio)
+--
+-- Nested Loop vs Hash Join:
+--   When outer relation estimated > ~1000 rows, Hash Join preferred
+--   (depends on cpu_tuple_cost and effective_cache_size)
+--
+-- Sort vs Hash Aggregate:
+--   When distinct values exceed work_mem capacity, Sort spills
+
+-- Demonstrate the tipping point:
+SET enable_hashjoin = on;
+SET enable_nestloop = on;
+
+-- With accurate stats (50K estimated, 50K actual):
+EXPLAIN ANALYZE SELECT ... -- Hash Join, 200ms
+
+-- After data growth + stale stats (500 estimated, 50K actual):
+EXPLAIN ANALYZE SELECT ... -- Nested Loop, 45 seconds!
+
+-- The plan "suddenly" changed because the estimate crossed the NL→HJ boundary.
+-- From the operator's perspective: "nothing changed, query just got slow overnight"
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 7: INDEX DEGRADATION
+         ============================================================ -->
+    <section id="index-issues">
+      <h2>Index Degradation</h2>
+      <details>
+        <summary>B-tree fragmentation and bloat</summary>
+        <p>
+          B-tree indexes in PostgreSQL can become <strong>bloated</strong> over time due to
+          page splits, deleted entries that aren't reclaimed, and non-HOT updates. A bloated
+          index forces more I/O per lookup, eventually making the planner prefer a Seq Scan
+          over using the bloated index.
+        </p>
+<pre><code class="language-sql">
+-- Check index bloat in PostgreSQL:
+SELECT
+  schemaname || '.' || relname AS table_name,
+  indexrelname AS index_name,
+  pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+  idx_scan AS times_used,
+  idx_tup_read,
+  idx_tup_fetch,
+  CASE WHEN idx_scan = 0 THEN 'UNUSED'
+       ELSE 'ACTIVE'
+  END AS usage_status
+FROM pg_stat_user_indexes
+WHERE schemaname = 'public'
+ORDER BY pg_relation_size(indexrelid) DESC;
+
+-- Estimate bloat using pgstattuple extension:
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+SELECT * FROM pgstatindex('idx_orders_customer_id');
+-- Key outputs:
+--   tree_level: 3        (depth of B-tree)
+--   index_size: 4 GB     (total size on disk)
+--   leaf_pages: 500000
+--   empty_pages: 150000  ← 30% empty = significant bloat!
+--   deleted_pages: 50000 ← dead pages not yet reclaimed
+--   avg_leaf_density: 45% ← should be ~90% for healthy index
+--   fragment_percent: 35% ← page ordering doesn't match logical order
+
+-- When bloat > 50%, REINDEX becomes necessary:
+-- Impact on query performance:
+-- Healthy index (90% density): 3 page reads for 1 lookup
+-- Bloated index (45% density): 6 page reads for 1 lookup (2x I/O)
+-- If bloat is extreme, planner may switch to Seq Scan entirely
+</code></pre>
+      </details>
+      <details>
+        <summary>Missing indexes for new access patterns</summary>
+        <p>
+          Applications evolve: new features add new WHERE clauses, new JOIN conditions, or new
+          ORDER BY requirements. The existing indexes don't cover these new patterns, causing
+          sequential scans on tables that grew from 1M to 100M rows.
+        </p>
+<pre><code class="language-sql">
+-- Common scenario:
+-- Original query (Day 1): WHERE customer_id = $1
+-- Index exists: idx_orders_customer_id → fast
+
+-- New feature (Month 6): WHERE customer_id = $1 AND status = $2
+-- No composite index → index scan on customer_id + filter on status
+-- When status='pending' is 90% of a customer's orders, this is fine
+-- When status='completed' is 0.1% of orders → still scanning all customer rows
+
+-- Detect missing indexes with pg_stat_user_tables:
+SELECT
+  relname,
+  seq_scan,
+  seq_tup_read,
+  idx_scan,
+  CASE WHEN seq_scan > 0
+    THEN round(seq_tup_read::numeric / seq_scan, 0)
+    ELSE 0
+  END AS avg_rows_per_seq_scan,
+  n_live_tup
+FROM pg_stat_user_tables
+WHERE seq_scan > 100  -- tables with frequent seq scans
+  AND n_live_tup > 100000  -- large tables (small tables are fine with seq scan)
+ORDER BY seq_tup_read DESC;
+
+-- Use pg_stat_statements to find slow queries:
+SELECT
+  query,
+  calls,
+  mean_exec_time,
+  total_exec_time,
+  rows
+FROM pg_stat_statements
+WHERE mean_exec_time > 1000  -- > 1 second average
+ORDER BY total_exec_time DESC
+LIMIT 20;
+
+-- Then check EXPLAIN for those queries to identify missing indexes
+</code></pre>
+      </details>
+      <details>
+        <summary>Index corruption and invalid indexes</summary>
+<pre><code class="language-sql">
+-- Rare but devastating: index becomes corrupted or marked invalid
+-- after failed operations (disk errors, OOM during CREATE INDEX, etc.)
+
+-- Check for invalid indexes:
+SELECT
+  indexrelid::regclass AS index_name,
+  indrelid::regclass AS table_name,
+  indisvalid,
+  indisready
+FROM pg_index
+WHERE NOT indisvalid OR NOT indisready;
+
+-- If an index is invalid, the planner won't use it → fallback to Seq Scan
+-- This can happen silently after:
+--   - CREATE INDEX CONCURRENTLY that failed mid-way
+--   - Disk corruption
+--   - OOM during reindex
+--   - pg_upgrade issues
+
+-- Fix: rebuild the index
+REINDEX INDEX CONCURRENTLY idx_orders_customer_id;
+
+-- Or for all indexes on a table:
+REINDEX TABLE CONCURRENTLY orders;
+</code></pre>
+      </details>
+      <details>
+        <summary>Index selection changes after data growth</summary>
+        <p>
+          As a table grows, the cost calculus for index usage changes. An index that was
+          beneficial at 1M rows might be deemed too expensive at 100M rows if the selectivity
+          of the indexed column decreases.
+        </p>
+<pre><code class="language-bash">
+# Index cost-effectiveness vs table size:
+#
+# ┌─────────────────┬────────────┬─────────────┬───────────────────────┐
+# │  Table Size     │  Index Size│  Selectivity │  Planner Decision     │
+# ├─────────────────┼────────────┼─────────────┼───────────────────────┤
+# │  1M rows        │  50 MB     │  5% (50K)   │  Index Scan (fast)    │
+# │  10M rows       │  500 MB    │  5% (500K)  │  Index Scan (OK)      │
+# │  100M rows      │  5 GB      │  5% (5M)    │  Bitmap Scan or Seq?  │
+# │  1B rows        │  50 GB     │  5% (50M)   │  Seq Scan (index too  │
+# │                 │            │             │  expensive for 50M    │
+# │                 │            │             │  random I/O reads)    │
+# └─────────────────┴────────────┴─────────────┴───────────────────────┘
+#
+# At 100M+ rows with 5% selectivity:
+# - Random I/O for 5M index lookups is slower than sequential read of entire table
+# - Planner switches from Index Scan → Sequential Scan
+# - Query goes from 200ms (index, warm cache) to 30s (full scan)
+#
+# The "sudden" slowdown happens when the table crosses the tipping point
+# where random_page_cost × estimated_rows > seq_page_cost × total_pages
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 8: VACUUM & BLOAT ISSUES
+         ============================================================ -->
+    <section id="vacuum-problems">
+      <h2>Vacuum &amp; Bloat Issues</h2>
+      <details>
+        <summary>Dead tuple accumulation and its impact on queries</summary>
+        <p>
+          In PostgreSQL's MVCC model, UPDATE and DELETE operations don't immediately remove old
+          row versions. These <strong>dead tuples</strong> remain on disk until VACUUM reclaims
+          them. As dead tuples accumulate, queries must read through dead rows during sequential
+          scans and index scans, causing progressive slowdown.
+        </p>
+<pre><code class="language-sql">
+-- Check dead tuple accumulation:
+SELECT
+  relname,
+  n_live_tup,
+  n_dead_tup,
+  round(n_dead_tup * 100.0 / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
+  last_vacuum,
+  last_autovacuum,
+  last_analyze,
+  last_autoanalyze
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 100000
+ORDER BY n_dead_tup DESC;
+
+-- Example output showing problems:
+-- relname  | n_live_tup | n_dead_tup | dead_pct | last_autovacuum
+-- orders   | 50,000,000 | 45,000,000 | 47.4%    | 3 days ago
+--
+-- 47% dead tuples means:
+-- - Table is nearly 2x its necessary size on disk
+-- - Sequential scans read 2x as many pages
+-- - Index scans hit dead tuples → recheck visible → wasted I/O
+-- - Buffer cache is 47% polluted with dead data
+
+-- Impact on query performance:
+-- Clean table (50M rows, 40 GB): Seq Scan reads 40 GB, 12 seconds
+-- Bloated table (50M live + 45M dead, 76 GB): Seq Scan reads 76 GB, 23 seconds
+-- Same query, same result, nearly 2x slower!
+</code></pre>
+      </details>
+      <details>
+        <summary>Autovacuum falling behind</summary>
+        <p>
+          Autovacuum can fall behind for several reasons, creating a feedback loop where the
+          more behind it gets, the harder it is to catch up:
+        </p>
+<pre><code class="language-bash">
+# Why autovacuum falls behind:
+#
+# 1. High-churn tables with default settings:
+#    - Table: 100M rows, 500K updates/hour
+#    - Default scale_factor: 0.20 → trigger at 20M dead tuples
+#    - At 500K/hour, takes 40 hours to accumulate 20M dead tuples
+#    - Vacuum then takes 6+ hours on 100M-row table
+#    - Net result: always 20-40M dead tuples present
+#
+# 2. Long-running transactions holding back xmin:
+#    - Transaction started 3 hours ago, still open
+#    - Vacuum cannot remove any tuples newer than that xmin
+#    - Dead tuples accumulate faster than vacuum can process
+#    - One forgotten pg_dump or idle transaction blocks ALL vacuums
+#
+# 3. Insufficient autovacuum workers:
+#    - Default: 3 workers for entire database cluster
+#    - If 10 tables need vacuuming simultaneously, 7 wait in queue
+#    - High-priority tables (heavily updated) compete with large tables
+#
+# 4. Cost-based vacuum throttling:
+#    - Default cost_limit: 200 (shared across all workers)
+#    - On large tables, this means vacuum processes ~60 MB/second
+#    - A 200 GB table takes 55+ minutes to vacuum at default throttle
+#    - During that time, more dead tuples accumulate
+</code></pre>
+      </details>
+      <details>
+        <summary>Table bloat causing plan changes</summary>
+<pre><code class="language-sql">
+-- Bloat affects the planner's cost calculations:
+-- pg_class.relpages = physical pages on disk (includes dead space)
+-- pg_class.reltuples = estimated live rows
+--
+-- When bloat is severe:
+-- relpages is 2-5x what it should be for the live data
+-- Cost of Seq Scan = seq_page_cost × relpages
+-- This inflated cost can make Index Scan look cheaper even when
+-- selectivity suggests Seq Scan should win → suboptimal plan!
+
+-- Check table bloat:
+SELECT
+  schemaname, relname,
+  pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+  pg_size_pretty(pg_relation_size(relid)) AS table_size,
+  n_live_tup,
+  n_dead_tup,
+  -- Estimated ideal size based on live tuples:
+  pg_size_pretty(
+    (n_live_tup * (SELECT avg_width FROM pg_stats WHERE tablename = relname LIMIT 1))::bigint
+  ) AS estimated_ideal_size
+FROM pg_stat_user_tables
+WHERE relname = 'orders';
+
+-- Severe bloat scenario:
+-- actual table_size: 120 GB
+-- estimated_ideal_size: 40 GB
+-- bloat_ratio: 3x → 80 GB of wasted space!
+
+-- Fix: VACUUM FULL (rewrites table, exclusive lock) or pg_repack:
+-- VACUUM FULL orders;  -- blocks ALL reads/writes!
+
+-- Better: pg_repack (online, minimal locking)
+-- pg_repack --table orders --no-kill-backend
+</code></pre>
+      </details>
+      <details>
+        <summary>Transaction ID wraparound emergency</summary>
+        <p>
+          The most severe vacuum-related emergency: if autovacuum can't complete anti-wraparound
+          vacuum before the 2-billion transaction ID limit, PostgreSQL will <strong>shut down
+          entirely</strong> to prevent data corruption. Before this happens, it forces aggressive
+          vacuuming that can make all queries slow.
+        </p>
+<pre><code class="language-sql">
+-- Monitor transaction ID age:
+SELECT
+  relname,
+  age(relfrozenxid) AS xid_age,
+  -- Warning threshold: 200M (autovacuum_freeze_max_age default)
+  -- Danger threshold: 1.2B (approaching wraparound)
+  -- Emergency: 2B (database shuts down)
+  CASE
+    WHEN age(relfrozenxid) > 1200000000 THEN 'CRITICAL'
+    WHEN age(relfrozenxid) > 500000000 THEN 'WARNING'
+    ELSE 'OK'
+  END AS status,
+  pg_size_pretty(pg_relation_size(oid)) AS table_size
+FROM pg_class
+WHERE relkind = 'r'
+ORDER BY age(relfrozenxid) DESC
+LIMIT 10;
+
+-- When XID age exceeds autovacuum_freeze_max_age (default 200M):
+-- PostgreSQL launches aggressive vacuum that:
+-- - Ignores cost_limit (runs at full speed)
+-- - Competes with queries for I/O
+-- - Can cause all queries to slow down simultaneously
+-- - Cannot be cancelled without risking wraparound
+
+-- Prevention:
+-- 1. Ensure no long-running transactions (check pg_stat_activity)
+-- 2. Tune autovacuum to vacuum more frequently on high-churn tables
+-- 3. Monitor xid_age in your alerting system
+-- 4. Kill idle-in-transaction sessions automatically:
+SET idle_in_transaction_session_timeout = '10min';
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 9: SPILL TO DISK
+         ============================================================ -->
+    <section id="spill-to-disk">
+      <h2>Spill to Disk</h2>
+      <details>
+        <summary>work_mem exhaustion and hash join spill</summary>
+        <p>
+          Hash joins build an in-memory hash table on the inner relation. When this table exceeds
+          <code>work_mem</code>, it <strong>spills to disk</strong> — partitioning data into
+          temporary files and processing them in batches. This can turn a 200ms in-memory hash
+          join into a 30-second disk-bound operation.
+        </p>
+<pre><code class="language-sql">
+-- PostgreSQL: detect hash join spill in EXPLAIN ANALYZE
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT o.order_id, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.customer_id
+WHERE o.created_at > '2024-01-01';
+
+-- When work_mem is sufficient (no spill):
+-- Hash Join (cost=... rows=500000 actual time=50..200 rows=500000)
+--   Hash Cond: (o.customer_id = c.customer_id)
+--   -> Seq Scan on orders o ...
+--   -> Hash (cost=... rows=1000000)
+--        Buckets: 1048576  Batches: 1  Memory Usage: 80 MB
+--                          ^^^^^^^^^
+--        Batches=1 means everything fit in memory ✓
+
+-- When work_mem is exhausted (spill to disk):
+-- Hash Join (cost=... rows=500000 actual time=50..28000 rows=500000)
+--   Hash Cond: (o.customer_id = c.customer_id)
+--   -> Seq Scan on orders o ...
+--   -> Hash (cost=... rows=1000000)
+--        Buckets: 131072  Batches: 16  Memory Usage: 40 MB
+--                         ^^^^^^^^^^
+--        Batches=16 means 16 passes over data on disk!
+--        Temp files written: 1.2 GB  ← disk I/O penalty
+
+-- Why this becomes sudden:
+-- Month 1: customers table = 500K rows → Hash = 40 MB → fits in work_mem (64 MB)
+-- Month 6: customers table = 2M rows → Hash = 160 MB → exceeds work_mem!
+-- Result: Batches goes from 1 to 4 → 3x-10x slower overnight
+
+-- Check current work_mem:
+SHOW work_mem;  -- default is often 4 MB (WAY too low for analytics)
+
+-- Set appropriate work_mem for the session:
+SET work_mem = '256MB';  -- per-operation, not per-connection total
+</code></pre>
+      </details>
+      <details>
+        <summary>Sort spill and external merge sort</summary>
+<pre><code class="language-sql">
+-- Sort operations also spill when data exceeds work_mem:
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders
+WHERE region = 'us-east-1'
+ORDER BY created_at DESC
+LIMIT 1000;
+
+-- In-memory sort (fast):
+-- Sort (cost=... rows=500000)
+--   Sort Key: created_at DESC
+--   Sort Method: top-N heapsort  Memory: 180kB  ← in memory ✓
+
+-- Disk sort (slow):
+-- Sort (cost=... rows=5000000)
+--   Sort Key: created_at DESC
+--   Sort Method: external merge  Disk: 2400MB  ← spilled to disk!
+--                                ^^^^^^^^^^^^
+-- External merge sort is 10-100x slower than in-memory sort
+
+-- Why it becomes sudden:
+-- The data matching WHERE region = 'us-east-1' grew past work_mem
+-- Previously: 500K rows × 200 bytes = 100 MB → fits in work_mem (128 MB)
+-- Now: 5M rows × 200 bytes = 1 GB → doesn't fit → external sort
+
+-- Detect sort spills in pg_stat_statements (PG 15+):
+SELECT
+  query,
+  calls,
+  mean_exec_time,
+  temp_blks_read,    -- pages read from temp files (sort spill)
+  temp_blks_written  -- pages written to temp files
+FROM pg_stat_statements
+WHERE temp_blks_written > 0
+ORDER BY temp_blks_written DESC;
+</code></pre>
+      </details>
+      <details>
+        <summary>Spark shuffle spill</summary>
+<pre><code class="language-python">
+# Spark: shuffle spill happens when a partition's data exceeds
+# spark.executor.memory during aggregation/join/sort operations
+
+# Detect spill in Spark UI:
+# Navigate to: Stages > Stage Details > Summary Metrics
+# Look for:
+#   - "Spill (Memory)": data size that exceeded in-memory budget
+#   - "Spill (Disk)": serialized data written to local disk
+#   - If Spill (Disk) > 0, you have a spill problem
+
+# Common spill scenarios in data engineering:
+#
+# 1. Large aggregation with many groups:
+df.groupBy("user_id").agg(  # 100M distinct users
+    F.collect_list("event").alias("events")  # accumulates in memory
+)
+# Fix: increase spark.executor.memory or use window function
+
+# 2. Skewed join partition:
+# One partition has 500MB, others have 5MB
+# The 500MB partition spills because it exceeds per-task memory
+# Fix: enable AQE or salt the skewed key
+
+# 3. Large broadcast threshold mismatch:
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "500MB")
+# If the "small" table is actually 2GB after filtering, broadcast fails
+# and falls back to sort-merge join with potential spill
+
+# Tuning to prevent spill:
+spark.conf.set("spark.executor.memory", "16g")
+spark.conf.set("spark.executor.memoryOverhead", "4g")
+spark.conf.set("spark.memory.fraction", "0.8")  # 80% for execution/storage
+spark.conf.set("spark.memory.storageFraction", "0.3")  # 30% for cache
+# Effective execution memory: 16GB × 0.8 × 0.7 = 8.96 GB per executor
+</code></pre>
+      </details>
+      <details>
+        <summary>Identifying spill as the root cause of sudden slowdown</summary>
+<pre><code class="language-bash">
+# Spill creates a "cliff" effect — performance is fine until the data
+# size exceeds memory, then drops dramatically:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Performance vs Data Size (Hash Join)                           │
+# │                                                                 │
+# │  Latency                                                        │
+# │  (ms)                                                           │
+# │   30000 │                              ╱                        │
+# │         │                             ╱                         │
+# │         │                            ╱ ← Disk-bound (spill)     │
+# │         │                           ╱                           │
+# │   5000  │                     ╱────╱                            │
+# │         │                    ╱ ← Partial spill                  │
+# │         │              ╱────╱                                   │
+# │   200   │─────────────╱ ← work_mem boundary (cliff!)            │
+# │         │  In-memory   │                                        │
+# │         └──────────────┼────────────────────────────────────    │
+# │              64MB    128MB    256MB    512MB    1GB              │
+# │                      Hash table size →                          │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# Key diagnostic steps:
+# 1. Check EXPLAIN ANALYZE for Batches > 1 (hash) or external sort
+# 2. Check temp_blks_written in pg_stat_statements
+# 3. Monitor disk I/O on temp tablespace (temp file writes)
+# 4. Compare hash table size vs work_mem setting
+# 5. Check if table growth pushed the operation past the boundary
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 10: EXTERNAL FACTORS
+         ============================================================ -->
+    <section id="external-factors">
+      <h2>External Factors</h2>
+      <details>
+        <summary>Noisy neighbors and resource contention</summary>
+        <p>
+          A query can slow down even without any change to data, statistics, or plans. External
+          resource pressure from other workloads on the same infrastructure causes contention:
+        </p>
+<pre><code class="language-bash">
+# Resource contention sources:
+#
+# ┌────────────────────────────────────────────────────────────────┐
+# │  Resource       │  Contention Source           │  Impact        │
+# ├─────────────────┼──────────────────────────────┼────────────────┤
+# │  CPU            │  Batch jobs, analytics       │  Query waits   │
+# │                 │  queries on same host        │  for CPU time  │
+# ├─────────────────┼──────────────────────────────┼────────────────┤
+# │  Memory/Buffer  │  Large seq scans evicting    │  Increased     │
+# │  Cache          │  cached pages (buffer pool   │  disk I/O for  │
+# │                 │  pollution)                  │  your query    │
+# ├─────────────────┼──────────────────────────────┼────────────────┤
+# │  Disk I/O       │  VACUUM, REINDEX, backups,   │  I/O queue     │
+# │                 │  other queries' temp files   │  depth grows   │
+# ├─────────────────┼──────────────────────────────┼────────────────┤
+# │  Network        │  Replication lag, large      │  Increased     │
+# │                 │  result transfers            │  latency       │
+# ├─────────────────┼──────────────────────────────┼────────────────┤
+# │  Locks          │  DDL operations, long txns,  │  Lock waits    │
+# │                 │  VACUUM FULL                 │               │
+# └─────────────────┴──────────────────────────────┴────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>Buffer cache pollution</summary>
+<pre><code class="language-sql">
+-- Scenario: your OLTP query relies on hot data being in shared_buffers
+-- A large analytics query does a sequential scan of a 100 GB table
+-- This evicts YOUR frequently-accessed pages from the buffer cache
+-- Next time your query runs: cold cache → disk reads → 10x slower
+
+-- PostgreSQL buffer cache inspection (pg_buffercache extension):
+CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+
+SELECT
+  c.relname,
+  COUNT(*) AS buffers_cached,
+  pg_size_pretty(COUNT(*) * current_setting('block_size')::int) AS cached_size,
+  ROUND(100.0 * COUNT(*) / (
+    SELECT setting::int FROM pg_settings WHERE name = 'shared_buffers'
+  ), 2) AS pct_of_cache
+FROM pg_buffercache b
+JOIN pg_class c ON b.relfilenode = c.relfilenode
+WHERE c.relname IS NOT NULL
+GROUP BY c.relname
+ORDER BY buffers_cached DESC
+LIMIT 15;
+
+-- If your critical table (e.g., 'orders') disappears from this list
+-- after a large batch job runs, that's buffer cache pollution.
+
+-- Mitigation strategies:
+-- 1. Separate OLTP and OLAP workloads (read replicas for analytics)
+-- 2. Use BufFileRead ring buffer (large seq scans in PG use limited buffer)
+-- 3. Pin critical tables in cache with pg_prewarm:
+SELECT pg_prewarm('orders');  -- load table into shared_buffers
+-- 4. Increase shared_buffers (but diminishing returns past 25% of RAM)
+</code></pre>
+      </details>
+      <details>
+        <summary>Storage degradation and I/O latency</summary>
+<pre><code class="language-bash">
+# Cloud storage performance can degrade due to:
+#
+# 1. EBS/gp3 burst credit exhaustion (AWS):
+#    - gp3 baseline: 3000 IOPS, 125 MB/s throughput
+#    - Heavy batch job consumes burst credits
+#    - Subsequent queries hit baseline performance → 3-5x slower
+#
+# 2. Shared storage throttling (multi-tenant):
+#    - Cloud providers rate-limit per-volume and per-instance
+#    - Other tenants on same physical hardware consume I/O budget
+#
+# 3. Network-attached storage latency spikes:
+#    - EBS latency p99 can spike from 1ms to 50ms during maintenance
+#    - Random I/O operations (index scans) are most affected
+#
+# Diagnostic commands:
+# Check I/O wait time:
+iostat -x 1 5
+# Look for: %util > 80%, await > 10ms, avgqu-sz > 4
+
+# Check for EBS burst credit depletion (AWS CloudWatch):
+# Metric: VolumeConsumedReadWriteOps vs BurstBalance
+
+# PostgreSQL I/O timing:
+SET track_io_timing = on;
+EXPLAIN (ANALYZE, BUFFERS, TIMING)
+SELECT * FROM orders WHERE order_id = 12345;
+-- I/O Timings: read=450.000 write=0.000
+--              ^^^^^^ abnormally high = storage problem
+-- Normal: read < 5ms per block
+-- Problem: read > 20ms per block
+</code></pre>
+      </details>
+      <details>
+        <summary>Connection pool saturation</summary>
+<pre><code class="language-sql">
+-- When connection pools are exhausted, new queries queue behind
+-- existing connections. The query itself doesn't change, but the
+-- perceived latency includes queue wait time.
+
+-- Check active connections:
+SELECT
+  state,
+  COUNT(*) AS connections,
+  AVG(EXTRACT(EPOCH FROM (NOW() - state_change))) AS avg_duration_sec
+FROM pg_stat_activity
+WHERE datname = current_database()
+GROUP BY state;
+
+-- state              | connections | avg_duration_sec
+-- active             | 95          | 2.5      ← all slots busy
+-- idle               | 3           | 120      ← few slots available
+-- idle in transaction| 2           | 3600     ← leaked transactions!
+
+-- Max connections: 100 (default)
+-- Active: 95 → new connections queue → "query suddenly slow"
+-- Root cause: not the query itself, but waiting for a connection
+
+-- Common triggers:
+-- 1. Slow query holding connections longer → fewer available → cascade
+-- 2. Connection leak (app doesn't return connections to pool)
+-- 3. Increased concurrent users (traffic spike)
+-- 4. Idle-in-transaction sessions hoarding connections
+
+-- Fix: identify and terminate idle-in-transaction sessions:
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND state_change < NOW() - INTERVAL '10 minutes';
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 11: PRODUCTION INCIDENT
+         ============================================================ -->
+    <section id="production-incident">
+      <h2>Production Incident: 200ms → 45s After Crossing 100M Rows</h2>
+      <details>
+        <summary>Incident timeline</summary>
+<pre><code class="language-bash">
+# INCIDENT REPORT: Order Lookup Query Regression
+# Severity: P1 (customer-facing latency SLA breach)
+# Duration: 6 hours before detection, 2 hours to resolve
+# Impact: 99th percentile latency went from 200ms to 45 seconds
+#         affecting 15% of checkout requests
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  TIMELINE                                                       │
+# ├─────────────────────────────────────────────────────────────────┤
+# │  Month 1-11: orders table grows from 10M to 95M rows           │
+# │    - Query: SELECT * FROM orders WHERE customer_id = $1         │
+# │      AND status = 'pending' ORDER BY created_at DESC LIMIT 10   │
+# │    - Plan: Index Scan on idx_orders_customer_status             │
+# │    - Latency: 5-200ms (p99)                                    │
+# │    - Statistics refreshed by autovacuum every ~2 days           │
+# │                                                                 │
+# │  Month 12, Day 1: Table crosses 100M rows                      │
+# │    - Black Friday bulk import adds 8M rows in 6 hours           │
+# │    - n_distinct for status column was estimated as 5            │
+# │    - Actual: still 5 values, but distribution shifted:          │
+# │      'pending' went from 2% to 35% of rows (bulk orders)       │
+# │    - Autovacuum threshold: 10M changes needed to trigger        │
+# │      (0.10 × 100M = 10M). Bulk insert = 8M < threshold         │
+# │    - Statistics NOT refreshed!                                  │
+# │                                                                 │
+# │  Month 12, Day 2: Query plan changes                           │
+# │    - Generic plan evaluation triggered (PG connection recycled) │
+# │    - Planner uses stale stats: 'pending' = 2% of 100M = 2M rows│
+# │    - Actual 'pending' rows per customer: 50-500 (was 1-5)       │
+# │    - BUT planner also thinks customer_id selectivity = 1/500K   │
+# │    - Combined estimate: 2M × (1/500K) = 4 rows ← WRONG!        │
+# │    - Actual rows returned: 350-5000 per customer                │
+# │    - Plan chosen: Nested Loop with inner Index Scan             │
+# │      (optimal for 4 rows, catastrophic for 5000 rows)          │
+# │                                                                 │
+# │  Month 12, Day 2, 03:00 UTC: Alerts fire                       │
+# │    - p99 latency: 45 seconds (SLA: 500ms)                      │
+# │    - Checkout error rate: 15% (timeout)                         │
+# │    - On-call paged                                              │
+# └─────────────────────────────────────────────────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>Root cause analysis</summary>
+<pre><code class="language-sql">
+-- ROOT CAUSE: Stale statistics + uniform distribution assumption
+--
+-- The planner's model:
+--   n_distinct(status) = 5 (correct)
+--   frequency('pending') = 0.02 (STALE: was 2%, now 35%)
+--   n_distinct(customer_id) = 500,000 (STALE: now 2M)
+--
+-- Selectivity calculation:
+--   P(customer_id = $1) = 1/500,000 = 0.000002
+--   P(status = 'pending') = 0.02
+--   Combined (independence assumed): 0.000002 × 0.02 = 0.00000004
+--   Estimated rows: 100,000,000 × 0.00000004 = 4 rows
+--
+-- Actual rows for typical customer with pending orders: 350-5000
+-- Underestimate: 87x to 1250x!
+--
+-- Plan chosen based on "4 rows" estimate:
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders
+WHERE customer_id = 'CUST_12345'
+  AND status = 'pending'
+ORDER BY created_at DESC
+LIMIT 10;
+
+-- Actual plan (problematic):
+-- Limit (rows=4 est, rows=10 actual)
+--   -> Sort (rows=4 est, rows=5000 actual)
+--        Sort Key: created_at DESC
+--        Sort Method: external merge  Disk: 48MB  ← SPILL!
+--        -> Nested Loop (rows=4 est, rows=5000 actual)
+--             -> Index Scan using idx_orders_customer on orders
+--                  Index Cond: (customer_id = 'CUST_12345')
+--                  Rows Removed by Filter: 45000  ← scanning ALL customer orders
+--             -> Index Scan using idx_pending_status ...
+--                  (loops=50000)  ← 50K index lookups!
+--
+-- Total: 45 seconds (should be 50ms with correct plan)
+
+-- What the correct plan should look like (after ANALYZE):
+-- Limit (rows=10)
+--   -> Index Scan using idx_orders_cust_status_created on orders
+--        Index Cond: (customer_id = 'CUST_12345' AND status = 'pending')
+--        Rows Returned: 10
+--        Heap Fetches: 10
+-- Total: 3ms
+</code></pre>
+      </details>
+      <details>
+        <summary>Investigation steps taken</summary>
+<pre><code class="language-sql">
+-- Step 1: Confirm the query is actually slow (not network/app issue)
+SELECT query, mean_exec_time, calls, max_exec_time
+FROM pg_stat_statements
+WHERE query LIKE '%orders%customer_id%status%'
+ORDER BY max_exec_time DESC;
+-- Result: mean_exec_time jumped from 80ms to 38000ms overnight
+
+-- Step 2: Compare current plan vs expected plan
+EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+SELECT * FROM orders
+WHERE customer_id = 'CUST_12345' AND status = 'pending'
+ORDER BY created_at DESC LIMIT 10;
+-- Found: Nested Loop where Hash Join expected, Sort spilling to disk
+
+-- Step 3: Check statistics freshness
+SELECT
+  relname, last_autoanalyze, n_mod_since_analyze, n_live_tup,
+  round(n_mod_since_analyze * 100.0 / n_live_tup, 1) AS pct_modified
+FROM pg_stat_user_tables
+WHERE relname = 'orders';
+-- Result: last_autoanalyze = 3 days ago, n_mod_since_analyze = 8,200,000
+-- 8.2M modifications but threshold is 10M → analyze hasn't triggered!
+
+-- Step 4: Check column statistics vs reality
+SELECT n_distinct, most_common_vals, most_common_freqs
+FROM pg_stats WHERE tablename = 'orders' AND attname = 'status';
+-- most_common_vals: {completed, shipped, pending, cancelled, refunded}
+-- most_common_freqs: {0.65, 0.18, 0.02, 0.10, 0.05}
+--                                   ^^^^
+-- Stats say pending = 2%, reality = 35% after bulk import!
+
+-- Step 5: Verify actual distribution
+SELECT status, COUNT(*), round(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM orders GROUP BY status;
+-- status     | count      | pct
+-- completed  | 45,000,000 | 43.3%
+-- pending    | 36,000,000 | 34.6%  ← actual 35%, stats said 2%!
+-- shipped    | 12,000,000 | 11.5%
+-- cancelled  | 8,000,000  | 7.7%
+-- refunded   | 3,000,000  | 2.9%
+</code></pre>
+      </details>
+      <details>
+        <summary>Resolution and prevention</summary>
+<pre><code class="language-sql">
+-- IMMEDIATE FIX (2 minutes):
+ANALYZE orders;
+-- Re-computes statistics → planner now sees pending = 35%
+-- All prepared statements get new plans on next execution
+-- Latency immediately drops back to 5-50ms
+
+-- LONGER-TERM FIXES:
+
+-- 1. Lower autovacuum thresholds for this table:
+ALTER TABLE orders SET (
+  autovacuum_analyze_threshold = 10000,
+  autovacuum_analyze_scale_factor = 0.01  -- 1% instead of 10%
+);
+-- Now triggers after 1M changes instead of 10M
+
+-- 2. Create composite index that covers the exact query pattern:
+CREATE INDEX CONCURRENTLY idx_orders_cust_status_created
+ON orders (customer_id, status, created_at DESC);
+-- This index serves the query directly, regardless of statistics
+
+-- 3. Add extended statistics for correlated columns:
+CREATE STATISTICS orders_status_customer_stats (dependencies, mcv)
+ON customer_id, status FROM orders;
+ANALYZE orders;
+
+-- 4. Monitoring: alert on statistics freshness
+-- Add to monitoring system (Datadog/Prometheus):
+-- Alert when n_mod_since_analyze / n_live_tup > 0.05 (5%)
+
+-- 5. Scheduled ANALYZE for critical tables after bulk operations:
+-- In the ETL pipeline, add:
+-- AFTER bulk_import: ANALYZE orders;
+
+-- 6. Connection pool: force plan recompilation after ANALYZE
+-- Recycle all connections in pgBouncer after emergency ANALYZE:
+-- pgbouncer: RECONNECT orders_db
+</code></pre>
+      </details>
+      <details>
+        <summary>Lessons learned</summary>
+        <ul>
+          <li><strong>Autovacuum thresholds don't scale</strong> — at 100M rows, 10% scale_factor means 10M changes before re-analyze. Tune per-table for critical paths.</li>
+          <li><strong>Bulk imports need explicit ANALYZE</strong> — always run ANALYZE after large data loads, don't rely on autovacuum timing.</li>
+          <li><strong>Monitor statistics age</strong> — alert on <code>n_mod_since_analyze / n_live_tup</code> ratio exceeding 5% for critical tables.</li>
+          <li><strong>The "uniform distribution" assumption kills</strong> — when one status value goes from 2% to 35%, the planner's independence assumption produces wildly wrong estimates.</li>
+          <li><strong>Composite indexes provide plan stability</strong> — an index on (customer_id, status, created_at) gives the same plan regardless of statistics accuracy.</li>
+          <li><strong>Generic plans in PG need monitoring</strong> — when connections recycle, new generic plans may be chosen based on stale statistics.</li>
+          <li><strong>Test with production data volumes</strong> — this bug would never appear in dev (10K rows) or staging (1M rows).</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 12: DEBUGGING WORKFLOW
+         ============================================================ -->
+    <section id="debugging-workflow">
+      <h2>Debugging Workflow: Systematic Investigation</h2>
+      <details>
+        <summary>Step 1: Confirm the regression and gather baseline</summary>
+<pre><code class="language-sql">
+-- First: confirm it's actually a query regression, not app/network issue
+
+-- Check pg_stat_statements for historical comparison:
+SELECT
+  query,
+  calls,
+  mean_exec_time AS avg_ms,
+  max_exec_time AS max_ms,
+  stddev_exec_time AS stddev_ms,
+  rows,
+  shared_blks_hit,
+  shared_blks_read,
+  temp_blks_written  -- non-zero = spill to disk
+FROM pg_stat_statements
+WHERE query LIKE '%your_query_pattern%'
+ORDER BY total_exec_time DESC;
+
+-- Compare with historical baseline:
+-- Was mean_exec_time ~200ms last week? Now 45000ms? Confirmed regression.
+
+-- Check WHEN the regression started (if you have monitoring):
+-- Grafana/Datadog: query latency p99 timeline
+-- Look for: step function change (not gradual) = plan change
+--           gradual increase = data growth or bloat
+
+-- PostgreSQL 14+: pg_stat_statements tracks planning time separately:
+SELECT query, mean_plan_time, mean_exec_time
+FROM pg_stat_statements WHERE query LIKE '%orders%';
+-- If mean_plan_time spiked: plan compilation issue
+-- If mean_exec_time spiked: execution issue (bad plan or resources)
+</code></pre>
+      </details>
+      <details>
+        <summary>Step 2: Compare old vs new EXPLAIN plans</summary>
+<pre><code class="language-sql">
+-- Get the current (bad) plan:
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM orders
+WHERE customer_id = 'CUST_12345'
+  AND status = 'pending'
+ORDER BY created_at DESC LIMIT 10;
+
+-- Key things to look for in the plan:
+--
+-- 1. ESTIMATE vs ACTUAL row mismatch:
+--    (rows=100 ... actual rows=500000) → cardinality error!
+--    Ratio > 10x is a red flag, > 100x is the likely root cause
+--
+-- 2. Join type:
+--    Nested Loop with loops=500000 → should be Hash Join
+--
+-- 3. Sort method:
+--    "Sort Method: external merge  Disk: XXX" → spill to disk
+--
+-- 4. Buffers:
+--    "shared read=500000" → cold cache or massive table scan
+--    Compare shared hit vs shared read ratio
+--
+-- 5. Filter waste:
+--    "Rows Removed by Filter: 5000000" → index not selective enough
+--
+-- 6. Scan type:
+--    Seq Scan on large table where Index Scan expected
+
+-- If you have the OLD (good) plan saved (from auto_explain logs):
+-- Compare side by side:
+-- Old: Hash Join, 200ms, Buffers: hit=500 read=20
+-- New: Nested Loop, 45s, Buffers: hit=50 read=500000
+-- → Plan changed from Hash Join to Nested Loop = root cause
+
+-- Force the old plan to verify it's still faster:
+SET enable_nestloop = off;  -- disable nested loop temporarily
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders
+WHERE customer_id = 'CUST_12345'
+  AND status = 'pending'
+ORDER BY created_at DESC LIMIT 10;
+-- If Hash Join plan is fast → confirms NL was the problem
+-- Reset: SET enable_nestloop = on;
+</code></pre>
+      </details>
+      <details>
+        <summary>Step 3: Check statistics freshness</summary>
+<pre><code class="language-sql">
+-- Comprehensive statistics check for the affected table:
+SELECT
+  relname,
+  last_vacuum,
+  last_autovacuum,
+  last_analyze,
+  last_autoanalyze,
+  n_live_tup,
+  n_dead_tup,
+  n_mod_since_analyze,
+  -- Staleness indicator:
+  round(n_mod_since_analyze * 100.0 / GREATEST(n_live_tup, 1), 1)
+    AS pct_stale
+FROM pg_stat_user_tables
+WHERE relname IN ('orders', 'customers', 'products');
+-- Any table with pct_stale > 5% is a suspect
+
+-- Check specific column statistics accuracy:
+-- Compare pg_stats estimates vs actual for the problematic columns:
+WITH stat_estimate AS (
+  SELECT
+    tablename,
+    attname,
+    n_distinct,
+    (SELECT reltuples FROM pg_class WHERE relname = tablename) AS total_rows
+  FROM pg_stats
+  WHERE tablename = 'orders' AND attname = 'status'
+)
+SELECT
+  attname,
+  n_distinct AS estimated_distinct,
+  (SELECT COUNT(DISTINCT status) FROM orders) AS actual_distinct
+FROM stat_estimate;
+
+-- Check if most_common_vals/freqs are current:
+SELECT attname, most_common_vals, most_common_freqs
+FROM pg_stats
+WHERE tablename = 'orders' AND attname IN ('status', 'customer_id');
+-- Compare frequencies with actual: SELECT status, count(*)/total FROM orders GROUP BY 1
+</code></pre>
+      </details>
+      <details>
+        <summary>Step 4: Use auto_explain to capture plans in production</summary>
+<pre><code class="language-sql">
+-- auto_explain logs execution plans for slow queries automatically
+-- Enable in postgresql.conf or per-session:
+
+-- Load the module:
+LOAD 'auto_explain';
+
+-- Configure thresholds:
+SET auto_explain.log_min_duration = '1000';  -- log plans for queries > 1s
+SET auto_explain.log_analyze = true;          -- include actual row counts
+SET auto_explain.log_buffers = true;          -- include buffer usage
+SET auto_explain.log_timing = true;           -- include per-node timing
+SET auto_explain.log_nested_statements = true; -- include functions/procedures
+SET auto_explain.log_format = 'json';         -- machine-parseable
+
+-- In postgresql.conf (persistent, all sessions):
+-- shared_preload_libraries = 'auto_explain'
+-- auto_explain.log_min_duration = '1000'
+-- auto_explain.log_analyze = true
+-- auto_explain.log_buffers = true
+
+-- Plans appear in PostgreSQL logs. Parse them to:
+-- 1. Detect plan changes over time (same query, different plan)
+-- 2. Find cardinality estimation errors (estimated vs actual)
+-- 3. Identify spill events (temp buffers written > 0)
+-- 4. Track buffer hit ratio degradation
+
+-- Alternative: pg_store_plans extension (stores plans in shared memory)
+-- Pairs with pg_stat_statements to match plans to query fingerprints
+</code></pre>
+      </details>
+      <details>
+        <summary>Step 5: Check for external factors</summary>
+<pre><code class="language-sql">
+-- Rule out resource contention:
+
+-- 1. Check for blocking queries:
+SELECT
+  blocked.pid AS blocked_pid,
+  blocked.query AS blocked_query,
+  blocking.pid AS blocking_pid,
+  blocking.query AS blocking_query,
+  blocked.wait_event_type,
+  blocked.wait_event
+FROM pg_stat_activity blocked
+JOIN pg_locks bl ON bl.pid = blocked.pid AND NOT bl.granted
+JOIN pg_locks gl ON gl.locktype = bl.locktype
+  AND gl.database IS NOT DISTINCT FROM bl.database
+  AND gl.relation IS NOT DISTINCT FROM bl.relation
+  AND gl.page IS NOT DISTINCT FROM bl.page
+  AND gl.tuple IS NOT DISTINCT FROM bl.tuple
+  AND gl.pid != bl.pid
+  AND gl.granted
+JOIN pg_stat_activity blocking ON blocking.pid = gl.pid
+WHERE blocked.pid != blocking.pid;
+
+-- 2. Check for long-running transactions blocking vacuum:
+SELECT
+  pid, state, query,
+  age(backend_xmin) AS xmin_age,
+  NOW() - xact_start AS transaction_duration
+FROM pg_stat_activity
+WHERE state != 'idle'
+  AND backend_xmin IS NOT NULL
+ORDER BY age(backend_xmin) DESC;
+
+-- 3. Check I/O statistics:
+SELECT * FROM pg_stat_bgwriter;
+-- High buffers_backend = shared_buffers too small or cache thrashing
+-- High checkpoints_timed vs checkpoints_req = checkpoint pressure
+
+-- 4. Check wait events distribution:
+SELECT wait_event_type, wait_event, COUNT(*)
+FROM pg_stat_activity
+WHERE state = 'active'
+GROUP BY 1, 2
+ORDER BY 3 DESC;
+-- "IO/DataFileRead" dominant = disk-bound (storage issue or cold cache)
+-- "Lock/relation" dominant = lock contention
+-- "LWLock/buffer_content" = buffer contention
+</code></pre>
+      </details>
+      <details>
+        <summary>Step 6: Decision tree for the fix</summary>
+<pre><code class="language-bash">
+# Systematic fix decision tree:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  ROOT CAUSE IDENTIFIED → FIX                                    │
+# ├─────────────────────────────────────────────────────────────────┤
+# │                                                                 │
+# │  Stale statistics?                                              │
+# │  ├─ YES → ANALYZE table; tune autovacuum thresholds             │
+# │  └─ NO ↓                                                       │
+# │                                                                 │
+# │  Plan cache / parameter sniffing?                               │
+# │  ├─ YES → DEALLOCATE; SET plan_cache_mode = force_custom_plan   │
+# │  └─ NO ↓                                                       │
+# │                                                                 │
+# │  Cardinality error (correlated columns)?                        │
+# │  ├─ YES → CREATE STATISTICS; increase statistics_target         │
+# │  └─ NO ↓                                                       │
+# │                                                                 │
+# │  Index bloat / missing index?                                   │
+# │  ├─ YES → REINDEX CONCURRENTLY; CREATE INDEX CONCURRENTLY       │
+# │  └─ NO ↓                                                       │
+# │                                                                 │
+# │  Table bloat (dead tuples)?                                     │
+# │  ├─ YES → VACUUM (VERBOSE); or pg_repack for severe cases       │
+# │  └─ NO ↓                                                       │
+# │                                                                 │
+# │  Spill to disk (work_mem)?                                      │
+# │  ├─ YES → SET work_mem = '256MB'; or add appropriate index      │
+# │  └─ NO ↓                                                       │
+# │                                                                 │
+# │  External factors (I/O, locks, cache)?                          │
+# │  ├─ YES → Isolate workloads; terminate blockers; scale storage  │
+# │  └─ NO → Escalate; capture full system state for deeper review  │
+# │                                                                 │
+# └─────────────────────────────────────────────────────────────────┘
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 13: CODE EXAMPLES
+         ============================================================ -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Monitoring script: detect statistics drift before incidents</summary>
+<pre><code class="language-python">
+#!/usr/bin/env python3
+"""
+Statistics Drift Monitor — alerts before stale stats cause plan regressions.
+Run as a cron job every 15 minutes or as a Prometheus exporter.
+"""
+import psycopg2
+import json
+from datetime import datetime, timedelta
+
+CONN_STRING = "host=localhost dbname=production user=monitor"
+STALENESS_THRESHOLD_PCT = 5.0   # alert if >5% of rows modified since analyze
+DEAD_TUPLE_THRESHOLD_PCT = 20.0  # alert if >20% dead tuples
+CRITICAL_TABLES = ['orders', 'customers', 'events', 'payments']
+
+
+def check_statistics_health(conn):
+    """Check statistics freshness for critical tables."""
+    alerts = []
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                relname,
+                n_live_tup,
+                n_dead_tup,
+                n_mod_since_analyze,
+                last_autoanalyze,
+                last_analyze,
+                COALESCE(
+                    round(n_mod_since_analyze * 100.0 /
+                          GREATEST(n_live_tup, 1), 2),
+                    0
+                ) AS staleness_pct,
+                COALESCE(
+                    round(n_dead_tup * 100.0 /
+                          GREATEST(n_live_tup + n_dead_tup, 1), 2),
+                    0
+                ) AS dead_pct
+            FROM pg_stat_user_tables
+            WHERE relname = ANY(%s)
+            ORDER BY staleness_pct DESC;
+        """, (CRITICAL_TABLES,))
+
+        for row in cur.fetchall():
+            table, live, dead, mods, last_aa, last_a, stale_pct, dead_pct = row
+
+            if stale_pct > STALENESS_THRESHOLD_PCT:
+                alerts.append({
+                    'severity': 'WARNING',
+                    'table': table,
+                    'message': f'Statistics {stale_pct}% stale '
+                               f'({mods:,} mods since last analyze)',
+                    'action': f'ANALYZE {table};',
+                    'last_analyze': str(last_a or last_aa)
+                })
+
+            if dead_pct > DEAD_TUPLE_THRESHOLD_PCT:
+                alerts.append({
+                    'severity': 'WARNING',
+                    'table': table,
+                    'message': f'{dead_pct}% dead tuples '
+                               f'({dead:,} dead / {live:,} live)',
+                    'action': f'VACUUM (VERBOSE) {table};',
+                })
+
+    return alerts
+
+
+def check_plan_regressions(conn):
+    """Detect queries whose execution time increased significantly."""
+    alerts = []
+    with conn.cursor() as cur:
+        # Requires pg_stat_statements with track_planning = on
+        cur.execute("""
+            SELECT
+                queryid,
+                LEFT(query, 100) AS query_preview,
+                calls,
+                mean_exec_time,
+                max_exec_time,
+                temp_blks_written,
+                -- Compare recent performance vs historical
+                CASE WHEN mean_exec_time > 5000 AND calls > 10
+                     THEN 'SLOW'
+                     ELSE 'OK'
+                END AS status
+            FROM pg_stat_statements
+            WHERE mean_exec_time > 5000  -- queries averaging > 5 seconds
+              AND calls > 10             -- with meaningful call volume
+            ORDER BY mean_exec_time DESC
+            LIMIT 20;
+        """)
+        for row in cur.fetchall():
+            qid, preview, calls, avg_ms, max_ms, temp_blks = row[:6]
+            alerts.append({
+                'severity': 'CRITICAL' if avg_ms > 30000 else 'WARNING',
+                'query_id': qid,
+                'message': f'Query avg {avg_ms:.0f}ms, max {max_ms:.0f}ms, '
+                           f'{calls} calls, temp_blks={temp_blks}',
+                'query': preview
+            })
+
+    return alerts
+
+
+def check_index_health(conn):
+    """Detect unused or bloated indexes."""
+    alerts = []
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                schemaname || '.' || relname AS table_name,
+                indexrelname,
+                idx_scan,
+                pg_relation_size(indexrelid) AS index_bytes
+            FROM pg_stat_user_indexes
+            WHERE idx_scan = 0
+              AND pg_relation_size(indexrelid) > 100 * 1024 * 1024  -- > 100 MB
+            ORDER BY pg_relation_size(indexrelid) DESC;
+        """)
+        for row in cur.fetchall():
+            table, idx, scans, size_bytes = row
+            alerts.append({
+                'severity': 'INFO',
+                'message': f'Unused index {idx} on {table} '
+                           f'({size_bytes / 1024 / 1024:.0f} MB)',
+                'action': f'DROP INDEX CONCURRENTLY {idx};'
+            })
+
+    return alerts
+
+
+if __name__ == '__main__':
+    conn = psycopg2.connect(CONN_STRING)
+    all_alerts = []
+    all_alerts.extend(check_statistics_health(conn))
+    all_alerts.extend(check_plan_regressions(conn))
+    all_alerts.extend(check_index_health(conn))
+    conn.close()
+
+    if all_alerts:
+        print(json.dumps(all_alerts, indent=2, default=str))
+        # Send to Slack/PagerDuty/Datadog as appropriate
+    else:
+        print("All checks passed.")
+</code></pre>
+      </details>
+      <details>
+        <summary>Automated ANALYZE after bulk operations</summary>
+<pre><code class="language-python">
+#!/usr/bin/env python3
+"""
+Post-bulk-load ANALYZE wrapper.
+Call this after any ETL pipeline that inserts/updates >1% of a table.
+"""
+import psycopg2
+import time
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def smart_analyze(conn, table_name, columns=None, verbose=True):
+    """
+    Run ANALYZE on a table, optionally targeting specific columns.
+    Measures impact and logs statistics changes.
+    """
+    with conn.cursor() as cur:
+        # Capture pre-analyze state
+        cur.execute("""
+            SELECT n_mod_since_analyze, last_analyze
+            FROM pg_stat_user_tables
+            WHERE relname = %s;
+        """, (table_name,))
+        pre_state = cur.fetchone()
+        logger.info(
+            f"Pre-ANALYZE: {table_name} has "
+            f"{pre_state[0]:,} modifications since last analyze "
+            f"(last: {pre_state[1]})"
+        )
+
+        # Run ANALYZE
+        start = time.time()
+        if columns:
+            col_list = ', '.join(columns)
+            sql = f"ANALYZE {'VERBOSE' if verbose else ''} {table_name} ({col_list})"
+        else:
+            sql = f"ANALYZE {'VERBOSE' if verbose else ''} {table_name}"
+
+        cur.execute(sql)
+        duration = time.time() - start
+        logger.info(f"ANALYZE {table_name} completed in {duration:.2f}s")
+
+        # Verify post-analyze state
+        cur.execute("""
+            SELECT n_mod_since_analyze, last_analyze
+            FROM pg_stat_user_tables
+            WHERE relname = %s;
+        """, (table_name,))
+        post_state = cur.fetchone()
+        logger.info(
+            f"Post-ANALYZE: n_mod_since_analyze reset to {post_state[0]}, "
+            f"last_analyze = {post_state[1]}"
+        )
+
+    conn.commit()
+    return duration
+
+
+def bulk_load_with_analyze(conn, table_name, data_source, key_columns):
+    """
+    Pattern: bulk load data, then immediately ANALYZE affected columns.
+    Prevents the "stale statistics after bulk import" problem.
+    """
+    with conn.cursor() as cur:
+        # Get row count before
+        cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+        count_before = cur.fetchone()[0]
+
+        # Perform bulk load (example: COPY)
+        logger.info(f"Starting bulk load into {table_name}...")
+        with open(data_source, 'r') as f:
+            cur.copy_expert(
+                f"COPY {table_name} FROM STDIN WITH CSV HEADER",
+                f
+            )
+        conn.commit()
+
+        # Get row count after
+        cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+        count_after = cur.fetchone()[0]
+        rows_loaded = count_after - count_before
+        logger.info(f"Loaded {rows_loaded:,} rows into {table_name}")
+
+        # Always ANALYZE after bulk load
+        pct_change = rows_loaded * 100.0 / max(count_before, 1)
+        if pct_change > 1.0:
+            logger.info(
+                f"Table changed by {pct_change:.1f}% — "
+                f"running ANALYZE on key columns"
+            )
+            smart_analyze(conn, table_name, columns=key_columns)
+        else:
+            logger.info(f"Small load ({pct_change:.2f}%), skipping ANALYZE")
+
+    return rows_loaded
+</code></pre>
+      </details>
+      <details>
+        <summary>Query plan regression detector using pg_stat_statements</summary>
+<pre><code class="language-sql">
+-- Create a baseline table to track query performance over time:
+CREATE TABLE IF NOT EXISTS query_performance_baseline (
+  snapshot_time TIMESTAMPTZ DEFAULT NOW(),
+  queryid BIGINT,
+  query TEXT,
+  calls BIGINT,
+  mean_exec_time FLOAT,
+  p99_exec_time FLOAT,
+  shared_blks_hit BIGINT,
+  shared_blks_read BIGINT,
+  temp_blks_written BIGINT,
+  rows_per_call FLOAT
+);
+
+-- Snapshot current performance (run hourly via cron):
+INSERT INTO query_performance_baseline
+SELECT
+  NOW(),
+  queryid,
+  LEFT(query, 500),
+  calls,
+  mean_exec_time,
+  max_exec_time,  -- approximation of p99
+  shared_blks_hit,
+  shared_blks_read,
+  temp_blks_written,
+  CASE WHEN calls > 0 THEN rows::float / calls ELSE 0 END
+FROM pg_stat_statements
+WHERE calls > 100  -- only track frequently-called queries
+  AND mean_exec_time > 10;  -- only track non-trivial queries
+
+-- Detect regressions (compare last hour vs 24-hour baseline):
+WITH recent AS (
+  SELECT queryid, mean_exec_time, temp_blks_written, snapshot_time
+  FROM query_performance_baseline
+  WHERE snapshot_time > NOW() - INTERVAL '1 hour'
+),
+baseline AS (
+  SELECT
+    queryid,
+    AVG(mean_exec_time) AS baseline_avg_ms,
+    AVG(temp_blks_written) AS baseline_temp_blks
+  FROM query_performance_baseline
+  WHERE snapshot_time BETWEEN NOW() - INTERVAL '25 hours'
+    AND NOW() - INTERVAL '2 hours'
+  GROUP BY queryid
+)
+SELECT
+  r.queryid,
+  b.baseline_avg_ms,
+  r.mean_exec_time AS current_avg_ms,
+  round((r.mean_exec_time / NULLIF(b.baseline_avg_ms, 0))::numeric, 1)
+    AS regression_factor,
+  r.temp_blks_written,
+  b.baseline_temp_blks
+FROM recent r
+JOIN baseline b ON r.queryid = b.queryid
+WHERE r.mean_exec_time > 3 * b.baseline_avg_ms  -- 3x slower = regression
+  AND b.baseline_avg_ms > 50  -- ignore sub-50ms queries
+ORDER BY regression_factor DESC;
+</code></pre>
+      </details>
+      <details>
+        <summary>PostgreSQL: force plan stability with plan hints</summary>
+<pre><code class="language-sql">
+-- pg_hint_plan extension: force specific plan choices
+-- Useful as emergency fix while root cause is being addressed
+
+-- Install:
+CREATE EXTENSION IF NOT EXISTS pg_hint_plan;
+
+-- Force Hash Join instead of Nested Loop:
+/*+ HashJoin(o c) */
+SELECT o.order_id, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.customer_id
+WHERE o.status = 'pending';
+
+-- Force specific index usage:
+/*+ IndexScan(orders idx_orders_cust_status_created) */
+SELECT * FROM orders
+WHERE customer_id = 'CUST_12345'
+  AND status = 'pending'
+ORDER BY created_at DESC LIMIT 10;
+
+-- Force Seq Scan (when index is bloated and causing regression):
+/*+ SeqScan(orders) */
+SELECT * FROM orders
+WHERE status = 'pending' AND created_at > '2024-01-01';
+
+-- Combine multiple hints:
+/*+ HashJoin(o c) IndexScan(o idx_orders_created) Leading((c o)) */
+SELECT o.order_id, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.customer_id
+WHERE o.created_at > '2024-06-01';
+
+-- WARNING: Plan hints are a band-aid, not a fix!
+-- Use them for:
+-- 1. Emergency production fix (buy time while investigating root cause)
+-- 2. Queries where the optimizer consistently makes wrong choices
+-- 3. Testing: "would this plan be faster?" before creating indexes
+--
+-- Do NOT use them as permanent solutions (they break when data changes)
+</code></pre>
+      </details>
+      <details>
+        <summary>Spark AQE: runtime plan adaptation</summary>
+<pre><code class="language-python">
+# Spark 3.0+ Adaptive Query Execution (AQE) prevents many
+# "sudden slowdown" scenarios by re-optimizing at runtime.
+
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .appName("AQEDemo") \
+    .config("spark.sql.adaptive.enabled", "true") \
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+    .config("spark.sql.adaptive.skewJoin.enabled", "true") \
+    .config("spark.sql.adaptive.localShuffleReader.enabled", "true") \
+    .getOrCreate()
+
+# AQE features that prevent sudden slowdowns:
+#
+# 1. Dynamically switching join strategy:
+#    - Compile time: estimated 500MB → Sort Merge Join planned
+#    - Runtime: actual 8MB after filter → switches to Broadcast Hash Join
+#    - Prevents: "query was fast when filter was selective, now it's not"
+spark.conf.set(
+    "spark.sql.adaptive.autoBroadcastJoinThreshold", "100MB"
+)
+
+# 2. Coalescing shuffle partitions:
+#    - Default: 200 partitions regardless of data size
+#    - AQE: reduces to actual needed partitions based on data volume
+#    - Prevents: 200 tasks processing 1KB each (scheduling overhead)
+spark.conf.set("spark.sql.adaptive.coalescePartitions.minPartitionSize", "64MB")
+spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "128MB")
+
+# 3. Handling skewed partitions:
+#    - Detects partitions > 5x median size at runtime
+#    - Splits skewed partition into smaller sub-partitions
+#    - Prevents: one straggler task holding up entire stage
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
+spark.conf.set(
+    "spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256MB"
+)
+
+# 4. Dynamic partition pruning:
+#    - At runtime, uses build-side filter to prune probe-side partitions
+#    - Prevents: "query was fast with old dimension, slow after dim grew"
+spark.conf.set(
+    "spark.sql.optimizer.dynamicPartitionPruning.enabled", "true"
+)
+
+# Example: query that benefits from AQE
+result = spark.sql("""
+    SELECT o.order_id, c.segment
+    FROM orders o
+    JOIN customers c ON o.customer_id = c.customer_id
+    WHERE c.country = 'US'
+      AND o.order_date = '2024-02-15'
+""")
+
+# Check actual vs planned execution in Spark UI:
+result.explain("cost")
+# Look for "AdaptiveSparkPlan" nodes in the plan
+# These indicate AQE made runtime adjustments
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 14: COMMON MISTAKES
+         ============================================================ -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Mistake 1: Blaming the query text when the plan changed</summary>
+        <p>
+          The most common error in debugging sudden slowdowns: developers focus on the SQL text
+          ("but we didn't change anything!") instead of examining the execution plan. The query
+          is constant, but the plan depends on statistics, parameter values, and system state.
+        </p>
+<pre><code class="language-bash">
+# Wrong approach:
+# "The query hasn't changed in 6 months, so it must be a hardware issue"
+# → Leads to expensive infrastructure upgrades that don't fix the problem
+
+# Right approach:
+# 1. EXPLAIN ANALYZE the slow query NOW
+# 2. Compare with the plan from when it was fast (auto_explain logs)
+# 3. Identify WHERE the plan differs (join type, scan type, row estimates)
+# 4. Ask: "What changed to make the planner choose differently?"
+#    - Statistics? (ANALYZE)
+#    - Data distribution? (skew)
+#    - Table size? (crossed a tipping point)
+#    - Plan cache? (parameter sniffing)
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 2: Running ANALYZE without checking the real root cause</summary>
+        <p>
+          ANALYZE is often the fix, but running it blindly can sometimes make things <em>worse</em>.
+          If the new statistics lead the planner to choose a genuinely suboptimal plan (e.g.,
+          the old plan was good despite inaccurate statistics), you need to understand why.
+        </p>
+<pre><code class="language-sql">
+-- Scenario: query was fast with "wrong" statistics
+-- Old stats: estimated 100 rows → Index Scan → fast (lucky)
+-- New stats (after ANALYZE): estimated 500K rows → Seq Scan → slow (correct estimate, wrong decision)
+--
+-- Why? The Seq Scan is actually slower because:
+-- - Data is on SSD (random_page_cost should be 1.1, not default 4.0)
+-- - Table is fully cached in shared_buffers
+-- - The Index Scan was actually optimal despite high selectivity
+
+-- Fix: adjust cost parameters to reflect actual hardware:
+SET random_page_cost = 1.1;    -- SSD (default 4.0 assumes spinning disk)
+SET effective_cache_size = '24GB';  -- actual available cache
+-- Now planner correctly prefers Index Scan even with accurate statistics
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 3: Increasing work_mem globally instead of per-query</summary>
+<pre><code class="language-sql">
+-- Problem: query spills to disk, so someone sets work_mem = 2GB globally
+-- Impact: 200 concurrent connections × 2GB = 400GB memory demand!
+-- Result: OOM killer, connection failures, worse performance overall
+
+-- BAD:
+ALTER SYSTEM SET work_mem = '2GB';  -- affects ALL queries on ALL connections
+
+-- GOOD: set work_mem per-session or per-transaction for heavy queries:
+-- In application code:
+BEGIN;
+SET LOCAL work_mem = '512MB';  -- only for this transaction
+SELECT ... complex query ...;
+COMMIT;
+-- work_mem reverts to default after COMMIT
+
+-- BETTER: use connection pool with role-based settings:
+-- Analytics role gets high work_mem:
+ALTER ROLE analytics_user SET work_mem = '512MB';
+-- OLTP role keeps low work_mem:
+ALTER ROLE app_user SET work_mem = '16MB';
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 4: Adding indexes without considering write overhead</summary>
+<pre><code class="language-bash">
+# Reflexive response to slow query: "just add an index!"
+# But every index has costs:
+#
+# ┌────────────────────────────────────────────────────────────────┐
+# │  Index Count   │  Insert Overhead  │  UPDATE Overhead  │  Space │
+# ├────────────────┼───────────────────┼───────────────────┼────────┤
+# │  1-3 indexes   │  +5-15%           │  +10-30%          │  +20%  │
+# │  4-7 indexes   │  +15-40%          │  +30-70%          │  +50%  │
+# │  8-12 indexes  │  +40-100%         │  +70-150%         │  +100% │
+# │  12+ indexes   │  +100-300%        │  +150-400%        │  +200% │
+# └────────────────┴───────────────────┴───────────────────┴────────┘
+#
+# High-write tables (orders, events, logs):
+# - Adding a 7th index can slow INSERTs from 1ms to 3ms
+# - At 10K inserts/second, that's 20,000 extra seconds of work/day
+# - Checkpoint I/O increases proportionally
+#
+# Before adding an index, ask:
+# 1. Will this query even USE the index? (check EXPLAIN first)
+# 2. Is the table high-write? What's the write:read ratio?
+# 3. Can an existing index be extended (composite) instead?
+# 4. Can the query be rewritten to use an existing index?
+# 5. Is a partial index sufficient? (WHERE status = 'pending')
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 5: Not monitoring plan stability over time</summary>
+<pre><code class="language-sql">
+-- Most teams only notice plan regressions AFTER users complain.
+-- By then, the SLA has been breached for hours.
+
+-- Prevention: continuous plan monitoring
+
+-- 1. Track query fingerprint performance in pg_stat_statements:
+-- Reset stats weekly and compare week-over-week:
+SELECT pg_stat_statements_reset();  -- weekly cron, after snapshotting
+
+-- 2. Use auto_explain to log plans for queries > threshold:
+-- This gives you a history of plan choices to compare
+
+-- 3. Alert on these signals:
+--    - mean_exec_time increased > 3x vs 7-day average
+--    - temp_blks_written > 0 (new spill events)
+--    - shared_blks_read / shared_blks_hit ratio increased (cache misses)
+--    - calls stayed same but total_exec_time jumped
+
+-- 4. PostgreSQL 14+: track plan changes via pg_stat_statements
+--    jit_generation_time > 0 may indicate plan recompilation
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 6: Ignoring dead tuples until it's an emergency</summary>
+<pre><code class="language-sql">
+-- Dead tuple accumulation is gradual — queries get 1% slower each week.
+-- Nobody notices until it's 50% dead tuples and queries are 2x slower.
+
+-- Set up monitoring thresholds:
+-- WARNING: dead_pct > 10%
+-- CRITICAL: dead_pct > 30%
+-- EMERGENCY: dead_pct > 50% OR xid_age > 500M
+
+-- Proactive vacuum scheduling for high-churn tables:
+-- Instead of relying on autovacuum defaults:
+ALTER TABLE orders SET (
+  autovacuum_vacuum_threshold = 5000,
+  autovacuum_vacuum_scale_factor = 0.01,  -- 1% dead → vacuum
+  autovacuum_analyze_threshold = 5000,
+  autovacuum_analyze_scale_factor = 0.01,
+  autovacuum_vacuum_cost_limit = 1000     -- faster vacuum (default 200)
+);
+
+-- For extreme cases (100K updates/second):
+ALTER TABLE hot_table SET (
+  autovacuum_vacuum_scale_factor = 0.001,  -- 0.1% dead → vacuum
+  autovacuum_vacuum_cost_delay = 2         -- 2ms delay (default 20ms)
+);
+</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 15: TRADE-OFFS
+         ============================================================ -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Plan stability vs plan optimality</summary>
+        <ul>
+          <li><strong>Stable plans (force hints/fixed plans):</strong> Predictable latency, no surprise regressions, but may be suboptimal as data changes. Requires manual plan review as data grows.</li>
+          <li><strong>Adaptive plans (let optimizer choose):</strong> Optimal for current data, but vulnerable to sudden plan changes when statistics shift. Requires robust monitoring.</li>
+          <li><strong>Compromise:</strong> Let the optimizer choose, but alert on plan changes >3x regression. Use hints only as emergency fixes while investigating root cause.</li>
+          <li><strong>Spark AQE approach:</strong> Best of both — compile-time plan is a starting point, runtime adaptation handles actual cardinality. Only available in modern engines.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Frequent ANALYZE vs I/O overhead</summary>
+        <ul>
+          <li><strong>Frequent ANALYZE (every 1% change):</strong> Always-fresh statistics, minimal plan regressions, but consumes I/O and CPU for sampling. On 1B-row tables, ANALYZE itself takes minutes.</li>
+          <li><strong>Infrequent ANALYZE (default 10% threshold):</strong> Less overhead, but statistics can be stale for days on large tables. Vulnerable to distribution shifts between ANALYZEs.</li>
+          <li><strong>Targeted ANALYZE:</strong> Only analyze columns used in WHERE/JOIN clauses of critical queries. Faster than full-table ANALYZE, keeps critical statistics fresh.</li>
+          <li><strong>Recommendation:</strong> Lower threshold to 1-2% for customer-facing query tables; keep 10% for internal/batch tables where latency isn't critical.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Composite indexes vs flexibility</summary>
+        <ul>
+          <li><strong>Composite index (a, b, c):</strong> Optimal for queries filtering on a, (a,b), or (a,b,c). Provides plan stability regardless of cardinality estimates. But only helps leftmost-prefix queries.</li>
+          <li><strong>Single-column indexes (a), (b), (c):</strong> More flexible — optimizer can combine with BitmapAnd. But plan depends heavily on cardinality estimates being correct. Vulnerable to plan regressions when estimates drift.</li>
+          <li><strong>Trade-off:</strong> For critical queries with known access patterns, composite indexes provide insurance against plan regressions. For ad-hoc analytics, single-column indexes + bitmap combine give flexibility.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>work_mem: memory vs spill risk</summary>
+        <ul>
+          <li><strong>High work_mem (256MB+):</strong> Prevents spill for most operations. But with 100+ concurrent connections, total memory demand can exceed available RAM → OOM risk.</li>
+          <li><strong>Low work_mem (4-16MB):</strong> Safe for high-concurrency OLTP. But analytical queries will spill to disk, creating unpredictable latency spikes when data grows past the threshold.</li>
+          <li><strong>Dynamic approach:</strong> Low default (16MB) + per-role overrides (analytics: 256MB). Or use connection pooling with separate pools for OLTP (low mem) vs analytics (high mem).</li>
+          <li><strong>Formula:</strong> work_mem × max_parallel_workers_per_gather × max_connections should not exceed 50% of available RAM.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Autovacuum aggressiveness vs write throughput</summary>
+        <ul>
+          <li><strong>Aggressive autovacuum:</strong> Low dead tuple percentage, fresh statistics, healthy tables. But vacuum competes with writes for I/O. On write-heavy tables, aggressive vacuum can reduce INSERT throughput by 10-20%.</li>
+          <li><strong>Conservative autovacuum:</strong> Minimal impact on write throughput. But dead tuples accumulate, table bloat grows, and eventually vacuum takes much longer when it finally triggers (vicious cycle).</li>
+          <li><strong>Best practice:</strong> Moderate aggression (1-2% threshold, 1000 cost_limit) for most tables. Very aggressive (0.1%, 2000 cost_limit) for tables with XID wraparound risk. Schedule manual VACUUM during off-peak hours for extreme cases.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Query rewriting vs infrastructure scaling</summary>
+        <ul>
+          <li><strong>Query/index optimization:</strong> Addresses root cause, cheap, sustainable. But requires expertise, time to diagnose, and may not help if the query is already optimal and data simply outgrew the hardware.</li>
+          <li><strong>Hardware scaling:</strong> Quick fix, buys time. But expensive, doesn't address inefficiency, and you'll hit the next cliff sooner. A bad plan on bigger hardware is still a bad plan.</li>
+          <li><strong>Decision framework:</strong> If EXPLAIN shows a bad plan (NL where HJ needed, full scan where index possible), fix the plan first. If EXPLAIN shows an optimal plan but data exceeds hardware capacity (I/O bandwidth saturated, table larger than RAM), then scale. Usually it's 80% bad plans, 20% legitimate scaling needs.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 16: FOLLOW-UP QUESTIONS
+         ============================================================ -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Q1: How would you prevent this from happening in a CI/CD pipeline?</summary>
+        <p>
+          Build regression detection into the deployment pipeline:
+        </p>
+        <ul>
+          <li><strong>Query regression tests:</strong> Run critical queries against a staging database with production-scale data. Alert if latency exceeds baseline + 2 standard deviations.</li>
+          <li><strong>EXPLAIN plan comparison:</strong> Capture EXPLAIN plans in staging vs production. Flag plan changes (different join types, scan types) for human review before deploy.</li>
+          <li><strong>Statistics snapshot:</strong> After each deployment, snapshot pg_stats for critical tables. If statistics are significantly different from last deploy, auto-trigger ANALYZE.</li>
+          <li><strong>Load testing with skewed data:</strong> Include worst-case parameter values (hot keys, NULL-heavy filters) in performance test suites.</li>
+          <li><strong>Canary deploys:</strong> Route 5% of traffic to new version, monitor p99 latency. Auto-rollback if regression detected.</li>
+        </ul>
+<pre><code class="language-python">
+# CI/CD query regression check:
+def check_query_regression(query, params, baseline_ms, threshold_factor=3.0):
+    """Run in staging, compare against baseline."""
+    import time
+    conn = get_staging_connection()
+    cur = conn.cursor()
+
+    # Warm cache
+    cur.execute(query, params)
+
+    # Measure
+    times = []
+    for _ in range(5):
+        start = time.time()
+        cur.execute(query, params)
+        cur.fetchall()
+        times.append((time.time() - start) * 1000)
+
+    p95 = sorted(times)[int(len(times) * 0.95)]
+
+    if p95 > baseline_ms * threshold_factor:
+        raise RegressionError(
+            f"Query p95={p95:.0f}ms exceeds "
+            f"{threshold_factor}x baseline ({baseline_ms}ms)"
+        )
+    return p95
+</code></pre>
+      </details>
+      <details>
+        <summary>Q2: How does this differ in distributed query engines (BigQuery, Snowflake)?</summary>
+        <p>
+          Distributed engines have different mechanisms but similar root causes:
+        </p>
+        <ul>
+          <li><strong>BigQuery:</strong> No persistent plan cache (re-optimizes every query). Main causes of sudden slowdown: slot contention (shared multi-tenant resources), shuffle explosion from data skew, clustering key becoming ineffective after data growth.</li>
+          <li><strong>Snowflake:</strong> Micro-partition pruning depends on natural clustering. If data ingestion changes (new ETL, different ordering), pruning effectiveness degrades. Also: warehouse auto-suspend/resume cold start, result cache invalidation.</li>
+          <li><strong>Redshift:</strong> Similar to PostgreSQL (uses statistics, has ANALYZE). Additional: distribution key skew causing leader node bottleneck, WLM queue contention, commit queue buildup.</li>
+          <li><strong>Key difference:</strong> In serverless engines, you don't control vacuum/autovacuum. The "sudden slow" is more often resource contention or data organization degradation than statistics drift.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Q3: What monitoring would you set up to catch this proactively?</summary>
+<pre><code class="language-bash">
+# Essential monitoring stack for query regression detection:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Layer           │  Tool                │  Alert Threshold       │
+# ├──────────────────┼──────────────────────┼────────────────────────┤
+# │  Query latency   │  pg_stat_statements  │  p99 > 3x baseline    │
+# │                  │  + Grafana dashboard │                        │
+# ├──────────────────┼──────────────────────┼────────────────────────┤
+# │  Plan changes    │  auto_explain logs   │  Join type changed OR  │
+# │                  │  + log parser        │  scan type changed     │
+# ├──────────────────┼──────────────────────┼────────────────────────┤
+# │  Statistics age  │  pg_stat_user_tables │  n_mod_since > 5%      │
+# ├──────────────────┼──────────────────────┼────────────────────────┤
+# │  Table bloat     │  pgstattuple         │  dead_pct > 20%        │
+# ├──────────────────┼──────────────────────┼────────────────────────┤
+# │  Index health    │  pg_stat_user_indexes│  unused + > 100 MB     │
+# ├──────────────────┼──────────────────────┼────────────────────────┤
+# │  Vacuum lag      │  pg_stat_progress    │  vacuum running > 1hr  │
+# │                  │  _vacuum             │  OR xid_age > 500M     │
+# ├──────────────────┼──────────────────────┼────────────────────────┤
+# │  Spill events    │  pg_stat_statements  │  temp_blks > 0 (new)   │
+# ├──────────────────┼──────────────────────┼────────────────────────┤
+# │  Lock waits      │  pg_stat_activity    │  wait_event Lock > 5s  │
+# ├──────────────────┼──────────────────────┼────────────────────────┤
+# │  I/O latency     │  pg_stat_io (PG16+)  │  read_time p99 > 20ms │
+# └──────────────────┴──────────────────────┴────────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>Q4: Can you explain the relationship between VACUUM and ANALYZE?</summary>
+        <p>
+          They are separate operations that are often confused:
+        </p>
+        <ul>
+          <li><strong>VACUUM:</strong> Reclaims space from dead tuples. Makes pages available for reuse. Does NOT update statistics (row estimates, histograms). Prevents XID wraparound.</li>
+          <li><strong>ANALYZE:</strong> Samples the table and updates pg_stats (n_distinct, most_common_vals, histogram_bounds). Does NOT reclaim any space. Enables better plan choices.</li>
+          <li><strong>VACUUM ANALYZE:</strong> Does both in one command. Autovacuum can trigger either independently based on separate thresholds.</li>
+          <li><strong>Common confusion:</strong> "I ran VACUUM but the query is still slow" — VACUUM doesn't fix bad plans caused by stale statistics. You needed ANALYZE.</li>
+          <li><strong>Autovacuum triggers:</strong> vacuum_threshold + scale_factor × n_tuples for dead tuples; analyze_threshold + scale_factor × n_tuples for modifications.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Q5: How do you handle this in a microservices environment with many databases?</summary>
+        <p>
+          At scale (50+ services, each with their own database), manual monitoring is impossible:
+        </p>
+        <ul>
+          <li><strong>Centralized query observatory:</strong> Collect pg_stat_statements from all databases into a central metrics store (Prometheus/Thanos). Unified dashboards across all services.</li>
+          <li><strong>Automated remediation:</strong> If staleness > threshold, auto-trigger ANALYZE via a management sidecar. If dead_pct > 30%, page on-call and schedule vacuum.</li>
+          <li><strong>Standardized per-table configs:</strong> Terraform/Ansible-managed autovacuum settings per table classification (high-churn, read-heavy, mixed). Don't rely on defaults for any production table.</li>
+          <li><strong>Query governance:</strong> Central registry of "critical queries" (checkout, payment, auth). These get enhanced monitoring: plan capture, regression alerts, automatic explain logging.</li>
+          <li><strong>Shared DBA tooling:</strong> Internal CLI/bot that any team can run: "analyze my table", "show my bloat", "explain my slow query". Lowers the expertise barrier for application teams.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Q6: What is the difference between plan regression and query regression?</summary>
+        <ul>
+          <li><strong>Plan regression:</strong> The execution plan changed (different join algorithm, different scan type, different join order). Same query text, different plan → performance change. Root cause is usually statistics drift, plan cache, or data distribution change.</li>
+          <li><strong>Query regression:</strong> Broader term — any degradation in query performance. Can be caused by plan regression, OR by resource contention, data growth (more I/O even with same plan), lock waits, network issues, etc.</li>
+          <li><strong>Key distinction:</strong> Plan regression is identifiable by comparing EXPLAIN output. Query regression without plan regression means the plan is the same but something external changed (more data, less resources, more contention).</li>
+          <li><strong>Debugging approach differs:</strong> Plan regression → fix statistics/indexes/hints. Non-plan regression → fix resources/contention/data management.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 17: SUMMARY
+         ============================================================ -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Key takeaways</summary>
+        <ul>
+          <li><strong>The query text is constant, but the plan is not.</strong> Execution plans depend on statistics, parameter values, available memory, and data distribution — all of which change over time.</li>
+          <li><strong>Statistics drift is the #1 cause.</strong> Large tables (100M+ rows) can have stale statistics for days because autovacuum's default 10% threshold requires millions of changes to trigger. Always run ANALYZE after bulk operations.</li>
+          <li><strong>Cardinality errors create tipping points.</strong> A 10x underestimate can flip a plan from Hash Join (fast) to Nested Loop (catastrophic). These transitions are discontinuous — fine one day, 100x slower the next.</li>
+          <li><strong>Parameter sniffing poisons plan caches.</strong> The first execution's parameters determine the plan for all subsequent executions. Atypical first-call values create permanently bad cached plans.</li>
+          <li><strong>Data skew amplifies all issues.</strong> Hot keys, seasonal patterns, and non-uniform distributions invalidate the optimizer's independence assumptions and uniform distribution models.</li>
+          <li><strong>work_mem boundaries cause cliff effects.</strong> Hash joins and sorts perform well until they exceed work_mem, then suddenly spill to disk with 10-100x latency increase.</li>
+          <li><strong>Vacuum debt compounds.</strong> Dead tuples make tables larger → sequential scans slower → buffer cache less effective → more disk I/O → everything degrades gradually then suddenly.</li>
+          <li><strong>Composite indexes provide plan stability.</strong> An index that exactly matches the query pattern gives consistent plans regardless of statistics accuracy.</li>
+          <li><strong>Monitoring is prevention.</strong> Track statistics freshness, plan changes, spill events, and dead tuple ratios. Alert before users notice, not after SLA breach.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Investigation checklist</summary>
+<pre><code class="language-bash">
+# When a query becomes suddenly slow — run through this checklist:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  □ 1. EXPLAIN ANALYZE: Get the current (bad) plan               │
+# │  □ 2. Compare estimated vs actual rows at each node             │
+# │       (ratio > 10x = likely root cause)                         │
+# │  □ 3. Check pg_stat_user_tables: last_autoanalyze,              │
+# │       n_mod_since_analyze                                       │
+# │  □ 4. Check pg_stats: most_common_freqs vs actual distribution  │
+# │  □ 5. Check for spill: Batches > 1 or external merge sort       │
+# │  □ 6. Check dead tuples: n_dead_tup / n_live_tup ratio          │
+# │  □ 7. Check pg_stat_activity: blocking queries, lock waits       │
+# │  □ 8. Check recent DDL/ANALYZE/VACUUM events (could trigger      │
+# │       plan recompilation)                                       │
+# │  □ 9. Check data growth: did table cross a size threshold?       │
+# │  □ 10. Check for new data patterns: hot keys, distribution shift │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# Quick fixes (in order of safety):
+# 1. ANALYZE table;                    (safe, non-blocking)
+# 2. SET work_mem = '256MB';           (session-level, temporary)
+# 3. CREATE INDEX CONCURRENTLY ...;    (non-blocking, but I/O)
+# 4. SET enable_nestloop = off;        (emergency, session-level)
+# 5. VACUUM (VERBOSE) table;           (safe, might take time)
+# 6. pg_hint_plan hints;               (emergency band-aid)
+</code></pre>
+      </details>
+      <details>
+        <summary>One-liner for interviews</summary>
+        <p>
+          "A query suddenly becomes slow because the execution plan changed, not the query text.
+          The usual suspects are stale statistics causing cardinality misestimates, parameter
+          sniffing poisoning the plan cache, data skew invalidating uniform distribution
+          assumptions, or work_mem exhaustion causing spill-to-disk — all triggered by gradual
+          data growth crossing invisible planner thresholds."
+        </p>
+      </details>
+    </section>
+
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav" aria-label="Chapter navigation">
+      <a href="ch07-locking-mechanisms.html" class="btn btn-prev">← Chapter 7: Locking Mechanisms</a>
+      <a href="ch09-warehouse-design.html" class="btn btn-next">Chapter 9: Warehouse Design →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

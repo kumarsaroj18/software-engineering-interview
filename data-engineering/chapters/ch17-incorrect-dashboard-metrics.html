@@ -1,0 +1,2099 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ch 17: Incorrect Dashboard Metrics | Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/style.css">
+  <link rel="stylesheet" href="../../assets/css/code.css">
+</head>
+<body>
+  <div class="layout">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <a href="../../index.html">Interview Handbook</a>
+        </div>
+      </div>
+      <div class="sidebar-chapter">
+        <span class="chapter-number">Ch 17</span>
+        <span class="chapter-title">Incorrect Metrics</span>
+      </div>
+      <nav class="sidebar-nav">
+        <ul>
+          <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+          <li><a href="#quick-answer">Quick Answer</a></li>
+          <li><a href="#data-validation">Data Validation Patterns</a></li>
+          <li><a href="#reconciliation">Reconciliation</a></li>
+          <li><a href="#schema-evolution">Schema Evolution Issues</a></li>
+          <li><a href="#null-handling">Null Handling Bugs</a></li>
+          <li><a href="#duplicate-events">Duplicate Events</a></li>
+          <li><a href="#late-arriving-data">Late-Arriving Data</a></li>
+          <li><a href="#cdc-issues">CDC Issues</a></li>
+          <li><a href="#backfill-problems">Backfill &amp; Reprocessing</a></li>
+          <li><a href="#production-incident">Production Incident</a></li>
+          <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+          <li><a href="#code-examples">Code Examples</a></li>
+          <li><a href="#common-mistakes">Common Mistakes</a></li>
+          <li><a href="#trade-offs">Trade-offs</a></li>
+          <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+          <li><a href="#summary">Summary</a></li>
+        </ul>
+      </nav>
+      <div class="sidebar-actions">
+        <button class="btn-prev" onclick="location.href='ch16-etl-pipeline-slow.html'">Previous Chapter</button>
+        <button class="btn-next" onclick="location.href='ch18-lakehouse-platform.html'">Next Chapter</button>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="content">
+      <!-- Breadcrumb -->
+      <nav class="breadcrumb">
+        <a href="../../index.html">Home</a> &gt;
+        <a href="../index.html">Part VI</a> &gt;
+        <span>Chapter 17</span>
+      </nav>
+
+      <!-- Chapter Header -->
+      <div class="chapter-header">
+        <span class="badge badge-medium">Medium</span>
+        <h1>Your Dashboard Shows Incorrect Metrics After Deployment. How Do You Debug It?</h1>
+        <div class="chapter-topics">
+          <span class="topic-tag">Data Quality</span>
+          <span class="topic-tag">Reconciliation</span>
+        </div>
+      </div>
+
+      <!-- Chapter Navigation -->
+      <div class="chapter-nav">
+        <a href="ch16-etl-pipeline-slow.html" class="nav-prev">Previous: ETL Pipeline Slow</a>
+        <a href="ch18-lakehouse-platform.html" class="nav-next">Next: Lakehouse Platform</a>
+      </div>
+
+
+      <!-- Section 1: Interviewer Intent -->
+      <section id="interviewer-intent" class="section">
+        <h2>Interviewer Intent</h2>
+        <p>
+          When an interviewer asks "Your dashboard shows incorrect metrics after deployment—how do
+          you debug it?", they are evaluating several critical competencies of a senior data engineer:
+        </p>
+        <ul>
+          <li>
+            <strong>Systematic Debugging:</strong> Can you methodically isolate the problem across the
+            entire data pipeline—from source ingestion, through transformation logic, to the final
+            presentation layer—rather than guessing randomly?
+          </li>
+          <li>
+            <strong>Data Quality Awareness:</strong> Do you understand the common root causes of metric
+            drift: schema changes, NULL propagation, duplicate events, late-arriving data, CDC issues,
+            and JOIN logic errors?
+          </li>
+          <li>
+            <strong>Validation Patterns:</strong> Are you familiar with industry-standard data validation
+            frameworks (Great Expectations, dbt tests, Monte Carlo) and can you design reconciliation
+            checks that catch discrepancies before they reach dashboards?
+          </li>
+          <li>
+            <strong>Production Mindset:</strong> Have you dealt with real incidents where metrics were
+            silently wrong for hours or days? Can you describe the detection, triage, root-cause analysis,
+            and prevention measures you implemented?
+          </li>
+          <li>
+            <strong>Communication Under Pressure:</strong> Can you explain the impact of incorrect metrics
+            to business stakeholders, provide accurate ETAs for resolution, and articulate what safeguards
+            you will put in place to prevent recurrence?
+          </li>
+          <li>
+            <strong>Prevention Over Detection:</strong> Do you think about data contracts, schema registries,
+            CI/CD validation gates, and automated reconciliation as preventive measures rather than relying
+            solely on reactive alerting?
+          </li>
+          <li>
+            <strong>Trade-off Reasoning:</strong> Can you balance freshness vs accuracy, completeness vs
+            latency, and strictness vs flexibility in your data quality framework?
+          </li>
+        </ul>
+        <p>
+          A senior data engineer should demonstrate both the technical depth to diagnose complex data
+          issues and the operational maturity to prevent them from recurring in production systems.
+        </p>
+      </section>
+
+      <!-- Section 2: Quick Answer -->
+      <section id="quick-answer" class="section">
+        <h2>Quick Answer</h2>
+        <p>
+          When a dashboard shows incorrect metrics after deployment, I follow a structured debugging
+          approach that moves from symptoms to root cause:
+        </p>
+        <ol>
+          <li>
+            <strong>Identify the scope:</strong> Which metrics are affected? Since when? Is it all data
+            or specific segments (regions, date partitions, customer cohorts)?
+          </li>
+          <li>
+            <strong>Compare before/after:</strong> Run the same query against pre-deployment and
+            post-deployment code. Diff the results to quantify the discrepancy.
+          </li>
+          <li>
+            <strong>Check the deployment diff:</strong> Review what changed—JOIN types, WHERE clauses,
+            column references, aggregation logic, filter conditions, or model dependencies.
+          </li>
+          <li>
+            <strong>Validate upstream data:</strong> Confirm source row counts, check for schema changes,
+            verify CDC stream health, and look for duplicate or missing events.
+          </li>
+          <li>
+            <strong>Reconcile layer by layer:</strong> Compare counts at source, staging, warehouse,
+            and mart layers to pinpoint where data diverges.
+          </li>
+          <li>
+            <strong>Root cause and fix:</strong> Common culprits include JOIN type changes (LEFT→INNER
+            dropping rows), new NULLable columns breaking aggregations, duplicate events from
+            at-least-once delivery, late-arriving data missing incremental windows, and schema
+            evolution without backward compatibility.
+          </li>
+          <li>
+            <strong>Prevent recurrence:</strong> Add data quality tests (dbt tests, Great Expectations),
+            reconciliation checks, data contracts, and CI/CD validation gates.
+          </li>
+        </ol>
+        <p>
+          The key insight is that incorrect dashboard metrics are almost always a <em>data pipeline</em>
+          problem, not a <em>visualization</em> problem. The debugging workflow must trace data lineage
+          from source to dashboard, comparing actual values against expected values at each layer.
+        </p>
+      </section>
+
+      <!-- Section 3: Data Validation Patterns -->
+      <section id="data-validation" class="section">
+        <h2>Data Validation Patterns</h2>
+        <p>
+          Data validation is the first line of defense against incorrect metrics. A mature data platform
+          implements validation at multiple layers—ingestion, transformation, and serving—to catch
+          issues before they propagate to dashboards.
+        </p>
+
+        <h3>Great Expectations</h3>
+        <p>
+          Great Expectations is a Python-based data validation framework that defines expectations as
+          declarative assertions about your data. It integrates with Airflow, Spark, and pandas:
+        </p>
+        <ul>
+          <li>
+            <strong>Column-level expectations:</strong> <code>expect_column_values_to_not_be_null</code>,
+            <code>expect_column_values_to_be_between</code>, <code>expect_column_values_to_be_in_set</code>
+          </li>
+          <li>
+            <strong>Table-level expectations:</strong> <code>expect_table_row_count_to_be_between</code>,
+            <code>expect_table_column_count_to_equal</code>
+          </li>
+          <li>
+            <strong>Distribution expectations:</strong> <code>expect_column_mean_to_be_between</code>,
+            <code>expect_column_stdev_to_be_between</code> for detecting statistical anomalies
+          </li>
+          <li>
+            <strong>Cross-table expectations:</strong> Custom expectations that compare row counts or
+            aggregates between source and target tables
+          </li>
+        </ul>
+        <p>
+          The power of Great Expectations lies in its ability to generate validation suites from profiling
+          existing data, then alert when new data violates learned patterns. This catches both explicit
+          bugs and subtle distribution shifts.
+        </p>
+
+        <h3>dbt Tests</h3>
+        <p>
+          dbt provides built-in and custom tests that run as part of the transformation pipeline. Tests
+          execute as SQL queries that should return zero rows if the assertion passes:
+        </p>
+        <ul>
+          <li>
+            <strong>Schema tests:</strong> <code>unique</code>, <code>not_null</code>,
+            <code>accepted_values</code>, <code>relationships</code> (referential integrity)
+          </li>
+          <li>
+            <strong>Custom singular tests:</strong> SQL queries in the <code>tests/</code> directory
+            that validate business logic (e.g., revenue should never be negative)
+          </li>
+          <li>
+            <strong>dbt-utils tests:</strong> <code>equal_rowcount</code>,
+            <code>expression_is_true</code>, <code>recency</code> (data freshness)
+          </li>
+          <li>
+            <strong>dbt-expectations:</strong> A package that brings Great Expectations-style tests to
+            dbt, including distribution checks and outlier detection
+          </li>
+        </ul>
+        <p>
+          The critical practice is running <code>dbt test</code> in CI/CD before merging model changes,
+          and again in production after each dbt run. Failed tests should block downstream models from
+          materializing stale or incorrect data.
+        </p>
+
+        <h3>Statistical Bounds</h3>
+        <p>
+          Beyond exact-match validation, statistical monitoring detects anomalies that rule-based tests
+          miss. This is especially important for metrics that naturally fluctuate:
+        </p>
+        <ul>
+          <li>
+            <strong>Z-score alerting:</strong> Flag metrics that deviate more than 3 standard deviations
+            from their historical mean for the same day-of-week or hour-of-day
+          </li>
+          <li>
+            <strong>Moving average comparison:</strong> Compare today's value against a 7-day or 28-day
+            rolling average. A sudden 30% deviation warrants investigation
+          </li>
+          <li>
+            <strong>Seasonal decomposition:</strong> Use STL decomposition to separate trend, seasonal,
+            and residual components. Alert on residuals exceeding thresholds
+          </li>
+          <li>
+            <strong>Interquartile range (IQR):</strong> Define acceptable range as
+            [Q1 - 1.5×IQR, Q3 + 1.5×IQR]. Values outside this range trigger validation failures
+          </li>
+        </ul>
+
+        <h3>Row Count Checks</h3>
+        <p>
+          The simplest and most effective validation is comparing row counts across pipeline stages.
+          A row count mismatch between source and target is the fastest signal that something went wrong:
+        </p>
+        <ul>
+          <li>
+            <strong>Source vs staging:</strong> After ingestion, count rows in staging and compare
+            against the source system's count for the same time window
+          </li>
+          <li>
+            <strong>Pre-transform vs post-transform:</strong> For 1:1 transformations (no aggregation),
+            input and output row counts should match exactly
+          </li>
+          <li>
+            <strong>Day-over-day stability:</strong> If yesterday had 1M events and today has 300K,
+            either traffic dropped legitimately or data is missing
+          </li>
+          <li>
+            <strong>Partition-level counts:</strong> Check each date partition individually. A single
+            missing partition can cause metrics to drop without affecting overall counts significantly
+          </li>
+        </ul>
+        <p>
+          Row count checks are cheap to implement, fast to execute, and catch a surprising number of
+          issues including dropped partitions, failed CDC streams, and accidentally filtered data.
+        </p>
+      </section>
+
+      <!-- Section 4: Reconciliation -->
+      <section id="reconciliation" class="section">
+        <h2>Reconciliation</h2>
+        <p>
+          Reconciliation is the practice of comparing data between two systems or pipeline stages to
+          ensure consistency. In a multi-layer data platform, reconciliation acts as an end-to-end
+          integrity check that catches issues no single-layer test can detect.
+        </p>
+
+        <h3>Source vs Target Row Counts</h3>
+        <p>
+          The most fundamental reconciliation compares total row counts between the operational source
+          and the analytical target for a given time window:
+        </p>
+        <ul>
+          <li>
+            <strong>Exact match:</strong> For append-only data (events, logs), the count in the warehouse
+            should exactly match the count in the source for completed partitions
+          </li>
+          <li>
+            <strong>Bounded tolerance:</strong> For mutable data with CDC, allow a small tolerance
+            (e.g., ±0.1%) to account for in-flight transactions during the snapshot
+          </li>
+          <li>
+            <strong>Segmented reconciliation:</strong> Break counts by date, region, or entity type.
+            An overall match can mask offsetting errors (e.g., +1000 in region A, -1000 in region B)
+          </li>
+          <li>
+            <strong>Automated scheduling:</strong> Run reconciliation queries hourly or daily. Store
+            results in a metadata table and alert on drift exceeding thresholds
+          </li>
+        </ul>
+
+        <h3>Aggregate Comparisons</h3>
+        <p>
+          Beyond row counts, aggregate reconciliation compares computed metrics between source and target:
+        </p>
+        <ul>
+          <li>
+            <strong>SUM validation:</strong> Compare SUM(revenue) in the source transactional database
+            against the mart table. They should match within rounding tolerance
+          </li>
+          <li>
+            <strong>COUNT DISTINCT:</strong> Verify that the number of unique customers, orders, or
+            sessions matches between systems
+          </li>
+          <li>
+            <strong>MIN/MAX bounds:</strong> The minimum and maximum values for key columns should be
+            consistent. A MAX(order_date) in the warehouse that's older than the source indicates
+            missing recent data
+          </li>
+          <li>
+            <strong>Group-by reconciliation:</strong> Compare aggregates by category. This catches
+            issues where total sums match but individual segments are wrong due to misclassification
+          </li>
+        </ul>
+
+        <h3>Hash-Based Validation</h3>
+        <p>
+          For row-level integrity without transferring all data, hash-based validation computes
+          checksums on both sides and compares them:
+        </p>
+        <ul>
+          <li>
+            <strong>Row-level hashing:</strong> Compute MD5 or SHA-256 of concatenated column values
+            for each row. Compare hash sets between source and target to find mismatched rows
+          </li>
+          <li>
+            <strong>Partition-level hashing:</strong> Compute an aggregate hash (e.g., MD5 of ordered
+            concatenation) per partition. If partition hashes match, all rows are identical
+          </li>
+          <li>
+            <strong>Column-level checksums:</strong> Compute SUM(CRC32(column)) for numeric columns
+            and compare between systems. Fast and catches bit-level corruption
+          </li>
+          <li>
+            <strong>Incremental reconciliation:</strong> Only hash rows modified since the last
+            reconciliation run. This makes hash-based validation feasible for large tables
+          </li>
+        </ul>
+        <p>
+          Hash-based validation is particularly valuable when migrating between systems (e.g., Oracle
+          to BigQuery) or when validating that a refactored pipeline produces identical output.
+        </p>
+      </section>
+
+      <!-- Section 5: Schema Evolution Issues -->
+      <section id="schema-evolution" class="section">
+        <h2>Schema Evolution Issues</h2>
+        <p>
+          Schema evolution is one of the most insidious causes of incorrect metrics because changes
+          propagate silently through the pipeline. A column rename, type change, or new nullable field
+          can break downstream logic without causing any explicit errors.
+        </p>
+
+        <h3>New Nullable Column</h3>
+        <p>
+          When a source system adds a new nullable column, several failure modes emerge:
+        </p>
+        <ul>
+          <li>
+            <strong>Aggregation breakage:</strong> If the new column is used in a SUM() or AVG()
+            without COALESCE, NULL values silently produce NULL results instead of expected numbers
+          </li>
+          <li>
+            <strong>JOIN key corruption:</strong> If the new column becomes part of a composite JOIN
+            key, NULL values cause rows to drop (NULL ≠ NULL in SQL)
+          </li>
+          <li>
+            <strong>Filter expansion:</strong> A WHERE clause like <code>status != 'cancelled'</code>
+            excludes NULL status values. If the new schema makes status nullable, legitimate rows
+            are silently filtered out
+          </li>
+          <li>
+            <strong>Type coercion:</strong> Some warehouses auto-cast NULL to 0 for numeric columns,
+            while others preserve NULL. This inconsistency causes different results depending on
+            the execution engine
+          </li>
+        </ul>
+
+        <h3>Type Change</h3>
+        <p>
+          Column type changes can cause subtle data corruption that doesn't trigger schema validation
+          errors but produces incorrect values:
+        </p>
+        <ul>
+          <li>
+            <strong>Integer to float:</strong> Changing an INT column to FLOAT can introduce floating-point
+            precision errors in SUM aggregations. A revenue column that was cents-as-integer (1599)
+            becomes 15.99 as float, but SUM(15.99) over millions of rows accumulates rounding errors
+          </li>
+          <li>
+            <strong>String to timestamp:</strong> If the format specification doesn't match all source
+            values, some rows get NULL timestamps and are excluded from time-based aggregations
+          </li>
+          <li>
+            <strong>Numeric precision loss:</strong> Changing DECIMAL(18,6) to DECIMAL(10,2) silently
+            truncates values. Revenue of $1,234,567.891234 becomes $1,234,567.89
+          </li>
+          <li>
+            <strong>Boolean interpretation:</strong> Source changes from string ('true'/'false') to
+            boolean (1/0). If downstream code still compares against string literals, all rows fail
+            the filter
+          </li>
+        </ul>
+
+        <h3>Field Rename</h3>
+        <p>
+          Field renames are particularly dangerous in loosely-typed systems like JSON/Avro where
+          column references are string-based:
+        </p>
+        <ul>
+          <li>
+            <strong>Silent NULL:</strong> In Spark/Presto, referencing a non-existent column in a
+            JSON struct returns NULL rather than raising an error. A renamed field produces NULL
+            values that propagate through all downstream calculations
+          </li>
+          <li>
+            <strong>Partial rename:</strong> The source renames <code>user_id</code> to
+            <code>customer_id</code> but only in new records. Historical data retains the old name,
+            causing schema-on-read failures or NULL for historical rows
+          </li>
+          <li>
+            <strong>Case sensitivity:</strong> A rename from <code>userId</code> to <code>userid</code>
+            may or may not break depending on the warehouse's case sensitivity settings. BigQuery is
+            case-sensitive; Snowflake defaults to case-insensitive but preserves case in quoted identifiers
+          </li>
+          <li>
+            <strong>Cascading breakage:</strong> A single field rename can break dozens of downstream
+            models, views, and dashboards that reference it. Without column-level lineage tracking,
+            identifying all affected assets requires manual investigation
+          </li>
+        </ul>
+
+        <h3>Backward Compatibility</h3>
+        <p>
+          Maintaining backward compatibility during schema evolution requires deliberate practices:
+        </p>
+        <ul>
+          <li>
+            <strong>Schema registry:</strong> Use Confluent Schema Registry or AWS Glue Schema Registry
+            to enforce compatibility rules (BACKWARD, FORWARD, FULL) on schema changes
+          </li>
+          <li>
+            <strong>Additive-only changes:</strong> Only allow adding new columns (not removing or
+            renaming). Deprecated columns are marked but retained for a transition period
+          </li>
+          <li>
+            <strong>Default values:</strong> New columns must have explicit defaults so that existing
+            code continues to function correctly without modification
+          </li>
+          <li>
+            <strong>Version fields:</strong> Include a schema_version column so that transformation
+            logic can branch based on the schema version of each record
+          </li>
+          <li>
+            <strong>Data contracts:</strong> Define explicit contracts between producers and consumers
+            specifying column names, types, nullability, and valid value ranges. Changes require
+            contract negotiation, not unilateral modification
+          </li>
+        </ul>
+      </section>
+
+      <!-- Section 6: Null Handling Bugs -->
+      <section id="null-handling" class="section">
+        <h2>Null Handling Bugs</h2>
+        <p>
+          NULL handling is arguably the most common source of incorrect metrics in analytical pipelines.
+          SQL's three-valued logic (TRUE, FALSE, UNKNOWN) means that NULLs don't behave like zero or
+          empty string—they propagate in ways that silently corrupt aggregations and filters.
+        </p>
+
+        <h3>NULL in Aggregations</h3>
+        <p>
+          SQL aggregate functions handle NULL in specific ways that can produce misleading results:
+        </p>
+        <ul>
+          <li>
+            <strong>SUM ignores NULLs:</strong> <code>SUM(revenue)</code> skips NULL rows. If 20% of
+            rows have NULL revenue due to a schema change, the total silently drops by 20% without
+            any error
+          </li>
+          <li>
+            <strong>COUNT(*) vs COUNT(column):</strong> <code>COUNT(*)</code> counts all rows including
+            those with NULLs, while <code>COUNT(revenue)</code> excludes NULLs. Using the wrong variant
+            produces incorrect averages: <code>SUM(revenue) / COUNT(*)</code> is wrong if revenue has NULLs
+          </li>
+          <li>
+            <strong>AVG and NULL:</strong> <code>AVG(revenue)</code> divides by the count of non-NULL
+            values. If NULLs represent zero-revenue transactions, AVG artificially inflates the result
+          </li>
+          <li>
+            <strong>MIN/MAX with NULLs:</strong> Both ignore NULLs, which is usually correct. But
+            <code>MAX(updated_at)</code> returning a stale timestamp because recent rows have NULL
+            timestamps is a common freshness-check failure
+          </li>
+          <li>
+            <strong>GROUP BY with NULL:</strong> NULL is treated as a single group. If a dimension
+            column becomes nullable, a new "NULL" group appears that may not be handled by downstream
+            logic or dashboard filters
+          </li>
+        </ul>
+
+        <h3>COALESCE and IFNULL</h3>
+        <p>
+          Defensive NULL handling using COALESCE is essential but introduces its own pitfalls:
+        </p>
+        <ul>
+          <li>
+            <strong>COALESCE(revenue, 0):</strong> Converts NULL to 0 for aggregation. This is correct
+            when NULL means "no revenue" but wrong when NULL means "revenue unknown"—the distinction
+            matters for accuracy
+          </li>
+          <li>
+            <strong>Multi-column COALESCE:</strong> <code>COALESCE(new_col, old_col, 0)</code> handles
+            schema migrations gracefully by falling through column renames
+          </li>
+          <li>
+            <strong>IFNULL vs COALESCE:</strong> IFNULL takes exactly two arguments (MySQL/BigQuery).
+            COALESCE is ANSI SQL and accepts multiple fallback values. Prefer COALESCE for portability
+          </li>
+          <li>
+            <strong>Performance impact:</strong> Wrapping every column in COALESCE can prevent predicate
+            pushdown and partition pruning in some engines. Apply defensively but not indiscriminately
+          </li>
+          <li>
+            <strong>Type mismatch:</strong> <code>COALESCE(varchar_col, 0)</code> may fail or produce
+            unexpected type coercion depending on the engine. Ensure fallback values match the column type
+          </li>
+        </ul>
+
+        <h3>Outer JOIN Introducing NULLs</h3>
+        <p>
+          JOINs are the primary mechanism by which NULLs enter analytical queries unexpectedly:
+        </p>
+        <ul>
+          <li>
+            <strong>LEFT JOIN + aggregation:</strong> A LEFT JOIN produces NULL values for all columns
+            from the right table when no match exists. If you then SUM a right-table column without
+            COALESCE, NULLs silently reduce the total
+          </li>
+          <li>
+            <strong>LEFT→INNER change:</strong> Converting a LEFT JOIN to INNER JOIN drops all
+            unmatched rows entirely. This is the classic cause of "metrics dropped after deployment"
+            when a developer "cleans up" a query
+          </li>
+          <li>
+            <strong>FULL OUTER JOIN NULLs:</strong> Both sides can be NULL. A FULL OUTER JOIN between
+            orders and payments produces NULL order_ids for unmatched payments and NULL payment_ids
+            for unmatched orders—both need explicit handling
+          </li>
+          <li>
+            <strong>Multi-table JOIN cascading:</strong> In a chain of LEFT JOINs (A LEFT JOIN B LEFT JOIN C),
+            if B has no match, then C also has no match. NULLs cascade through the entire chain,
+            potentially nullifying all derived columns
+          </li>
+          <li>
+            <strong>Anti-join pattern:</strong> <code>WHERE right_table.id IS NULL</code> after a LEFT
+            JOIN identifies unmatched rows. If this pattern is accidentally removed during refactoring,
+            the query returns all rows instead of just unmatched ones
+          </li>
+        </ul>
+      </section>
+
+      <!-- Section 7: Duplicate Events -->
+      <section id="duplicate-events" class="section">
+        <h2>Duplicate Events</h2>
+        <p>
+          Duplicate events are endemic in distributed systems because at-least-once delivery is the
+          default guarantee for most message brokers and event streaming platforms. Without explicit
+          deduplication, metrics inflate silently—revenue doubles, user counts spike, and conversion
+          rates become meaningless.
+        </p>
+
+        <h3>At-Least-Once Producing Duplicates</h3>
+        <p>
+          Understanding where duplicates originate is essential for choosing the right dedup strategy:
+        </p>
+        <ul>
+          <li>
+            <strong>Producer retries:</strong> When a Kafka producer doesn't receive an ACK (network
+            timeout), it retries the send. If the original message was actually persisted, you now
+            have duplicates in the topic. Enable idempotent producers (<code>enable.idempotence=true</code>)
+            to prevent this at the broker level
+          </li>
+          <li>
+            <strong>Consumer reprocessing:</strong> A consumer crashes after processing a message but
+            before committing the offset. On restart, it reprocesses the same messages. This is
+            inherent to at-least-once semantics
+          </li>
+          <li>
+            <strong>CDC replay:</strong> Debezium connectors that restart from an earlier offset
+            re-emit events that were already captured. The same INSERT appears twice in the target
+          </li>
+          <li>
+            <strong>Webhook retries:</strong> Third-party systems retry webhook deliveries on timeout.
+            Your ingestion endpoint receives the same payment event multiple times
+          </li>
+          <li>
+            <strong>Airflow task retries:</strong> A failed Airflow task that partially wrote data
+            retries and writes the same rows again. Without idempotent writes, duplicates accumulate
+          </li>
+        </ul>
+
+        <h3>Deduplication Strategies</h3>
+        <p>
+          Different pipeline architectures call for different deduplication approaches:
+        </p>
+        <ul>
+          <li>
+            <strong>Event-level dedup key:</strong> Every event should have a globally unique
+            <code>event_id</code> (UUID or composite of entity_id + timestamp + sequence). Dedup by
+            this key at ingestion or transformation time
+          </li>
+          <li>
+            <strong>Exactly-once sinks:</strong> Use MERGE/UPSERT operations that are inherently
+            idempotent. Writing the same event twice with the same primary key overwrites rather than
+            duplicates
+          </li>
+          <li>
+            <strong>Streaming dedup window:</strong> In Flink or Spark Structured Streaming, deduplicate
+            within a time window using <code>dropDuplicates("event_id")</code> with a watermark. Events
+            arriving outside the window are treated as new
+          </li>
+          <li>
+            <strong>Bloom filter pre-check:</strong> For high-volume streams where maintaining a full
+            dedup set is expensive, use a Bloom filter to probabilistically detect duplicates with
+            configurable false-positive rates
+          </li>
+          <li>
+            <strong>Database constraints:</strong> Add UNIQUE constraints on natural keys. Bulk inserts
+            use <code>INSERT ... ON CONFLICT DO NOTHING</code> (Postgres) or
+            <code>MERGE</code> (Snowflake/BigQuery) to silently drop duplicates
+          </li>
+        </ul>
+
+        <h3>QUALIFY ROW_NUMBER Pattern</h3>
+        <p>
+          The most common SQL-based deduplication technique uses window functions to select one
+          representative row from each group of duplicates:
+        </p>
+        <ul>
+          <li>
+            <strong>Basic pattern:</strong> <code>QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id
+            ORDER BY ingested_at DESC) = 1</code> keeps the most recently ingested version of each event
+          </li>
+          <li>
+            <strong>Tie-breaking:</strong> When the ORDER BY column has ties, add secondary sort keys
+            (e.g., <code>ORDER BY ingested_at DESC, _file_name DESC</code>) to ensure deterministic results
+          </li>
+          <li>
+            <strong>Soft-delete aware:</strong> For CDC data, order by the operation timestamp and
+            keep the latest state: <code>QUALIFY ROW_NUMBER() OVER (PARTITION BY pk ORDER BY
+            op_timestamp DESC) = 1</code>. Then filter out DELETE operations if needed
+          </li>
+          <li>
+            <strong>Performance consideration:</strong> QUALIFY with ROW_NUMBER requires sorting the
+            entire partition. For very large tables, materializing deduplicated data incrementally
+            (processing only new arrivals) is more efficient than full-table dedup on every run
+          </li>
+          <li>
+            <strong>Engine support:</strong> QUALIFY is natively supported in Snowflake, BigQuery, and
+            Databricks. In engines without QUALIFY (Redshift, Postgres), use a CTE with ROW_NUMBER
+            and filter in the outer query: <code>WITH ranked AS (...) SELECT * FROM ranked WHERE rn = 1</code>
+          </li>
+        </ul>
+      </section>
+
+      <!-- Section 8: Late-Arriving Data -->
+      <section id="late-arriving-data" class="section">
+        <h2>Late-Arriving Data</h2>
+        <p>
+          Late-arriving data occurs when events reach the pipeline after the processing window for their
+          event_time has already closed. This is especially common in mobile applications (devices offline
+          for hours), IoT sensors (buffered uploads), and cross-timezone batch exports. The result is
+          incomplete metrics for past periods that were already reported to stakeholders.
+        </p>
+
+        <h3>Partition Already Closed</h3>
+        <p>
+          In partitioned data lakes, once a partition is written and downstream queries execute, late
+          data for that partition creates inconsistency:
+        </p>
+        <ul>
+          <li>
+            <strong>Immutable partitions:</strong> If partitions are treated as immutable after creation,
+            late data is simply lost. The 2024-01-15 partition was finalized at midnight, but events
+            from that day arrive at 3 AM—they have nowhere to go
+          </li>
+          <li>
+            <strong>Overwrite risk:</strong> Appending to a closed partition can cause double-counting
+            if downstream models have already processed it. The mart table now has the old aggregate
+            plus new rows arrive, but the aggregate isn't recomputed
+          </li>
+          <li>
+            <strong>Partition grace period:</strong> Keep partitions writable for a grace period
+            (e.g., 72 hours). After the grace period, late data goes to a "late arrivals" staging
+            table for manual or batch reprocessing
+          </li>
+          <li>
+            <strong>Bi-temporal modeling:</strong> Store both event_time (when it happened) and
+            processing_time (when we received it). This allows reprocessing by processing_time
+            windows while correctly attributing metrics to event_time
+          </li>
+        </ul>
+
+        <h3>Incremental Model Missed It</h3>
+        <p>
+          Incremental models (dbt incremental, Spark append mode) only process new data since the last
+          run. Late-arriving data that falls outside the incremental window is permanently excluded:
+        </p>
+        <ul>
+          <li>
+            <strong>is_incremental() lookback:</strong> In dbt, use a lookback window larger than your
+            expected late-arrival window: <code>WHERE event_time &gt;= (SELECT MAX(event_time) - INTERVAL '3 days'
+            FROM {{ this }})</code>. This reprocesses recent partitions to capture late data
+          </li>
+          <li>
+            <strong>Merge strategy:</strong> Use <code>incremental_strategy='merge'</code> with a unique
+            key so that reprocessed rows update existing records rather than creating duplicates
+          </li>
+          <li>
+            <strong>Processing watermark:</strong> Track the maximum event_time processed by each model.
+            When late data arrives with event_time below the watermark, trigger a targeted reprocessing
+            of affected partitions
+          </li>
+          <li>
+            <strong>Freshness monitoring:</strong> Use <code>dbt source freshness</code> to detect when
+            sources have data gaps. A source that usually updates every hour but hasn't updated in 6 hours
+            likely indicates missing late data
+          </li>
+        </ul>
+
+        <h3>Reprocessing Window</h3>
+        <p>
+          Designing a reprocessing strategy for late data requires balancing completeness against cost:
+        </p>
+        <ul>
+          <li>
+            <strong>Rolling reprocess:</strong> Every day, reprocess the last N days of data. This
+            automatically captures late arrivals within the window. Cost scales with N × daily_volume
+          </li>
+          <li>
+            <strong>Event-triggered reprocess:</strong> When late data arrives, identify affected
+            partitions and trigger targeted reprocessing only for those partitions. More efficient
+            but requires infrastructure to detect late arrivals
+          </li>
+          <li>
+            <strong>SLA-based cutoff:</strong> Define an SLA that says "metrics are preliminary for
+            72 hours and final after 7 days." Late data within 72 hours triggers reprocessing; after
+            7 days, it goes to a correction log but doesn't update dashboards
+          </li>
+          <li>
+            <strong>Lambda architecture:</strong> Maintain a speed layer (real-time, potentially incomplete)
+            and a batch layer (complete but delayed). The serving layer merges both, with the batch
+            layer eventually overwriting speed layer approximations
+          </li>
+        </ul>
+      </section>
+
+      <!-- Section 9: CDC Issues -->
+      <section id="cdc-issues" class="section">
+        <h2>CDC Issues</h2>
+        <p>
+          Change Data Capture (CDC) pipelines introduce unique failure modes because they must faithfully
+          replicate the sequence of mutations (INSERT, UPDATE, DELETE) from operational databases into
+          analytical systems. Any disruption in ordering, completeness, or schema alignment produces
+          incorrect point-in-time snapshots in the warehouse.
+        </p>
+
+        <h3>Debezium Lag</h3>
+        <p>
+          Debezium is the most widely used open-source CDC connector, but operational issues can cause
+          it to fall behind the source database's transaction log:
+        </p>
+        <ul>
+          <li>
+            <strong>WAL retention exhaustion:</strong> If Debezium falls too far behind and the database
+            recycles WAL segments (PostgreSQL) or binlog files (MySQL), the connector cannot resume
+            from its saved position. It must perform a full snapshot, which can take hours and produces
+            duplicate data for the snapshot period
+          </li>
+          <li>
+            <strong>Large transactions:</strong> A bulk UPDATE affecting millions of rows generates a
+            massive batch of CDC events. If the connector's memory is insufficient, it may OOM or
+            produce backpressure that delays all subsequent events
+          </li>
+          <li>
+            <strong>Connector restart lag:</strong> After a restart, Debezium replays events from the
+            last committed offset. The gap between "last committed" and "actually processed by downstream"
+            produces duplicates that must be handled idempotently
+          </li>
+          <li>
+            <strong>Network partitions:</strong> Temporary connectivity loss between Debezium and the
+            database causes gaps in the CDC stream. Events that occurred during the partition are lost
+            unless the connector has WAL-based recovery
+          </li>
+        </ul>
+
+        <h3>Schema Drift</h3>
+        <p>
+          When the source database schema changes (DDL), the CDC stream must handle the transition:
+        </p>
+        <ul>
+          <li>
+            <strong>Column addition:</strong> New columns appear as NULL in historical events but have
+            values in new events. Downstream consumers must handle both schemas simultaneously
+          </li>
+          <li>
+            <strong>Column removal:</strong> Debezium's schema history may still reference the dropped
+            column. If the target table has a NOT NULL constraint on that column, inserts fail
+          </li>
+          <li>
+            <strong>Type change:</strong> A column changed from VARCHAR(50) to VARCHAR(200) in the source.
+            If the target table wasn't updated, values are silently truncated
+          </li>
+          <li>
+            <strong>Schema registry conflicts:</strong> Avro-encoded CDC events with schema registry
+            may fail compatibility checks when schemas evolve. This blocks the entire CDC pipeline
+            until the compatibility rule is relaxed or the schema is manually registered
+          </li>
+        </ul>
+
+        <h3>Out-of-Order CDC Events</h3>
+        <p>
+          CDC events can arrive out of order due to Kafka partition routing, connector parallelism,
+          or network reordering:
+        </p>
+        <ul>
+          <li>
+            <strong>Multi-partition topics:</strong> If CDC events for the same entity are spread across
+            multiple Kafka partitions (e.g., hashed by table name rather than primary key), updates
+            for the same row can be processed out of order
+          </li>
+          <li>
+            <strong>UPDATE before INSERT:</strong> If an UPDATE event for a row arrives before its
+            INSERT event (due to reordering), an UPSERT-based sink handles this correctly, but an
+            INSERT-only sink fails with a "row not found" error
+          </li>
+          <li>
+            <strong>Last-writer-wins resolution:</strong> Use the event's transaction timestamp
+            (<code>source.ts_ms</code> in Debezium) to resolve conflicts. Only apply an event if
+            its timestamp is newer than the current row's timestamp
+          </li>
+          <li>
+            <strong>Sequence numbers:</strong> Debezium provides <code>source.lsn</code> (Postgres)
+            or <code>source.pos</code> (MySQL) that represent the monotonically increasing position
+            in the transaction log. Use these for ordering rather than wall-clock timestamps
+          </li>
+        </ul>
+
+        <h3>Delete Handling</h3>
+        <p>
+          DELETE events in CDC require special handling because analytical systems often need historical
+          data that the source system has removed:
+        </p>
+        <ul>
+          <li>
+            <strong>Tombstone events:</strong> Debezium emits a DELETE event followed by a tombstone
+            (null value) for log compaction. Consumers must distinguish between "record deleted" and
+            "record never existed"
+          </li>
+          <li>
+            <strong>Soft delete in warehouse:</strong> Rather than physically deleting warehouse rows,
+            set an <code>is_deleted</code> flag and <code>deleted_at</code> timestamp. This preserves
+            historical analytics while reflecting the source's current state
+          </li>
+          <li>
+            <strong>Hard delete propagation:</strong> If the warehouse physically deletes rows, any
+            downstream mart that has already aggregated the deleted row will show inflated historical
+            metrics. Reprocessing is required
+          </li>
+          <li>
+            <strong>GDPR/compliance deletes:</strong> Legal requirements may mandate hard deletion
+            from all systems within a time window. This requires tracking lineage to identify every
+            table containing the affected data and triggering coordinated deletes
+          </li>
+        </ul>
+      </section>
+
+      <!-- Section 10: Backfill & Reprocessing -->
+      <section id="backfill-problems" class="section">
+        <h2>Backfill &amp; Reprocessing</h2>
+        <p>
+          Backfills are necessary when historical data needs correction, a new model needs to be
+          materialized for past periods, or a data loss event requires recovery. However, backfills
+          are also one of the most dangerous operations because they can overwrite correct production
+          data with incorrect data if not handled carefully.
+        </p>
+
+        <h3>Overwriting Production with Test Data</h3>
+        <p>
+          One of the most common backfill disasters occurs when test or development data accidentally
+          overwrites production tables:
+        </p>
+        <ul>
+          <li>
+            <strong>Wrong target database:</strong> A developer runs a backfill script pointed at the
+            production database instead of dev. The script TRUNCATES the table and reloads with a
+            subset of test data. Dashboards immediately show catastrophically wrong metrics
+          </li>
+          <li>
+            <strong>Shared infrastructure:</strong> When dev and prod share the same warehouse (different
+            schemas/datasets), a misconfigured dbt profile or environment variable can route backfill
+            writes to production
+          </li>
+          <li>
+            <strong>Prevention:</strong> Use separate service accounts with write access only to their
+            designated environment. Implement database-level DENY rules that prevent dev credentials
+            from writing to prod schemas
+          </li>
+          <li>
+            <strong>Recovery:</strong> Maintain time-travel capabilities (Snowflake Time Travel, BigQuery
+            snapshot decorators, Delta Lake time travel) to restore tables to their pre-backfill state
+            within the retention window
+          </li>
+        </ul>
+
+        <h3>Missing Partition Guards</h3>
+        <p>
+          Backfills that don't properly scope their writes can corrupt data outside the intended range:
+        </p>
+        <ul>
+          <li>
+            <strong>Full table overwrite:</strong> Using <code>INSERT OVERWRITE</code> without a
+            partition filter replaces the entire table. If the backfill source only contains data for
+            January, all other months are deleted
+          </li>
+          <li>
+            <strong>Static partition overwrite:</strong> In Spark, <code>spark.sql.sources.partitionOverwriteMode=static</code>
+            (the default) replaces ALL partitions. Set to <code>dynamic</code> to only overwrite partitions
+            present in the DataFrame
+          </li>
+          <li>
+            <strong>Date range guards:</strong> Always include explicit date range filters in backfill
+            queries: <code>WHERE dt BETWEEN '2024-01-01' AND '2024-01-31'</code>. This prevents
+            accidental processing of data outside the backfill window
+          </li>
+          <li>
+            <strong>Dry-run validation:</strong> Before executing a backfill, run it in dry-run mode
+            that logs which partitions would be affected and how many rows would be written. Compare
+            against expectations before committing
+          </li>
+        </ul>
+
+        <h3>Idempotent Backfills</h3>
+        <p>
+          An idempotent backfill produces the same result regardless of how many times it runs. This
+          property is essential for safe retry and recovery:
+        </p>
+        <ul>
+          <li>
+            <strong>DELETE + INSERT pattern:</strong> First delete existing data for the target partition,
+            then insert the new data. Running twice produces the same result. Wrap in a transaction
+            for atomicity
+          </li>
+          <li>
+            <strong>MERGE/UPSERT pattern:</strong> Use MERGE with a match key to update existing rows
+            and insert new ones. This handles partial backfills where some rows already exist
+          </li>
+          <li>
+            <strong>Partition-level atomicity:</strong> Write new partition data to a staging location,
+            validate it, then atomically swap the partition pointer. If the backfill fails mid-way,
+            the original partition remains intact
+          </li>
+          <li>
+            <strong>Backfill metadata:</strong> Record which partitions were backfilled, when, by whom,
+            and from which source version. This audit trail enables debugging and rollback
+          </li>
+          <li>
+            <strong>Concurrency control:</strong> Prevent multiple backfills from running simultaneously
+            on overlapping partitions. Use distributed locks (e.g., Airflow sensors, database advisory
+            locks) to serialize conflicting operations
+          </li>
+        </ul>
+      </section>
+
+      <!-- Section 11: Production Incident -->
+      <section id="production-incident" class="section">
+        <h2>Production Incident: Revenue Dashboard 30% Drop</h2>
+        <p>
+          This section describes a real production incident that illustrates how a seemingly innocuous
+          code change can cause significant metric discrepancies.
+        </p>
+
+        <h3>The Symptom</h3>
+        <p>
+          On Monday morning after a Friday deployment, the finance team reported that the revenue
+          dashboard showed a 30% drop in daily revenue compared to the previous week. The business
+          team was alarmed—had something catastrophic happened to sales over the weekend?
+        </p>
+
+        <h3>Initial Triage</h3>
+        <ul>
+          <li>
+            <strong>Scope identification:</strong> The revenue drop was consistent across all days
+            since Friday's deployment. Pre-deployment days showed normal values. This immediately
+            pointed to the deployment as the cause
+          </li>
+          <li>
+            <strong>Source verification:</strong> Checked the transactional database directly:
+            <code>SELECT SUM(amount) FROM orders WHERE order_date = '2024-01-20'</code> returned the
+            expected ~$3.2M. The warehouse mart table showed only ~$2.2M for the same date
+          </li>
+          <li>
+            <strong>Layer-by-layer comparison:</strong> Raw staging table had correct row counts.
+            The intermediate model <code>int_orders_enriched</code> showed 30% fewer rows than staging.
+            The problem was in the enrichment layer
+          </li>
+        </ul>
+
+        <h3>Root Cause</h3>
+        <p>
+          The deployment included a refactoring of the <code>int_orders_enriched</code> dbt model.
+          A developer changed a LEFT JOIN to an INNER JOIN while "cleaning up" the query, reasoning
+          that "all orders should have a matching customer record":
+        </p>
+        <pre><code>-- BEFORE (correct)
+SELECT
+  o.order_id,
+  o.amount,
+  o.order_date,
+  c.customer_segment
+FROM staging.orders o
+LEFT JOIN staging.customers c
+  ON o.customer_id = c.customer_id
+
+-- AFTER (incorrect)
+SELECT
+  o.order_id,
+  o.amount,
+  o.order_date,
+  c.customer_segment
+FROM staging.orders o
+INNER JOIN staging.customers c
+  ON o.customer_id = c.customer_id</code></pre>
+        <p>
+          The assumption that "all orders have a matching customer" was wrong. Approximately 30% of
+          orders came from guest checkouts (no customer record), B2B API integrations (customer records
+          in a different system), and recently created customers whose records hadn't yet been replicated
+          via CDC. The INNER JOIN silently dropped all these orders.
+        </p>
+
+        <h3>Why It Wasn't Caught</h3>
+        <ul>
+          <li>
+            <strong>No row count test:</strong> There was no dbt test comparing the output row count
+            of <code>int_orders_enriched</code> against its source <code>staging.orders</code>
+          </li>
+          <li>
+            <strong>CI ran on subset:</strong> The CI environment used a small sample dataset where
+            all orders happened to have matching customers. The 30% mismatch only existed in production
+          </li>
+          <li>
+            <strong>No metric monitoring:</strong> There was no automated alert on revenue deviation
+            exceeding a threshold. The issue was discovered manually 60 hours after deployment
+          </li>
+          <li>
+            <strong>Code review gap:</strong> The reviewer approved the LEFT→INNER change because the
+            PR description said "all orders should have customers" without verifying this assumption
+            against production data
+          </li>
+        </ul>
+
+        <h3>Resolution</h3>
+        <ol>
+          <li>
+            <strong>Immediate fix:</strong> Reverted the JOIN type back to LEFT JOIN and re-ran the
+            dbt model to restore correct metrics within 30 minutes of diagnosis
+          </li>
+          <li>
+            <strong>Data correction:</strong> Triggered a full refresh of all downstream mart tables
+            that depended on <code>int_orders_enriched</code> to ensure no stale aggregations remained
+          </li>
+          <li>
+            <strong>Stakeholder communication:</strong> Notified finance team that the revenue drop was
+            a data pipeline bug, not an actual business decline. Provided corrected figures for the
+            affected days
+          </li>
+        </ol>
+
+        <h3>Prevention Measures Implemented</h3>
+        <ul>
+          <li>
+            <strong>Row count test:</strong> Added <code>dbt_utils.equal_rowcount</code> test comparing
+            <code>int_orders_enriched</code> against <code>staging.orders</code> to catch any future
+            row drops
+          </li>
+          <li>
+            <strong>Revenue bounds test:</strong> Added a singular test that asserts daily revenue is
+            within 20% of the 7-day rolling average. Deviations trigger pipeline failure and alert
+          </li>
+          <li>
+            <strong>CI with production data sample:</strong> Modified CI to test against a representative
+            production sample (10% random sample) that includes edge cases like guest checkouts
+          </li>
+          <li>
+            <strong>JOIN audit policy:</strong> Established a team policy that any change from LEFT to
+            INNER JOIN requires an accompanying query proving that the JOIN produces zero unmatched
+            rows in production
+          </li>
+          <li>
+            <strong>Automated metric monitoring:</strong> Deployed a daily reconciliation job that
+            compares warehouse revenue against the source transactional database and alerts within
+            1 hour if deviation exceeds 1%
+          </li>
+        </ul>
+
+        <h3>Lessons Learned</h3>
+        <ul>
+          <li>
+            <strong>Assumptions are dangerous:</strong> Never change JOIN semantics based on assumptions
+            about data completeness. Verify with production queries first
+          </li>
+          <li>
+            <strong>Silent failures are worst:</strong> The query didn't error—it produced fewer rows
+            silently. Data quality tests must validate not just correctness of present data but
+            completeness of expected data
+          </li>
+          <li>
+            <strong>CI must reflect production:</strong> Test datasets must include the edge cases and
+            data quality issues present in production. Pristine test data gives false confidence
+          </li>
+          <li>
+            <strong>60 hours is too long:</strong> Critical business metrics should have automated
+            anomaly detection that catches discrepancies within hours, not days
+          </li>
+        </ul>
+      </section>
+
+      <!-- Section 12: Debugging Workflow -->
+      <section id="debugging-workflow" class="section">
+        <h2>Debugging Workflow</h2>
+        <p>
+          When a dashboard shows incorrect metrics after deployment, follow this systematic workflow
+          to minimize time-to-resolution and avoid chasing false leads:
+        </p>
+
+        <h3>Step 1: Define the Discrepancy</h3>
+        <ul>
+          <li>Quantify the error: "Revenue is 30% lower" is actionable; "something looks wrong" is not</li>
+          <li>Identify the time boundary: When did correct metrics end and incorrect ones begin?</li>
+          <li>Determine the scope: All metrics or specific ones? All segments or specific regions/products?</li>
+          <li>Check if the dashboard itself changed (filter defaults, date ranges, cached data)</li>
+        </ul>
+
+        <h3>Step 2: Correlate with Deployments</h3>
+        <ul>
+          <li>List all deployments in the window between "last known good" and "first known bad"</li>
+          <li>Include not just code deployments but infrastructure changes, schema migrations, and config updates</li>
+          <li>Check dbt run logs for model changes, Airflow DAG modifications, and upstream source changes</li>
+          <li>Verify that no one ran a manual backfill or ad-hoc data fix during the window</li>
+        </ul>
+
+        <h3>Step 3: Layer-by-Layer Reconciliation</h3>
+        <ul>
+          <li>
+            <strong>Source layer:</strong> Query the operational database directly. Does it show
+            the expected values for the affected time period?
+          </li>
+          <li>
+            <strong>Ingestion layer:</strong> Check raw/staging tables. Do row counts match the source?
+            Are there gaps in event timestamps?
+          </li>
+          <li>
+            <strong>Transformation layer:</strong> Compare intermediate model outputs against their
+            inputs. Where do row counts diverge? Which transformation introduces the error?
+          </li>
+          <li>
+            <strong>Serving layer:</strong> Check the final mart/reporting table. Does its content
+            match what the dashboard displays? Rule out caching or dashboard-level issues
+          </li>
+        </ul>
+
+        <h3>Step 4: Isolate the Root Cause</h3>
+        <ul>
+          <li>Once you know which layer diverges, examine the transformation logic for that layer</li>
+          <li>Run the transformation manually with debug logging to see exactly which rows are included/excluded</li>
+          <li>Compare the current code against the previous version (git diff) focusing on JOINs, WHEREs, and GROUP BYs</li>
+          <li>Check for data issues: NULLs in JOIN keys, duplicates, schema changes in source data</li>
+        </ul>
+
+        <h3>Step 5: Validate the Fix</h3>
+        <ul>
+          <li>Write a query that demonstrates the bug: show the missing/extra/incorrect rows</li>
+          <li>Apply the fix and verify that the same query now shows correct results</li>
+          <li>Run the full pipeline and compare output metrics against the source of truth</li>
+          <li>Add a regression test that would have caught this issue before it reached production</li>
+        </ul>
+
+        <h3>Step 6: Communicate and Prevent</h3>
+        <ul>
+          <li>Notify affected stakeholders with: what happened, impact window, corrected data availability</li>
+          <li>Write a post-mortem documenting: timeline, root cause, impact, resolution, and prevention</li>
+          <li>Implement automated checks that would catch this class of issue in the future</li>
+          <li>Update runbooks with the debugging steps that proved effective</li>
+        </ul>
+      </section>
+
+      <!-- Section 13: Code Examples -->
+      <section id="code-examples" class="section">
+        <h2>Code Examples</h2>
+
+        <h3>dbt Tests for Data Quality</h3>
+        <p>
+          The following examples demonstrate dbt tests that would have caught the revenue dashboard
+          incident and similar data quality issues:
+        </p>
+
+        <h4>Schema-Level Tests (schema.yml)</h4>
+        <pre><code>version: 2
+
+models:
+  - name: int_orders_enriched
+    description: "Orders enriched with customer dimensions"
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: amount
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 1000000
+              row_condition: "amount is not null"
+      - name: order_date
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: "'2020-01-01'"
+              max_value: "current_date()"
+    tests:
+      - dbt_utils.equal_rowcount:
+          compare_model: ref('stg_orders')
+      - dbt_utils.expression_is_true:
+          expression: "count(*) > 0"
+      - dbt_expectations.expect_table_row_count_to_be_between:
+          min_value: 10000
+          max_value: 10000000</code></pre>
+
+        <h4>Singular Test: Revenue Bounds Check</h4>
+        <pre><code>-- tests/assert_revenue_within_bounds.sql
+-- This test fails if daily revenue deviates more than 30%
+-- from the 7-day rolling average
+
+WITH daily_revenue AS (
+  SELECT
+    order_date,
+    SUM(amount) AS total_revenue
+  FROM {{ ref('int_orders_enriched') }}
+  WHERE order_date >= CURRENT_DATE - INTERVAL '30 days'
+  GROUP BY order_date
+),
+
+with_rolling_avg AS (
+  SELECT
+    order_date,
+    total_revenue,
+    AVG(total_revenue) OVER (
+      ORDER BY order_date
+      ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
+    ) AS rolling_7d_avg
+  FROM daily_revenue
+)
+
+SELECT
+  order_date,
+  total_revenue,
+  rolling_7d_avg,
+  ABS(total_revenue - rolling_7d_avg) / NULLIF(rolling_7d_avg, 0) AS deviation_pct
+FROM with_rolling_avg
+WHERE order_date = CURRENT_DATE - INTERVAL '1 day'
+  AND ABS(total_revenue - rolling_7d_avg) / NULLIF(rolling_7d_avg, 0) > 0.30</code></pre>
+
+        <h4>Singular Test: JOIN Completeness</h4>
+        <pre><code>-- tests/assert_no_dropped_orders.sql
+-- Ensures LEFT JOIN behavior: all source orders appear in enriched model
+
+SELECT
+  o.order_id,
+  o.order_date,
+  o.amount
+FROM {{ ref('stg_orders') }} o
+LEFT JOIN {{ ref('int_orders_enriched') }} e
+  ON o.order_id = e.order_id
+WHERE e.order_id IS NULL
+  AND o.order_date >= CURRENT_DATE - INTERVAL '7 days'</code></pre>
+
+        <h4>Freshness and Recency Test</h4>
+        <pre><code>-- tests/assert_data_freshness.sql
+-- Ensures data is no more than 4 hours stale
+
+SELECT
+  MAX(event_timestamp) AS latest_event,
+  CURRENT_TIMESTAMP AS check_time,
+  TIMESTAMPDIFF(HOUR, MAX(event_timestamp), CURRENT_TIMESTAMP) AS hours_stale
+FROM {{ ref('stg_events') }}
+HAVING TIMESTAMPDIFF(HOUR, MAX(event_timestamp), CURRENT_TIMESTAMP) > 4</code></pre>
+
+        <h3>Great Expectations Suite</h3>
+        <p>
+          A comprehensive Great Expectations suite for validating the orders pipeline:
+        </p>
+
+        <pre><code># great_expectations/expectations/orders_suite.py
+import great_expectations as gx
+
+context = gx.get_context()
+
+# Define expectations for the orders dataset
+suite = context.add_expectation_suite("orders_quality_suite")
+
+# Table-level expectations
+validator.expect_table_row_count_to_be_between(
+    min_value=10000,
+    max_value=5000000,
+    meta={"notes": "Daily order volume should be between 10K and 5M"}
+)
+
+validator.expect_table_column_count_to_equal(value=12)
+
+# Column: order_id
+validator.expect_column_values_to_not_be_null(column="order_id")
+validator.expect_column_values_to_be_unique(column="order_id")
+
+# Column: amount
+validator.expect_column_values_to_not_be_null(column="amount")
+validator.expect_column_values_to_be_between(
+    column="amount",
+    min_value=0,
+    max_value=1000000,
+    mostly=0.999  # Allow 0.1% outliers
+)
+validator.expect_column_mean_to_be_between(
+    column="amount",
+    min_value=50,
+    max_value=500,
+    meta={"notes": "Average order value should be $50-$500"}
+)
+validator.expect_column_stdev_to_be_between(
+    column="amount",
+    min_value=10,
+    max_value=1000
+)
+
+# Column: order_date
+validator.expect_column_values_to_not_be_null(column="order_date")
+validator.expect_column_values_to_be_between(
+    column="order_date",
+    min_value="2020-01-01",
+    max_value="{today}"
+)
+
+# Column: customer_id (nullable for guest checkouts)
+validator.expect_column_values_to_not_be_null(
+    column="customer_id",
+    mostly=0.70  # At least 70% should have customer_id
+)
+
+# Distribution check
+validator.expect_column_proportion_of_unique_values_to_be_between(
+    column="customer_segment",
+    min_value=0.00001,
+    max_value=0.01
+)
+
+# Cross-table validation (custom expectation)
+validator.expect_column_pair_values_to_be_equal(
+    column_A="total_row_count",
+    column_B="source_row_count",
+    meta={"notes": "Row count reconciliation with source"}
+)</code></pre>
+
+        <h4>Great Expectations Checkpoint Configuration</h4>
+        <pre><code># great_expectations/checkpoints/orders_checkpoint.yml
+name: orders_daily_checkpoint
+config_version: 1.0
+class_name: Checkpoint
+run_name_template: "orders_validation_%Y%m%d_%H%M%S"
+validations:
+  - batch_request:
+      datasource_name: warehouse_datasource
+      data_connector_name: daily_partition_connector
+      data_asset_name: int_orders_enriched
+      data_connector_query:
+        index: -1  # Latest partition
+    expectation_suite_name: orders_quality_suite
+action_list:
+  - name: store_validation_result
+    action:
+      class_name: StoreValidationResultAction
+  - name: update_data_docs
+    action:
+      class_name: UpdateDataDocsAction
+  - name: send_slack_notification
+    action:
+      class_name: SlackNotificationAction
+      slack_webhook: ${SLACK_WEBHOOK_URL}
+      notify_on: failure
+      renderer:
+        module_name: great_expectations.render.renderer.slack_renderer
+        class_name: SlackRenderer</code></pre>
+
+        <h3>Reconciliation SQL</h3>
+        <p>
+          Production-grade reconciliation queries that compare source and warehouse data:
+        </p>
+
+        <h4>Row Count Reconciliation</h4>
+        <pre><code>-- Reconciliation: Source vs Warehouse row counts by date
+WITH source_counts AS (
+  SELECT
+    DATE(created_at) AS dt,
+    COUNT(*) AS source_rows,
+    SUM(amount) AS source_revenue,
+    COUNT(DISTINCT customer_id) AS source_customers
+  FROM source_db.orders
+  WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
+  GROUP BY DATE(created_at)
+),
+
+warehouse_counts AS (
+  SELECT
+    order_date AS dt,
+    COUNT(*) AS warehouse_rows,
+    SUM(amount) AS warehouse_revenue,
+    COUNT(DISTINCT customer_id) AS warehouse_customers
+  FROM analytics.fct_orders
+  WHERE order_date >= CURRENT_DATE - INTERVAL '7 days'
+  GROUP BY order_date
+)
+
+SELECT
+  COALESCE(s.dt, w.dt) AS dt,
+  s.source_rows,
+  w.warehouse_rows,
+  s.source_rows - COALESCE(w.warehouse_rows, 0) AS row_diff,
+  ROUND(
+    100.0 * (s.source_rows - COALESCE(w.warehouse_rows, 0)) / NULLIF(s.source_rows, 0),
+    2
+  ) AS row_diff_pct,
+  s.source_revenue,
+  w.warehouse_revenue,
+  ROUND(s.source_revenue - COALESCE(w.warehouse_revenue, 0), 2) AS revenue_diff,
+  ROUND(
+    100.0 * (s.source_revenue - COALESCE(w.warehouse_revenue, 0)) / NULLIF(s.source_revenue, 0),
+    2
+  ) AS revenue_diff_pct
+FROM source_counts s
+FULL OUTER JOIN warehouse_counts w ON s.dt = w.dt
+ORDER BY dt DESC;</code></pre>
+
+        <h4>Duplicate Detection Query</h4>
+        <pre><code>-- Find duplicate events by event_id
+WITH duplicates AS (
+  SELECT
+    event_id,
+    COUNT(*) AS occurrence_count,
+    MIN(ingested_at) AS first_seen,
+    MAX(ingested_at) AS last_seen,
+    TIMESTAMPDIFF(MINUTE, MIN(ingested_at), MAX(ingested_at)) AS duplicate_window_minutes
+  FROM raw.events
+  WHERE event_date >= CURRENT_DATE - INTERVAL '1 day'
+  GROUP BY event_id
+  HAVING COUNT(*) > 1
+)
+
+SELECT
+  COUNT(*) AS total_duplicate_groups,
+  SUM(occurrence_count - 1) AS total_extra_rows,
+  AVG(occurrence_count) AS avg_duplicates_per_event,
+  MAX(occurrence_count) AS max_duplicates,
+  AVG(duplicate_window_minutes) AS avg_duplicate_window_min
+FROM duplicates;</code></pre>
+
+        <h4>Schema Drift Detection</h4>
+        <pre><code>-- Detect schema changes between consecutive loads
+WITH current_schema AS (
+  SELECT
+    column_name,
+    data_type,
+    is_nullable,
+    ordinal_position
+  FROM information_schema.columns
+  WHERE table_schema = 'staging'
+    AND table_name = 'orders'
+),
+
+expected_schema AS (
+  SELECT
+    column_name,
+    data_type,
+    is_nullable,
+    ordinal_position
+  FROM data_contracts.expected_schemas
+  WHERE table_name = 'staging.orders'
+    AND contract_version = (
+      SELECT MAX(contract_version)
+      FROM data_contracts.expected_schemas
+      WHERE table_name = 'staging.orders'
+    )
+)
+
+-- Columns in actual but not in contract (additions)
+SELECT 'ADDED' AS change_type, c.column_name, c.data_type, NULL AS expected_type
+FROM current_schema c
+LEFT JOIN expected_schema e ON c.column_name = e.column_name
+WHERE e.column_name IS NULL
+
+UNION ALL
+
+-- Columns in contract but not in actual (removals)
+SELECT 'REMOVED' AS change_type, e.column_name, NULL AS actual_type, e.data_type
+FROM expected_schema e
+LEFT JOIN current_schema c ON e.column_name = c.column_name
+WHERE c.column_name IS NULL
+
+UNION ALL
+
+-- Type mismatches
+SELECT 'TYPE_CHANGED' AS change_type, c.column_name, c.data_type, e.data_type
+FROM current_schema c
+JOIN expected_schema e ON c.column_name = e.column_name
+WHERE c.data_type != e.data_type;</code></pre>
+
+        <h3>Data Contracts</h3>
+        <p>
+          Data contracts formalize the agreement between data producers and consumers, preventing
+          unilateral schema changes from breaking downstream systems:
+        </p>
+
+        <h4>Data Contract Definition (YAML)</h4>
+        <pre><code># contracts/orders_contract.yml
+apiVersion: datacontract/v1.0
+kind: DataContract
+metadata:
+  name: orders-contract
+  version: 2.1.0
+  owner: platform-team@company.com
+  domain: commerce
+
+schema:
+  type: object
+  properties:
+    order_id:
+      type: string
+      format: uuid
+      description: "Unique order identifier"
+      required: true
+      pii: false
+    customer_id:
+      type: string
+      format: uuid
+      description: "Customer identifier (NULL for guest checkout)"
+      required: false
+      nullable: true
+    amount:
+      type: number
+      format: decimal(10,2)
+      description: "Order total in USD"
+      required: true
+      minimum: 0
+      maximum: 1000000
+    order_date:
+      type: string
+      format: date
+      description: "Date the order was placed"
+      required: true
+    status:
+      type: string
+      enum: ["pending", "confirmed", "shipped", "delivered", "cancelled"]
+      required: true
+    created_at:
+      type: string
+      format: timestamp
+      description: "Record creation timestamp in UTC"
+      required: true
+
+quality:
+  freshness:
+    max_delay: "4 hours"
+    measured_at: created_at
+  completeness:
+    min_row_count: 10000
+    max_null_percentage:
+      order_id: 0
+      amount: 0
+      customer_id: 30  # 30% NULL allowed (guest checkouts)
+  uniqueness:
+    - order_id
+  referential_integrity:
+    - column: customer_id
+      references: customers.customer_id
+      enforcement: soft  # Warn but don't block
+
+sla:
+  availability: 99.9%
+  update_frequency: "hourly"
+  support_channel: "#data-platform-support"
+
+compatibility:
+  breaking_changes:
+    - column_removal
+    - type_narrowing
+    - nullable_to_required
+  non_breaking_changes:
+    - column_addition
+    - type_widening
+    - required_to_nullable</code></pre>
+
+        <h4>Contract Validation in CI/CD</h4>
+        <pre><code># .github/workflows/data_contract_validation.yml
+name: Data Contract Validation
+
+on:
+  pull_request:
+    paths:
+      - 'models/**'
+      - 'contracts/**'
+
+jobs:
+  validate-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: pip install soda-core datacontract-cli
+
+      - name: Validate schema compatibility
+        run: |
+          datacontract lint contracts/orders_contract.yml
+          datacontract breaking contracts/orders_contract.yml \
+            --against main:contracts/orders_contract.yml
+
+      - name: Run contract tests against staging
+        env:
+          WAREHOUSE_CONNECTION: ${{ secrets.STAGING_WAREHOUSE_URL }}
+        run: |
+          datacontract test contracts/orders_contract.yml \
+            --connection $WAREHOUSE_CONNECTION \
+            --environment staging
+
+      - name: Check for breaking changes
+        run: |
+          RESULT=$(datacontract breaking contracts/orders_contract.yml \
+            --against main:contracts/orders_contract.yml --output json)
+          if echo "$RESULT" | jq -e '.breaking_changes | length > 0'; then
+            echo "::error::Breaking schema changes detected!"
+            echo "$RESULT" | jq '.breaking_changes[]'
+            exit 1
+          fi</code></pre>
+      </section>
+
+      <!-- Section 14: Common Mistakes -->
+      <section id="common-mistakes" class="section">
+        <h2>Common Mistakes</h2>
+        <p>
+          These are the mistakes senior data engineers frequently see (or make) when debugging and
+          preventing incorrect dashboard metrics:
+        </p>
+
+        <h3>Debugging Mistakes</h3>
+        <ul>
+          <li>
+            <strong>Blaming the dashboard first:</strong> Engineers spend hours investigating Looker/Tableau
+            caching, filter configurations, and visualization bugs when the issue is almost always in the
+            data pipeline. Start at the source and work forward
+          </li>
+          <li>
+            <strong>Not quantifying the discrepancy:</strong> "The numbers look wrong" is not actionable.
+            Always compute the exact delta: "Revenue is $1.02M lower than expected, representing 30%
+            of orders from the guest checkout segment"
+          </li>
+          <li>
+            <strong>Checking only totals:</strong> Overall row counts or sums can appear correct while
+            hiding offsetting errors. A segment gaining 10K rows while another loses 10K shows correct
+            totals but incorrect segments. Always reconcile at granular levels
+          </li>
+          <li>
+            <strong>Assuming the source is correct:</strong> Sometimes the source system itself has
+            bugs—duplicate events, retroactive updates, or timezone issues. Validate the source against
+            business expectations, not just against itself
+          </li>
+          <li>
+            <strong>Fixing without understanding:</strong> Applying a quick fix (e.g., "just add COALESCE")
+            without understanding why NULLs appeared. The underlying cause (schema change, CDC failure,
+            missing data) will produce different symptoms next time
+          </li>
+        </ul>
+
+        <h3>Prevention Mistakes</h3>
+        <ul>
+          <li>
+            <strong>Testing only happy path:</strong> dbt tests that validate column types and uniqueness
+            but don't check row counts, metric bounds, or cross-table consistency. The most dangerous
+            bugs produce valid-looking data with wrong values
+          </li>
+          <li>
+            <strong>Static thresholds:</strong> Setting alert thresholds like "revenue must exceed $2M"
+            fails during weekends, holidays, or seasonal dips. Use relative thresholds (deviation from
+            rolling average) that adapt to natural patterns
+          </li>
+          <li>
+            <strong>Alert fatigue:</strong> Too many low-priority alerts cause teams to ignore all alerts.
+            Tier your data quality checks: P0 (blocks pipeline), P1 (alerts on-call), P2 (logged for
+            weekly review)
+          </li>
+          <li>
+            <strong>No data contracts:</strong> Allowing upstream producers to change schemas without
+            notifying consumers. A single column rename can break dozens of downstream models silently
+          </li>
+          <li>
+            <strong>Incremental-only with no lookback:</strong> Incremental models that process only new
+            data without a lookback window permanently miss late-arriving events. Always include at
+            least a 24-72 hour lookback
+          </li>
+          <li>
+            <strong>Testing in isolation:</strong> Running dbt tests that validate each model independently
+            but never testing end-to-end metric accuracy against the source of truth
+          </li>
+        </ul>
+
+        <h3>Operational Mistakes</h3>
+        <ul>
+          <li>
+            <strong>No deployment rollback plan:</strong> Deploying model changes without the ability to
+            quickly revert. If a dbt model change breaks metrics, you need to restore the previous
+            version within minutes, not hours
+          </li>
+          <li>
+            <strong>Manual backfills without safeguards:</strong> Running ad-hoc INSERT/UPDATE statements
+            in production without partition guards, row count validation, or rollback capability
+          </li>
+          <li>
+            <strong>Shared credentials between environments:</strong> Dev and production using the same
+            database credentials allows accidental cross-environment writes. Use separate service accounts
+            with environment-specific permissions
+          </li>
+          <li>
+            <strong>No post-deployment validation:</strong> Deploying model changes and assuming success
+            if the dbt run completes without errors. Always run reconciliation checks after deployment
+            to verify output correctness
+          </li>
+        </ul>
+      </section>
+
+      <!-- Section 15: Trade-offs -->
+      <section id="trade-offs" class="section">
+        <h2>Trade-offs</h2>
+        <p>
+          Data quality engineering involves fundamental trade-offs. Understanding these helps you
+          make informed decisions appropriate to your organization's priorities:
+        </p>
+
+        <h3>Freshness vs Accuracy</h3>
+        <ul>
+          <li>
+            <strong>Real-time with approximation:</strong> Streaming dashboards can show metrics within
+            seconds but may include duplicates, miss late data, or show pre-dedup counts. Suitable
+            for operational monitoring where directional accuracy is sufficient
+          </li>
+          <li>
+            <strong>Batch with completeness:</strong> Daily batch processing allows full deduplication,
+            late-arrival handling, and reconciliation but introduces 24+ hour latency. Suitable for
+            financial reporting where accuracy is non-negotiable
+          </li>
+          <li>
+            <strong>Hybrid approach:</strong> Show real-time preliminary metrics with a "provisional"
+            badge, then replace with reconciled batch metrics after a delay. This gives both speed
+            and eventual accuracy
+          </li>
+        </ul>
+
+        <h3>Strictness vs Flexibility</h3>
+        <ul>
+          <li>
+            <strong>Strict validation (fail fast):</strong> Any data quality violation halts the pipeline.
+            This prevents bad data from reaching dashboards but causes cascading downstream failures
+            and stale data. Appropriate for financial/regulatory data
+          </li>
+          <li>
+            <strong>Lenient validation (warn and continue):</strong> Log violations and alert but
+            continue processing. Bad data reaches dashboards but the pipeline stays running. Appropriate
+            for exploratory analytics and non-critical metrics
+          </li>
+          <li>
+            <strong>Tiered strictness:</strong> Critical columns (revenue, customer_id) have strict
+            validation. Non-critical columns (utm_source, device_type) have lenient validation. This
+            balances reliability with availability
+          </li>
+        </ul>
+
+        <h3>Testing Depth vs Pipeline Speed</h3>
+        <ul>
+          <li>
+            <strong>Comprehensive testing:</strong> Running 200+ dbt tests after every model refresh
+            adds 15-30 minutes to pipeline execution but catches subtle issues. Appropriate for
+            daily batch runs with generous SLA windows
+          </li>
+          <li>
+            <strong>Minimal testing:</strong> Running only critical tests (uniqueness, not-null on
+            primary keys) keeps pipeline fast but misses data drift and metric anomalies. Appropriate
+            for hourly micro-batch runs with tight SLAs
+          </li>
+          <li>
+            <strong>Async testing:</strong> Run the pipeline and serve data immediately, then run
+            comprehensive tests asynchronously. If tests fail, roll back to the previous version.
+            This gives both speed and coverage but adds complexity
+          </li>
+        </ul>
+
+        <h3>Deduplication: Exact vs Probabilistic</h3>
+        <ul>
+          <li>
+            <strong>Exact dedup (hash/key-based):</strong> Guarantees no duplicates but requires
+            maintaining state (seen event IDs) that grows with data volume. Memory-intensive for
+            high-cardinality streams
+          </li>
+          <li>
+            <strong>Probabilistic dedup (Bloom filter):</strong> Bounded memory with configurable
+            false-positive rate. May incorrectly mark unique events as duplicates (data loss) but
+            never lets true duplicates through. Suitable for metrics where 0.1% loss is acceptable
+          </li>
+          <li>
+            <strong>Windowed dedup:</strong> Only dedup within a time window (e.g., 1 hour). Events
+            with the same ID arriving days apart are treated as separate. Trades completeness for
+            bounded resource usage
+          </li>
+        </ul>
+
+        <h3>Schema Enforcement: Strict vs Schema-on-Read</h3>
+        <ul>
+          <li>
+            <strong>Schema-on-write (strict):</strong> Reject data that doesn't conform to the registered
+            schema. Prevents data quality issues at ingestion but may drop valid events during schema
+            transitions
+          </li>
+          <li>
+            <strong>Schema-on-read (flexible):</strong> Accept all data into raw storage, apply schema
+            during transformation. More resilient to source changes but pushes validation downstream
+            where it's harder to debug
+          </li>
+          <li>
+            <strong>Schema evolution with compatibility:</strong> Accept schema changes that maintain
+            backward/forward compatibility. Reject breaking changes. This balances flexibility with
+            safety
+          </li>
+        </ul>
+
+        <h3>Reconciliation Frequency vs Cost</h3>
+        <ul>
+          <li>
+            <strong>Real-time reconciliation:</strong> Compare every micro-batch against source within
+            minutes. Catches issues fast but doubles query load on source systems and increases
+            warehouse compute costs
+          </li>
+          <li>
+            <strong>Daily reconciliation:</strong> Run comprehensive reconciliation once per day during
+            off-peak hours. Low cost but issues may persist for up to 24 hours before detection
+          </li>
+          <li>
+            <strong>Event-driven reconciliation:</strong> Trigger reconciliation only after deployments,
+            backfills, or schema changes. Targeted and cost-effective but misses issues caused by
+            gradual data drift
+          </li>
+        </ul>
+      </section>
+
+      <!-- Section 16: Follow-up Questions -->
+      <section id="follow-up-questions" class="section">
+        <h2>Follow-up Questions</h2>
+        <p>
+          After the initial discussion, interviewers often probe deeper with these follow-up questions.
+          Prepare structured answers for each:
+        </p>
+
+        <h3>Detection and Alerting</h3>
+        <ul>
+          <li>
+            <strong>"How would you detect incorrect metrics before stakeholders notice?"</strong>
+            Implement automated reconciliation that runs after every pipeline execution, comparing
+            key metrics against source systems. Set up anomaly detection using statistical bounds
+            (z-score, rolling average deviation) that alert the on-call engineer within an hour of
+            detecting drift. Additionally, use dbt test failures to block downstream model refreshes.
+          </li>
+          <li>
+            <strong>"What's your alerting strategy for data quality?"</strong>
+            Tier alerts by severity: P0 alerts page on-call for &gt;5% deviation in revenue metrics,
+            P1 alerts Slack for schema changes or row count anomalies, P2 creates tickets for
+            gradual drift or minor completeness issues. Avoid alert fatigue by suppressing during
+            known maintenance windows and deduplicating related alerts.
+          </li>
+          <li>
+            <strong>"How do you handle false positive alerts?"</strong>
+            Maintain a suppression list for known patterns (holiday dips, end-of-quarter spikes).
+            Use day-of-week and seasonality-aware thresholds. When a false positive occurs, tune
+            the threshold and document the pattern. Track alert precision monthly—if precision drops
+            below 70%, the alerting is too aggressive.
+          </li>
+        </ul>
+
+        <h3>Architecture and Prevention</h3>
+        <ul>
+          <li>
+            <strong>"How would you design a data quality framework from scratch?"</strong>
+            Layer the framework: (1) Schema validation at ingestion using schema registry,
+            (2) Freshness and completeness checks via dbt source freshness, (3) Business logic
+            tests in dbt models, (4) Cross-system reconciliation in a dedicated quality DAG,
+            (5) Statistical anomaly detection on served metrics. Each layer catches different
+            failure modes.
+          </li>
+          <li>
+            <strong>"How do data contracts prevent this class of issue?"</strong>
+            Data contracts formalize the interface between producers and consumers. The producer
+            commits to schema stability, freshness SLAs, and value constraints. Breaking changes
+            require a contract version bump and consumer acknowledgment. This prevents the "surprise
+            schema change" that causes silent metric corruption.
+          </li>
+          <li>
+            <strong>"How do you validate data quality in CI/CD before deployment?"</strong>
+            Run dbt models against a production-representative sample in CI. Execute all tests
+            including row count comparisons, metric bounds, and JOIN completeness checks. Compare
+            output metrics of the PR branch against main branch. Flag any metric deviating by more
+            than 1% for manual review before merge.
+          </li>
+        </ul>
+
+        <h3>Incident Response</h3>
+        <ul>
+          <li>
+            <strong>"The CEO is asking about the revenue drop in 30 minutes. What do you do?"</strong>
+            First, confirm whether the drop is a data issue or a real business event by querying the
+            source system directly. If it's a data issue, communicate immediately: "We've identified
+            a data pipeline issue affecting revenue reporting since [date]. Actual revenue is unaffected.
+            We expect corrected numbers within [ETA]." Provide the source-of-truth number from the
+            operational database as an interim figure.
+          </li>
+          <li>
+            <strong>"How do you handle a situation where you can't quickly determine if the metric
+            change is real or a bug?"</strong>
+            Run reconciliation between source and warehouse. If they match, the change is real—escalate
+            to the business team. If they don't match, it's a pipeline issue—investigate the
+            transformation layer. While investigating, communicate uncertainty explicitly: "We're
+            validating whether this represents actual business change or a data issue. ETA for
+            confirmation: [time]."
+          </li>
+          <li>
+            <strong>"How do you prevent the same incident from recurring?"</strong>
+            Implement the specific test that would have caught this issue (e.g., row count comparison
+            for JOIN changes). Add it to CI so it runs on every PR. Conduct a blameless post-mortem
+            documenting timeline, root cause, and prevention. Update the team's code review checklist
+            to include JOIN-type change verification.
+          </li>
+        </ul>
+
+        <h3>Scale and Complexity</h3>
+        <ul>
+          <li>
+            <strong>"How do you handle data quality at scale with 1000+ models?"</strong>
+            Prioritize by business impact: identify the 50 critical models that drive executive
+            dashboards and apply comprehensive testing. Use automated profiling (Great Expectations
+            auto-profiling, Monte Carlo) for the long tail. Implement column-level lineage to
+            propagate quality scores downstream and identify which models are affected by upstream issues.
+          </li>
+          <li>
+            <strong>"How do you debug incorrect metrics in a complex DAG with 20+ dependencies?"</strong>
+            Use binary search on the DAG: run reconciliation at the midpoint. If correct there, the
+            issue is downstream; if incorrect, it's upstream. Repeat until you find the exact model
+            where data diverges. Column-level lineage tools (dbt Explorer, DataHub) help identify
+            which specific transformation introduced the error.
+          </li>
+          <li>
+            <strong>"What's your approach when multiple issues compound?"</strong>
+            Isolate each issue independently. For example, if you find both duplicates AND missing
+            rows, fix duplicates first (dedup), then assess whether the remaining count matches
+            expectations. Log each issue separately in the post-mortem because they may have
+            different root causes and different prevention measures.
+          </li>
+        </ul>
+      </section>
+
+      <!-- Section 17: Summary -->
+      <section id="summary" class="section">
+        <h2>Summary</h2>
+        <p>
+          Debugging incorrect dashboard metrics after deployment requires a systematic, layer-by-layer
+          approach that traces data from source to visualization. The key principles are:
+        </p>
+
+        <h3>Core Debugging Framework</h3>
+        <ul>
+          <li>
+            <strong>Quantify first:</strong> Define the exact discrepancy (metric, magnitude, time
+            window, affected segments) before investigating
+          </li>
+          <li>
+            <strong>Correlate with changes:</strong> Identify all deployments, schema changes, and
+            infrastructure modifications in the affected time window
+          </li>
+          <li>
+            <strong>Reconcile layer by layer:</strong> Compare source → staging → transformation → mart
+            → dashboard to pinpoint where data diverges
+          </li>
+          <li>
+            <strong>Verify assumptions:</strong> Never trust assumptions about data completeness (e.g.,
+            "all orders have customers"). Validate with production queries
+          </li>
+        </ul>
+
+        <h3>Common Root Causes</h3>
+        <ul>
+          <li><strong>JOIN type changes:</strong> LEFT→INNER silently drops unmatched rows</li>
+          <li><strong>NULL propagation:</strong> New nullable columns corrupt aggregations</li>
+          <li><strong>Duplicate events:</strong> At-least-once delivery inflates metrics</li>
+          <li><strong>Late-arriving data:</strong> Incremental models miss events outside their window</li>
+          <li><strong>Schema evolution:</strong> Field renames, type changes, and new columns break logic</li>
+          <li><strong>CDC failures:</strong> Lag, reordering, and missed deletes produce stale snapshots</li>
+          <li><strong>Backfill accidents:</strong> Overwriting production data or missing partition guards</li>
+        </ul>
+
+        <h3>Prevention Stack</h3>
+        <ul>
+          <li>
+            <strong>Data validation:</strong> dbt tests, Great Expectations suites, and statistical
+            anomaly detection at every pipeline layer
+          </li>
+          <li>
+            <strong>Reconciliation:</strong> Automated source-vs-warehouse comparison for row counts,
+            aggregates, and hash-based integrity
+          </li>
+          <li>
+            <strong>Data contracts:</strong> Formal agreements between producers and consumers that
+            prevent unilateral breaking changes
+          </li>
+          <li>
+            <strong>CI/CD validation:</strong> Run tests against production-representative data in
+            CI before merging model changes
+          </li>
+          <li>
+            <strong>Monitoring and alerting:</strong> Tiered alerts with statistical thresholds that
+            detect anomalies within hours, not days
+          </li>
+        </ul>
+
+        <h3>Key Takeaways for the Interview</h3>
+        <ul>
+          <li>Lead with structure: show the interviewer you have a repeatable debugging methodology</li>
+          <li>Demonstrate breadth: mention multiple root causes and explain how to differentiate them</li>
+          <li>Show production experience: reference real incidents and lessons learned</li>
+          <li>Emphasize prevention: great engineers build systems that detect issues automatically</li>
+          <li>Communicate trade-offs: explain when you'd choose speed over accuracy or vice versa</li>
+        </ul>
+      </section>
+
+
+      <!-- Chapter Navigation (bottom) -->
+      <div class="chapter-nav">
+        <a href="ch16-etl-pipeline-slow.html" class="nav-prev">Previous: ETL Pipeline Slow</a>
+        <a href="ch18-lakehouse-platform.html" class="nav-next">Next: Lakehouse Platform</a>
+      </div>
+    </main>
+  </div>
+
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

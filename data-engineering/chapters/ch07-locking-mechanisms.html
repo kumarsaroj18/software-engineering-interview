@@ -1,0 +1,2874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ch 7 — Database Locking Mechanisms | Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark/light theme">☀️</button>
+  <button class="mobile-menu-toggle" id="mobile-menu-toggle" aria-label="Toggle sidebar menu">☰</button>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="brand">DE Interview Handbook</a>
+    </div>
+    <div class="sidebar-chapter">Ch 7 / Locking Mechanisms</div>
+    <nav class="sidebar-nav">
+      <a href="#interviewer-intent">Interviewer Intent</a>
+      <a href="#quick-answer">Quick Answer</a>
+      <a href="#lock-types">Lock Types</a>
+      <a href="#lock-granularity">Lock Granularity</a>
+      <a href="#lock-compatibility">Compatibility Matrix</a>
+      <a href="#deadlocks">Deadlocks</a>
+      <a href="#lock-escalation">Lock Escalation</a>
+      <a href="#advisory-locks">Advisory Locks</a>
+      <a href="#mvcc-vs-locking">MVCC vs Locking</a>
+      <a href="#distributed-locking">Distributed Locking</a>
+      <a href="#production-incident">Production Incident</a>
+      <a href="#debugging-workflow">Debugging Workflow</a>
+      <a href="#code-examples">Code Examples</a>
+      <a href="#common-mistakes">Common Mistakes</a>
+      <a href="#trade-offs">Trade-offs</a>
+      <a href="#follow-up-questions">Follow-up Questions</a>
+      <a href="#summary">Summary</a>
+    </nav>
+    <div class="sidebar-actions">
+      <a href="ch06-mvcc.html" class="btn">← Ch 6</a>
+      <a href="ch08-query-suddenly-slow.html" class="btn">Ch 8 →</a>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <a href="../index.html#part-ii">Part II</a> &gt;
+      <span>Chapter 7</span>
+    </nav>
+
+    <header class="chapter-header">
+      <span class="badge badge-medium">Medium</span>
+      <h1>Database Locking Mechanisms</h1>
+      <div class="topics">
+        <span class="topic-tag">Locks</span>
+        <span class="topic-tag">Deadlocks</span>
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="search" id="chapter-search" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+
+    <!-- ============================================================
+         SECTION 1: INTERVIEWER INTENT
+         ============================================================ -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>Why interviewers ask this question</summary>
+        <p>
+          Database locking is a foundational concurrency control mechanism. Interviewers use this
+          topic to assess whether a senior Data Engineer can reason about concurrent access,
+          diagnose production bottlenecks, and design systems that avoid lock contention. They
+          want to verify:
+        </p>
+        <ul>
+          <li><strong>Concurrency fundamentals</strong> — Can you explain how multiple transactions safely share data?</li>
+          <li><strong>Lock taxonomy</strong> — Do you know the difference between shared, exclusive, intent, and update locks?</li>
+          <li><strong>Granularity awareness</strong> — Can you reason about row-level vs page-level vs table-level locks and their throughput implications?</li>
+          <li><strong>Deadlock reasoning</strong> — Can you identify, prevent, and resolve deadlock scenarios?</li>
+          <li><strong>Production debugging</strong> — Have you diagnosed lock contention in real systems using pg_locks, sys.dm_tran_locks, or equivalent?</li>
+          <li><strong>Distributed context</strong> — Can you connect locking concepts to modern data platforms (BigQuery, Snowflake, Delta Lake)?</li>
+          <li><strong>MVCC interaction</strong> — Do you understand when MVCC eliminates lock needs and when explicit locks are still required?</li>
+        </ul>
+        <p>
+          At senior+ levels, the interviewer expects you to connect locking behavior to
+          <strong>pipeline throughput</strong>, <strong>ETL/OLTP conflicts</strong>, and
+          <strong>distributed system design</strong>.
+        </p>
+      </details>
+      <details>
+        <summary>What a strong answer demonstrates</summary>
+        <ul>
+          <li>Precise definitions of lock modes with concrete examples of when each is acquired</li>
+          <li>Understanding of the multigranularity locking protocol (intent locks)</li>
+          <li>Ability to draw and reason about a lock compatibility matrix</li>
+          <li>Knowledge of deadlock detection algorithms (wait-for graph, timeout)</li>
+          <li>Experience with lock escalation behavior differences across engines</li>
+          <li>Practical debugging skills using system views and catalogs</li>
+          <li>Real-world war stories involving lock contention in data pipelines</li>
+          <li>Awareness of how MVCC and locking complement each other</li>
+        </ul>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 2: QUICK ANSWER
+         ============================================================ -->
+    <section id="quick-answer">
+      <h2>Quick Answer (60-Second Version)</h2>
+      <details>
+        <summary>Elevator pitch</summary>
+        <p>
+          <strong>Database locks</strong> are synchronization primitives that control concurrent
+          access to shared data. A <strong>shared (S) lock</strong> allows multiple readers; an
+          <strong>exclusive (X) lock</strong> gives a single writer sole access. <strong>Intent
+          locks</strong> (IS, IX) signal coarse-grained intention to lock at a finer granularity,
+          enabling the multigranularity protocol that avoids scanning every row lock when checking
+          table-level compatibility.
+        </p>
+        <p>
+          Locks operate at different <strong>granularities</strong>: row, page, table, or database.
+          Finer granularity increases concurrency but raises memory overhead. When too many
+          fine-grained locks accumulate, <strong>lock escalation</strong> promotes them to a
+          coarser level.
+        </p>
+        <p>
+          <strong>Deadlocks</strong> occur when two or more transactions hold locks and each waits
+          for a lock held by another, forming a cycle in the wait-for graph. Databases detect
+          deadlocks by periodically checking this graph (or via timeouts) and abort the cheapest
+          transaction to break the cycle.
+        </p>
+        <p>
+          Modern MVCC systems (PostgreSQL, Oracle, Snowflake) eliminate read-write conflicts by
+          giving readers a consistent snapshot without acquiring shared locks. However, exclusive
+          locks are still required for writes, DDL operations, and explicit <code>SELECT FOR UPDATE</code>
+          scenarios.
+        </p>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 3: LOCK TYPES
+         ============================================================ -->
+    <section id="lock-types">
+      <h2>Lock Types</h2>
+      <details>
+        <summary>Shared (S) Lock</summary>
+        <p>
+          A shared lock permits concurrent reads. Multiple transactions can hold S locks on the
+          same resource simultaneously. An S lock blocks exclusive lock requests but allows other
+          shared lock requests.
+        </p>
+<pre><code class="language-sql">
+-- PostgreSQL: implicit S lock during SELECT under Read Committed
+-- (In MVCC systems, readers don't actually acquire row-level S locks;
+--  instead they read a snapshot. S locks appear at table level as AccessShareLock.)
+
+-- SQL Server: explicit S lock during SELECT under default isolation
+SELECT customer_name FROM customers WHERE customer_id = 42;
+-- Acquires S lock on the row (released immediately under Read Committed)
+
+-- S lock held for duration under Repeatable Read / Serializable:
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT balance FROM accounts WHERE id = 100;
+-- S lock held until COMMIT — blocks any X lock on this row
+COMMIT;
+</code></pre>
+      </details>
+      <details>
+        <summary>Exclusive (X) Lock</summary>
+        <p>
+          An exclusive lock provides sole access for writes. Only one transaction can hold an X
+          lock on a resource. It blocks all other lock requests (both S and X) on that resource.
+        </p>
+<pre><code class="language-sql">
+-- Any DML statement acquires X locks on affected rows:
+UPDATE accounts SET balance = balance - 100 WHERE id = 42;
+-- X lock on row id=42 held until COMMIT/ROLLBACK
+
+DELETE FROM orders WHERE order_id = 9001;
+-- X lock on the deleted row until transaction ends
+
+INSERT INTO events (id, data) VALUES (1, 'test');
+-- X lock on the new row (prevents phantom reads in Serializable)
+
+-- PostgreSQL: RowExclusiveLock on the table + X on individual rows
+-- SQL Server: IX on table/page + X on row
+</code></pre>
+      </details>
+      <details>
+        <summary>Intent Shared (IS) Lock</summary>
+        <p>
+          An intent shared lock on a higher-level resource (table or page) signals that the
+          transaction intends to acquire shared locks on lower-level resources (rows). This
+          enables efficient compatibility checking — the database doesn't need to scan all
+          row locks to determine if a table-level exclusive lock can be granted.
+        </p>
+<pre><code class="language-bash">
+# Multigranularity protocol example:
+#
+# Transaction T1: SELECT * FROM orders WHERE id = 5;
+#   1. Acquire IS lock on TABLE orders        (intent to read a row)
+#   2. Acquire IS lock on PAGE containing id=5 (if page-level exists)
+#   3. Acquire S lock on ROW id=5             (actual read lock)
+#
+# Transaction T2: LOCK TABLE orders IN EXCLUSIVE MODE;
+#   1. Try to acquire X lock on TABLE orders
+#   2. Check: any IS/IX/S/X held on table?
+#   3. IS found from T1 → X request BLOCKED
+#   (Without IS, database would need to scan ALL row locks)
+</code></pre>
+      </details>
+      <details>
+        <summary>Intent Exclusive (IX) Lock</summary>
+        <p>
+          An intent exclusive lock on a higher-level resource signals that the transaction
+          intends to acquire exclusive locks on lower-level resources. IX is compatible with
+          other IX locks (multiple transactions can write to different rows in the same table)
+          but incompatible with S or X locks at the same level.
+        </p>
+<pre><code class="language-bash">
+# Transaction T1: UPDATE orders SET status='shipped' WHERE id = 5;
+#   1. Acquire IX lock on TABLE orders
+#   2. Acquire IX lock on PAGE
+#   3. Acquire X lock on ROW id=5
+#
+# Transaction T2: UPDATE orders SET status='cancelled' WHERE id = 99;
+#   1. Acquire IX lock on TABLE orders   ← COMPATIBLE with T1's IX
+#   2. Acquire IX lock on PAGE (different page) ← no conflict
+#   3. Acquire X lock on ROW id=99       ← no conflict
+#
+# Both transactions proceed concurrently because IX + IX is compatible.
+# They modify different rows — no actual conflict exists.
+</code></pre>
+      </details>
+      <details>
+        <summary>Update (U) Lock</summary>
+        <p>
+          An update lock is a hybrid used during the read phase of an UPDATE statement. It
+          prevents the classic conversion deadlock: two transactions both acquire S locks on a
+          row, then both try to upgrade to X — neither can because the other holds S. A U lock
+          is compatible with S but not with other U or X locks, ensuring only one transaction
+          can be in the "about to update" state.
+        </p>
+<pre><code class="language-sql">
+-- SQL Server update lock scenario:
+-- Without U locks (deadlock-prone):
+--   T1: S lock on row → tries to upgrade to X → blocked by T2's S
+--   T2: S lock on row → tries to upgrade to X → blocked by T1's S
+--   DEADLOCK!
+
+-- With U locks (SQL Server default for UPDATE):
+--   T1: U lock on row (read phase of UPDATE)
+--   T2: tries U lock → BLOCKED (U + U incompatible)
+--   T1: upgrades U → X (write phase)
+--   T1: COMMIT → releases X
+--   T2: acquires U → upgrades to X → completes
+
+-- Explicit U lock hint in SQL Server:
+SELECT * FROM accounts WITH (UPDLOCK) WHERE id = 42;
+-- Acquires U lock — signals "I will update this soon"
+
+-- PostgreSQL equivalent: SELECT ... FOR UPDATE
+SELECT * FROM accounts WHERE id = 42 FOR UPDATE;
+-- Acquires RowExclusiveLock (effectively X on the row)
+</code></pre>
+      </details>
+      <details>
+        <summary>Schema (Sch) and Bulk Update (BU) Locks</summary>
+        <p>
+          <strong>Schema Stability (Sch-S):</strong> Prevents table schema from being modified
+          while a query references it. Acquired by every DML/SELECT statement.
+        </p>
+        <p>
+          <strong>Schema Modification (Sch-M):</strong> Acquired by DDL statements (ALTER TABLE,
+          DROP INDEX). Blocks all other access to the table — the most restrictive lock.
+        </p>
+        <p>
+          <strong>Bulk Update (BU):</strong> Used by bulk-load operations (BULK INSERT, bcp)
+          with TABLOCK hint. Allows concurrent bulk inserts but blocks normal DML.
+        </p>
+<pre><code class="language-sql">
+-- PostgreSQL DDL lock escalation:
+-- Adding a column with DEFAULT acquires AccessExclusiveLock
+ALTER TABLE orders ADD COLUMN priority INT DEFAULT 0;
+-- Blocks ALL concurrent queries on orders until complete
+
+-- PostgreSQL 11+ optimization: non-volatile defaults don't rewrite table
+-- But lock is still held during catalog update (brief but exclusive)
+
+-- Safe pattern for large tables:
+ALTER TABLE orders ADD COLUMN priority INT;  -- no default, instant
+-- Then backfill in batches:
+UPDATE orders SET priority = 0 WHERE id BETWEEN 1 AND 100000;
+-- Smaller batches = shorter X locks = less blocking
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 4: LOCK GRANULARITY
+         ============================================================ -->
+    <section id="lock-granularity">
+      <h2>Lock Granularity</h2>
+      <details>
+        <summary>Row-level locking</summary>
+        <p>
+          The finest practical granularity. Each individual row can be independently locked,
+          maximizing concurrency. Two transactions modifying different rows in the same table
+          never block each other. Used by PostgreSQL, MySQL InnoDB, Oracle, and modern OLTP
+          databases.
+        </p>
+<pre><code class="language-bash">
+# Row-level locking characteristics:
+# ┌──────────────────────────────────────────────────────────────────┐
+# │  Pros:                                                           │
+# │  • Maximum concurrency — independent row access                  │
+# │  • Minimal blocking for mixed read/write workloads               │
+# │  • Ideal for OLTP (many small transactions on different rows)    │
+# │                                                                  │
+# │  Cons:                                                           │
+# │  • Memory overhead — each lock consumes ~100-200 bytes           │
+# │  • Lock manager bookkeeping for millions of rows                 │
+# │  • Can lead to lock escalation under bulk operations             │
+# │  • Deadlock detection more complex (more edges in wait-for graph)│
+# └──────────────────────────────────────────────────────────────────┘
+#
+# Memory calculation (SQL Server):
+#   Each lock structure: ~96 bytes
+#   UPDATE on 1M rows: 96 bytes × 1,000,000 = ~96 MB in lock memory
+#   Default lock memory: 40% of buffer pool
+#   If buffer pool = 16 GB → lock memory cap = 6.4 GB → ~67M locks
+</code></pre>
+      </details>
+      <details>
+        <summary>Page-level locking</summary>
+        <p>
+          Locks an entire data page (typically 8 KB in SQL Server, 8 KB in PostgreSQL). A
+          compromise between row and table granularity. Less memory overhead than row locks
+          but reduces concurrency when multiple hot rows reside on the same page.
+        </p>
+<pre><code class="language-bash">
+# Page-level locking characteristics:
+# ┌──────────────────────────────────────────────────────────────────┐
+# │  • SQL Server uses page-level locks as intermediate granularity  │
+# │  • Typical page: 8 KB, holding ~50-200 rows                     │
+# │  • One lock protects all rows on the page                        │
+# │                                                                  │
+# │  When databases choose page locks:                               │
+# │  • Scan touching many rows on same page (range scan)             │
+# │  • Lock escalation threshold not yet met but row locks expensive │
+# │  • Heap tables with no clustered index (SQL Server)              │
+# │                                                                  │
+# │  PostgreSQL note:                                                │
+# │  • PostgreSQL does NOT have explicit page-level row locks        │
+# │  • It uses page-level cleanup locks (VACUUM) but row-level xmax │
+# │  • Buffer pins serve a similar purpose for I/O coordination      │
+# └──────────────────────────────────────────────────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>Table-level locking</summary>
+        <p>
+          Locks the entire table. Maximum simplicity and minimum memory (one lock structure)
+          but severely limits concurrency. Used for DDL operations, bulk loads, and explicit
+          LOCK TABLE statements.
+        </p>
+<pre><code class="language-sql">
+-- PostgreSQL table-level lock modes (from least to most restrictive):
+-- 1. AccessShareLock          — SELECT
+-- 2. RowShareLock             — SELECT FOR UPDATE/SHARE
+-- 3. RowExclusiveLock         — INSERT, UPDATE, DELETE
+-- 4. ShareUpdateExclusiveLock — VACUUM, CREATE INDEX CONCURRENTLY
+-- 5. ShareLock                — CREATE INDEX (non-concurrent)
+-- 6. ShareRowExclusiveLock    — CREATE TRIGGER, some ALTER TABLE
+-- 7. ExclusiveLock            — REFRESH MATERIALIZED VIEW CONCURRENTLY
+-- 8. AccessExclusiveLock      — DROP TABLE, ALTER TABLE, VACUUM FULL
+
+-- Explicit table lock:
+BEGIN;
+LOCK TABLE orders IN SHARE MODE;
+-- All concurrent INSERTs/UPDATEs/DELETEs are blocked
+-- But SELECTs proceed freely
+SELECT sum(amount) FROM orders;  -- consistent snapshot
+COMMIT;
+
+-- Exclusive table lock (blocks everything):
+BEGIN;
+LOCK TABLE orders IN ACCESS EXCLUSIVE MODE;
+-- Even SELECTs are blocked — use sparingly!
+ALTER TABLE orders ADD COLUMN new_col INT;
+COMMIT;
+</code></pre>
+      </details>
+      <details>
+        <summary>Database-level locking</summary>
+        <p>
+          The coarsest granularity. Locks the entire database, preventing any concurrent access.
+          Used during database restore, schema migration scripts, or single-user maintenance modes.
+        </p>
+<pre><code class="language-sql">
+-- SQL Server: set database to single-user mode
+ALTER DATABASE analytics SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+-- All other connections terminated and blocked
+-- Perform maintenance...
+ALTER DATABASE analytics SET MULTI_USER;
+
+-- PostgreSQL: prevent new connections during maintenance
+-- (No true database-level lock; use pg_hba.conf or connection limits)
+ALTER DATABASE warehouse CONNECTION LIMIT 0;  -- block new connections
+-- Existing connections remain active
+-- Perform maintenance...
+ALTER DATABASE warehouse CONNECTION LIMIT -1;  -- unlimited again
+
+-- SQLite: database-level locking is the ONLY option
+-- SHARED lock for readers, EXCLUSIVE lock for writers
+-- Only one writer at a time for the entire database file
+</code></pre>
+      </details>
+      <details>
+        <summary>Multigranularity locking protocol</summary>
+        <p>
+          The multigranularity protocol uses intent locks to efficiently combine locks at
+          different levels of the hierarchy. Before acquiring a fine-grained lock, the
+          transaction must acquire intent locks on all ancestor resources in the hierarchy.
+        </p>
+<pre><code class="language-bash">
+# Lock hierarchy: DATABASE → TABLE → PAGE → ROW
+#
+# Protocol rules:
+# 1. To acquire S or IS on a node, must hold IS or IX on parent
+# 2. To acquire X, IX, or SIX on a node, must hold IX or SIX on parent
+# 3. Locks are released in bottom-up order (or all at commit in 2PL)
+#
+# Example: UPDATE orders SET status='done' WHERE id = 42;
+#
+# Step 1: IX on DATABASE (intent to write somewhere in this DB)
+# Step 2: IX on TABLE orders (intent to write in this table)
+# Step 3: IX on PAGE containing row 42
+# Step 4: X on ROW id=42 (actual exclusive lock)
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  DATABASE ─── IX                                            │
+# │    └── TABLE orders ─── IX                                  │
+# │          └── PAGE 7 ─── IX                                  │
+# │                └── ROW id=42 ─── X                          │
+# └─────────────────────────────────────────────────────────────┘
+#
+# When T2 wants: LOCK TABLE orders IN EXCLUSIVE MODE;
+# Check TABLE orders: IX held by T1 → X request INCOMPATIBLE → WAIT
+# (No need to scan individual row locks!)
+#
+# This is the key insight: intent locks make table-level compatibility
+# checking O(1) instead of O(n) where n = number of locked rows.
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 5: LOCK COMPATIBILITY MATRIX
+         ============================================================ -->
+    <section id="lock-compatibility">
+      <h2>Lock Compatibility Matrix</h2>
+      <details>
+        <summary>Standard compatibility matrix (S, X, IS, IX, SIX)</summary>
+<pre><code class="language-bash">
+# Lock Compatibility Matrix
+# ─────────────────────────────────────────────────────────────────
+# "Y" = Compatible (both can be held simultaneously)
+# "N" = Incompatible (requester must wait)
+#
+# ┌──────────────┬──────┬──────┬──────┬──────┬──────┐
+# │  Requested → │  IS  │  IX  │   S  │  SIX │   X  │
+# │  Held ↓      │      │      │      │      │      │
+# ├──────────────┼──────┼──────┼──────┼──────┼──────┤
+# │  IS          │  Y   │  Y   │  Y   │  Y   │  N   │
+# │  IX          │  Y   │  Y   │  N   │  N   │  N   │
+# │  S           │  Y   │  N   │  Y   │  N   │  N   │
+# │  SIX         │  Y   │  N   │  N   │  N   │  N   │
+# │  X           │  N   │  N   │  N   │  N   │  N   │
+# └──────────────┴──────┴──────┴──────┴──────┴──────┘
+#
+# Key observations:
+# 1. X is incompatible with everything (total exclusion)
+# 2. IS is the most permissive (only conflicts with X)
+# 3. IX + IX = compatible (multiple writers to different rows)
+# 4. IX + S = incompatible (writer intent conflicts with full read lock)
+# 5. SIX = S + IX combined (read whole table + modify some rows)
+#    → only compatible with IS (readers of individual rows)
+</code></pre>
+      </details>
+      <details>
+        <summary>PostgreSQL table-level lock compatibility</summary>
+<pre><code class="language-bash">
+# PostgreSQL has 8 table-level lock modes with a more granular matrix:
+#
+# ┌─────────────────────────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+# │ Requested →             │ AS  │ RS  │ RE  │ SUE │ S   │ SRE │ E   │ AE  │
+# │ Held ↓                  │     │     │     │     │     │     │     │     │
+# ├─────────────────────────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
+# │ AccessShare (AS)        │  Y  │  Y  │  Y  │  Y  │  Y  │  Y  │  Y  │  N  │
+# │ RowShare (RS)           │  Y  │  Y  │  Y  │  Y  │  Y  │  Y  │  N  │  N  │
+# │ RowExclusive (RE)       │  Y  │  Y  │  Y  │  Y  │  N  │  N  │  N  │  N  │
+# │ ShareUpdateExcl (SUE)   │  Y  │  Y  │  Y  │  N  │  N  │  N  │  N  │  N  │
+# │ Share (S)               │  Y  │  Y  │  N  │  N  │  Y  │  N  │  N  │  N  │
+# │ ShareRowExcl (SRE)      │  Y  │  Y  │  N  │  N  │  N  │  N  │  N  │  N  │
+# │ Exclusive (E)           │  Y  │  N  │  N  │  N  │  N  │  N  │  N  │  N  │
+# │ AccessExclusive (AE)    │  N  │  N  │  N  │  N  │  N  │  N  │  N  │  N  │
+# └─────────────────────────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+#
+# Common operations → lock mode:
+# SELECT                          → AccessShareLock
+# SELECT FOR UPDATE               → RowShareLock
+# INSERT/UPDATE/DELETE            → RowExclusiveLock
+# VACUUM (non-FULL), ANALYZE     → ShareUpdateExclusiveLock
+# CREATE INDEX (non-concurrent)  → ShareLock
+# CREATE INDEX CONCURRENTLY      → ShareUpdateExclusiveLock
+# ALTER TABLE (most forms)       → AccessExclusiveLock
+# DROP TABLE                     → AccessExclusiveLock
+</code></pre>
+      </details>
+      <details>
+        <summary>Practical implications of the matrix</summary>
+<pre><code class="language-sql">
+-- Scenario 1: ETL writer vs OLTP readers
+-- ETL: INSERT INTO orders SELECT ... (acquires RowExclusiveLock on table)
+-- OLTP: SELECT * FROM orders WHERE id=42 (acquires AccessShareLock)
+-- Matrix: RowExclusive + AccessShare = COMPATIBLE ✓
+-- Both proceed concurrently (MVCC provides snapshot isolation for reader)
+
+-- Scenario 2: VACUUM vs DDL (dangerous!)
+-- VACUUM: acquires ShareUpdateExclusiveLock
+-- ALTER TABLE: needs AccessExclusiveLock
+-- Matrix: SUE + AE = INCOMPATIBLE
+-- ALTER TABLE waits for VACUUM to finish
+-- Problem: VACUUM on large table can take hours → DDL blocked for hours
+
+-- Scenario 3: Concurrent CREATE INDEX
+-- Non-concurrent: acquires ShareLock → blocks INSERT/UPDATE/DELETE
+CREATE INDEX idx_orders_date ON orders(order_date);
+-- ALL writes blocked until index build completes!
+
+-- Concurrent (preferred for production):
+CREATE INDEX CONCURRENTLY idx_orders_date ON orders(order_date);
+-- Acquires ShareUpdateExclusiveLock → only blocks VACUUM and DDL
+-- Writes proceed normally during index build (takes longer but non-blocking)
+
+-- Scenario 4: Two concurrent ALTER TABLE statements
+-- Both need AccessExclusiveLock → second waits for first
+-- Dangerous: if first ALTER is slow, second blocks, and ALL queries
+-- that arrive after the second ALTER also queue behind it!
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 6: DEADLOCKS
+         ============================================================ -->
+    <section id="deadlocks">
+      <h2>Deadlocks</h2>
+      <details>
+        <summary>What causes a deadlock</summary>
+        <p>
+          A deadlock occurs when two or more transactions form a cycle of dependencies: each
+          holds a resource the other needs, and neither can proceed. The four necessary conditions
+          (Coffman conditions) are:
+        </p>
+        <ul>
+          <li><strong>Mutual exclusion</strong> — resources cannot be shared (X locks)</li>
+          <li><strong>Hold and wait</strong> — transaction holds one lock while waiting for another</li>
+          <li><strong>No preemption</strong> — locks cannot be forcibly taken from a holder</li>
+          <li><strong>Circular wait</strong> — a cycle exists in the wait-for graph</li>
+        </ul>
+<pre><code class="language-sql">
+-- Classic deadlock scenario:
+-- T1: Transfer $100 from account A to account B
+-- T2: Transfer $50 from account B to account A
+
+-- T1:
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 'A';  -- X lock on A
+-- (context switch)
+
+-- T2:
+BEGIN;
+UPDATE accounts SET balance = balance - 50 WHERE id = 'B';   -- X lock on B
+UPDATE accounts SET balance = balance + 50 WHERE id = 'A';   -- WAIT (T1 holds X on A)
+
+-- T1 (continues):
+UPDATE accounts SET balance = balance + 100 WHERE id = 'B';  -- WAIT (T2 holds X on B)
+
+-- DEADLOCK: T1 waits for B (held by T2), T2 waits for A (held by T1)
+-- Cycle: T1 → B → T2 → A → T1
+</code></pre>
+      </details>
+      <details>
+        <summary>Detection via wait-for graph</summary>
+        <p>
+          The wait-for graph (WFG) is a directed graph where nodes represent transactions and
+          edges represent "waits for" relationships. A cycle in the WFG indicates a deadlock.
+          Most databases run a background deadlock detector thread that periodically traverses
+          this graph.
+        </p>
+<pre><code class="language-bash">
+# Wait-For Graph for the deadlock above:
+#
+#   T1 ──waits for B──→ T2
+#   ↑                     │
+#   └──── waits for A ────┘
+#
+# Cycle detected: T1 → T2 → T1
+#
+# Detection algorithms:
+#
+# 1. Periodic DFS/BFS on WFG (PostgreSQL)
+#    - Runs every deadlock_timeout (default: 1 second in PostgreSQL)
+#    - Triggered when a transaction has waited longer than deadlock_timeout
+#    - O(V + E) where V = waiting transactions, E = wait edges
+#
+# 2. Continuous edge tracking (SQL Server)
+#    - Lock manager maintains WFG incrementally
+#    - Checks for cycles on every new wait edge
+#    - Faster detection but slightly more overhead per lock request
+#
+# 3. Timeout-based (simpler systems, distributed databases)
+#    - If a transaction waits longer than threshold → assume deadlock
+#    - Simple but may abort transactions that aren't actually deadlocked
+#    - Used when maintaining a global WFG is impractical (distributed)
+#
+# PostgreSQL deadlock detection timeline:
+#   T=0:     Transaction starts waiting for lock
+#   T=1s:    deadlock_timeout fires → trigger deadlock check
+#   T=1.001s: WFG traversal finds cycle (or doesn't)
+#   T=1.002s: Victim selected → ERROR: deadlock detected
+</code></pre>
+      </details>
+      <details>
+        <summary>Victim selection</summary>
+        <p>
+          When a deadlock is detected, the database must abort one transaction (the "victim")
+          to break the cycle. Different databases use different cost heuristics:
+        </p>
+<pre><code class="language-bash">
+# Victim selection strategies:
+#
+# PostgreSQL:
+#   - Aborts the transaction that triggered the deadlock check
+#   - Simple: the one that most recently started waiting
+#   - No cost-based selection
+#
+# SQL Server:
+#   - DEADLOCK_PRIORITY setting (LOW, NORMAL, HIGH, or -10 to 10)
+#   - Among equal priorities: picks the cheapest to rollback
+#   - Cost = amount of log generated (work done so far)
+#   - SET DEADLOCK_PRIORITY LOW; — volunteer as victim
+#
+# Oracle:
+#   - Aborts the statement (not entire transaction) that detected the deadlock
+#   - Application must handle ORA-00060 and retry
+#
+# MySQL InnoDB:
+#   - Picks transaction with fewest undo log records (least work to rollback)
+#   - innodb_lock_wait_timeout (default 50s) for general lock waits
+</code></pre>
+<pre><code class="language-sql">
+-- SQL Server: control victim selection
+-- Mark ETL transactions as expendable:
+SET DEADLOCK_PRIORITY LOW;
+BEGIN TRANSACTION;
+-- If this deadlocks with an OLTP transaction, this one dies
+INSERT INTO staging_table SELECT * FROM source;
+COMMIT;
+
+-- Mark critical OLTP as protected:
+SET DEADLOCK_PRIORITY HIGH;
+BEGIN TRANSACTION;
+UPDATE accounts SET balance = balance - amount WHERE id = @id;
+COMMIT;
+</code></pre>
+      </details>
+      <details>
+        <summary>Prevention: consistent ordering</summary>
+        <p>
+          The most reliable deadlock prevention technique is <strong>consistent lock ordering</strong>:
+          all transactions acquire locks on resources in the same global order. If every
+          transaction locks account A before account B, the circular wait condition cannot form.
+        </p>
+<pre><code class="language-python">
+# Deadlock prevention via consistent ordering (application level):
+
+def transfer_funds(from_account, to_account, amount):
+    """Transfer funds with deadlock-free locking order."""
+    # Always lock the lower-ID account first
+    first_id = min(from_account, to_account)
+    second_id = max(from_account, to_account)
+
+    with db.transaction():
+        # Lock in consistent order (by account ID)
+        row1 = db.execute(
+            "SELECT balance FROM accounts WHERE id = %s FOR UPDATE",
+            (first_id,)
+        )
+        row2 = db.execute(
+            "SELECT balance FROM accounts WHERE id = %s FOR UPDATE",
+            (second_id,)
+        )
+
+        # Now perform the transfer
+        db.execute(
+            "UPDATE accounts SET balance = balance - %s WHERE id = %s",
+            (amount, from_account)
+        )
+        db.execute(
+            "UPDATE accounts SET balance = balance + %s WHERE id = %s",
+            (amount, to_account)
+        )
+
+# With this ordering:
+# Transfer(A→B): locks A, then B
+# Transfer(B→A): locks A, then B (NOT B then A!)
+# No cycle possible → no deadlock
+</code></pre>
+      </details>
+      <details>
+        <summary>Prevention: lock timeout</summary>
+<pre><code class="language-sql">
+-- PostgreSQL: set lock timeout to fail fast instead of deadlocking
+SET lock_timeout = '5s';  -- fail if lock not acquired within 5 seconds
+
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 'A';
+-- If another transaction holds the lock for > 5s:
+-- ERROR: canceling statement due to lock timeout
+
+-- Difference between lock_timeout and statement_timeout:
+-- lock_timeout: time waiting to ACQUIRE a lock
+-- statement_timeout: total execution time of the statement
+-- deadlock_timeout: time before deadlock detection check runs
+
+-- Recommended production settings:
+ALTER DATABASE mydb SET lock_timeout = '10s';
+ALTER DATABASE mydb SET statement_timeout = '30s';
+ALTER DATABASE mydb SET deadlock_timeout = '1s';  -- default
+
+-- MySQL InnoDB:
+SET innodb_lock_wait_timeout = 10;  -- seconds (default: 50)
+
+-- SQL Server:
+SET LOCK_TIMEOUT 5000;  -- milliseconds (default: -1 = wait forever)
+</code></pre>
+      </details>
+      <details>
+        <summary>Deadlocks in data engineering pipelines</summary>
+<pre><code class="language-bash">
+# Common deadlock patterns in ETL/ELT:
+#
+# 1. Concurrent partition loads:
+#    Pipeline A: INSERT INTO fact_table PARTITION (date='2024-01-15')
+#    Pipeline B: INSERT INTO fact_table PARTITION (date='2024-01-16')
+#    Both need IX on table → compatible, but if either needs table-level
+#    operations (statistics update, index maintenance) → potential deadlock
+#
+# 2. Merge/Upsert on overlapping key ranges:
+#    MERGE INTO target USING source ON target.id = source.id
+#    Two concurrent MERGE statements with overlapping IDs can deadlock
+#    if they lock rows in different orders (depends on index scan order)
+#
+# 3. Parent-child foreign key locks:
+#    T1: DELETE FROM orders WHERE customer_id = 42; (locks parent check)
+#    T2: INSERT INTO orders (customer_id) VALUES (42); (locks FK check)
+#    FK enforcement acquires S locks on parent → potential cycles
+#
+# 4. Index maintenance deadlocks:
+#    UPDATE touches column in index A (locks index A entry, then table row)
+#    Another UPDATE touches same row via index B (locks index B, then row)
+#    Different index traversal orders → different lock acquisition orders
+#
+# Prevention for pipelines:
+# • Partition data so concurrent jobs never touch same rows
+# • Use SERIALIZABLE isolation with retry logic (pessimistic but safe)
+# • Set short lock_timeout + retry at application level
+# • Process records in primary key order within each batch
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 7: LOCK ESCALATION
+         ============================================================ -->
+    <section id="lock-escalation">
+      <h2>Lock Escalation</h2>
+      <details>
+        <summary>SQL Server lock escalation behavior</summary>
+        <p>
+          Lock escalation is the process of converting many fine-grained locks (row or page)
+          into fewer coarse-grained locks (table). SQL Server triggers escalation when a single
+          transaction exceeds a threshold of locks on a single table.
+        </p>
+<pre><code class="language-bash">
+# SQL Server lock escalation thresholds:
+#
+# Default trigger: ~5,000 locks on a single table
+# (Actually dynamic: based on memory pressure and lock count)
+#
+# Escalation path: ROW → TABLE (skips page in modern versions)
+#
+# ┌────────────────────────────────────────────────────────────────┐
+# │  Timeline of escalation:                                       │
+# │                                                                │
+# │  T=0:    UPDATE orders SET status='x' WHERE date='2024-01-15' │
+# │  T=1:    Row lock #1 acquired                                  │
+# │  T=2:    Row lock #2 acquired                                  │
+# │  ...                                                           │
+# │  T=5000: Row lock #5000 acquired                               │
+# │  T=5001: ESCALATION TRIGGERED                                  │
+# │          - Attempt to acquire TABLE-level X lock                │
+# │          - If successful: release all 5000 row locks            │
+# │          - If blocked: keep row locks, retry at ~7500           │
+# │                                                                │
+# │  After escalation:                                             │
+# │  - ONE table lock replaces thousands of row locks               │
+# │  - Memory freed in lock manager                                 │
+# │  - BUT: entire table is now exclusively locked                  │
+# │  - ALL concurrent queries on this table are blocked!            │
+# └────────────────────────────────────────────────────────────────┘
+</code></pre>
+<pre><code class="language-sql">
+-- SQL Server: control lock escalation at table level
+-- Disable escalation entirely (risky — can exhaust lock memory):
+ALTER TABLE orders SET (LOCK_ESCALATION = DISABLE);
+
+-- Escalate to partition level instead of table (SQL Server 2008+):
+ALTER TABLE orders SET (LOCK_ESCALATION = AUTO);
+-- With partitioned table: escalates to partition lock, not table lock
+-- Non-partitioned table: behaves like TABLE mode
+
+-- Force table-level escalation (default):
+ALTER TABLE orders SET (LOCK_ESCALATION = TABLE);
+
+-- Monitor escalation events:
+SELECT * FROM sys.dm_exec_query_stats
+WHERE total_lock_escalation_count > 0;
+
+-- Trace lock escalation in real-time:
+-- Extended Events session:
+CREATE EVENT SESSION lock_escalation ON SERVER
+ADD EVENT sqlserver.lock_escalation
+ADD TARGET package0.ring_buffer;
+</code></pre>
+      </details>
+      <details>
+        <summary>Why SQL Server escalates — memory pressure</summary>
+<pre><code class="language-bash">
+# Lock memory management in SQL Server:
+#
+# Each lock structure: ~96 bytes (lock resource) + ~64 bytes (lock owner)
+# Bulk update of 10M rows: ~160 bytes × 10,000,000 = 1.6 GB of lock memory!
+#
+# SQL Server's lock memory pool:
+# • Dynamically allocated from buffer pool memory
+# • Default: up to 40% of SQL Server memory for locks
+# • If lock memory nears capacity → aggressive escalation
+# • If escalation fails → ERROR 1204 (lock resources exhausted)
+#
+# Production scenario:
+# ┌────────────────────────────────────────────────────────────────┐
+# │  ETL job: DELETE FROM events WHERE event_date < '2024-01-01'   │
+# │  Table has 500M rows matching predicate                         │
+# │                                                                │
+# │  Without escalation:                                           │
+# │  500M × 160 bytes = 80 GB lock memory (impossible!)            │
+# │                                                                │
+# │  With escalation (at 5000 locks):                              │
+# │  1 table lock = 160 bytes                                      │
+# │  But entire table locked → all queries blocked for hours        │
+# │                                                                │
+# │  Solution: batch the delete                                    │
+# │  WHILE EXISTS (SELECT 1 FROM events WHERE event_date < '...')  │
+# │    DELETE TOP (10000) FROM events WHERE event_date < '...'     │
+# │    -- Stays under 5000-lock threshold, no escalation           │
+# │    -- Brief X locks released between batches                   │
+# └────────────────────────────────────────────────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>PostgreSQL: no lock escalation</summary>
+        <p>
+          PostgreSQL does <strong>not</strong> perform lock escalation. Row-level locks are
+          stored in the tuple header (xmax field) rather than in a separate lock table, so
+          they consume no additional memory regardless of how many rows are locked.
+        </p>
+<pre><code class="language-bash">
+# PostgreSQL lock architecture — why no escalation is needed:
+#
+# ┌────────────────────────────────────────────────────────────────┐
+# │  Row-level "locks" in PostgreSQL:                              │
+# │                                                                │
+# │  • NOT stored in a lock table / lock manager                   │
+# │  • Stored in the tuple header (xmax field + infomask bits)     │
+# │  • xmax = transaction ID that locked/deleted the row           │
+# │  • No per-row memory allocation for locks!                     │
+# │                                                                │
+# │  UPDATE orders SET status='x' WHERE date = '2024-01-15';      │
+# │  • 10 million rows updated                                    │
+# │  • Zero additional lock memory consumed                        │
+# │  • Each row's xmax set to current transaction ID               │
+# │  • Other transactions check xmax to see if row is locked       │
+# │                                                                │
+# │  Table-level locks (in shared lock table):                     │
+# │  • Only ONE entry per transaction per table                    │
+# │  • RowExclusiveLock on 'orders' table                          │
+# │  • Regardless of whether you update 1 row or 10M rows          │
+# │  • Lock table memory: O(transactions × tables), not O(rows)    │
+# └────────────────────────────────────────────────────────────────┘
+#
+# Implications for data engineering:
+# • Bulk operations in PostgreSQL don't cause escalation surprises
+# • No "suddenly the whole table is locked" behavior
+# • BUT: long-running transactions hold xmax references → VACUUM can't clean
+# • Trade-off: no escalation but potential table bloat from dead tuples
+</code></pre>
+      </details>
+      <details>
+        <summary>MySQL InnoDB lock memory</summary>
+<pre><code class="language-sql">
+-- MySQL InnoDB: similar to PostgreSQL — no escalation
+-- Row locks stored in lock bitmaps per page (memory-efficient)
+-- Lock structure: one entry per page with a bitmap for locked rows
+-- 100 rows on a page with 50 locked = 1 lock struct + 100-bit bitmap
+
+-- Monitor lock memory:
+SELECT * FROM performance_schema.memory_summary_global_by_event_name
+WHERE event_name LIKE '%lock%';
+
+-- InnoDB lock wait monitoring:
+SELECT * FROM information_schema.INNODB_LOCK_WAITS;
+SELECT * FROM information_schema.INNODB_LOCKS;
+
+-- In MySQL 8.0+:
+SELECT * FROM performance_schema.data_locks;
+SELECT * FROM performance_schema.data_lock_waits;
+
+-- Key difference from SQL Server:
+-- No escalation occurs, but innodb_lock_wait_timeout (50s default)
+-- will abort a waiting transaction if it can't acquire the lock
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 8: ADVISORY LOCKS
+         ============================================================ -->
+    <section id="advisory-locks">
+      <h2>Advisory Locks</h2>
+      <details>
+        <summary>PostgreSQL pg_advisory_lock overview</summary>
+        <p>
+          Advisory locks are application-level locks managed by PostgreSQL but with no
+          connection to actual data. They provide a mechanism for applications to coordinate
+          using the database as a distributed lock manager. The database doesn't enforce
+          them automatically — the application must explicitly check and acquire them.
+        </p>
+<pre><code class="language-sql">
+-- Advisory lock functions in PostgreSQL:
+--
+-- Session-level (held until session ends or explicitly released):
+SELECT pg_advisory_lock(key);           -- blocking acquire
+SELECT pg_advisory_lock(key1, key2);    -- two-integer key
+SELECT pg_try_advisory_lock(key);       -- non-blocking (returns true/false)
+SELECT pg_advisory_unlock(key);         -- explicit release
+SELECT pg_advisory_unlock_all();        -- release all session locks
+
+-- Transaction-level (released at COMMIT/ROLLBACK):
+SELECT pg_advisory_xact_lock(key);      -- blocking acquire
+SELECT pg_try_advisory_xact_lock(key);  -- non-blocking
+
+-- Shared advisory locks (multiple holders allowed):
+SELECT pg_advisory_lock_shared(key);
+SELECT pg_try_advisory_lock_shared(key);
+
+-- Key space: bigint (single 64-bit key) or (int, int) pair
+-- Lock storage: in-memory, in PostgreSQL's lock table
+-- No WAL logging, no persistence — survives only as long as session
+</code></pre>
+      </details>
+      <details>
+        <summary>Use case: ETL job deduplication</summary>
+<pre><code class="language-python">
+# Problem: Airflow/cron may trigger the same ETL job concurrently
+# (scheduler overlap, manual re-run, retry after timeout)
+# Two concurrent instances of the same pipeline corrupt data.
+#
+# Solution: advisory lock as a distributed mutex
+
+import psycopg2
+import hashlib
+
+def get_lock_key(job_name: str) -> int:
+    """Generate a consistent lock key from job name."""
+    # Hash job name to a bigint key
+    h = hashlib.md5(job_name.encode()).hexdigest()
+    return int(h[:15], 16)  # 60-bit positive integer
+
+def run_etl_with_advisory_lock(job_name: str, conn_string: str):
+    """Run ETL job with advisory lock to prevent concurrent execution."""
+    lock_key = get_lock_key(job_name)
+
+    conn = psycopg2.connect(conn_string)
+    conn.autocommit = True  # advisory locks work outside transactions
+    cur = conn.cursor()
+
+    # Try to acquire lock (non-blocking)
+    cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+    acquired = cur.fetchone()[0]
+
+    if not acquired:
+        print(f"Job '{job_name}' is already running (lock {lock_key} held)")
+        conn.close()
+        return False  # skip this run
+
+    try:
+        print(f"Acquired lock {lock_key} for job '{job_name}'")
+        # === Run the actual ETL logic ===
+        execute_pipeline(job_name)
+        return True
+    finally:
+        # Release the lock
+        cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+        conn.close()
+
+# Usage in Airflow:
+# @task
+# def load_daily_orders():
+#     success = run_etl_with_advisory_lock(
+#         "load_daily_orders",
+#         POSTGRES_CONN_STRING
+#     )
+#     if not success:
+#         raise AirflowSkipException("Skipping — already running")
+</code></pre>
+      </details>
+      <details>
+        <summary>Use case: distributed locking for microservices</summary>
+<pre><code class="language-python">
+# Using PostgreSQL advisory locks as a lightweight distributed lock
+# (alternative to Redis/ZooKeeper for small-scale systems)
+
+import contextlib
+import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+
+@contextlib.contextmanager
+def distributed_lock(lock_name: str, conn_string: str, timeout_ms: int = 5000):
+    """
+    Context manager for distributed locking via PostgreSQL advisory locks.
+    
+    Advantages over Redis SETNX:
+    - Automatic release on connection drop (no stale locks)
+    - ACID guarantees on lock state
+    - No separate infrastructure to maintain
+    
+    Disadvantages:
+    - Tied to PostgreSQL availability
+    - Higher latency than Redis (~1ms vs ~0.1ms)
+    - Connection per lock holder
+    """
+    lock_key = hash(lock_name) & 0x7FFFFFFFFFFFFFFF  # positive bigint
+    
+    conn = psycopg2.connect(conn_string)
+    conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+    cur = conn.cursor()
+    
+    # Set lock timeout
+    cur.execute(f"SET lock_timeout = '{timeout_ms}ms'")
+    
+    try:
+        # Blocking acquire with timeout
+        cur.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+        yield  # Critical section
+    except psycopg2.errors.LockNotAvailable:
+        raise TimeoutError(f"Could not acquire lock '{lock_name}' within {timeout_ms}ms")
+    finally:
+        try:
+            cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+        except Exception:
+            pass  # Connection drop auto-releases
+        conn.close()
+
+# Usage:
+with distributed_lock("daily-revenue-calculation", CONN_STRING):
+    # Only one instance runs this code across all workers
+    compute_daily_revenue()
+    write_to_warehouse()
+</code></pre>
+      </details>
+      <details>
+        <summary>Use case: rate limiting and queue processing</summary>
+<pre><code class="language-sql">
+-- Advisory locks for exactly-once processing from a queue table:
+-- (Skip-locked pattern — PostgreSQL 9.5+)
+
+-- Queue table:
+CREATE TABLE job_queue (
+  id BIGSERIAL PRIMARY KEY,
+  payload JSONB NOT NULL,
+  status TEXT DEFAULT 'pending',
+  created_at TIMESTAMPTZ DEFAULT now(),
+  locked_by TEXT
+);
+
+-- Worker picks up a job with advisory lock (non-blocking):
+WITH next_job AS (
+  SELECT id, payload
+  FROM job_queue
+  WHERE status = 'pending'
+  ORDER BY created_at
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED  -- skip rows locked by other workers
+)
+UPDATE job_queue
+SET status = 'processing', locked_by = pg_backend_pid()::text
+FROM next_job
+WHERE job_queue.id = next_job.id
+RETURNING job_queue.id, job_queue.payload;
+
+-- Alternative: use advisory lock as a "processing slot" limiter
+-- Only allow N concurrent workers for a specific job type:
+DO $$
+DECLARE
+  slot INT;
+  acquired BOOLEAN;
+BEGIN
+  -- Try slots 1..10 for 'report-generation' job type
+  FOR slot IN 1..10 LOOP
+    SELECT pg_try_advisory_lock(hashtext('report-generation'), slot)
+    INTO acquired;
+    IF acquired THEN
+      -- Got a slot — proceed with work
+      PERFORM generate_report();
+      PERFORM pg_advisory_unlock(hashtext('report-generation'), slot);
+      RETURN;
+    END IF;
+  END LOOP;
+  -- All 10 slots occupied — reject or queue
+  RAISE NOTICE 'All processing slots full, job queued';
+END $$;
+</code></pre>
+      </details>
+      <details>
+        <summary>Monitoring advisory locks</summary>
+<pre><code class="language-sql">
+-- View currently held advisory locks:
+SELECT
+  l.locktype,
+  l.classid,       -- first key (if two-key form)
+  l.objid,         -- second key or single key
+  l.mode,
+  l.granted,
+  a.pid,
+  a.application_name,
+  a.query,
+  a.state,
+  age(now(), a.query_start) AS lock_duration
+FROM pg_locks l
+JOIN pg_stat_activity a ON l.pid = a.pid
+WHERE l.locktype = 'advisory'
+ORDER BY a.query_start;
+
+-- Check if a specific lock is held (without acquiring):
+SELECT EXISTS (
+  SELECT 1 FROM pg_locks
+  WHERE locktype = 'advisory'
+    AND objid = 12345
+    AND granted = true
+) AS is_locked;
+
+-- Warning signs:
+-- 1. Advisory locks held for hours → leaked lock (session didn't release)
+-- 2. Many sessions waiting on same advisory lock → bottleneck
+-- 3. advisory locks with granted=false → contention
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 9: MVCC VS LOCKING
+         ============================================================ -->
+    <section id="mvcc-vs-locking">
+      <h2>MVCC vs Pure Locking</h2>
+      <details>
+        <summary>How MVCC reduces the need for read locks</summary>
+        <p>
+          In a pure two-phase locking (2PL) system, readers acquire shared locks that block
+          writers, and writers acquire exclusive locks that block readers. This creates severe
+          contention in mixed workloads. MVCC (Multi-Version Concurrency Control) eliminates
+          this by keeping multiple versions of each row — readers see a consistent snapshot
+          without acquiring locks on the data.
+        </p>
+<pre><code class="language-bash">
+# Pure 2PL (SQL Server default under Read Committed without RCSI):
+#
+# ┌──────────────────┬───────────────────────────────────────────┐
+# │  Reader (T1)     │  Writer (T2)                              │
+# ├──────────────────┼───────────────────────────────────────────┤
+# │  SELECT balance  │                                           │
+# │  → Acquire S     │                                           │
+# │  → Read: $1000   │                                           │
+# │  → Release S     │  UPDATE balance = 900                     │
+# │                  │  → Acquire X (succeeds, S released)       │
+# │  SELECT balance  │  → Write: $900                            │
+# │  → Acquire S     │  → X held until COMMIT                   │
+# │  → BLOCKED! ←────│─── X held by T2                          │
+# │  (waits...)      │  COMMIT                                   │
+# │  → Read: $900    │  → Release X                              │
+# └──────────────────┴───────────────────────────────────────────┘
+# Reader blocked by writer — bad for mixed workloads!
+
+# MVCC (PostgreSQL, Oracle, MySQL InnoDB):
+#
+# ┌──────────────────┬───────────────────────────────────────────┐
+# │  Reader (T1)     │  Writer (T2)                              │
+# ├──────────────────┼───────────────────────────────────────────┤
+# │  SELECT balance  │                                           │
+# │  → No lock!      │                                           │
+# │  → Read v1: $1000│                                           │
+# │                  │  UPDATE balance = 900                     │
+# │                  │  → Acquire X on row (for other writers)   │
+# │                  │  → Create new version v2: $900            │
+# │  SELECT balance  │  → X held until COMMIT                   │
+# │  → No lock!      │                                           │
+# │  → Read v1: $1000│  (reads old version — snapshot isolation) │
+# │  → NOT BLOCKED!  │  COMMIT                                   │
+# └──────────────────┴───────────────────────────────────────────┘
+# Reader never blocked by writer — massive concurrency improvement!
+</code></pre>
+      </details>
+      <details>
+        <summary>When locks are still needed under MVCC</summary>
+        <p>
+          MVCC doesn't eliminate all locking. Several scenarios still require explicit locks:
+        </p>
+<pre><code class="language-sql">
+-- 1. Write-write conflicts (X locks still required):
+-- T1: UPDATE accounts SET balance = 900 WHERE id = 42; -- X lock on row
+-- T2: UPDATE accounts SET balance = 800 WHERE id = 42; -- WAITS for T1's X
+-- MVCC doesn't help: both want to MODIFY the same current row
+
+-- 2. SELECT FOR UPDATE (explicit pessimistic lock):
+BEGIN;
+SELECT balance FROM accounts WHERE id = 42 FOR UPDATE;
+-- Acquires X lock — prevents concurrent modifications
+-- Use case: read-then-write patterns that need atomicity
+-- E.g., check balance >= amount, then debit
+UPDATE accounts SET balance = balance - 100 WHERE id = 42;
+COMMIT;
+
+-- 3. Serializable isolation (PostgreSQL SSI):
+-- Uses predicate locks (SIReadLock) to detect serialization anomalies
+-- Not blocking locks — but track read sets for conflict detection
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+BEGIN;
+SELECT sum(balance) FROM accounts WHERE branch = 'NYC';
+-- PostgreSQL records "this transaction read WHERE branch='NYC'"
+-- If concurrent transaction inserts/modifies matching rows → abort one
+
+-- 4. DDL operations (schema locks):
+ALTER TABLE orders ADD COLUMN priority INT;
+-- AccessExclusiveLock on table — blocks ALL operations including SELECT
+-- MVCC cannot provide a "schema snapshot" — DDL needs full exclusion
+
+-- 5. Foreign key checks:
+INSERT INTO orders (customer_id, amount) VALUES (42, 100);
+-- Acquires RowShareLock on customers table (prevents customer deletion)
+-- Without this: concurrent DELETE FROM customers WHERE id=42 would
+-- leave orphan orders
+
+-- 6. VACUUM and maintenance:
+VACUUM orders;
+-- ShareUpdateExclusiveLock on table — blocks DDL but not DML
+-- Needs exclusive access to clean dead tuples (not conflicting with MVCC reads)
+</code></pre>
+      </details>
+      <details>
+        <summary>Comparison table: MVCC vs 2PL trade-offs</summary>
+<pre><code class="language-bash">
+# ┌────────────────────────┬───────────────────────┬─────────────────────────┐
+# │  Aspect               │  Pure 2PL             │  MVCC + Locks           │
+# ├────────────────────────┼───────────────────────┼─────────────────────────┤
+# │  Readers vs writers    │  Block each other     │  Never block            │
+# │  Writers vs writers    │  Block each other     │  Block each other       │
+# │  Read throughput       │  Lower (lock waits)   │  Higher (no read locks) │
+# │  Storage overhead      │  Minimal              │  Multiple versions      │
+# │  VACUUM/GC needed      │  No                   │  Yes (dead tuples)      │
+# │  Deadlock risk         │  Higher (more locks)  │  Lower (fewer locks)    │
+# │  Implementation        │  Simpler              │  Complex (versioning)   │
+# │  Serializable          │  Natural (via locks)  │  SSI / predicate locks  │
+# │  Rollback cost         │  Undo via log         │  Just discard version   │
+# │  Long transactions     │  Block others         │  Cause bloat (can't GC) │
+# │  Analytics + OLTP      │  Painful              │  Natural fit            │
+# ├────────────────────────┼───────────────────────┼─────────────────────────┤
+# │  Used by               │  SQL Server (default) │  PostgreSQL, Oracle,    │
+# │                        │  MySQL MyISAM         │  MySQL InnoDB, CockroachDB│
+# │                        │  SQLite (exclusive)   │  Snowflake, BigQuery    │
+# └────────────────────────┴───────────────────────┴─────────────────────────┘
+#
+# Note: SQL Server supports MVCC via READ_COMMITTED_SNAPSHOT_ISOLATION (RCSI)
+# and SNAPSHOT isolation level (must be explicitly enabled per database):
+# ALTER DATABASE mydb SET READ_COMMITTED_SNAPSHOT ON;
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 10: DISTRIBUTED LOCKING
+         ============================================================ -->
+    <section id="distributed-locking">
+      <h2>Locking in Distributed Systems</h2>
+      <details>
+        <summary>BigQuery slot contention</summary>
+        <p>
+          BigQuery doesn't use traditional row/table locks. Instead, contention manifests as
+          <strong>slot contention</strong> (compute resources) and <strong>table mutation
+          conflicts</strong> (concurrent DML on the same table).
+        </p>
+<pre><code class="language-bash">
+# BigQuery concurrency model:
+#
+# ┌──────────────────────────────────────────────────────────────────┐
+# │  READS: No locks. Snapshot isolation via immutable columnar files│
+# │         Multiple queries can read the same table simultaneously  │
+# │         Each sees a consistent snapshot at query start time      │
+# │                                                                  │
+# │  WRITES (DML): Table-level mutation lock                         │
+# │  • Only one DML statement can modify a table at a time           │
+# │  • Concurrent DMLs queue behind each other                       │
+# │  • Quota: 20 DML statements per table per day (legacy)           │
+# │  • Now: rate-limited, not hard-capped                            │
+# │                                                                  │
+# │  STREAMING INSERTS: No table lock (append-only buffer)           │
+# │  • Rows buffered in streaming buffer, eventually materialized    │
+# │  • No conflict with batch DML or queries                         │
+# │                                                                  │
+# │  SLOT CONTENTION:                                                │
+# │  • On-demand: 2000 slots shared across project                   │
+# │  • If all slots busy: query queues (no error, just latency)      │
+# │  • Flat-rate: dedicated slots per reservation                    │
+# │  • Symptoms: query start latency, "Resources exceeded" errors    │
+# └──────────────────────────────────────────────────────────────────┘
+</code></pre>
+<pre><code class="language-sql">
+-- BigQuery: detect slot contention via INFORMATION_SCHEMA
+SELECT
+  job_id,
+  start_time,
+  end_time,
+  TIMESTAMP_DIFF(start_time, creation_time, SECOND) AS queue_seconds,
+  total_slot_ms,
+  state
+FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+WHERE creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+  AND TIMESTAMP_DIFF(start_time, creation_time, SECOND) > 5
+ORDER BY queue_seconds DESC;
+-- queue_seconds > 5 indicates slot contention (query waited to start)
+
+-- BigQuery DML concurrency error:
+-- "Could not serialize access due to concurrent DML statements"
+-- Solution: serialize DML operations on the same table
+-- Or use MERGE instead of separate INSERT + UPDATE
+</code></pre>
+      </details>
+      <details>
+        <summary>Snowflake warehouse locks and table locks</summary>
+<pre><code class="language-bash">
+# Snowflake concurrency model:
+#
+# ┌──────────────────────────────────────────────────────────────────┐
+# │  Architecture: Separation of storage and compute                 │
+# │  Lock granularity: TABLE level for DML, partition-level internal │
+# │                                                                  │
+# │  READ vs WRITE:                                                  │
+# │  • Readers never block writers (MVCC via micro-partitions)       │
+# │  • Writers never block readers                                   │
+# │  • Multiple readers always concurrent                            │
+# │                                                                  │
+# │  WRITE vs WRITE (same table):                                    │
+# │  • INSERT: concurrent (append to different micro-partitions)     │
+# │  • UPDATE/DELETE/MERGE: table-level lock                         │
+# │    - Only one UPDATE/DELETE/MERGE at a time per table            │
+# │    - Subsequent writes queue (up to lock timeout)                │
+# │                                                                  │
+# │  DDL:                                                            │
+# │  • ALTER TABLE, DROP TABLE: exclusive table lock                 │
+# │  • Blocks all other operations until complete                    │
+# │                                                                  │
+# │  Warehouse contention:                                           │
+# │  • Each warehouse has fixed compute resources                    │
+# │  • Too many concurrent queries → queueing                       │
+# │  • Multi-cluster warehouse auto-scales (additional clusters)     │
+# └──────────────────────────────────────────────────────────────────┘
+</code></pre>
+<pre><code class="language-sql">
+-- Snowflake: monitor lock contention
+-- Check blocked queries:
+SELECT
+  query_id,
+  query_text,
+  execution_status,
+  blocked_query_id,
+  DATEDIFF('second', start_time, end_time) AS duration_seconds
+FROM snowflake.account_usage.query_history
+WHERE execution_status = 'BLOCKED'
+  AND start_time > DATEADD('hour', -6, CURRENT_TIMESTAMP())
+ORDER BY start_time DESC;
+
+-- Set statement-level lock timeout:
+ALTER SESSION SET LOCK_TIMEOUT = 300;  -- 300 seconds (default: 43200 = 12h!)
+
+-- Common Snowflake lock contention scenario:
+-- Pipeline A: MERGE INTO target USING staging ON ...  (takes 10 min)
+-- Pipeline B: INSERT INTO target SELECT ...           (queued behind A)
+-- Pipeline C: DELETE FROM target WHERE date < ...     (queued behind B)
+-- Solution: schedule non-overlapping windows, or partition into separate tables
+</code></pre>
+      </details>
+      <details>
+        <summary>Spark write conflicts on Delta Lake</summary>
+<pre><code class="language-bash">
+# Delta Lake: optimistic concurrency control (not locking)
+#
+# ┌──────────────────────────────────────────────────────────────────┐
+# │  Delta Lake uses OPTIMISTIC CONCURRENCY:                         │
+# │  • No locks acquired before writing                              │
+# │  • At commit time: check if concurrent writes conflict           │
+# │  • If conflict detected: FAIL the commit (ConcurrentModification)│
+# │  • Application must retry                                        │
+# │                                                                  │
+# │  Conflict rules:                                                 │
+# │  • Two APPEND operations → NEVER conflict (different files)      │
+# │  • APPEND vs UPDATE/DELETE → conflict only if touching same files│
+# │  • Two UPDATEs on same partition → ALWAYS conflict               │
+# │  • UPDATE + OPTIMIZE → may conflict                              │
+# │                                                                  │
+# │  Conflict detection mechanism:                                   │
+# │  1. Transaction reads current version (snapshot) at start        │
+# │  2. Transaction writes new files                                 │
+# │  3. At commit: check if snapshot version is still current        │
+# │  4. If not: check if any new commits touch the same files/rows   │
+# │  5. If overlap: ConcurrentModificationException → retry          │
+# └──────────────────────────────────────────────────────────────────┘
+</code></pre>
+<pre><code class="language-python">
+# Delta Lake write conflict handling:
+from delta.tables import DeltaTable
+from pyspark.sql.functions import col
+import time
+
+def safe_merge_with_retry(spark, target_path, source_df, merge_key,
+                          max_retries=3, backoff_base=5):
+    """
+    Perform Delta Lake MERGE with retry on concurrent modification.
+    """
+    for attempt in range(max_retries):
+        try:
+            target = DeltaTable.forPath(spark, target_path)
+            target.alias("t").merge(
+                source_df.alias("s"),
+                f"t.{merge_key} = s.{merge_key}"
+            ).whenMatchedUpdateAll() \
+             .whenNotMatchedInsertAll() \
+             .execute()
+            return  # Success
+        except Exception as e:
+            if "ConcurrentModificationException" in str(e) or \
+               "ConcurrentAppendException" in str(e):
+                wait_time = backoff_base * (2 ** attempt)
+                print(f"Write conflict (attempt {attempt + 1}), "
+                      f"retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise  # Non-retryable error
+    raise RuntimeError(f"Failed after {max_retries} retries due to conflicts")
+
+# Delta Lake isolation levels:
+# WriteSerializable (default): writes are serializable, reads snapshot
+# Serializable: full serializability (stricter conflict detection)
+spark.sql("""
+  ALTER TABLE delta.`s3://warehouse/orders/`
+  SET TBLPROPERTIES ('delta.isolationLevel' = 'WriteSerializable')
+""")
+
+# Enable automatic conflict resolution for appends:
+spark.sql("""
+  ALTER TABLE delta.`s3://warehouse/events/`
+  SET TBLPROPERTIES ('delta.enableChangeDataFeed' = true)
+""")
+</code></pre>
+      </details>
+      <details>
+        <summary>Distributed lock services (ZooKeeper, etcd, Redis)</summary>
+<pre><code class="language-bash">
+# When database advisory locks aren't sufficient:
+# (cross-database, cross-service, or non-PostgreSQL environments)
+#
+# ┌───────────────────────────────────────────────────────────────────┐
+# │  Service     │  Mechanism        │  Use Case                      │
+# ├──────────────┼───────────────────┼────────────────────────────────┤
+# │  ZooKeeper   │  Ephemeral znodes │  Leader election, config locks │
+# │  etcd        │  Lease + KV       │  Kubernetes, distributed mutex │
+# │  Redis       │  SETNX + TTL      │  Rate limiting, job dedup      │
+# │  DynamoDB    │  Conditional write│  Serverless distributed locks  │
+# │  PostgreSQL  │  Advisory locks   │  App-level coordination        │
+# └──────────────┴───────────────────┴────────────────────────────────┘
+#
+# Redis Redlock algorithm (distributed lock across N Redis instances):
+# 1. Get current timestamp
+# 2. Try to acquire lock on N/2+1 Redis instances (majority)
+# 3. If majority acquired within TTL window → lock granted
+# 4. If failed → release all acquired locks, retry with backoff
+#
+# Caution: Redis Redlock has known issues (Martin Kleppmann's analysis)
+# - Clock drift between nodes can cause split-brain
+# - Network partitions can lead to two holders
+# - For critical correctness: use ZooKeeper/etcd consensus-based locks
+# - For performance locks (deduplication): Redis is fine
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 11: PRODUCTION INCIDENT
+         ============================================================ -->
+    <section id="production-incident">
+      <h2>Production Incident: Deadlock Cascade During ETL + OLTP</h2>
+      <details>
+        <summary>Incident timeline</summary>
+<pre><code class="language-bash">
+# INCIDENT REPORT: Deadlock Storm on Shared PostgreSQL
+# Severity: P1 (customer-facing API degradation)
+# Duration: 45 minutes
+# Impact: 30% API error rate, 12x latency increase
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  TIMELINE                                                       │
+# ├─────────────────────────────────────────────────────────────────┤
+# │  02:00 UTC — Nightly ETL pipeline starts                        │
+# │    Job: MERGE INTO orders USING staging_orders ON id = id       │
+# │    Scope: 2.5M rows updated, 500K rows inserted                 │
+# │    Table: orders (shared between OLTP API and analytics ETL)    │
+# │                                                                 │
+# │  02:05 UTC — ETL acquires RowExclusiveLock on orders table      │
+# │    Begins updating rows in batches (100K per transaction)       │
+# │    X locks held on rows being updated                           │
+# │                                                                 │
+# │  02:07 UTC — OLTP API processes customer order updates          │
+# │    Endpoint: PATCH /orders/:id (single row UPDATE)              │
+# │    Pattern: SELECT FOR UPDATE → business logic → UPDATE         │
+# │    First deadlocks appear in application logs                   │
+# │                                                                 │
+# │  02:08 UTC — Deadlock cascade begins                            │
+# │    ETL locks rows A, B, C (sequential by batch)                 │
+# │    API request 1: locks row D, needs row B → WAIT              │
+# │    API request 2: locks row E, needs row A → WAIT              │
+# │    ETL batch needs row D (FK check) → DEADLOCK with request 1  │
+# │                                                                 │
+# │  02:10 UTC — PostgreSQL kills ETL transaction (deadlock victim) │
+# │    ETL retries immediately → acquires new locks                 │
+# │    More API requests arrive → more deadlocks                    │
+# │    Error rate: 5% → 15% → 30%                                  │
+# │                                                                 │
+# │  02:15 UTC — PagerDuty alert fires (error rate > 10%)           │
+# │    On-call engineer investigates                                │
+# │                                                                 │
+# │  02:25 UTC — Root cause identified: ETL + API lock contention   │
+# │    ETL killed manually: SELECT pg_terminate_backend(etl_pid);   │
+# │                                                                 │
+# │  02:30 UTC — Error rate returns to normal                       │
+# │    Dead tuples from rolled-back ETL transactions → VACUUM       │
+# │                                                                 │
+# │  02:45 UTC — VACUUM completes, latency fully normalized         │
+# └─────────────────────────────────────────────────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>Root cause analysis</summary>
+<pre><code class="language-sql">
+-- ROOT CAUSE: ETL and OLTP competing for row-level X locks
+-- on the same table with different lock acquisition orders.
+
+-- ETL pattern (batch sequential order by internal ID):
+BEGIN;
+UPDATE orders
+SET status = staging.status, amount = staging.amount
+FROM staging_orders staging
+WHERE orders.id = staging.id
+  AND orders.id BETWEEN 1000001 AND 1100000;  -- batch by ID range
+-- Locks rows 1000001..1100000 in ID order
+COMMIT;
+
+-- OLTP pattern (random access by customer request):
+BEGIN;
+SELECT * FROM orders WHERE id = 1050000 FOR UPDATE;
+-- Application logic (50-200ms)
+UPDATE orders SET status = 'shipped' WHERE id = 1050000;
+-- Also triggers FK check: SELECT ... FROM customers WHERE id = X FOR SHARE
+COMMIT;
+
+-- The deadlock:
+-- 1. ETL locks row 1050000 (in its batch range)
+-- 2. OLTP request arrives: tries to lock row 1050000 → WAITS
+-- 3. ETL continues: hits FK check → needs shared lock on customers row 42
+-- 4. Different OLTP request: already holds lock on customers row 42
+--    (doing: UPDATE customers SET last_order_date = now() WHERE id = 42)
+--    and is waiting for orders row 1050100 (in ETL's batch)
+-- 5. CYCLE: ETL → customers.42 → OLTP_2 → orders.1050100 → ETL
+-- 6. PostgreSQL detects deadlock → kills ETL (more work to rollback)
+-- 7. ETL retries → same scenario repeats with new batch overlap
+
+-- Why this wasn't caught before:
+-- • ETL previously ran at 04:00 (zero OLTP traffic)
+-- • Cron schedule changed to 02:00 (overlaps with west-coast users)
+-- • No lock_timeout set on ETL connection
+-- • No deadlock monitoring/alerting
+</code></pre>
+      </details>
+      <details>
+        <summary>Fix and prevention measures</summary>
+<pre><code class="language-sql">
+-- FIX 1: Temporal separation (immediate)
+-- Move ETL back to 04:00-05:00 UTC (no OLTP traffic)
+-- Schedule via Airflow with SLA check:
+--   Only run if API request rate < 10 req/min
+
+-- FIX 2: Reduce lock hold time (medium-term)
+-- Before: single transaction updating 100K rows (holds locks for minutes)
+-- After: micro-batches of 1000 rows with explicit commits
+
+DO $$
+DECLARE
+  batch_start BIGINT := 1;
+  batch_size BIGINT := 1000;
+  max_id BIGINT;
+BEGIN
+  SELECT max(id) INTO max_id FROM staging_orders;
+  WHILE batch_start <= max_id LOOP
+    UPDATE orders o
+    SET status = s.status, amount = s.amount
+    FROM staging_orders s
+    WHERE o.id = s.id
+      AND o.id >= batch_start
+      AND o.id < batch_start + batch_size;
+    COMMIT;  -- Release locks between batches
+    batch_start := batch_start + batch_size;
+    PERFORM pg_sleep(0.1);  -- 100ms breathing room for OLTP
+  END LOOP;
+END $$;
+
+-- FIX 3: Set lock_timeout on ETL connections
+ALTER ROLE etl_user SET lock_timeout = '5s';
+-- ETL fails fast if it can't get a lock, instead of causing cascade
+-- Application retries individual failed batches
+
+-- FIX 4: Use advisory locks to coordinate
+-- ETL acquires advisory lock before processing each partition:
+SELECT pg_advisory_lock(hashtext('orders_etl'));
+-- OLTP checks and backs off if ETL is running:
+-- (Or: OLTP doesn't use FOR UPDATE, relies on MVCC snapshot)
+
+-- FIX 5: Eliminate SELECT FOR UPDATE in OLTP (long-term)
+-- Before: pessimistic locking
+BEGIN;
+SELECT * FROM orders WHERE id = :id FOR UPDATE;  -- acquires X lock
+-- business logic
+UPDATE orders SET status = :new_status WHERE id = :id;
+COMMIT;
+
+-- After: optimistic concurrency with version column
+UPDATE orders
+SET status = :new_status, version = version + 1
+WHERE id = :id AND version = :expected_version;
+-- If 0 rows affected → conflict detected → retry at application level
+-- No FOR UPDATE → no long-held row locks → no deadlock with ETL
+</code></pre>
+      </details>
+      <details>
+        <summary>Lessons learned</summary>
+        <ul>
+          <li><strong>Never share tables between ETL and OLTP without lock budgeting</strong> — use separate schemas, read replicas, or temporal separation</li>
+          <li><strong>Set lock_timeout on all connections</strong> — fail fast rather than cascade</li>
+          <li><strong>Batch DML with intermediate commits</strong> — 1K-10K rows per transaction, not 100K+</li>
+          <li><strong>Monitor deadlock frequency</strong> — alert when deadlocks/hour exceeds baseline</li>
+          <li><strong>Prefer optimistic concurrency for OLTP</strong> — version columns avoid long lock holds</li>
+          <li><strong>Add pg_sleep between ETL batches</strong> — gives OLTP transactions time to complete</li>
+          <li><strong>Consider read replicas for analytics queries</strong> — zero lock contention with primary</li>
+          <li><strong>Log and alert on pg_stat_activity.wait_event = 'Lock'</strong> — early warning before deadlocks</li>
+        </ul>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 12: DEBUGGING WORKFLOW
+         ============================================================ -->
+    <section id="debugging-workflow">
+      <h2>Debugging Workflow: pg_locks, pg_stat_activity, Blocking Queries</h2>
+      <details>
+        <summary>pg_locks — viewing all current locks</summary>
+<pre><code class="language-sql">
+-- Basic lock view: what locks exist right now?
+SELECT
+  l.locktype,
+  l.relation::regclass AS table_name,
+  l.mode,
+  l.granted,
+  l.pid,
+  a.usename,
+  a.application_name,
+  a.state,
+  LEFT(a.query, 80) AS query_preview,
+  age(now(), a.xact_start) AS transaction_age
+FROM pg_locks l
+JOIN pg_stat_activity a ON l.pid = a.pid
+WHERE l.locktype = 'relation'  -- table-level locks
+  AND l.relation IS NOT NULL
+ORDER BY a.xact_start;
+
+-- Interpretation:
+-- granted=true  → lock is held (this process has the lock)
+-- granted=false → lock is WAITING (this process is blocked)
+-- mode: AccessShareLock, RowExclusiveLock, AccessExclusiveLock, etc.
+-- transaction_age: how long this transaction has been open
+</code></pre>
+      </details>
+      <details>
+        <summary>Finding blocking queries</summary>
+<pre><code class="language-sql">
+-- THE essential query: who is blocking whom?
+SELECT
+  blocked_locks.pid AS blocked_pid,
+  blocked_activity.usename AS blocked_user,
+  LEFT(blocked_activity.query, 60) AS blocked_query,
+  blocking_locks.pid AS blocking_pid,
+  blocking_activity.usename AS blocking_user,
+  LEFT(blocking_activity.query, 60) AS blocking_query,
+  age(now(), blocked_activity.xact_start) AS blocked_duration,
+  age(now(), blocking_activity.xact_start) AS blocking_duration
+FROM pg_locks blocked_locks
+JOIN pg_stat_activity blocked_activity
+  ON blocked_activity.pid = blocked_locks.pid
+JOIN pg_locks blocking_locks
+  ON blocking_locks.locktype = blocked_locks.locktype
+  AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+  AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+  AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+  AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+  AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
+  AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+  AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+  AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+  AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+  AND blocking_locks.pid != blocked_locks.pid
+JOIN pg_stat_activity blocking_activity
+  ON blocking_activity.pid = blocking_locks.pid
+WHERE NOT blocked_locks.granted
+  AND blocking_locks.granted
+ORDER BY blocked_activity.xact_start;
+
+-- Simpler version (PostgreSQL 14+):
+SELECT * FROM pg_blocking_pids(blocked_pid);
+
+-- Or use pg_stat_activity.wait_event_type:
+SELECT
+  pid,
+  wait_event_type,
+  wait_event,
+  state,
+  LEFT(query, 80) AS query,
+  age(now(), xact_start) AS tx_duration
+FROM pg_stat_activity
+WHERE wait_event_type = 'Lock'
+ORDER BY xact_start;
+</code></pre>
+      </details>
+      <details>
+        <summary>pg_stat_activity — active sessions and their state</summary>
+<pre><code class="language-sql">
+-- Full diagnostic view of all connections:
+SELECT
+  pid,
+  usename,
+  application_name,
+  client_addr,
+  state,                    -- active, idle, idle in transaction
+  wait_event_type,          -- Lock, IO, Client, etc.
+  wait_event,               -- specific wait (relation, transactionid, etc.)
+  LEFT(query, 100) AS query,
+  xact_start,               -- when current transaction started
+  query_start,              -- when current query started
+  age(now(), xact_start) AS tx_age,
+  age(now(), query_start) AS query_age
+FROM pg_stat_activity
+WHERE state != 'idle'
+  AND pid != pg_backend_pid()  -- exclude self
+ORDER BY xact_start NULLS LAST;
+
+-- DANGER: "idle in transaction" connections
+-- These hold locks but do nothing — often forgotten transactions
+SELECT
+  pid,
+  usename,
+  application_name,
+  age(now(), xact_start) AS idle_tx_duration,
+  LEFT(query, 80) AS last_query
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND xact_start < now() - interval '5 minutes';
+
+-- Kill long-idle transactions (with caution):
+-- Graceful cancel (cancels current query):
+SELECT pg_cancel_backend(pid);
+-- Force terminate (closes connection):
+SELECT pg_terminate_backend(pid);
+</code></pre>
+      </details>
+      <details>
+        <summary>lock_timeout and statement_timeout settings</summary>
+<pre><code class="language-sql">
+-- Defensive settings for production PostgreSQL:
+
+-- Per-session lock timeout (fail if lock not acquired):
+SET lock_timeout = '10s';
+
+-- Per-role defaults (recommended):
+ALTER ROLE api_user SET lock_timeout = '5s';
+ALTER ROLE api_user SET statement_timeout = '30s';
+
+ALTER ROLE etl_user SET lock_timeout = '30s';
+ALTER ROLE etl_user SET statement_timeout = '3600s';  -- 1 hour for ETL
+
+ALTER ROLE analytics_user SET statement_timeout = '300s';  -- 5 min max
+
+-- Relationship between timeouts:
+-- ┌─────────────────────────────────────────────────────────────────┐
+-- │  deadlock_timeout (default: 1s)                                 │
+-- │    How long before deadlock detection runs                      │
+-- │    Does NOT abort — just triggers cycle check                   │
+-- │                                                                 │
+-- │  lock_timeout (default: 0 = disabled!)                          │
+-- │    Max time waiting to acquire ANY lock                         │
+-- │    ERROR: canceling statement due to lock timeout               │
+-- │    ALWAYS set this in production!                               │
+-- │                                                                 │
+-- │  statement_timeout (default: 0 = disabled!)                     │
+-- │    Max total execution time for any statement                   │
+-- │    Includes compute time + lock wait time                       │
+-- │                                                                 │
+-- │  idle_in_transaction_session_timeout (default: 0 = disabled!)   │
+-- │    Max time a session can sit idle with an open transaction     │
+-- │    Prevents leaked transactions from holding locks indefinitely │
+-- │    CRITICAL: set to 5-30 minutes in production                  │
+-- └─────────────────────────────────────────────────────────────────┘
+
+-- Recommended production configuration (postgresql.conf):
+-- deadlock_timeout = 1s
+-- lock_timeout = 0 (set per-role instead)
+-- statement_timeout = 0 (set per-role instead)
+-- idle_in_transaction_session_timeout = 300000  -- 5 minutes (ms)
+</code></pre>
+      </details>
+      <details>
+        <summary>Lock monitoring dashboard query</summary>
+<pre><code class="language-sql">
+-- Comprehensive lock monitoring — run periodically or as a dashboard:
+
+-- 1. Lock wait chain (who blocks whom, with depth):
+WITH RECURSIVE lock_chain AS (
+  -- Base: processes that are blocked
+  SELECT
+    blocked.pid AS blocked_pid,
+    blocked.pid AS root_blocked_pid,
+    blocking.pid AS blocking_pid,
+    1 AS depth,
+    ARRAY[blocking.pid] AS chain
+  FROM pg_locks blocked
+  JOIN pg_locks blocking
+    ON blocking.locktype = blocked.locktype
+    AND blocking.relation = blocked.relation
+    AND blocking.pid != blocked.pid
+    AND blocked.granted = false
+    AND blocking.granted = true
+
+  UNION ALL
+
+  -- Recursive: follow the chain upward
+  SELECT
+    lc.root_blocked_pid,
+    lc.blocked_pid,
+    blocking.pid,
+    lc.depth + 1,
+    lc.chain || blocking.pid
+  FROM lock_chain lc
+  JOIN pg_locks blocked ON blocked.pid = lc.blocking_pid AND NOT blocked.granted
+  JOIN pg_locks blocking
+    ON blocking.locktype = blocked.locktype
+    AND blocking.relation = blocked.relation
+    AND blocking.pid != blocked.pid
+    AND blocking.granted = true
+  WHERE lc.depth < 10
+    AND NOT blocking.pid = ANY(lc.chain)  -- prevent infinite loops
+)
+SELECT
+  lc.root_blocked_pid,
+  lc.blocking_pid AS root_blocker_pid,
+  lc.depth AS chain_length,
+  a.usename AS blocker_user,
+  LEFT(a.query, 60) AS blocker_query,
+  age(now(), a.xact_start) AS blocker_tx_age
+FROM lock_chain lc
+JOIN pg_stat_activity a ON a.pid = lc.blocking_pid
+WHERE lc.depth = (
+  SELECT max(depth) FROM lock_chain lc2
+  WHERE lc2.root_blocked_pid = lc.root_blocked_pid
+)
+ORDER BY chain_length DESC;
+
+-- 2. Table lock summary:
+SELECT
+  l.relation::regclass AS table_name,
+  l.mode,
+  count(*) AS lock_count,
+  count(*) FILTER (WHERE NOT l.granted) AS waiting_count,
+  max(age(now(), a.xact_start)) AS oldest_lock_age
+FROM pg_locks l
+JOIN pg_stat_activity a ON l.pid = a.pid
+WHERE l.relation IS NOT NULL
+GROUP BY l.relation, l.mode
+HAVING count(*) FILTER (WHERE NOT l.granted) > 0
+ORDER BY waiting_count DESC;
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 13: CODE EXAMPLES
+         ============================================================ -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Example 1: Deadlock-free batch update pattern</summary>
+<pre><code class="language-python">
+"""
+Deadlock-free batch update pattern for large tables.
+Key principles:
+1. Process in consistent primary key order
+2. Small batch sizes (avoid lock escalation)
+3. Explicit commit between batches (release locks)
+4. Retry logic for transient deadlocks
+"""
+import psycopg2
+import time
+from contextlib import contextmanager
+
+@contextmanager
+def get_connection(dsn):
+    conn = psycopg2.connect(dsn)
+    conn.autocommit = False
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def batch_update_safe(dsn: str, batch_size: int = 5000,
+                      sleep_between: float = 0.05,
+                      max_retries: int = 3):
+    """
+    Update rows in small batches with deadlock retry.
+    
+    Pattern avoids:
+    - Lock escalation (batch_size < 5000)
+    - Deadlocks (consistent PK ordering)
+    - Long lock holds (commit per batch)
+    - Starving OLTP (sleep between batches)
+    """
+    total_updated = 0
+    last_id = 0
+
+    while True:
+        for attempt in range(max_retries):
+            try:
+                with get_connection(dsn) as conn:
+                    with conn.cursor() as cur:
+                        # Set lock timeout to fail fast
+                        cur.execute("SET lock_timeout = '5s'")
+
+                        # Update one batch in PK order
+                        cur.execute("""
+                            UPDATE orders
+                            SET status = 'archived',
+                                updated_at = now()
+                            WHERE id IN (
+                                SELECT id FROM orders
+                                WHERE status = 'completed'
+                                  AND completed_at < now() - interval '90 days'
+                                  AND id > %s
+                                ORDER BY id
+                                LIMIT %s
+                                FOR UPDATE SKIP LOCKED
+                            )
+                            RETURNING id
+                        """, (last_id, batch_size))
+
+                        rows = cur.fetchall()
+                        if not rows:
+                            print(f"Done. Total updated: {total_updated}")
+                            conn.commit()
+                            return total_updated
+
+                        last_id = rows[-1][0]
+                        total_updated += len(rows)
+                        conn.commit()  # Release all locks
+
+                        print(f"Batch complete: {len(rows)} rows "
+                              f"(total: {total_updated}, last_id: {last_id})")
+
+                break  # Success, exit retry loop
+
+            except psycopg2.errors.DeadlockDetected:
+                print(f"Deadlock on attempt {attempt + 1}, retrying...")
+                time.sleep(backoff_time(attempt))
+            except psycopg2.errors.LockNotAvailable:
+                print(f"Lock timeout on attempt {attempt + 1}, retrying...")
+                time.sleep(backoff_time(attempt))
+        else:
+            raise RuntimeError(f"Failed after {max_retries} retries at id={last_id}")
+
+        # Breathing room for OLTP between batches
+        time.sleep(sleep_between)
+
+def backoff_time(attempt: int) -> float:
+    """Exponential backoff with jitter."""
+    import random
+    return min(30, (2 ** attempt) + random.uniform(0, 1))
+</code></pre>
+      </details>
+      <details>
+        <summary>Example 2: PostgreSQL advisory lock for pipeline coordination</summary>
+<pre><code class="language-python">
+"""
+Airflow DAG using advisory locks to prevent concurrent pipeline runs
+on the same target table.
+"""
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowSkipException
+from datetime import datetime, timedelta
+import psycopg2
+
+DAG_ID = "daily_orders_etl"
+LOCK_KEY = abs(hash(DAG_ID)) % (2**63)  # Consistent lock key from DAG name
+
+default_args = {
+    'owner': 'data-engineering',
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
+}
+
+def acquire_pipeline_lock(**context):
+    """Acquire advisory lock or skip if another instance is running."""
+    conn = psycopg2.connect(context['params']['conn_string'])
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    cur.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,))
+    acquired = cur.fetchone()[0]
+
+    if not acquired:
+        conn.close()
+        raise AirflowSkipException(
+            f"Pipeline {DAG_ID} already running (lock {LOCK_KEY} held)"
+        )
+
+    # Store connection in XCom for release later
+    # (In practice, store PID and reconnect in release task)
+    context['ti'].xcom_push(key='lock_pid', value=conn.info.backend_pid)
+    # Don't close connection — lock released on disconnect
+    # Better: use transaction-level lock within the ETL transaction
+
+def run_etl(**context):
+    """Main ETL logic — runs only if lock acquired."""
+    conn = psycopg2.connect(context['params']['conn_string'])
+    try:
+        with conn.cursor() as cur:
+            # Acquire transaction-level advisory lock
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_KEY,))
+
+            # ETL operations
+            cur.execute("""
+                INSERT INTO orders_warehouse
+                SELECT * FROM orders_staging
+                WHERE process_date = %s
+                ON CONFLICT (order_id) DO UPDATE
+                SET status = EXCLUDED.status,
+                    amount = EXCLUDED.amount,
+                    updated_at = now()
+            """, (context['ds'],))
+
+            rows = cur.rowcount
+            conn.commit()
+            print(f"ETL complete: {rows} rows upserted")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()  # Advisory xact lock auto-released on commit/rollback
+
+def release_pipeline_lock(**context):
+    """Explicitly release advisory lock (safety net)."""
+    conn = psycopg2.connect(context['params']['conn_string'])
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+    conn.close()
+
+with DAG(DAG_ID, default_args=default_args,
+         schedule_interval='@daily',
+         start_date=datetime(2024, 1, 1),
+         catchup=False,
+         params={'conn_string': 'postgresql://etl@db:5432/warehouse'}) as dag:
+
+    lock = PythonOperator(task_id='acquire_lock', python_callable=acquire_pipeline_lock)
+    etl = PythonOperator(task_id='run_etl', python_callable=run_etl)
+    unlock = PythonOperator(task_id='release_lock', python_callable=release_pipeline_lock,
+                            trigger_rule='all_done')  # Always release, even on failure
+
+    lock >> etl >> unlock
+</code></pre>
+      </details>
+      <details>
+        <summary>Example 3: Detecting and resolving lock contention in production</summary>
+<pre><code class="language-python">
+"""
+Production lock monitoring script.
+Runs as a sidecar or cron job to detect and alert on lock issues.
+"""
+import psycopg2
+import json
+import time
+from datetime import datetime
+
+LOCK_ALERT_THRESHOLD_SECONDS = 30
+DEADLOCK_QUERY = """
+SELECT
+  blocked.pid AS blocked_pid,
+  blocked_activity.usename AS blocked_user,
+  blocked_activity.application_name AS blocked_app,
+  blocked_activity.query AS blocked_query,
+  blocking.pid AS blocking_pid,
+  blocking_activity.usename AS blocking_user,
+  blocking_activity.application_name AS blocking_app,
+  blocking_activity.query AS blocking_query,
+  EXTRACT(EPOCH FROM (now() - blocked_activity.query_start)) AS wait_seconds
+FROM pg_locks blocked
+JOIN pg_stat_activity blocked_activity ON blocked.pid = blocked_activity.pid
+JOIN pg_locks blocking
+  ON blocking.locktype = blocked.locktype
+  AND blocking.relation IS NOT DISTINCT FROM blocked.relation
+  AND blocking.pid != blocked.pid
+  AND blocking.granted = true
+JOIN pg_stat_activity blocking_activity ON blocking.pid = blocking_activity.pid
+WHERE NOT blocked.granted
+  AND EXTRACT(EPOCH FROM (now() - blocked_activity.query_start)) > %s
+ORDER BY wait_seconds DESC;
+"""
+
+IDLE_TX_QUERY = """
+SELECT
+  pid,
+  usename,
+  application_name,
+  state,
+  query,
+  EXTRACT(EPOCH FROM (now() - xact_start)) AS tx_duration_seconds
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND EXTRACT(EPOCH FROM (now() - xact_start)) > %s;
+"""
+
+def check_lock_contention(conn_string: str, threshold: int = 30):
+    """Check for blocking queries exceeding threshold."""
+    conn = psycopg2.connect(conn_string)
+    cur = conn.cursor()
+
+    # Check blocking chains
+    cur.execute(DEADLOCK_QUERY, (threshold,))
+    blocked = cur.fetchall()
+
+    if blocked:
+        alert = {
+            "type": "lock_contention",
+            "timestamp": datetime.utcnow().isoformat(),
+            "blocked_count": len(blocked),
+            "details": []
+        }
+        for row in blocked:
+            alert["details"].append({
+                "blocked_pid": row[0],
+                "blocked_user": row[1],
+                "blocked_app": row[2],
+                "blocked_query": row[3][:200],
+                "blocking_pid": row[4],
+                "blocking_user": row[5],
+                "blocking_app": row[6],
+                "blocking_query": row[7][:200],
+                "wait_seconds": round(row[8], 1)
+            })
+        send_alert(alert)
+
+    # Check idle-in-transaction
+    cur.execute(IDLE_TX_QUERY, (300,))  # 5 minutes
+    idle_txs = cur.fetchall()
+
+    if idle_txs:
+        for row in idle_txs:
+            send_alert({
+                "type": "idle_in_transaction",
+                "pid": row[0],
+                "user": row[1],
+                "app": row[2],
+                "duration_seconds": round(row[5], 1),
+                "last_query": row[4][:200]
+            })
+
+    conn.close()
+    return len(blocked), len(idle_txs)
+
+def send_alert(payload: dict):
+    """Send alert to monitoring system (Slack, PagerDuty, etc.)."""
+    print(json.dumps(payload, indent=2))
+    # In production: post to Slack webhook, PagerDuty event, etc.
+
+if __name__ == "__main__":
+    import sys
+    conn_string = sys.argv[1] if len(sys.argv) > 1 else "postgresql://monitor@localhost/prod"
+    while True:
+        blocked, idle = check_lock_contention(conn_string)
+        if blocked or idle:
+            print(f"[{datetime.utcnow()}] Blocked: {blocked}, Idle TX: {idle}")
+        time.sleep(10)  # Check every 10 seconds
+</code></pre>
+      </details>
+      <details>
+        <summary>Example 4: Optimistic locking pattern (version column)</summary>
+<pre><code class="language-python">
+"""
+Optimistic locking: avoid database locks entirely for OLTP updates.
+Use a version column to detect concurrent modifications.
+"""
+import psycopg2
+from dataclasses import dataclass
+from typing import Optional
+
+class OptimisticLockError(Exception):
+    """Raised when a concurrent modification is detected."""
+    pass
+
+@dataclass
+class Order:
+    id: int
+    status: str
+    amount: float
+    version: int  # Incremented on every update
+
+def get_order(conn, order_id: int) -> Optional[Order]:
+    """Read order with its current version."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, status, amount, version FROM orders WHERE id = %s",
+            (order_id,)
+        )
+        row = cur.fetchone()
+        if row:
+            return Order(id=row[0], status=row[1], amount=row[2], version=row[3])
+        return None
+
+def update_order_optimistic(conn, order: Order, new_status: str,
+                            max_retries: int = 3) -> Order:
+    """
+    Update order using optimistic locking.
+    
+    No SELECT FOR UPDATE needed — version column detects conflicts.
+    This pattern eliminates row-level X locks during the read phase,
+    dramatically reducing deadlock risk in high-contention scenarios.
+    """
+    for attempt in range(max_retries):
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE orders
+                SET status = %s,
+                    version = version + 1,
+                    updated_at = now()
+                WHERE id = %s
+                  AND version = %s
+                RETURNING id, status, amount, version
+            """, (new_status, order.id, order.version))
+
+            row = cur.fetchone()
+
+            if row:
+                conn.commit()
+                return Order(id=row[0], status=row[1],
+                            amount=row[2], version=row[3])
+            else:
+                # Version mismatch — someone else updated first
+                conn.rollback()
+
+                if attempt < max_retries - 1:
+                    # Re-read and retry with fresh version
+                    order = get_order(conn, order.id)
+                    if order is None:
+                        raise ValueError(f"Order {order.id} no longer exists")
+                    # Apply business logic validation on fresh data
+                    continue
+
+    raise OptimisticLockError(
+        f"Order {order.id} was modified by another transaction "
+        f"after {max_retries} retries"
+    )
+
+# Usage:
+# conn = psycopg2.connect(DSN)
+# order = get_order(conn, 42)  # No lock held!
+# # ... business logic (can take 100ms without holding locks) ...
+# updated = update_order_optimistic(conn, order, 'shipped')
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 14: COMMON MISTAKES
+         ============================================================ -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Mistake 1: Long-running transactions holding locks</summary>
+        <p>
+          The #1 cause of lock contention in production. A transaction that stays open for
+          minutes (or hours) holds all its locks for the entire duration, blocking every
+          other transaction that needs conflicting access.
+        </p>
+<pre><code class="language-sql">
+-- BAD: open transaction, do slow work, then commit
+BEGIN;
+SELECT * FROM orders WHERE id = 42 FOR UPDATE;
+-- ... application does HTTP call to payment service (500ms - 30s) ...
+-- ... lock held the entire time! ...
+UPDATE orders SET status = 'paid' WHERE id = 42;
+COMMIT;
+
+-- GOOD: minimize lock hold time
+-- Do all slow work BEFORE acquiring locks:
+-- 1. Read data (MVCC snapshot, no lock)
+SELECT * FROM orders WHERE id = 42;
+-- 2. Call external service (no transaction open)
+-- result = call_payment_service(order)
+-- 3. Short transaction for the actual update:
+BEGIN;
+UPDATE orders SET status = 'paid', version = version + 1
+WHERE id = 42 AND version = 5;  -- optimistic check
+COMMIT;  -- Lock held for ~1ms, not 30s
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 2: Missing lock_timeout in production</summary>
+<pre><code class="language-sql">
+-- BAD: default lock_timeout = 0 (wait forever!)
+-- One stuck transaction can cascade-block hundreds of connections:
+--
+-- DDL waiting for idle-in-transaction:
+--   ALTER TABLE orders ADD COLUMN x INT;  -- waits for AccessExclusiveLock
+-- All subsequent queries queue behind the DDL:
+--   SELECT * FROM orders WHERE id = 1;  -- blocked!
+--   SELECT * FROM orders WHERE id = 2;  -- blocked!
+--   INSERT INTO orders ...              -- blocked!
+--   (Connection pool exhausted in minutes)
+
+-- GOOD: always set lock_timeout
+SET lock_timeout = '5s';
+ALTER TABLE orders ADD COLUMN x INT;
+-- If blocked for > 5s: ERROR: canceling statement due to lock timeout
+-- Application can retry during off-peak
+
+-- Set globally for safety:
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '300000';  -- 5 min
+-- Prevents forgotten transactions from blocking DDL indefinitely
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 3: SELECT FOR UPDATE when unnecessary</summary>
+<pre><code class="language-sql">
+-- BAD: using FOR UPDATE "just in case"
+BEGIN;
+SELECT * FROM orders WHERE customer_id = 42 FOR UPDATE;
+-- Locks ALL orders for customer 42 (could be hundreds of rows)
+-- Only needed one specific order
+-- Other transactions updating this customer's orders: BLOCKED
+
+-- GOOD: lock only what you'll modify
+BEGIN;
+SELECT * FROM orders WHERE id = 9001 FOR UPDATE;
+-- Locks exactly one row
+UPDATE orders SET status = 'shipped' WHERE id = 9001;
+COMMIT;
+
+-- BETTER: use optimistic locking if contention is low
+UPDATE orders SET status = 'shipped', version = version + 1
+WHERE id = 9001 AND version = current_version;
+
+-- ALSO BAD: FOR UPDATE with LIMIT but without ORDER BY
+SELECT * FROM orders WHERE status = 'pending'
+FOR UPDATE LIMIT 10;
+-- Which 10 rows? Nondeterministic → different transactions may
+-- lock overlapping sets → deadlock risk
+
+-- GOOD: deterministic ordering for SKIP LOCKED patterns
+SELECT * FROM orders WHERE status = 'pending'
+ORDER BY id
+FOR UPDATE SKIP LOCKED
+LIMIT 10;
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 4: Mixing DDL with DML in same transaction</summary>
+<pre><code class="language-sql">
+-- BAD: DDL + DML in one transaction (holds AccessExclusiveLock for duration)
+BEGIN;
+ALTER TABLE orders ADD COLUMN priority INT DEFAULT 0;
+-- AccessExclusiveLock acquired → ALL queries on orders blocked
+UPDATE orders SET priority = 1 WHERE status = 'urgent';
+-- Could take minutes on large table
+-- All queries still blocked!
+CREATE INDEX idx_priority ON orders(priority);
+-- Even longer...
+COMMIT;
+-- Table was locked for potentially 30+ minutes
+
+-- GOOD: separate DDL from DML
+-- Step 1: instant DDL (lock held briefly)
+ALTER TABLE orders ADD COLUMN priority INT;  -- no default, instant
+-- Step 2: backfill in batches (brief locks)
+-- (use batch update pattern from code examples)
+-- Step 3: concurrent index creation (non-blocking)
+CREATE INDEX CONCURRENTLY idx_priority ON orders(priority);
+-- Step 4: add default for future inserts
+ALTER TABLE orders ALTER COLUMN priority SET DEFAULT 0;
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 5: Ignoring lock ordering in application code</summary>
+<pre><code class="language-python">
+# BAD: no consistent lock ordering → deadlock-prone
+def process_transfer(from_id, to_id, amount):
+    with db.transaction():
+        # Lock source account
+        db.execute("SELECT ... FROM accounts WHERE id=%s FOR UPDATE", from_id)
+        # Lock destination account
+        db.execute("SELECT ... FROM accounts WHERE id=%s FOR UPDATE", to_id)
+        # If concurrent: transfer(A→B) and transfer(B→A) → DEADLOCK
+
+# GOOD: always lock in consistent order (e.g., lower ID first)
+def process_transfer_safe(from_id, to_id, amount):
+    with db.transaction():
+        ids = sorted([from_id, to_id])
+        for account_id in ids:
+            db.execute(
+                "SELECT ... FROM accounts WHERE id=%s FOR UPDATE",
+                account_id
+            )
+        # Now safe to proceed — no cycle possible
+        db.execute("UPDATE accounts SET balance=balance-%s WHERE id=%s",
+                   amount, from_id)
+        db.execute("UPDATE accounts SET balance=balance+%s WHERE id=%s",
+                   amount, to_id)
+</code></pre>
+      </details>
+      <details>
+        <summary>Mistake 6: Not using SKIP LOCKED for queue processing</summary>
+<pre><code class="language-sql">
+-- BAD: multiple workers fight over same rows
+-- Worker 1:
+SELECT * FROM job_queue WHERE status='pending' ORDER BY id LIMIT 1 FOR UPDATE;
+-- Worker 2:
+SELECT * FROM job_queue WHERE status='pending' ORDER BY id LIMIT 1 FOR UPDATE;
+-- Worker 2 BLOCKED waiting for Worker 1 to finish the same row!
+-- Only one worker active at a time — defeats purpose of multiple workers
+
+-- GOOD: SKIP LOCKED lets each worker grab a different row
+-- Worker 1:
+SELECT * FROM job_queue WHERE status='pending'
+ORDER BY id LIMIT 1
+FOR UPDATE SKIP LOCKED;  -- grabs row 1
+
+-- Worker 2 (concurrent):
+SELECT * FROM job_queue WHERE status='pending'
+ORDER BY id LIMIT 1
+FOR UPDATE SKIP LOCKED;  -- skips row 1 (locked), grabs row 2
+
+-- All workers proceed concurrently, each on different rows
+-- Zero contention, zero blocking, zero deadlocks
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 15: TRADE-OFFS
+         ============================================================ -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Fine-grained vs coarse-grained locks</summary>
+        <ul>
+          <li><strong>Row locks (fine):</strong> Maximum concurrency — unrelated rows never conflict. But higher memory usage per lock, more complex deadlock graphs, and increased lock manager CPU.</li>
+          <li><strong>Table locks (coarse):</strong> Minimal memory, simple deadlock detection, fast lock acquisition. But severely limits concurrency — all operations on the table serialize.</li>
+          <li><strong>Decision:</strong> Use row-level for OLTP (many concurrent small transactions). Use table-level for bulk ETL on dedicated tables. Never mix without temporal separation or timeouts.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Pessimistic vs optimistic concurrency control</summary>
+        <ul>
+          <li><strong>Pessimistic (SELECT FOR UPDATE):</strong> Guarantees no conflict at update time. Higher throughput under high contention because conflicts are prevented rather than detected-and-retried. But increases lock hold time and deadlock risk.</li>
+          <li><strong>Optimistic (version column):</strong> No locks during read phase — maximum concurrency. But under high contention, retry storms can waste more resources than locks would. Each retry re-reads and re-computes.</li>
+          <li><strong>Decision:</strong> Optimistic for low-to-moderate contention (most web apps). Pessimistic for high contention on specific hot rows (inventory, seat booking).</li>
+        </ul>
+<pre><code class="language-bash">
+# Decision matrix:
+# ┌─────────────────────┬──────────────────┬──────────────────────┐
+# │  Scenario           │  Pessimistic     │  Optimistic          │
+# ├─────────────────────┼──────────────────┼──────────────────────┤
+# │  Low contention     │  Overhead waste  │  ✓ Best choice       │
+# │  High contention    │  ✓ Best choice   │  Retry storms        │
+# │  Long business logic│  Blocks others   │  ✓ No locks held     │
+# │  Hot rows           │  ✓ Serializes    │  Too many retries    │
+# │  Distributed system │  Hard to do      │  ✓ Natural fit       │
+# └─────────────────────┴──────────────────┴──────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>Lock timeout: strict vs lenient</summary>
+        <ul>
+          <li><strong>Strict timeout (1-5s):</strong> Prevents cascade blocking, fails fast, enables retry-at-application-level. But may reject legitimate operations during brief contention spikes.</li>
+          <li><strong>Lenient timeout (30s-5min):</strong> Tolerates brief contention without failing. But allows blocking chains to build up, risks connection pool exhaustion.</li>
+          <li><strong>Decision:</strong> API/OLTP: strict (3-10s). ETL: moderate (30-60s). DDL migrations: strict (5-10s) with retry loop. Never use 0 (infinite) in production.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Advisory locks vs external lock services</summary>
+        <ul>
+          <li><strong>PostgreSQL advisory locks:</strong> Zero additional infrastructure, auto-release on disconnect, transactional semantics available. But tied to PostgreSQL availability, connection per lock holder, ~1ms latency.</li>
+          <li><strong>Redis (SETNX + TTL):</strong> Sub-millisecond latency, language-agnostic, works across any services. But no auto-release on crash (relies on TTL expiry), potential split-brain with Redlock, requires Redis infrastructure.</li>
+          <li><strong>ZooKeeper/etcd:</strong> Consensus-based correctness, ephemeral nodes auto-cleanup, well-suited for leader election. But operational complexity, higher latency (~5-10ms), additional infrastructure.</li>
+          <li><strong>Decision:</strong> If you already have PostgreSQL and need coordination among services that connect to it — advisory locks. If cross-service with high throughput — Redis. If correctness-critical distributed coordination — ZooKeeper/etcd.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>MVCC snapshot bloat vs lock-based blocking</summary>
+        <ul>
+          <li><strong>MVCC (no read locks):</strong> Readers never block writers. But long-running read transactions prevent VACUUM from cleaning dead tuples → table bloat → degraded performance over time.</li>
+          <li><strong>Lock-based (readers block writers):</strong> No table bloat issue. But mixed read/write workloads suffer from contention, lower throughput.</li>
+          <li><strong>Decision:</strong> MVCC is almost always better for mixed workloads. Mitigate bloat with: short transactions, read replicas for long analytics queries, and aggressive VACUUM tuning.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Batched commits vs single large transaction</summary>
+        <ul>
+          <li><strong>Single transaction:</strong> Atomicity guarantee — all-or-nothing. Simpler error handling (just ROLLBACK). But holds locks for duration, memory pressure, lock escalation risk.</li>
+          <li><strong>Batched commits:</strong> Short lock holds, no escalation, concurrent-friendly. But no atomicity across batches (partial completion on failure), requires application-level progress tracking.</li>
+          <li><strong>Decision:</strong> If all-or-nothing semantics are required (financial), use single transaction with appropriate isolation. For ETL/backfills where idempotent retry is possible, batch with progress checkpointing.</li>
+        </ul>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 16: FOLLOW-UP QUESTIONS
+         ============================================================ -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Q1: How does PostgreSQL handle deadlocks differently from SQL Server?</summary>
+        <p>
+          <strong>PostgreSQL:</strong> Deadlock detection is lazy — triggered only when a
+          transaction has waited longer than <code>deadlock_timeout</code> (default 1s).
+          Detection runs a DFS on the wait-for graph. Victim is always the transaction that
+          triggered the check (the most recent waiter). No cost-based victim selection.
+        </p>
+        <p>
+          <strong>SQL Server:</strong> Deadlock detection is proactive — the lock manager
+          maintains the wait-for graph incrementally and checks for cycles every 5 seconds
+          (or more frequently under contention). Victim selection is cost-based: the transaction
+          with the least log generated (cheapest to rollback) is chosen, unless
+          <code>DEADLOCK_PRIORITY</code> overrides.
+        </p>
+<pre><code class="language-sql">
+-- PostgreSQL: tune deadlock detection
+ALTER SYSTEM SET deadlock_timeout = '500ms';  -- faster detection (more CPU)
+-- Lower values: faster detection, more frequent (wasteful) WFG traversals
+-- Higher values: less CPU, but longer wait before detection
+
+-- SQL Server: trace deadlock graphs
+DBCC TRACEON(1222, -1);  -- log deadlock graphs to error log
+-- Or use Extended Events: system_health session captures deadlocks
+SELECT XEvent.query('(event/data/value/deadlock)[1]')
+FROM (
+  SELECT CAST(target_data AS XML) AS TargetData
+  FROM sys.dm_xe_session_targets st
+  JOIN sys.dm_xe_sessions s ON s.address = st.event_session_address
+  WHERE s.name = 'system_health'
+    AND st.target_name = 'ring_buffer'
+) AS Data
+CROSS APPLY TargetData.nodes('//event[@name="xml_deadlock_report"]') AS XEventData(XEvent);
+</code></pre>
+      </details>
+      <details>
+        <summary>Q2: What happens when CREATE INDEX blocks on a busy table?</summary>
+        <p>
+          Standard <code>CREATE INDEX</code> acquires a <code>ShareLock</code> on the table,
+          blocking all INSERT/UPDATE/DELETE operations for the duration of the index build.
+          On large tables, this can take hours — effectively taking the table offline for writes.
+        </p>
+        <p>
+          <code>CREATE INDEX CONCURRENTLY</code> avoids this by using a multi-phase approach:
+          it acquires only <code>ShareUpdateExclusiveLock</code> (compatible with DML) and
+          builds the index while allowing concurrent modifications. The tradeoff: it takes
+          longer, cannot run inside a transaction block, and may fail (leaving an INVALID index
+          that must be dropped and recreated).
+        </p>
+<pre><code class="language-sql">
+-- Safe index creation on production tables:
+CREATE INDEX CONCURRENTLY idx_orders_status ON orders(status);
+
+-- Check for invalid indexes (from failed concurrent creation):
+SELECT indexrelid::regclass, indisvalid
+FROM pg_index
+WHERE NOT indisvalid;
+
+-- If invalid: drop and recreate
+DROP INDEX CONCURRENTLY idx_orders_status;
+CREATE INDEX CONCURRENTLY idx_orders_status ON orders(status);
+</code></pre>
+      </details>
+      <details>
+        <summary>Q3: How do you handle locking in a read-replica architecture?</summary>
+        <p>
+          Read replicas receive WAL records from the primary and replay them. If a replay
+          needs to modify a page that a long-running query on the replica is reading, a conflict
+          occurs. PostgreSQL handles this with <code>max_standby_streaming_delay</code> — queries
+          on the replica are cancelled if they block replay for too long.
+        </p>
+<pre><code class="language-bash">
+# PostgreSQL streaming replica lock conflicts:
+#
+# Primary: UPDATE orders SET status='done' WHERE id=42;
+#   → WAL record: "modify page 7 of orders"
+#
+# Replica: long-running SELECT scanning page 7 of orders
+#   → Replay BLOCKED (can't modify page while query reads it)
+#
+# After max_standby_streaming_delay (default: 30s):
+#   → Query on replica CANCELLED
+#   → ERROR: canceling statement due to conflict with recovery
+#
+# Mitigation strategies:
+# 1. Increase max_standby_streaming_delay (allows more query time)
+# 2. Set hot_standby_feedback = on (primary delays VACUUM)
+#    ⚠️ Can cause bloat on primary!
+# 3. Use multiple replicas: one for fast queries, one for long analytics
+# 4. Use logical replication (no replay conflicts, but different trade-offs)
+</code></pre>
+      </details>
+      <details>
+        <summary>Q4: What is a SIX (Shared + Intent Exclusive) lock and when is it used?</summary>
+        <p>
+          A SIX lock is held when a transaction reads an entire table (S lock) while
+          simultaneously modifying some rows within it (IX for those rows). It's equivalent
+          to holding S + IX on the same resource. The compatibility matrix shows SIX is only
+          compatible with IS — meaning other transactions can read individual rows but cannot
+          write to any row or read the entire table with S.
+        </p>
+<pre><code class="language-sql">
+-- Scenario requiring SIX lock:
+-- "Read all rows in a table, update rows matching a condition"
+BEGIN;
+-- Conceptually: read full table (needs S) + update some rows (needs IX)
+-- Combined: SIX lock on table
+
+-- SQL Server: this manifests as SIX when using cursors or
+-- when the optimizer chooses a table scan for the UPDATE:
+UPDATE orders
+SET discount = 0.10
+WHERE total > (SELECT AVG(total) FROM orders);
+-- Inner SELECT reads entire table (S intent)
+-- UPDATE modifies qualifying rows (IX intent)
+-- Combined table lock: SIX
+
+-- In PostgreSQL, this is represented as RowExclusiveLock at table level
+-- (PostgreSQL doesn't use explicit SIX terminology)
+</code></pre>
+      </details>
+      <details>
+        <summary>Q5: How does Delta Lake handle concurrent OPTIMIZE and write operations?</summary>
+        <p>
+          Delta Lake OPTIMIZE compacts small files into larger ones. Since Delta uses
+          optimistic concurrency, a concurrent write (INSERT/UPDATE) that touches files
+          being compacted will conflict at commit time. Delta Lake 2.0+ introduced
+          <em>file-level conflict detection</em>: OPTIMIZE only conflicts with writes that
+          modified the same set of files.
+        </p>
+<pre><code class="language-python">
+# Delta Lake OPTIMIZE conflict scenarios:
+#
+# ┌──────────────────────────────────────────────────────────────────┐
+# │  Operation A         │  Operation B        │  Conflict?          │
+# ├──────────────────────┼─────────────────────┼─────────────────────┤
+# │  OPTIMIZE partition1 │  INSERT partition1   │  Only if same files │
+# │  OPTIMIZE partition1 │  INSERT partition2   │  No conflict ✓      │
+# │  OPTIMIZE partition1 │  UPDATE partition1   │  Yes → retry        │
+# │  OPTIMIZE partition1 │  OPTIMIZE partition1 │  Yes → one wins     │
+# │  OPTIMIZE            │  APPEND (new files)  │  No conflict ✓      │
+# └──────────────────────┴─────────────────────┴─────────────────────┘
+
+# Best practice: run OPTIMIZE during low-write windows
+# Or partition OPTIMIZE by time:
+spark.sql("""
+  OPTIMIZE delta.`s3://warehouse/events/`
+  WHERE event_date = '2024-01-15'
+""")
+# Only compacts one partition → conflict scope limited to that partition
+</code></pre>
+      </details>
+      <details>
+        <summary>Q6: Can you have a deadlock with only one table?</summary>
+        <p>
+          Yes. A single-table deadlock occurs when two transactions update different rows
+          in different orders, or when index traversal causes lock acquisition in different
+          orders for different access paths.
+        </p>
+<pre><code class="language-sql">
+-- Single-table deadlock example:
+-- T1:
+BEGIN;
+UPDATE accounts SET balance = 100 WHERE id = 1;  -- X lock on row 1
+UPDATE accounts SET balance = 200 WHERE id = 2;  -- WAITS for T2
+
+-- T2 (concurrent):
+BEGIN;
+UPDATE accounts SET balance = 300 WHERE id = 2;  -- X lock on row 2
+UPDATE accounts SET balance = 400 WHERE id = 1;  -- WAITS for T1 → DEADLOCK
+
+-- Also possible with a single UPDATE via different index paths:
+-- If table has indexes on (col_a) and (col_b):
+-- T1 scans via idx_col_a: locks rows in col_a order
+-- T2 scans via idx_col_b: locks rows in col_b order
+-- Same rows, different order → deadlock
+
+-- Prevention: add ORDER BY to UPDATE subquery, or use consistent access path
+</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 17: SUMMARY
+         ============================================================ -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Key takeaways</summary>
+        <ul>
+          <li><strong>Lock modes</strong> — Shared (S) for reads, Exclusive (X) for writes, Intent (IS/IX) for hierarchical efficiency, Update (U) to prevent conversion deadlocks.</li>
+          <li><strong>Granularity</strong> — Row-level maximizes concurrency; table-level minimizes overhead. The multigranularity protocol uses intent locks to make compatibility checking O(1).</li>
+          <li><strong>Compatibility matrix</strong> — The foundational tool for reasoning about concurrency. IX+IX compatible (different rows), IX+S incompatible (writer intent vs full reader), X incompatible with everything.</li>
+          <li><strong>Deadlocks</strong> — Circular wait in the lock graph. Detected via WFG traversal (PostgreSQL, SQL Server) or timeout (distributed systems). Prevented by consistent lock ordering and short transactions.</li>
+          <li><strong>Lock escalation</strong> — SQL Server promotes row→table at ~5000 locks (memory protection). PostgreSQL doesn't escalate (row locks in tuple header = zero extra memory). Critical difference for bulk ETL design.</li>
+          <li><strong>Advisory locks</strong> — Application-level coordination via PostgreSQL. Ideal for job deduplication, distributed locking, and rate limiting without external infrastructure.</li>
+          <li><strong>MVCC interaction</strong> — MVCC eliminates read-lock needs (readers never block writers). Locks still needed for: write-write conflicts, DDL, FOR UPDATE, foreign keys.</li>
+          <li><strong>Distributed systems</strong> — BigQuery uses table mutation locks, Snowflake has table-level DML locks, Delta Lake uses optimistic concurrency with file-level conflict detection.</li>
+          <li><strong>Production essentials</strong> — Always set lock_timeout, batch large DML, use SKIP LOCKED for queues, monitor pg_locks/pg_stat_activity, prefer optimistic locking for OLTP.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Decision framework cheat sheet</summary>
+<pre><code class="language-bash">
+# WHEN TO USE PESSIMISTIC LOCKS (SELECT FOR UPDATE):
+# ┌────────────────────────────────────────────────────────────────┐
+# │  • High contention on specific rows (inventory, bookings)      │
+# │  • Business logic requires guaranteed exclusive access          │
+# │  • Short transaction duration (< 100ms)                        │
+# │  • Retry cost is higher than lock wait cost                    │
+# └────────────────────────────────────────────────────────────────┘
+#
+# WHEN TO USE OPTIMISTIC LOCKING (version column):
+# ┌────────────────────────────────────────────────────────────────┐
+# │  • Low-to-moderate contention (most web applications)          │
+# │  • Long business logic between read and write                  │
+# │  • Distributed systems where DB locks don't span services      │
+# │  • Read-heavy workloads where conflicts are rare               │
+# └────────────────────────────────────────────────────────────────┘
+#
+# WHEN TO USE ADVISORY LOCKS:
+# ┌────────────────────────────────────────────────────────────────┐
+# │  • Job/pipeline deduplication (prevent concurrent ETL runs)    │
+# │  • Distributed mutex among services sharing PostgreSQL         │
+# │  • Rate limiting (slot-based concurrency control)              │
+# │  • Leader election (simple cases)                              │
+# └────────────────────────────────────────────────────────────────┘
+#
+# PRODUCTION CHECKLIST:
+# ┌────────────────────────────────────────────────────────────────┐
+# │  □ lock_timeout set for all roles (never 0 in prod)            │
+# │  □ idle_in_transaction_session_timeout configured              │
+# │  □ ETL jobs use batched commits (< 5000 rows per batch)        │
+# │  □ OLTP uses optimistic locking or short FOR UPDATE            │
+# │  □ DDL uses CONCURRENTLY variants where possible               │
+# │  □ Deadlock monitoring and alerting in place                   │
+# │  □ pg_stat_activity dashboard for lock waits                   │
+# │  □ ETL and OLTP temporally separated or on different tables    │
+# └────────────────────────────────────────────────────────────────┘
+</code></pre>
+      </details>
+      <details>
+        <summary>One-liner for interviews</summary>
+        <p>
+          "Database locks coordinate concurrent access: shared locks allow multiple readers,
+          exclusive locks isolate writers, and intent locks enable efficient multigranularity
+          checking. Modern MVCC systems eliminate read-write lock conflicts via snapshots,
+          but write-write conflicts, DDL, and explicit serialization still require locks —
+          making deadlock prevention (consistent ordering, short transactions, timeouts) and
+          lock monitoring (pg_locks, wait-for graphs) essential skills for production data systems."
+        </p>
+      </details>
+    </section>
+
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav" aria-label="Chapter navigation">
+      <a href="ch06-mvcc.html" class="btn btn-prev">← Chapter 6: MVCC</a>
+      <a href="ch08-query-suddenly-slow.html" class="btn btn-next">Chapter 8: Query Suddenly Slow →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,2924 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ch 15: Exactly-Once Processing | Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/style.css">
+  <link rel="stylesheet" href="../../assets/css/code.css">
+</head>
+<body>
+  <div class="layout">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <a href="../../index.html">Interview Handbook</a>
+        </div>
+      </div>
+      <div class="sidebar-chapter">
+        <span class="chapter-number">Ch 15</span>
+        <span class="chapter-title">Exactly-Once Processing</span>
+      </div>
+      <nav class="sidebar-nav">
+        <ul>
+          <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+          <li><a href="#quick-answer">Quick Answer</a></li>
+          <li><a href="#delivery-semantics">Delivery Semantics</a></li>
+          <li><a href="#kafka-transactions">Kafka Transactions</a></li>
+          <li><a href="#checkpointing">Checkpointing</a></li>
+          <li><a href="#idempotent-sinks">Idempotent Sinks</a></li>
+          <li><a href="#two-phase-commit">Two-Phase Commit</a></li>
+          <li><a href="#deduplication">Deduplication Patterns</a></li>
+          <li><a href="#failure-recovery">Failure Recovery &amp; Replay</a></li>
+          <li><a href="#end-to-end">End-to-End Exactly-Once</a></li>
+          <li><a href="#production-incident">Production Incident</a></li>
+          <li><a href="#code-examples">Code Examples</a></li>
+          <li><a href="#common-mistakes">Common Mistakes</a></li>
+          <li><a href="#trade-offs">Trade-offs</a></li>
+          <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+          <li><a href="#summary">Summary</a></li>
+        </ul>
+      </nav>
+      <div class="sidebar-actions">
+        <button class="btn-prev" onclick="location.href='ch14-realtime-pipeline.html'">Previous Chapter</button>
+        <button class="btn-next" onclick="location.href='ch16-etl-pipeline-slow.html'">Next Chapter</button>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="content">
+      <!-- Breadcrumb -->
+      <nav class="breadcrumb">
+        <a href="../../index.html">Home</a> &gt;
+        <a href="../index.html">Part V</a> &gt;
+        <span>Chapter 15</span>
+      </nav>
+
+      <!-- Chapter Header -->
+      <div class="chapter-header">
+        <span class="badge badge-hard">Hard</span>
+        <h1>How Do You Guarantee Exactly-Once Processing?</h1>
+        <div class="chapter-topics">
+          <span class="topic-tag">Checkpointing</span>
+          <span class="topic-tag">Idempotency</span>
+        </div>
+      </div>
+
+      <!-- Chapter Navigation -->
+      <div class="chapter-nav">
+        <a href="ch14-realtime-pipeline.html" class="nav-prev">Previous: Real-Time Pipeline</a>
+        <a href="ch16-etl-pipeline-slow.html" class="nav-next">Next: ETL Pipeline Slow</a>
+      </div>
+
+
+      <!-- Section 1: Interviewer Intent -->
+      <section id="interviewer-intent" class="section">
+        <h2>Interviewer Intent</h2>
+        <p>
+          When an interviewer asks "How do you guarantee exactly-once processing in a streaming system?",
+          they are probing several dimensions of your distributed systems expertise:
+        </p>
+        <ul>
+          <li>
+            <strong>Theoretical Foundation:</strong> Do you understand that true exactly-once delivery
+            is impossible in distributed systems (per the Two Generals Problem and FLP impossibility result),
+            and that what we actually achieve is "effectively exactly-once" through a combination of
+            at-least-once delivery plus idempotent processing?
+          </li>
+          <li>
+            <strong>Systems Thinking:</strong> Can you reason about the end-to-end pipeline—source,
+            processing engine, and sink—and identify where duplicates or data loss can occur at each stage?
+          </li>
+          <li>
+            <strong>Framework Expertise:</strong> Are you familiar with how Apache Kafka, Apache Flink,
+            and Apache Spark implement exactly-once guarantees through transactions, checkpointing,
+            and two-phase commit protocols?
+          </li>
+          <li>
+            <strong>Production Experience:</strong> Have you dealt with real failures—checkpoint corruption,
+            offset rewinds, duplicate writes—and can you describe the mitigations you implemented?
+          </li>
+          <li>
+            <strong>Trade-off Awareness:</strong> Do you understand the latency, throughput, and
+            complexity costs of exactly-once guarantees, and can you articulate when at-least-once
+            with deduplication might be preferable?
+          </li>
+          <li>
+            <strong>Sink-Side Guarantees:</strong> Can you design idempotent sinks using upserts,
+            deduplication tables, or conditional writes that prevent duplicate effects even when
+            the same message is delivered multiple times?
+          </li>
+        </ul>
+        <p>
+          A senior data engineer should demonstrate both breadth (knowing the landscape of techniques)
+          and depth (being able to configure, debug, and optimize exactly-once pipelines in production).
+        </p>
+      </section>
+
+      <!-- Section 2: Quick Answer -->
+      <section id="quick-answer" class="section">
+        <h2>Quick Answer</h2>
+        <div class="answer-box">
+          <p>
+            Exactly-once processing in streaming is achieved through <strong>effective exactly-once</strong>:
+            combining at-least-once delivery with mechanisms that ensure duplicate processing has no
+            additional effect. The three pillars are:
+          </p>
+          <ol>
+            <li>
+              <strong>Checkpointing with atomic offset commits:</strong> The processing engine
+              periodically snapshots its state along with the source offsets it has consumed.
+              On recovery, processing resumes from the last consistent snapshot, replaying
+              messages but applying them idempotently.
+            </li>
+            <li>
+              <strong>Transactional writes:</strong> Using Kafka transactions or two-phase commit
+              protocols to atomically commit processed results and consumer offsets together,
+              ensuring no gap between "processed" and "acknowledged."
+            </li>
+            <li>
+              <strong>Idempotent sinks:</strong> Designing downstream stores to handle duplicate
+              writes gracefully—through upserts keyed on event IDs, conditional inserts,
+              or deduplication tables that track which events have already been applied.
+            </li>
+          </ol>
+          <p>
+            In practice: Kafka provides transactional producers and read_committed consumers.
+            Flink uses distributed snapshots (Chandy-Lamport algorithm) with barrier alignment
+            and TwoPhaseCommitSinkFunction. The combination of these mechanisms across source,
+            engine, and sink delivers end-to-end exactly-once semantics.
+          </p>
+        </div>
+      </section>
+
+
+      <!-- Section 3: Delivery Semantics -->
+      <section id="delivery-semantics" class="section">
+        <h2>Delivery Semantics</h2>
+
+        <h3>The Three Guarantees</h3>
+        <p>
+          Distributed messaging systems offer three levels of delivery guarantees, each with
+          distinct trade-offs in complexity, performance, and correctness:
+        </p>
+
+        <div class="comparison-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Semantic</th>
+                <th>Guarantee</th>
+                <th>Failure Behavior</th>
+                <th>Use Case</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>At-Most-Once</strong></td>
+                <td>Messages delivered zero or one time</td>
+                <td>On failure, message is lost (fire-and-forget)</td>
+                <td>Metrics, logging where loss is acceptable</td>
+              </tr>
+              <tr>
+                <td><strong>At-Least-Once</strong></td>
+                <td>Messages delivered one or more times</td>
+                <td>On failure, message is retried (potential duplicates)</td>
+                <td>Most pipelines with idempotent consumers</td>
+              </tr>
+              <tr>
+                <td><strong>Exactly-Once</strong></td>
+                <td>Messages processed with exactly one effect</td>
+                <td>On failure, replay + dedup ensures single effect</td>
+                <td>Financial transactions, billing, inventory</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>At-Most-Once: Fire and Forget</h3>
+        <p>
+          The simplest delivery model commits the consumer offset <em>before</em> processing the
+          message. If the consumer crashes after committing but before processing, the message is
+          permanently lost. This is appropriate only when occasional data loss is acceptable—
+          such as real-time metrics dashboards or debug logging.
+        </p>
+        <pre><code class="language-text">
+Producer ──▶ Broker ──▶ Consumer
+                         │
+                    commit offset
+                         │
+                    process message  ← crash here = message lost
+        </code></pre>
+
+        <h3>At-Least-Once: Retry on Failure</h3>
+        <p>
+          The consumer processes the message first, then commits the offset. If it crashes after
+          processing but before committing, the message will be redelivered on restart. This
+          guarantees no data loss but introduces the possibility of duplicates.
+        </p>
+        <pre><code class="language-text">
+Producer ──▶ Broker ──▶ Consumer
+                         │
+                    process message
+                         │
+                    commit offset  ← crash here = message reprocessed
+        </code></pre>
+        <p>
+          Most production streaming pipelines use at-least-once delivery combined with
+          idempotent processing to achieve effective exactly-once behavior. This is the most
+          practical approach because:
+        </p>
+        <ul>
+          <li>It guarantees no data loss under any failure scenario</li>
+          <li>Duplicates can be handled at the sink layer</li>
+          <li>It has lower latency than full transactional exactly-once</li>
+          <li>It works across heterogeneous systems that may not support transactions</li>
+        </ul>
+
+        <h3>The Impossibility of True Exactly-Once</h3>
+        <p>
+          True exactly-once delivery—where a message is physically transmitted exactly one time
+          across a network—is impossible in distributed systems. This follows from fundamental
+          results in distributed computing:
+        </p>
+        <ul>
+          <li>
+            <strong>Two Generals Problem:</strong> Two parties communicating over an unreliable
+            channel cannot achieve common knowledge of message delivery. Any acknowledgment
+            can itself be lost, requiring further acknowledgments ad infinitum.
+          </li>
+          <li>
+            <strong>FLP Impossibility:</strong> In an asynchronous system with even one faulty
+            process, no deterministic algorithm can guarantee consensus. Since exactly-once
+            requires consensus on whether a message was processed, it cannot be guaranteed
+            in all cases.
+          </li>
+          <li>
+            <strong>Network Partitions:</strong> During a partition, the sender cannot distinguish
+            between "message lost" and "acknowledgment lost," making it impossible to know
+            whether exactly one delivery occurred.
+          </li>
+        </ul>
+
+        <h3>Effective Exactly-Once: The Practical Solution</h3>
+        <p>
+          What modern streaming systems call "exactly-once" is more precisely <strong>effectively
+          exactly-once</strong> or <strong>exactly-once semantics (EOS)</strong>. The message may
+          be physically delivered multiple times, but the system ensures that the <em>effect</em>
+          of processing is applied exactly once. This is achieved through:
+        </p>
+        <ol>
+          <li>
+            <strong>Idempotent operations:</strong> Processing the same message multiple times
+            produces the same result as processing it once. Example: setting a value (PUT)
+            vs. incrementing a counter (non-idempotent without additional mechanisms).
+          </li>
+          <li>
+            <strong>Transactional boundaries:</strong> Atomically committing the processing
+            result and the consumer offset together, so either both succeed or both fail.
+          </li>
+          <li>
+            <strong>Deterministic replay:</strong> On failure recovery, replaying from the
+            last checkpoint produces identical results, and the sink can detect and discard
+            duplicates.
+          </li>
+        </ol>
+
+        <div class="key-insight">
+          <h4>Key Insight</h4>
+          <p>
+            "Exactly-once" in streaming does not mean a message is delivered exactly one time.
+            It means the <em>observable effect</em> on downstream state is as if each message
+            was processed exactly once. The implementation always involves at-least-once
+            delivery combined with deduplication or transactional guarantees.
+          </p>
+        </div>
+
+        <h3>Where Each Semantic Applies</h3>
+        <div class="comparison-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Scenario</th>
+                <th>Acceptable Semantic</th>
+                <th>Reasoning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Click-stream analytics</td>
+                <td>At-Most-Once / At-Least-Once</td>
+                <td>Approximate counts are acceptable; duplicates skew slightly</td>
+              </tr>
+              <tr>
+                <td>Payment processing</td>
+                <td>Exactly-Once</td>
+                <td>Double-charging customers is unacceptable</td>
+              </tr>
+              <tr>
+                <td>Sensor data ingestion</td>
+                <td>At-Least-Once</td>
+                <td>Idempotent upserts by sensor ID + timestamp handle duplicates</td>
+              </tr>
+              <tr>
+                <td>Order fulfillment</td>
+                <td>Exactly-Once</td>
+                <td>Shipping duplicate items has real cost</td>
+              </tr>
+              <tr>
+                <td>Log aggregation</td>
+                <td>At-Least-Once</td>
+                <td>Duplicate log lines are tolerable; loss is not</td>
+              </tr>
+              <tr>
+                <td>Inventory updates</td>
+                <td>Exactly-Once</td>
+                <td>Over-decrementing inventory causes stock-out errors</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+
+      <!-- Section 4: Kafka Transactions -->
+      <section id="kafka-transactions" class="section">
+        <h2>Kafka Transactions</h2>
+
+        <h3>Overview</h3>
+        <p>
+          Apache Kafka introduced transactions in version 0.11 (KIP-98) to enable exactly-once
+          semantics for read-process-write patterns. Kafka transactions allow a producer to
+          atomically write to multiple partitions and commit consumer offsets in a single
+          atomic operation. If any part fails, the entire transaction is aborted and no
+          partial results are visible to consumers reading at <code>isolation.level=read_committed</code>.
+        </p>
+
+        <h3>Transactional Producer</h3>
+        <p>
+          A Kafka transactional producer is configured with a unique <code>transactional.id</code>.
+          This ID enables Kafka to fence zombie instances—if a producer with the same
+          transactional ID starts up (e.g., after a restart), it will abort any pending
+          transactions from the previous instance before proceeding.
+        </p>
+        <pre><code class="language-java">
+// Kafka Transactional Producer Configuration
+Properties props = new Properties();
+props.put("bootstrap.servers", "kafka-broker-1:9092,kafka-broker-2:9092");
+props.put("transactional.id", "payment-processor-txn-001");
+props.put("enable.idempotence", "true");  // Required for transactions
+props.put("acks", "all");                  // Required for transactions
+props.put("max.in.flight.requests.per.connection", "5");
+props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
+KafkaProducer&lt;String, String&gt; producer = new KafkaProducer&lt;&gt;(props);
+producer.initTransactions();
+        </code></pre>
+
+        <h3>Read-Process-Write Pattern</h3>
+        <p>
+          The canonical exactly-once pattern in Kafka reads from input topics, processes
+          the data, writes results to output topics, and commits the consumer offsets—all
+          within a single transaction. This guarantees that either all operations succeed
+          atomically, or none of them take effect.
+        </p>
+        <pre><code class="language-java">
+// Read-Process-Write with Kafka Transactions
+KafkaConsumer&lt;String, String&gt; consumer = createConsumer();
+consumer.subscribe(Collections.singletonList("payments-input"));
+
+while (true) {
+    ConsumerRecords&lt;String, String&gt; records = consumer.poll(Duration.ofMillis(100));
+
+    if (records.isEmpty()) continue;
+
+    producer.beginTransaction();
+    try {
+        for (ConsumerRecord&lt;String, String&gt; record : records) {
+            // Process the payment event
+            PaymentResult result = processPayment(record.value());
+
+            // Write result to output topic within the transaction
+            producer.send(new ProducerRecord&lt;&gt;(
+                "payments-processed",
+                record.key(),
+                result.toJson()
+            ));
+        }
+
+        // Atomically commit offsets and produced messages
+        Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets = getConsumedOffsets(records);
+        producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
+        producer.commitTransaction();
+
+    } catch (ProducerFencedException | OutOfOrderSequenceException e) {
+        // Fatal errors - cannot recover, must shut down
+        producer.close();
+        throw e;
+    } catch (KafkaException e) {
+        // Abort transaction and retry
+        producer.abortTransaction();
+        resetConsumerToLastCommittedOffsets(consumer);
+    }
+}
+        </code></pre>
+
+        <h3>How Kafka Transactions Work Internally</h3>
+        <p>
+          Kafka's transaction protocol involves several components working together:
+        </p>
+        <ol>
+          <li>
+            <strong>Transaction Coordinator:</strong> A broker-side component (one per
+            transactional.id, partitioned by hash) that manages the transaction lifecycle.
+            It stores transaction metadata in an internal <code>__transaction_state</code> topic.
+          </li>
+          <li>
+            <strong>Transaction Log:</strong> The <code>__transaction_state</code> internal topic
+            stores the state machine for each transaction: Empty → Ongoing → PrepareCommit → CompleteCommit
+            (or PrepareAbort → CompleteAbort).
+          </li>
+          <li>
+            <strong>Producer ID and Epoch:</strong> Each transactional producer gets a unique
+            PID (Producer ID) and an epoch number. The epoch is incremented on each
+            <code>initTransactions()</code> call, fencing any older instances with the same
+            transactional.id.
+          </li>
+          <li>
+            <strong>Control Messages:</strong> Transaction commit/abort markers are written to
+            each partition involved in the transaction. Consumers with
+            <code>isolation.level=read_committed</code> filter out messages from aborted
+            transactions and buffer messages from ongoing transactions until commit.
+          </li>
+        </ol>
+
+        <h3>Isolation Level: read_committed</h3>
+        <p>
+          For exactly-once guarantees to work end-to-end in Kafka, consumers must be configured
+          with <code>isolation.level=read_committed</code>. This ensures they only see messages
+          from committed transactions:
+        </p>
+        <pre><code class="language-java">
+// Consumer configuration for exactly-once reads
+Properties consumerProps = new Properties();
+consumerProps.put("bootstrap.servers", "kafka-broker-1:9092");
+consumerProps.put("group.id", "payment-consumer-group");
+consumerProps.put("isolation.level", "read_committed");  // Critical for EOS
+consumerProps.put("enable.auto.commit", "false");         // Manual offset management
+consumerProps.put("auto.offset.reset", "earliest");
+        </code></pre>
+        <p>
+          With <code>read_committed</code>, the consumer's <code>poll()</code> will not return
+          messages that are part of an open or aborted transaction. The Last Stable Offset (LSO)
+          tracks the earliest offset of any open transaction on a partition—consumers cannot
+          read beyond this point until the transaction resolves.
+        </p>
+
+        <div class="warning-box">
+          <h4>Warning: LSO Lag</h4>
+          <p>
+            Long-running transactions or stuck producers can cause the LSO to lag behind the
+            log end offset (LEO), blocking read_committed consumers from making progress.
+            Configure <code>transaction.timeout.ms</code> (default 60s) to bound this lag.
+            Monitor the <code>records-lag</code> metric on read_committed consumers to detect
+            this condition.
+          </p>
+        </div>
+
+        <h3>Idempotent Producer (enable.idempotence=true)</h3>
+        <p>
+          Kafka's idempotent producer eliminates duplicates caused by producer retries. Each
+          message batch is assigned a sequence number; the broker deduplicates based on
+          (PID, partition, sequence number). This is a prerequisite for transactions and
+          provides per-partition exactly-once for individual produce calls:
+        </p>
+        <ul>
+          <li>Handles network retries transparently—duplicate sends are detected and discarded</li>
+          <li>Ensures in-order delivery per partition even with <code>max.in.flight.requests.per.connection=5</code></li>
+          <li>Requires <code>acks=all</code> to prevent data loss on leader failover</li>
+          <li>The broker maintains a sliding window of 5 sequence numbers per PID/partition</li>
+        </ul>
+
+        <h3>Transaction Performance Considerations</h3>
+        <div class="comparison-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Configuration</th>
+                <th>Impact</th>
+                <th>Recommendation</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>transaction.timeout.ms</code></td>
+                <td>Max time before coordinator aborts transaction</td>
+                <td>Set to 2-3x your expected processing time; default 60000ms</td>
+              </tr>
+              <tr>
+                <td><code>max.block.ms</code></td>
+                <td>Max time producer blocks on buffer full</td>
+                <td>Set higher than transaction.timeout.ms to avoid premature failures</td>
+              </tr>
+              <tr>
+                <td>Batch size</td>
+                <td>More messages per transaction amortizes commit overhead</td>
+                <td>Batch 100-1000 messages per transaction for throughput</td>
+              </tr>
+              <tr>
+                <td>Number of partitions in transaction</td>
+                <td>More partitions = more control messages on commit</td>
+                <td>Minimize cross-partition transactions when possible</td>
+              </tr>
+              <tr>
+                <td><code>linger.ms</code></td>
+                <td>Batching delay before sending</td>
+                <td>Higher values improve throughput but add latency</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+
+      <!-- Section 5: Checkpointing -->
+      <section id="checkpointing" class="section">
+        <h2>Checkpointing</h2>
+
+        <h3>Flink Distributed Snapshots (Chandy-Lamport Algorithm)</h3>
+        <p>
+          Apache Flink achieves exactly-once processing guarantees through distributed snapshots
+          based on the Chandy-Lamport algorithm. This approach captures a globally consistent
+          snapshot of all operator states and in-flight messages without stopping the pipeline.
+        </p>
+
+        <h4>How Flink Checkpointing Works</h4>
+        <ol>
+          <li>
+            <strong>Barrier Injection:</strong> The JobManager periodically injects checkpoint
+            barriers into the source streams. These barriers are special markers that flow
+            through the data stream alongside regular records.
+          </li>
+          <li>
+            <strong>Barrier Alignment:</strong> When an operator with multiple inputs receives
+            a barrier on one input, it buffers records from that input until barriers arrive
+            on all inputs. This ensures the snapshot captures a consistent cut across all streams.
+          </li>
+          <li>
+            <strong>State Snapshot:</strong> Once barriers are aligned, the operator snapshots
+            its state (key-value state, window contents, timers) to the configured state backend
+            (RocksDB, filesystem, or heap).
+          </li>
+          <li>
+            <strong>Async Persistence:</strong> The snapshot is written asynchronously to durable
+            storage (HDFS, S3, GCS) while the operator continues processing. This minimizes
+            the performance impact of checkpointing.
+          </li>
+          <li>
+            <strong>Completion:</strong> When all operators have acknowledged their snapshots,
+            the checkpoint is marked complete. On failure, the job restores from the last
+            complete checkpoint.
+          </li>
+        </ol>
+
+        <pre><code class="language-text">
+Checkpoint Barrier Flow:
+
+Source 1: ──── data ──── |barrier n| ──── data ──── |barrier n+1| ────▶
+                              │
+Operator A: ──── data ── |barrier n| ──── [snapshot state] ──── data ──▶
+                              │
+Source 2: ──── data ──── |barrier n| ──── data ──── |barrier n+1| ────▶
+                              │
+Operator B: ──── data ── |barrier n| ──── [snapshot state] ──── data ──▶
+                              │
+Sink:      ──── data ──── |barrier n| ── [commit to external system] ──▶
+        </code></pre>
+
+        <h4>Unaligned Checkpoints (Flink 1.11+)</h4>
+        <p>
+          Traditional barrier alignment can cause backpressure when one input is slower than
+          others. Flink 1.11 introduced unaligned checkpoints that include in-flight data
+          (buffered records) in the snapshot rather than waiting for alignment:
+        </p>
+        <ul>
+          <li>Barriers overtake buffered records rather than waiting behind them</li>
+          <li>In-flight records between the barrier position and the buffer are included in the snapshot</li>
+          <li>Eliminates checkpoint-induced backpressure at the cost of larger snapshot sizes</li>
+          <li>Particularly beneficial for jobs with high parallelism and data skew</li>
+        </ul>
+
+        <h4>Flink Checkpoint Configuration</h4>
+        <pre><code class="language-java">
+// Flink Checkpoint Configuration for Exactly-Once
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+// Enable checkpointing every 30 seconds
+env.enableCheckpointing(30000, CheckpointingMode.EXACTLY_ONCE);
+
+// Advanced checkpoint configuration
+CheckpointConfig config = env.getCheckpointConfig();
+config.setMinPauseBetweenCheckpoints(10000);       // Min 10s between checkpoints
+config.setCheckpointTimeout(120000);                // Timeout after 2 minutes
+config.setMaxConcurrentCheckpoints(1);              // Only one at a time
+config.setTolerableCheckpointFailureNumber(3);      // Allow 3 failures before job fails
+
+// Retain checkpoints on job cancellation for manual recovery
+config.setExternalizedCheckpointCleanup(
+    CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION
+);
+
+// Use RocksDB state backend for large state
+env.setStateBackend(new EmbeddedRocksDBStateBackend());
+
+// Store checkpoints on S3
+config.setCheckpointStorage("s3://my-bucket/flink-checkpoints/");
+        </code></pre>
+
+        <h3>Spark Structured Streaming Checkpointing</h3>
+        <p>
+          Spark Structured Streaming uses a write-ahead log (WAL) and checkpoint directory to
+          achieve exactly-once guarantees. The checkpoint stores:
+        </p>
+        <ul>
+          <li><strong>Offset ranges:</strong> Which offsets from each source partition have been committed</li>
+          <li><strong>State data:</strong> Aggregation state for stateful operations (watermarks, windows)</li>
+          <li><strong>Commit log:</strong> Which micro-batches have been successfully written to the sink</li>
+        </ul>
+
+        <pre><code class="language-python">
+# Spark Structured Streaming with Checkpointing
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .appName("ExactlyOncePayments") \
+    .config("spark.sql.streaming.checkpointLocation", "s3://bucket/checkpoints/") \
+    .getOrCreate()
+
+# Read from Kafka
+payments = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", "broker1:9092,broker2:9092") \
+    .option("subscribe", "payments") \
+    .option("startingOffsets", "earliest") \
+    .option("kafka.isolation.level", "read_committed") \
+    .load()
+
+# Process payments
+processed = payments.selectExpr(
+    "CAST(key AS STRING) as payment_id",
+    "CAST(value AS STRING) as payload",
+    "timestamp"
+).transform(enrich_payment)
+
+# Write with exactly-once guarantees
+query = processed.writeStream \
+    .format("delta") \
+    .outputMode("append") \
+    .option("checkpointLocation", "s3://bucket/checkpoints/payments-sink/") \
+    .option("mergeSchema", "true") \
+    .trigger(processingTime="30 seconds") \
+    .start("s3://bucket/payments-processed/")
+        </code></pre>
+
+        <h4>Spark Checkpoint Directory Structure</h4>
+        <pre><code class="language-text">
+s3://bucket/checkpoints/payments-sink/
+├── metadata                    # Query metadata (ID, run ID)
+├── offsets/                    # Committed offset ranges per batch
+│   ├── 0                       # Batch 0 offsets
+│   ├── 1                       # Batch 1 offsets
+│   └── ...
+├── commits/                    # Successfully committed batches
+│   ├── 0
+│   ├── 1
+│   └── ...
+├── state/                      # Operator state snapshots
+│   └── 0/
+│       └── partition-0/
+│           ├── 1.delta
+│           └── 2.snapshot
+└── sources/                    # Source-specific metadata
+    └── 0/
+        └── 0                   # Initial offsets
+        </code></pre>
+
+        <h3>Exactly-Once with Stateful Processing</h3>
+        <p>
+          Checkpointing is especially critical for stateful operations where operator state
+          must be consistent with the processed input:
+        </p>
+        <ul>
+          <li>
+            <strong>Windowed aggregations:</strong> Window contents are part of the checkpoint.
+            On recovery, the window is restored and reprocessing does not double-count events
+            that were already in the window.
+          </li>
+          <li>
+            <strong>Session windows:</strong> Active sessions and their accumulated state are
+            snapshotted. Recovery restores the exact session boundaries.
+          </li>
+          <li>
+            <strong>Keyed state:</strong> Per-key state (counters, accumulators, last-seen values)
+            is checkpointed alongside the offset. Replay from checkpoint produces identical
+            state transitions.
+          </li>
+          <li>
+            <strong>Process functions with timers:</strong> Registered timers and their associated
+            state are included in checkpoints. On recovery, timers fire at the correct times
+            relative to event-time watermarks.
+          </li>
+        </ul>
+
+        <div class="key-insight">
+          <h4>Key Insight</h4>
+          <p>
+            Checkpointing alone does not provide exactly-once to external systems. It guarantees
+            exactly-once within the processing engine's state. For end-to-end exactly-once,
+            you also need either idempotent sinks or two-phase commit protocols to coordinate
+            with external systems.
+          </p>
+        </div>
+      </section>
+
+
+      <!-- Section 6: Idempotent Sinks -->
+      <section id="idempotent-sinks" class="section">
+        <h2>Idempotent Sinks</h2>
+
+        <h3>The Principle</h3>
+        <p>
+          An idempotent sink produces the same result whether an operation is applied once or
+          multiple times. This is the most robust approach to exactly-once because it works
+          regardless of the delivery guarantee provided by the upstream system. Even with
+          at-least-once delivery, an idempotent sink ensures no duplicate effects.
+        </p>
+
+        <h3>Database Upserts</h3>
+        <p>
+          The most common idempotent sink pattern uses database upserts (INSERT ON CONFLICT UPDATE
+          or MERGE) keyed on a natural business key or event ID:
+        </p>
+        <pre><code class="language-sql">
+-- PostgreSQL: Idempotent upsert for payment events
+INSERT INTO processed_payments (
+    payment_id,
+    customer_id,
+    amount,
+    currency,
+    status,
+    processed_at,
+    kafka_offset,
+    kafka_partition
+)
+VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7)
+ON CONFLICT (payment_id)
+DO UPDATE SET
+    status = EXCLUDED.status,
+    processed_at = EXCLUDED.processed_at,
+    kafka_offset = EXCLUDED.kafka_offset
+WHERE processed_payments.kafka_offset < EXCLUDED.kafka_offset;
+-- Only update if the incoming offset is newer (prevents out-of-order overwrites)
+        </code></pre>
+
+        <pre><code class="language-sql">
+-- MySQL: Idempotent upsert using INSERT ... ON DUPLICATE KEY
+INSERT INTO order_events (
+    event_id,
+    order_id,
+    event_type,
+    payload,
+    created_at
+)
+VALUES (?, ?, ?, ?, NOW())
+ON DUPLICATE KEY UPDATE
+    event_type = VALUES(event_type),
+    payload = VALUES(payload),
+    created_at = VALUES(created_at);
+        </code></pre>
+
+        <h3>Deduplication Tables</h3>
+        <p>
+          When the sink operation is not naturally idempotent (e.g., incrementing a counter,
+          appending to a log), use a deduplication table to track processed event IDs:
+        </p>
+        <pre><code class="language-sql">
+-- Deduplication with transactional check-and-insert
+BEGIN;
+
+-- Check if we've already processed this event
+SELECT 1 FROM processed_events WHERE event_id = $1;
+
+-- If not found, process it
+INSERT INTO processed_events (event_id, processed_at)
+VALUES ($1, NOW());
+
+-- Apply the non-idempotent operation
+UPDATE account_balances
+SET balance = balance + $2
+WHERE account_id = $3;
+
+COMMIT;
+        </code></pre>
+
+        <pre><code class="language-python">
+# Python implementation with deduplication table
+class IdempotentSink:
+    def __init__(self, db_pool):
+        self.db_pool = db_pool
+
+    async def process_event(self, event):
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                # Check dedup table
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM processed_events WHERE event_id = $1",
+                    event.event_id
+                )
+                if exists:
+                    # Already processed - skip silently
+                    return
+
+                # Record the event as processed
+                await conn.execute(
+                    "INSERT INTO processed_events (event_id, processed_at) VALUES ($1, NOW())",
+                    event.event_id
+                )
+
+                # Apply the business logic (non-idempotent operation)
+                await conn.execute(
+                    "UPDATE account_balances SET balance = balance + $1 WHERE account_id = $2",
+                    event.amount,
+                    event.account_id
+                )
+        </code></pre>
+
+        <h4>Dedup Table Maintenance</h4>
+        <p>
+          Deduplication tables grow indefinitely unless pruned. Strategies for managing their size:
+        </p>
+        <ul>
+          <li>
+            <strong>Time-based TTL:</strong> Delete entries older than the maximum replay window
+            (e.g., if Kafka retention is 7 days, keep dedup entries for 8 days)
+          </li>
+          <li>
+            <strong>Partition by date:</strong> Use date-partitioned tables and drop old partitions
+            (much faster than row-level deletes)
+          </li>
+          <li>
+            <strong>Offset-based pruning:</strong> Once all consumers have advanced past a certain
+            offset, events at or below that offset will never be replayed
+          </li>
+        </ul>
+
+        <pre><code class="language-sql">
+-- Partition dedup table by date for efficient pruning
+CREATE TABLE processed_events (
+    event_id VARCHAR(64) NOT NULL,
+    processed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (event_id, processed_at)
+) PARTITION BY RANGE (processed_at);
+
+-- Create daily partitions
+CREATE TABLE processed_events_20240101
+    PARTITION OF processed_events
+    FOR VALUES FROM ('2024-01-01') TO ('2024-01-02');
+
+-- Drop old partitions (instant operation)
+DROP TABLE processed_events_20231225;
+        </code></pre>
+
+        <h3>BigQuery Streaming Buffer Deduplication</h3>
+        <p>
+          Google BigQuery's streaming insert API provides built-in deduplication through
+          <code>insertId</code>. Records with the same insertId are deduplicated within a
+          time window (best effort, approximately 1 minute):
+        </p>
+        <pre><code class="language-python">
+# BigQuery streaming insert with deduplication
+from google.cloud import bigquery
+
+client = bigquery.Client()
+table_ref = client.dataset("payments").table("transactions")
+
+def write_to_bigquery(events):
+    rows_to_insert = []
+    for event in events:
+        rows_to_insert.append({
+            "insertId": event.event_id,  # Deduplication key
+            "json": {
+                "payment_id": event.payment_id,
+                "amount": event.amount,
+                "currency": event.currency,
+                "customer_id": event.customer_id,
+                "processed_at": event.timestamp.isoformat(),
+            }
+        })
+
+    errors = client.insert_rows_json(
+        table_ref,
+        rows_to_insert,
+        row_ids=[r["insertId"] for r in rows_to_insert]
+    )
+
+    if errors:
+        raise BigQueryInsertError(f"Failed to insert rows: {errors}")
+        </code></pre>
+
+        <div class="warning-box">
+          <h4>BigQuery Dedup Limitations</h4>
+          <p>
+            BigQuery's insertId deduplication is best-effort and only works within the streaming
+            buffer (before data is committed to columnar storage). For stronger guarantees,
+            combine with a periodic MERGE statement that deduplicates the committed data:
+          </p>
+        </div>
+
+        <pre><code class="language-sql">
+-- BigQuery: Periodic deduplication merge
+MERGE INTO `project.dataset.payments_final` AS target
+USING (
+    SELECT *,
+        ROW_NUMBER() OVER (PARTITION BY payment_id ORDER BY processed_at DESC) as rn
+    FROM `project.dataset.payments_staging`
+    WHERE DATE(processed_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+) AS source
+ON target.payment_id = source.payment_id
+WHEN MATCHED AND source.rn = 1 THEN
+    UPDATE SET
+        amount = source.amount,
+        status = source.status,
+        processed_at = source.processed_at
+WHEN NOT MATCHED AND source.rn = 1 THEN
+    INSERT (payment_id, amount, status, processed_at)
+    VALUES (source.payment_id, source.amount, source.status, source.processed_at);
+        </code></pre>
+
+        <h3>Conditional Writes in DynamoDB</h3>
+        <p>
+          DynamoDB conditional expressions provide atomic check-and-write that enables
+          idempotent sinks:
+        </p>
+        <pre><code class="language-python">
+# DynamoDB conditional write for idempotency
+import boto3
+from botocore.exceptions import ClientError
+
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('processed_events')
+
+def idempotent_write(event):
+    try:
+        table.put_item(
+            Item={
+                'event_id': event['event_id'],
+                'payload': event['payload'],
+                'processed_at': int(time.time()),
+                'ttl': int(time.time()) + 86400 * 7  # 7-day TTL
+            },
+            ConditionExpression='attribute_not_exists(event_id)'
+        )
+        # First time processing - apply business logic
+        apply_business_logic(event)
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            # Already processed - idempotent skip
+            return False
+        raise
+        </code></pre>
+      </section>
+
+
+      <!-- Section 7: Two-Phase Commit in Streaming -->
+      <section id="two-phase-commit" class="section">
+        <h2>Two-Phase Commit in Streaming</h2>
+
+        <h3>Overview</h3>
+        <p>
+          Two-phase commit (2PC) is a distributed consensus protocol that coordinates commits
+          across multiple participants to ensure atomicity. In streaming, 2PC enables exactly-once
+          delivery to external systems that support transactions (databases, Kafka, etc.) by
+          tying the external commit to the checkpoint completion.
+        </p>
+
+        <h3>The Two Phases</h3>
+        <ol>
+          <li>
+            <strong>Phase 1 - Pre-commit (Prepare):</strong> During checkpointing, the sink
+            operator pre-commits (prepares) the transaction in the external system but does not
+            finalize it. Data is written but not yet visible to readers.
+          </li>
+          <li>
+            <strong>Phase 2 - Commit:</strong> After the checkpoint completes successfully
+            (all operators have acknowledged), the JobManager notifies the sink to commit the
+            prepared transaction. Only then does the data become visible.
+          </li>
+        </ol>
+
+        <pre><code class="language-text">
+Two-Phase Commit Timeline:
+
+Checkpoint Triggered
+    │
+    ├─── Operator snapshots state
+    │
+    ├─── Sink: pre-commit (BEGIN + write + PREPARE)
+    │         └── Data written but NOT visible
+    │
+    ├─── All operators acknowledge checkpoint
+    │
+    ├─── Checkpoint marked COMPLETE
+    │
+    └─── Sink: commit (COMMIT PREPARED)
+              └── Data becomes visible to readers
+
+On Failure (before checkpoint complete):
+    └─── Sink: abort (ROLLBACK PREPARED)
+              └── Pre-committed data is discarded
+        </code></pre>
+
+        <h3>Flink TwoPhaseCommitSinkFunction</h3>
+        <p>
+          Flink provides the abstract class <code>TwoPhaseCommitSinkFunction</code> that
+          implements the 2PC protocol integrated with Flink's checkpointing mechanism:
+        </p>
+        <pre><code class="language-java">
+// Flink Two-Phase Commit Sink for PostgreSQL
+public class PostgresTwoPhaseCommitSink
+    extends TwoPhaseCommitSinkFunction&lt;PaymentEvent, Connection, Void&gt; {
+
+    @Override
+    protected Connection beginTransaction() throws Exception {
+        // Phase 0: Start a new transaction
+        Connection conn = dataSource.getConnection();
+        conn.setAutoCommit(false);
+        return conn;
+    }
+
+    @Override
+    protected void invoke(Connection transaction, PaymentEvent event, Context context)
+        throws Exception {
+        // Write data within the transaction (not yet visible)
+        PreparedStatement stmt = transaction.prepareStatement(
+            "INSERT INTO payments (payment_id, amount, status) VALUES (?, ?, ?) " +
+            "ON CONFLICT (payment_id) DO UPDATE SET status = EXCLUDED.status"
+        );
+        stmt.setString(1, event.getPaymentId());
+        stmt.setBigDecimal(2, event.getAmount());
+        stmt.setString(3, event.getStatus());
+        stmt.executeUpdate();
+    }
+
+    @Override
+    protected void preCommit(Connection transaction) throws Exception {
+        // Phase 1: Prepare the transaction (flush all writes)
+        // For databases supporting PREPARE TRANSACTION:
+        transaction.prepareStatement(
+            "PREPARE TRANSACTION 'flink_checkpoint_" + getCurrentCheckpointId() + "'"
+        ).execute();
+    }
+
+    @Override
+    protected void commit(Connection transaction) {
+        // Phase 2: Commit after checkpoint succeeds
+        try {
+            transaction.prepareStatement(
+                "COMMIT PREPARED 'flink_checkpoint_" + getCurrentCheckpointId() + "'"
+            ).execute();
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to commit prepared transaction", e);
+        }
+    }
+
+    @Override
+    protected void abort(Connection transaction) {
+        // Abort if checkpoint fails
+        try {
+            transaction.prepareStatement(
+                "ROLLBACK PREPARED 'flink_checkpoint_" + getCurrentCheckpointId() + "'"
+            ).execute();
+        } catch (SQLException e) {
+            log.warn("Failed to rollback prepared transaction", e);
+        }
+    }
+}
+        </code></pre>
+
+        <h3>Kafka Sink Connector with 2PC</h3>
+        <p>
+          Flink's Kafka sink uses transactions to implement exactly-once delivery to Kafka topics.
+          Each checkpoint interval maps to a Kafka transaction:
+        </p>
+        <pre><code class="language-java">
+// Flink KafkaSink with exactly-once delivery (Flink 1.14+)
+KafkaSink&lt;String&gt; kafkaSink = KafkaSink.&lt;String&gt;builder()
+    .setBootstrapServers("kafka-broker-1:9092,kafka-broker-2:9092")
+    .setRecordSerializer(
+        KafkaRecordSerializationSchema.builder()
+            .setTopic("payments-output")
+            .setValueSerializationSchema(new SimpleStringSchema())
+            .build()
+    )
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("flink-payments-sink")
+    .setProperty("transaction.timeout.ms", "900000")  // 15 min > checkpoint interval
+    .build();
+
+dataStream.sinkTo(kafkaSink);
+        </code></pre>
+
+        <div class="warning-box">
+          <h4>Critical: transaction.timeout.ms</h4>
+          <p>
+            The Kafka <code>transaction.timeout.ms</code> on the sink must be greater than the
+            Flink checkpoint interval. If a transaction times out before the checkpoint completes,
+            Kafka will abort it and data will be lost. Set it to at least 2x the checkpoint
+            interval. Note: the Kafka broker's <code>transaction.max.timeout.ms</code> (default
+            15 minutes) caps this value.
+          </p>
+        </div>
+
+        <h3>Limitations of 2PC in Streaming</h3>
+        <ul>
+          <li>
+            <strong>Blocking:</strong> Prepared transactions hold locks on the external system.
+            Long checkpoint intervals mean long lock durations.
+          </li>
+          <li>
+            <strong>External system support required:</strong> The sink must support distributed
+            transactions (PREPARE TRANSACTION). Not all databases/systems support this.
+          </li>
+          <li>
+            <strong>Recovery complexity:</strong> On job restart, the sink must be able to
+            recover and either commit or abort any in-doubt (prepared but not committed)
+            transactions from the previous run.
+          </li>
+          <li>
+            <strong>Increased latency:</strong> Data is not visible until the checkpoint
+            completes and the commit phase executes, adding end-to-end latency equal to
+            the checkpoint interval.
+          </li>
+          <li>
+            <strong>Coordinator failure:</strong> If the Flink JobManager fails after pre-commit
+            but before commit, prepared transactions remain in-doubt until the job restarts
+            and resolves them.
+          </li>
+        </ul>
+
+        <h3>When to Use 2PC vs Idempotent Sinks</h3>
+        <div class="comparison-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Criteria</th>
+                <th>Two-Phase Commit</th>
+                <th>Idempotent Sink</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Sink supports transactions</td>
+                <td>Required</td>
+                <td>Not required</td>
+              </tr>
+              <tr>
+                <td>Operation idempotency</td>
+                <td>Not required (transactional guarantee)</td>
+                <td>Required (upserts, conditional writes)</td>
+              </tr>
+              <tr>
+                <td>Visibility latency</td>
+                <td>Higher (waits for checkpoint)</td>
+                <td>Lower (writes immediately visible)</td>
+              </tr>
+              <tr>
+                <td>Lock contention</td>
+                <td>Holds locks during checkpoint</td>
+                <td>No long-held locks</td>
+              </tr>
+              <tr>
+                <td>Implementation complexity</td>
+                <td>Higher (manage prepared transactions)</td>
+                <td>Lower (design idempotent writes)</td>
+              </tr>
+              <tr>
+                <td>Recovery complexity</td>
+                <td>Must resolve in-doubt transactions</td>
+                <td>Replay is safe (idempotent)</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+
+      <!-- Section 8: Deduplication Patterns -->
+      <section id="deduplication" class="section">
+        <h2>Deduplication Patterns</h2>
+
+        <h3>Event ID Tracking</h3>
+        <p>
+          The simplest deduplication approach assigns a globally unique ID to each event at
+          the source and tracks which IDs have been processed. This works well when:
+        </p>
+        <ul>
+          <li>Events have natural unique identifiers (order_id, transaction_id)</li>
+          <li>The deduplication window is bounded (you don't need to remember all IDs forever)</li>
+          <li>The processing rate allows for per-event lookups</li>
+        </ul>
+
+        <pre><code class="language-java">
+// Flink Event ID Deduplication with KeyedState
+public class DeduplicationFunction
+    extends KeyedProcessFunction&lt;String, PaymentEvent, PaymentEvent&gt; {
+
+    // State to track processed event IDs with TTL
+    private ValueState&lt;Boolean&gt; processedState;
+
+    @Override
+    public void open(Configuration parameters) {
+        ValueStateDescriptor&lt;Boolean&gt; descriptor =
+            new ValueStateDescriptor&lt;&gt;("processed", Boolean.class);
+
+        // Configure state TTL for automatic cleanup
+        StateTtlConfig ttlConfig = StateTtlConfig.newBuilder(Time.hours(24))
+            .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+            .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+            .cleanupInRocksdbCompactFilter(1000)
+            .build();
+        descriptor.enableTimeToLive(ttlConfig);
+
+        processedState = getRuntimeContext().getState(descriptor);
+    }
+
+    @Override
+    public void processElement(PaymentEvent event, Context ctx,
+        Collector&lt;PaymentEvent&gt; out) throws Exception {
+
+        // Check if already processed
+        Boolean processed = processedState.value();
+        if (processed != null &amp;&amp; processed) {
+            // Duplicate - skip
+            ctx.output(duplicateTag, event);
+            return;
+        }
+
+        // Mark as processed
+        processedState.update(true);
+
+        // Emit for downstream processing
+        out.collect(event);
+    }
+}
+        </code></pre>
+
+        <h3>Bloom Filters for High-Volume Deduplication</h3>
+        <p>
+          When tracking millions of event IDs, exact set membership becomes expensive. Bloom
+          filters provide space-efficient probabilistic deduplication with a configurable
+          false positive rate (duplicate events incorrectly identified as new):
+        </p>
+        <pre><code class="language-java">
+// Bloom Filter Deduplication (space-efficient, probabilistic)
+public class BloomFilterDedup
+    extends KeyedProcessFunction&lt;String, Event, Event&gt; {
+
+    private transient BloomFilter&lt;String&gt; bloomFilter;
+    private ValueState&lt;byte[]&gt; bloomFilterState;
+
+    @Override
+    public void open(Configuration parameters) {
+        bloomFilterState = getRuntimeContext().getState(
+            new ValueStateDescriptor&lt;&gt;("bloom-filter", byte[].class)
+        );
+    }
+
+    @Override
+    public void processElement(Event event, Context ctx,
+        Collector&lt;Event&gt; out) throws Exception {
+
+        // Restore or create bloom filter
+        byte[] serialized = bloomFilterState.value();
+        if (serialized != null) {
+            bloomFilter = deserializeBloomFilter(serialized);
+        } else {
+            // 10M expected insertions, 0.01% false positive rate
+            bloomFilter = BloomFilter.create(
+                Funnels.stringFunnel(Charsets.UTF_8),
+                10_000_000,
+                0.0001
+            );
+        }
+
+        String eventId = event.getEventId();
+
+        if (bloomFilter.mightContain(eventId)) {
+            // Possible duplicate - send to secondary exact check or skip
+            ctx.output(possibleDuplicateTag, event);
+            return;
+        }
+
+        // Definitely new - add to filter and emit
+        bloomFilter.put(eventId);
+        bloomFilterState.update(serializeBloomFilter(bloomFilter));
+        out.collect(event);
+    }
+}
+        </code></pre>
+
+        <div class="key-insight">
+          <h4>Bloom Filter Trade-offs</h4>
+          <p>
+            Bloom filters have false positives (marking a new event as duplicate) but never
+            false negatives (never letting a true duplicate through). For exactly-once, this
+            means occasional data loss (false positive = dropped event). Use a two-tier
+            approach: Bloom filter as fast check, then exact lookup for positives.
+          </p>
+        </div>
+
+        <h3>Time-Windowed Deduplication</h3>
+        <p>
+          Many streaming systems only need to deduplicate within a time window (e.g., the last
+          5 minutes). This bounds memory usage and is appropriate when the source guarantees
+          that duplicates arrive within a known time skew:
+        </p>
+        <pre><code class="language-java">
+// Time-windowed deduplication using Flink's window state
+public class WindowedDedup extends ProcessWindowFunction&lt;
+    Event, Event, String, TimeWindow&gt; {
+
+    @Override
+    public void process(String key, Context context,
+        Iterable&lt;Event&gt; elements, Collector&lt;Event&gt; out) {
+
+        // Within each window, deduplicate by event ID
+        Map&lt;String, Event&gt; seen = new HashMap&lt;&gt;();
+        for (Event event : elements) {
+            seen.putIfAbsent(event.getEventId(), event);
+        }
+
+        // Emit only unique events
+        seen.values().forEach(out::collect);
+    }
+}
+
+// Apply with tumbling window
+dataStream
+    .keyBy(Event::getPartitionKey)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .process(new WindowedDedup());
+        </code></pre>
+
+        <h3>Redis-Based Deduplication</h3>
+        <p>
+          Redis provides fast, centralized deduplication that works across multiple consumer
+          instances. The SET NX (set if not exists) command with TTL provides atomic
+          check-and-mark:
+        </p>
+        <pre><code class="language-python">
+# Redis-based deduplication with TTL
+import redis
+import hashlib
+
+class RedisDeduplicator:
+    def __init__(self, redis_url, ttl_seconds=3600):
+        self.redis = redis.Redis.from_url(redis_url)
+        self.ttl = ttl_seconds
+        self.prefix = "dedup:"
+
+    def is_duplicate(self, event_id: str) -> bool:
+        """
+        Returns True if event was already processed (duplicate).
+        Uses SET NX for atomic check-and-mark.
+        """
+        key = f"{self.prefix}{event_id}"
+        # SET NX returns True if key was set (new event), False if exists (duplicate)
+        is_new = self.redis.set(key, "1", nx=True, ex=self.ttl)
+        return not is_new
+
+    def process_event(self, event):
+        if self.is_duplicate(event["event_id"]):
+            # Already processed - skip
+            metrics.increment("dedup.duplicates_skipped")
+            return None
+
+        # Process the event
+        result = self._apply_business_logic(event)
+        metrics.increment("dedup.events_processed")
+        return result
+
+    def batch_check(self, event_ids: list) -> dict:
+        """
+        Check multiple event IDs in a single pipeline call.
+        Returns dict of {event_id: is_duplicate}
+        """
+        pipe = self.redis.pipeline()
+        for eid in event_ids:
+            pipe.set(f"{self.prefix}{eid}", "1", nx=True, ex=self.ttl)
+        results = pipe.execute()
+        return {eid: not is_new for eid, is_new in zip(event_ids, results)}
+        </code></pre>
+
+        <h4>Redis Deduplication at Scale</h4>
+        <ul>
+          <li>
+            <strong>Memory optimization:</strong> Use Redis bitmaps or HyperLogLog for
+            approximate deduplication at very high cardinality
+          </li>
+          <li>
+            <strong>Cluster mode:</strong> Shard dedup keys across Redis cluster nodes
+            using consistent hashing
+          </li>
+          <li>
+            <strong>Lua scripting:</strong> Use Redis Lua scripts for atomic check-process-mark
+            operations that cannot race
+          </li>
+          <li>
+            <strong>TTL alignment:</strong> Set TTL to match the maximum replay window
+            (Kafka consumer restart from earliest uncommitted offset)
+          </li>
+        </ul>
+
+        <pre><code class="language-lua">
+-- Redis Lua script for atomic dedup + processing metadata
+-- KEYS[1] = dedup key
+-- ARGV[1] = TTL in seconds
+-- ARGV[2] = event metadata (JSON)
+-- Returns: 1 if new (processed), 0 if duplicate
+
+local exists = redis.call('EXISTS', KEYS[1])
+if exists == 1 then
+    return 0
+end
+
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[1])
+return 1
+        </code></pre>
+      </section>
+
+
+      <!-- Section 9: Failure Recovery & Replay -->
+      <section id="failure-recovery" class="section">
+        <h2>Failure Recovery &amp; Replay</h2>
+
+        <h3>Kafka Offset Reset</h3>
+        <p>
+          When a streaming job fails and restarts, it needs to determine where to resume
+          consuming from. Kafka provides several mechanisms for offset management and reset:
+        </p>
+
+        <h4>Consumer Group Offset Management</h4>
+        <pre><code class="language-text">
+Offset Reset Strategies:
+
+1. From committed offset (default):
+   ├── Consumer reads __consumer_offsets for its group
+   ├── Resumes from last committed offset
+   └── May reprocess events since last commit (at-least-once)
+
+2. auto.offset.reset=earliest:
+   ├── If no committed offset exists
+   ├── Start from beginning of topic
+   └── Full reprocessing (useful for new consumer groups)
+
+3. auto.offset.reset=latest:
+   ├── If no committed offset exists
+   ├── Start from current end of topic
+   └── Skip all historical data (may lose events)
+
+4. Manual seek to timestamp:
+   ├── consumer.offsetsForTimes(timestampMap)
+   ├── Seek to specific point in time
+   └── Useful for replaying from a known good state
+        </code></pre>
+
+        <pre><code class="language-java">
+// Manual offset reset to a specific timestamp
+Map&lt;TopicPartition, Long&gt; timestampMap = new HashMap&lt;&gt;();
+for (TopicPartition tp : consumer.assignment()) {
+    // Reset to 2 hours ago
+    timestampMap.put(tp, System.currentTimeMillis() - 7200000L);
+}
+
+Map&lt;TopicPartition, OffsetAndTimestamp&gt; offsets =
+    consumer.offsetsForTimes(timestampMap);
+
+for (Map.Entry&lt;TopicPartition, OffsetAndTimestamp&gt; entry : offsets.entrySet()) {
+    if (entry.getValue() != null) {
+        consumer.seek(entry.getKey(), entry.getValue().offset());
+    }
+}
+        </code></pre>
+
+        <h4>Kafka Consumer Group Reset Tool</h4>
+        <pre><code class="language-bash">
+# Reset consumer group offsets using kafka-consumer-groups CLI
+
+# Reset to earliest (full replay)
+kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+    --group payment-processor \
+    --topic payments \
+    --reset-offsets --to-earliest \
+    --execute
+
+# Reset to specific timestamp
+kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+    --group payment-processor \
+    --topic payments \
+    --reset-offsets --to-datetime 2024-01-15T10:00:00.000 \
+    --execute
+
+# Reset to specific offset per partition
+kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+    --group payment-processor \
+    --topic payments \
+    --reset-offsets --to-offset 12345 \
+    --execute
+
+# Shift backward by N offsets
+kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+    --group payment-processor \
+    --topic payments \
+    --reset-offsets --shift-by -1000 \
+    --execute
+        </code></pre>
+
+        <h3>Flink Savepoints</h3>
+        <p>
+          Flink savepoints are user-triggered snapshots that capture the complete state of a
+          streaming job. Unlike checkpoints (which are automatic and managed by Flink),
+          savepoints are designed for operational tasks:
+        </p>
+        <ul>
+          <li><strong>Planned maintenance:</strong> Stop job, upgrade code, restart from savepoint</li>
+          <li><strong>A/B testing:</strong> Fork job state to test different processing logic</li>
+          <li><strong>Scaling:</strong> Change parallelism and redistribute state from savepoint</li>
+          <li><strong>Bug fixes:</strong> Rewind to a savepoint before the bug was introduced</li>
+          <li><strong>Migration:</strong> Move jobs between clusters or Flink versions</li>
+        </ul>
+
+        <pre><code class="language-bash">
+# Flink Savepoint Operations
+
+# Trigger a savepoint (job continues running)
+flink savepoint &lt;job-id&gt; s3://bucket/savepoints/
+
+# Cancel job with savepoint (graceful stop)
+flink cancel -s s3://bucket/savepoints/ &lt;job-id&gt;
+
+# Stop job with savepoint (drain sources first, Flink 1.12+)
+flink stop --savepointPath s3://bucket/savepoints/ &lt;job-id&gt;
+
+# Resume from savepoint
+flink run -s s3://bucket/savepoints/savepoint-abc123 \
+    --allowNonRestoredState \
+    my-streaming-job.jar
+
+# Resume from savepoint with modified parallelism
+flink run -s s3://bucket/savepoints/savepoint-abc123 \
+    -p 16 \
+    my-streaming-job.jar
+        </code></pre>
+
+        <h3>State Migration</h3>
+        <p>
+          When evolving a streaming application, the state schema may need to change. Flink
+          provides mechanisms for state schema evolution:
+        </p>
+
+        <h4>Compatible Schema Changes (Automatic)</h4>
+        <ul>
+          <li>Adding new fields with default values to Avro/POJO state</li>
+          <li>Removing optional fields from state</li>
+          <li>Changing field order in Avro schemas</li>
+          <li>Widening numeric types (int → long)</li>
+        </ul>
+
+        <h4>Incompatible Schema Changes (Manual Migration)</h4>
+        <pre><code class="language-java">
+// State migration using Flink's State Processor API
+// Read state from existing savepoint, transform, write new savepoint
+
+SavepointReader reader = SavepointReader.read(
+    env,
+    "s3://bucket/savepoints/savepoint-abc123",
+    new EmbeddedRocksDBStateBackend()
+);
+
+// Read old state schema
+DataSet&lt;OldPaymentState&gt; oldState = reader
+    .readKeyedState("payment-processor", new OldPaymentStateReader());
+
+// Transform to new schema
+DataSet&lt;NewPaymentState&gt; newState = oldState.map(old -&gt; {
+    NewPaymentState state = new NewPaymentState();
+    state.setPaymentId(old.getPaymentId());
+    state.setAmount(old.getAmount());
+    state.setRetryCount(0);  // New field with default
+    state.setLastAttempt(Instant.now());  // New field
+    return state;
+});
+
+// Write new savepoint
+SavepointWriter writer = SavepointWriter.newSavepoint(
+    env, new EmbeddedRocksDBStateBackend(), 128
+);
+writer.withOperator("payment-processor", new NewPaymentStateWriter(newState));
+writer.write("s3://bucket/savepoints/migrated-savepoint/");
+        </code></pre>
+
+        <h3>Recovery Strategies Comparison</h3>
+        <div class="comparison-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Strategy</th>
+                <th>Data Loss Risk</th>
+                <th>Duplicate Risk</th>
+                <th>Recovery Time</th>
+                <th>Use Case</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Resume from checkpoint</td>
+                <td>None</td>
+                <td>None (with EOS)</td>
+                <td>Fast (seconds)</td>
+                <td>Automatic failure recovery</td>
+              </tr>
+              <tr>
+                <td>Resume from savepoint</td>
+                <td>None</td>
+                <td>Possible (if sink not idempotent)</td>
+                <td>Medium (state restore)</td>
+                <td>Planned restarts, upgrades</td>
+              </tr>
+              <tr>
+                <td>Reset to timestamp</td>
+                <td>None</td>
+                <td>High (reprocessing)</td>
+                <td>Slow (reprocessing)</td>
+                <td>Bug fix replay with idempotent sink</td>
+              </tr>
+              <tr>
+                <td>Reset to earliest</td>
+                <td>None</td>
+                <td>Very high</td>
+                <td>Very slow</td>
+                <td>Full recomputation, new consumer</td>
+              </tr>
+              <tr>
+                <td>Reset to latest</td>
+                <td>High (gap)</td>
+                <td>None</td>
+                <td>Instant</td>
+                <td>Skip corrupted data, fresh start</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+
+      <!-- Section 10: End-to-End Exactly-Once -->
+      <section id="end-to-end" class="section">
+        <h2>End-to-End Exactly-Once</h2>
+
+        <h3>The Three-Layer Model</h3>
+        <p>
+          End-to-end exactly-once is not a property of any single component. It requires
+          coordinated guarantees across three layers of the streaming pipeline:
+        </p>
+        <pre><code class="language-text">
+End-to-End Exactly-Once = Source Guarantee + Processing Guarantee + Sink Guarantee
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    END-TO-END EXACTLY-ONCE                          │
+├──────────────────┬──────────────────────┬───────────────────────────┤
+│   SOURCE         │   PROCESSING         │   SINK                    │
+│                  │                      │                           │
+│ • Replayable     │ • Checkpointing      │ • Idempotent writes       │
+│ • Offset tracking│ • Barrier alignment  │ • Two-phase commit        │
+│ • Durable log    │ • Atomic state       │ • Deduplication table     │
+│                  │   snapshots          │ • Conditional inserts     │
+│                  │ • Deterministic      │ • Transactional output    │
+│                  │   processing         │                           │
+├──────────────────┼──────────────────────┼───────────────────────────┤
+│ Kafka ✓          │ Flink ✓              │ Kafka (transactions) ✓    │
+│ Kinesis ✓        │ Spark (micro-batch) ✓│ PostgreSQL (upsert) ✓     │
+│ Pulsar ✓         │ Kafka Streams ✓      │ DynamoDB (conditional) ✓  │
+│ Files (S3) ✓     │                      │ BigQuery (insertId) ~     │
+│ Database CDC ✓   │                      │ S3 (rename on commit) ✓   │
+└──────────────────┴──────────────────────┴───────────────────────────┘
+        </code></pre>
+
+        <h3>Source Requirements</h3>
+        <p>
+          For exactly-once to work, the source must be <strong>replayable</strong>. The processing
+          engine must be able to re-read data from a known position after a failure. Sources
+          that support this:
+        </p>
+        <ul>
+          <li>
+            <strong>Apache Kafka:</strong> Durable log with offset-based replay. Consumers can
+            seek to any offset within retention. The gold standard for replayable sources.
+          </li>
+          <li>
+            <strong>AWS Kinesis:</strong> Shard iterators with sequence numbers. Supports replay
+            within retention period (default 24h, max 365 days).
+          </li>
+          <li>
+            <strong>Apache Pulsar:</strong> Durable log with cursor-based replay. Supports both
+            exclusive and shared subscriptions with exactly-once.
+          </li>
+          <li>
+            <strong>File-based (S3/GCS/HDFS):</strong> Files are immutable and always replayable.
+            Track processed files in checkpoint state.
+          </li>
+          <li>
+            <strong>Database CDC:</strong> WAL-based CDC (Debezium) produces a replayable stream
+            with LSN/GTID positions.
+          </li>
+        </ul>
+        <p>
+          Sources that do <strong>not</strong> support replay (and thus cannot participate in
+          exactly-once): UDP streams, webhooks without replay, MQTT with QoS 0.
+        </p>
+
+        <h3>Processing Layer Requirements</h3>
+        <p>
+          The processing engine must maintain consistent state and support deterministic replay:
+        </p>
+        <ul>
+          <li>
+            <strong>Consistent checkpoints:</strong> Atomically snapshot operator state and
+            source positions so recovery resumes from a consistent point.
+          </li>
+          <li>
+            <strong>Deterministic processing:</strong> Given the same input from the same offset,
+            the engine produces the same output. Non-deterministic operations (wall-clock time,
+            random values, external calls) must be captured in state or made deterministic.
+          </li>
+          <li>
+            <strong>Exactly-once state updates:</strong> Internal state is updated exactly once
+            per event, enforced by the checkpoint/restore mechanism.
+          </li>
+        </ul>
+
+        <div class="warning-box">
+          <h4>Non-Determinism Breaks Exactly-Once</h4>
+          <p>
+            If processing logic uses <code>System.currentTimeMillis()</code>, random numbers, or
+            makes external API calls with side effects, replay may produce different results.
+            Use event-time (from the message) instead of wall-clock time, seed random generators
+            from message content, and guard external calls with the dedup pattern.
+          </p>
+        </div>
+
+        <h3>Sink Requirements</h3>
+        <p>
+          The sink is where exactly-once is most challenging because you're writing to an
+          external system outside the processing engine's transactional boundary. Two approaches:
+        </p>
+
+        <h4>Approach 1: Transactional Sink (2PC)</h4>
+        <p>
+          Coordinate the sink's transaction with the checkpoint using two-phase commit.
+          The sink writes are only made visible (committed) when the checkpoint completes.
+        </p>
+        <ul>
+          <li>Requires the external system to support transactions (Kafka, PostgreSQL, MySQL)</li>
+          <li>Adds latency equal to checkpoint interval before data is visible</li>
+          <li>Complex failure recovery (in-doubt transactions)</li>
+        </ul>
+
+        <h4>Approach 2: Idempotent Sink</h4>
+        <p>
+          Design the write operation so that applying it multiple times has the same effect
+          as applying it once. On replay/reprocessing, duplicate writes are harmless.
+        </p>
+        <ul>
+          <li>Works with any storage system that supports upserts or conditional writes</li>
+          <li>Lower latency (writes visible immediately)</li>
+          <li>Simpler implementation and recovery</li>
+          <li>Requires careful key design and event ID propagation</li>
+        </ul>
+
+        <h3>Complete Example: End-to-End Pipeline</h3>
+        <pre><code class="language-java">
+// End-to-end exactly-once pipeline: Kafka → Flink → PostgreSQL
+
+// Source: Kafka with exactly-once (read_committed)
+KafkaSource&lt;PaymentEvent&gt; source = KafkaSource.&lt;PaymentEvent&gt;builder()
+    .setBootstrapServers("broker:9092")
+    .setTopics("payments")
+    .setGroupId("payment-processor")
+    .setStartingOffsets(OffsetsInitializer.committedOffsets(OffsetResetStrategy.EARLIEST))
+    .setDeserializer(new PaymentEventDeserializer())
+    .setProperty("isolation.level", "read_committed")
+    .build();
+
+// Processing: Flink with exactly-once checkpointing
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+env.enableCheckpointing(30000, CheckpointingMode.EXACTLY_ONCE);
+env.setStateBackend(new EmbeddedRocksDBStateBackend());
+
+DataStream&lt;PaymentResult&gt; results = env
+    .fromSource(source, WatermarkStrategy.forBoundedOutOfOrderness(Duration.ofSeconds(5)),
+        "Kafka Source")
+    .keyBy(PaymentEvent::getCustomerId)
+    .process(new PaymentProcessor())  // Stateful processing with dedup
+    .name("Payment Processor");
+
+// Sink: Idempotent PostgreSQL upsert
+results.addSink(new IdempotentPostgresSink(
+    "jdbc:postgresql://db:5432/payments",
+    "INSERT INTO results (payment_id, status, amount) VALUES (?, ?, ?) " +
+    "ON CONFLICT (payment_id) DO UPDATE SET status = EXCLUDED.status"
+)).name("PostgreSQL Idempotent Sink");
+
+env.execute("Exactly-Once Payment Pipeline");
+        </code></pre>
+
+        <h3>End-to-End Guarantees Matrix</h3>
+        <div class="comparison-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Source</th>
+                <th>Engine</th>
+                <th>Sink</th>
+                <th>End-to-End Guarantee</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Kafka (replayable)</td>
+                <td>Flink (EOS checkpoints)</td>
+                <td>Kafka (transactions)</td>
+                <td>Exactly-Once ✓</td>
+              </tr>
+              <tr>
+                <td>Kafka (replayable)</td>
+                <td>Flink (EOS checkpoints)</td>
+                <td>PostgreSQL (upsert)</td>
+                <td>Exactly-Once ✓</td>
+              </tr>
+              <tr>
+                <td>Kafka (replayable)</td>
+                <td>Flink (EOS checkpoints)</td>
+                <td>S3 (append-only, no dedup)</td>
+                <td>At-Least-Once (duplicates in S3)</td>
+              </tr>
+              <tr>
+                <td>Kafka (replayable)</td>
+                <td>Spark (micro-batch)</td>
+                <td>Delta Lake (MERGE)</td>
+                <td>Exactly-Once ✓</td>
+              </tr>
+              <tr>
+                <td>HTTP webhook (not replayable)</td>
+                <td>Flink (EOS checkpoints)</td>
+                <td>Any sink</td>
+                <td>At-Most-Once (source cannot replay)</td>
+              </tr>
+              <tr>
+                <td>Kinesis (replayable)</td>
+                <td>Flink (EOS checkpoints)</td>
+                <td>DynamoDB (conditional write)</td>
+                <td>Exactly-Once ✓</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+
+      <!-- Section 11: Production Incident -->
+      <section id="production-incident" class="section">
+        <h2>Production Incident: Duplicate Payments After Checkpoint Failure</h2>
+
+        <div class="incident-box">
+          <h3>Incident Summary</h3>
+          <p>
+            <strong>Impact:</strong> 2,847 duplicate payment transactions totaling $1.2M were
+            processed over a 45-minute window before detection.<br>
+            <strong>Root Cause:</strong> Flink checkpoint failed due to S3 timeout, job crashed,
+            and restarted from an earlier checkpoint without an idempotent sink to handle replayed events.<br>
+            <strong>Duration:</strong> 45 minutes from first duplicate to detection; 4 hours for full remediation.
+          </p>
+        </div>
+
+        <h3>Timeline of Events</h3>
+        <pre><code class="language-text">
+14:00 UTC - Normal operation. Flink job processing payments.
+            Checkpoint interval: 60s. Last successful checkpoint: #4521
+
+14:12 UTC - S3 experiences elevated latency (P99 > 5s) in us-east-1.
+            Checkpoint #4533 starts but state upload to S3 stalls.
+
+14:14 UTC - Checkpoint #4533 times out (120s timeout).
+            Job continues processing with at-least-once delivery.
+            Checkpoint #4534 triggered but also fails (S3 still slow).
+
+14:18 UTC - Three consecutive checkpoint failures trigger job restart
+            (tolerable-checkpoint-failure-number=3 reached).
+
+14:18 UTC - Job restarts from last successful checkpoint #4521.
+            This was taken at 14:00 UTC — 18 minutes of data will be replayed.
+
+14:18 UTC - Job begins reprocessing events from Kafka offset at checkpoint #4521.
+            All events between 14:00-14:18 are replayed.
+
+14:18 UTC - THE BUG: The PostgreSQL sink uses INSERT (not upsert).
+            Replayed payment events create new rows instead of being deduplicated.
+            2,847 payments are processed a second time.
+
+14:19 UTC - Downstream payment gateway receives duplicate charge requests.
+            Most succeed because they carry new internal transaction IDs
+            (generated at processing time, not derived from event).
+
+14:45 UTC - Customer complaints trigger investigation.
+            On-call engineer notices payment count anomaly in dashboard.
+
+15:00 UTC - Job paused. Duplicate payments identified by querying:
+            SELECT payment_id, COUNT(*) FROM processed_payments
+            GROUP BY payment_id HAVING COUNT(*) > 1;
+
+15:30 UTC - Refund process initiated for all duplicates.
+
+18:00 UTC - All 2,847 refunds completed. Post-mortem scheduled.
+        </code></pre>
+
+        <h3>Root Cause Analysis</h3>
+        <ol>
+          <li>
+            <strong>Primary cause:</strong> The PostgreSQL sink used a plain INSERT statement
+            without ON CONFLICT handling. When events were replayed after the checkpoint
+            restore, each produced a new row with a new auto-generated primary key.
+          </li>
+          <li>
+            <strong>Contributing factor:</strong> The internal transaction ID was generated
+            using <code>UUID.randomUUID()</code> at processing time rather than being derived
+            deterministically from the event ID. This meant replayed events got new transaction
+            IDs and were treated as new payments by the downstream gateway.
+          </li>
+          <li>
+            <strong>Contributing factor:</strong> The checkpoint timeout (120s) was too aggressive
+            for the state size. Large RocksDB snapshots to S3 regularly took 90-100s under normal
+            conditions, leaving little margin for S3 latency spikes.
+          </li>
+          <li>
+            <strong>Detection gap:</strong> No real-time duplicate detection was in place. The
+            anomaly was only detected through customer complaints 27 minutes after the duplicates
+            were processed.
+          </li>
+        </ol>
+
+        <h3>Remediation Steps</h3>
+        <pre><code class="language-sql">
+-- Immediate: Identify and refund duplicates
+WITH duplicates AS (
+    SELECT payment_id,
+           MIN(id) as keep_id,
+           array_agg(id) FILTER (WHERE id != MIN(id)) as duplicate_ids
+    FROM processed_payments
+    WHERE processed_at BETWEEN '2024-01-15 14:00:00' AND '2024-01-15 15:00:00'
+    GROUP BY payment_id
+    HAVING COUNT(*) > 1
+)
+UPDATE processed_payments
+SET status = 'REFUND_PENDING'
+WHERE id = ANY(SELECT unnest(duplicate_ids) FROM duplicates);
+        </code></pre>
+
+        <h3>Permanent Fixes Implemented</h3>
+        <pre><code class="language-java">
+// Fix 1: Convert to idempotent upsert sink
+public class IdempotentPaymentSink extends RichSinkFunction&lt;PaymentEvent&gt; {
+    private static final String UPSERT_SQL =
+        "INSERT INTO processed_payments (payment_id, customer_id, amount, status, " +
+        "    event_id, kafka_partition, kafka_offset, processed_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, NOW()) " +
+        "ON CONFLICT (payment_id) DO UPDATE SET " +
+        "    status = EXCLUDED.status, " +
+        "    processed_at = EXCLUDED.processed_at " +
+        "WHERE processed_payments.kafka_offset < EXCLUDED.kafka_offset";
+
+    @Override
+    public void invoke(PaymentEvent event, Context context) throws Exception {
+        try (PreparedStatement stmt = connection.prepareStatement(UPSERT_SQL)) {
+            stmt.setString(1, event.getPaymentId());
+            stmt.setString(2, event.getCustomerId());
+            stmt.setBigDecimal(3, event.getAmount());
+            stmt.setString(4, event.getStatus());
+            stmt.setString(5, event.getEventId());
+            stmt.setInt(6, event.getKafkaPartition());
+            stmt.setLong(7, event.getKafkaOffset());
+            stmt.executeUpdate();
+        }
+    }
+}
+        </code></pre>
+
+        <pre><code class="language-java">
+// Fix 2: Deterministic transaction ID derived from event
+public class PaymentProcessor extends KeyedProcessFunction&lt;...&gt; {
+    @Override
+    public void processElement(PaymentEvent event, Context ctx,
+        Collector&lt;PaymentResult&gt; out) {
+        // BEFORE (non-deterministic): UUID.randomUUID()
+        // AFTER (deterministic): derived from event content
+        String transactionId = generateDeterministicId(
+            event.getPaymentId(),
+            event.getAmount(),
+            event.getTimestamp()
+        );
+        // ...
+    }
+
+    private String generateDeterministicId(String paymentId, BigDecimal amount,
+        Instant timestamp) {
+        String input = paymentId + "|" + amount + "|" + timestamp.toEpochMilli();
+        return UUID.nameUUIDFromBytes(input.getBytes(StandardCharsets.UTF_8)).toString();
+    }
+}
+        </code></pre>
+
+        <pre><code class="language-yaml">
+# Fix 3: Checkpoint configuration hardening
+flink:
+  checkpoint:
+    interval: 60000          # 60 seconds
+    timeout: 300000          # 5 minutes (increased from 120s)
+    min-pause: 30000         # 30 seconds between checkpoints
+    tolerable-failures: 10   # More tolerance before restart
+    unaligned: true          # Reduce checkpoint duration
+  state:
+    backend: rocksdb
+    incremental: true        # Only upload changed state (smaller uploads)
+    storage: "s3://bucket/checkpoints/"
+  restart-strategy:
+    type: exponential-delay
+    initial-backoff: 10s
+    max-backoff: 300s
+    backoff-multiplier: 2.0
+        </code></pre>
+
+        <h3>Monitoring Added Post-Incident</h3>
+        <ul>
+          <li>
+            <strong>Duplicate detection alert:</strong> Real-time query counting payment_id
+            occurrences in a sliding window, alerting if any exceeds 1
+          </li>
+          <li>
+            <strong>Checkpoint health dashboard:</strong> Tracking checkpoint duration,
+            size, failure rate, and time-since-last-successful-checkpoint
+          </li>
+          <li>
+            <strong>Offset lag monitoring:</strong> Alert if consumer lag exceeds the
+            checkpoint interval (indicates potential replay window growing)
+          </li>
+          <li>
+            <strong>Sink duplicate rate metric:</strong> Counter on ON CONFLICT DO UPDATE
+            matches (indicates replayed events hitting the upsert path)
+          </li>
+        </ul>
+
+        <div class="key-insight">
+          <h4>Lesson Learned</h4>
+          <p>
+            Never rely solely on exactly-once checkpointing for correctness. Checkpointing
+            provides exactly-once for <em>internal state</em>, but external sinks must
+            independently guarantee idempotency. The sink is your last line of defense
+            against duplicates—design it to be safe regardless of how many times the same
+            event is delivered.
+          </p>
+        </div>
+      </section>
+
+
+      <!-- Section 12: Code Examples -->
+      <section id="code-examples" class="section">
+        <h2>Code Examples</h2>
+
+        <h3>Kafka Transactional Producer (Complete)</h3>
+        <pre><code class="language-java">
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.clients.producer.*;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.ProducerFencedException;
+import java.time.Duration;
+import java.util.*;
+
+/**
+ * Complete exactly-once Kafka read-process-write loop.
+ * Demonstrates transactional producer with consumer offset commits.
+ */
+public class ExactlyOnceKafkaProcessor {
+
+    private final KafkaProducer&lt;String, String&gt; producer;
+    private final KafkaConsumer&lt;String, String&gt; consumer;
+    private final String outputTopic;
+
+    public ExactlyOnceKafkaProcessor(String bootstrapServers,
+        String inputTopic, String outputTopic, String groupId) {
+
+        this.outputTopic = outputTopic;
+
+        // Producer config - transactional
+        Properties producerProps = new Properties();
+        producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        producerProps.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG,
+            "eos-processor-" + groupId);
+        producerProps.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        producerProps.put(ProducerConfig.ACKS_CONFIG, "all");
+        producerProps.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+        producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
+            "org.apache.kafka.common.serialization.StringSerializer");
+        producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+            "org.apache.kafka.common.serialization.StringSerializer");
+
+        this.producer = new KafkaProducer&lt;&gt;(producerProps);
+        this.producer.initTransactions();
+
+        // Consumer config - read_committed
+        Properties consumerProps = new Properties();
+        consumerProps.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        consumerProps.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        consumerProps.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+        consumerProps.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        consumerProps.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        consumerProps.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
+            "org.apache.kafka.common.serialization.StringDeserializer");
+        consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
+            "org.apache.kafka.common.serialization.StringDeserializer");
+
+        this.consumer = new KafkaConsumer&lt;&gt;(consumerProps);
+        this.consumer.subscribe(Collections.singletonList(inputTopic));
+    }
+
+    public void run() {
+        try {
+            while (true) {
+                ConsumerRecords&lt;String, String&gt; records =
+                    consumer.poll(Duration.ofMillis(200));
+
+                if (records.isEmpty()) continue;
+
+                producer.beginTransaction();
+                try {
+                    // Process each record and produce output
+                    for (ConsumerRecord&lt;String, String&gt; record : records) {
+                        String result = processRecord(record);
+                        producer.send(new ProducerRecord&lt;&gt;(
+                            outputTopic, record.key(), result
+                        ));
+                    }
+
+                    // Commit offsets within the transaction
+                    Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets =
+                        computeOffsets(records);
+                    producer.sendOffsetsToTransaction(
+                        offsets, consumer.groupMetadata()
+                    );
+
+                    // Atomic commit: output messages + offset advancement
+                    producer.commitTransaction();
+
+                } catch (ProducerFencedException e) {
+                    // Another instance took over - shut down
+                    throw e;
+                } catch (Exception e) {
+                    // Abort and retry from last committed offset
+                    producer.abortTransaction();
+                    resetToCommittedOffsets();
+                }
+            }
+        } finally {
+            producer.close();
+            consumer.close();
+        }
+    }
+
+    private Map&lt;TopicPartition, OffsetAndMetadata&gt; computeOffsets(
+        ConsumerRecords&lt;String, String&gt; records) {
+        Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets = new HashMap&lt;&gt;();
+        for (TopicPartition partition : records.partitions()) {
+            List&lt;ConsumerRecord&lt;String, String&gt;&gt; partRecords =
+                records.records(partition);
+            long lastOffset = partRecords.get(partRecords.size() - 1).offset();
+            offsets.put(partition, new OffsetAndMetadata(lastOffset + 1));
+        }
+        return offsets;
+    }
+
+    private void resetToCommittedOffsets() {
+        Set&lt;TopicPartition&gt; assignment = consumer.assignment();
+        Map&lt;TopicPartition, OffsetAndMetadata&gt; committed =
+            consumer.committed(assignment);
+        for (Map.Entry&lt;TopicPartition, OffsetAndMetadata&gt; entry :
+            committed.entrySet()) {
+            if (entry.getValue() != null) {
+                consumer.seek(entry.getKey(), entry.getValue().offset());
+            }
+        }
+    }
+
+    private String processRecord(ConsumerRecord&lt;String, String&gt; record) {
+        // Business logic here
+        return "{\"processed\": true, \"original\": " + record.value() + "}";
+    }
+}
+        </code></pre>
+
+        <h3>Flink Checkpoint Configuration (Production-Ready)</h3>
+        <pre><code class="language-java">
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.streaming.api.environment.CheckpointConfig;
+import org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend;
+import org.apache.flink.configuration.Configuration;
+
+/**
+ * Production Flink checkpoint configuration for exactly-once guarantees.
+ */
+public class FlinkCheckpointConfig {
+
+    public static StreamExecutionEnvironment configureForExactlyOnce() {
+        Configuration conf = new Configuration();
+        // RocksDB tuning for large state
+        conf.setString("state.backend.rocksdb.predefined-options",
+            "SPINNING_DISK_OPTIMIZED_HIGH_MEM");
+        conf.setString("state.backend.rocksdb.block.cache-size", "256mb");
+
+        StreamExecutionEnvironment env =
+            StreamExecutionEnvironment.getExecutionEnvironment(conf);
+
+        // Enable exactly-once checkpointing
+        env.enableCheckpointing(30_000, CheckpointingMode.EXACTLY_ONCE);
+
+        // State backend: RocksDB with incremental checkpoints
+        EmbeddedRocksDBStateBackend rocksDB = new EmbeddedRocksDBStateBackend(true);
+        env.setStateBackend(rocksDB);
+
+        // Checkpoint configuration
+        CheckpointConfig cpConfig = env.getCheckpointConfig();
+        cpConfig.setCheckpointStorage("s3://my-bucket/flink/checkpoints/");
+        cpConfig.setMinPauseBetweenCheckpoints(15_000);
+        cpConfig.setCheckpointTimeout(300_000);  // 5 min timeout
+        cpConfig.setMaxConcurrentCheckpoints(1);
+        cpConfig.setTolerableCheckpointFailureNumber(5);
+
+        // Enable unaligned checkpoints for better performance under backpressure
+        cpConfig.enableUnalignedCheckpoints();
+        cpConfig.setAlignedCheckpointTimeout(Duration.ofSeconds(30));
+
+        // Retain checkpoints on cancellation
+        cpConfig.setExternalizedCheckpointCleanup(
+            CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION
+        );
+
+        // Restart strategy: exponential backoff
+        env.setRestartStrategy(RestartStrategies.exponentialDelayRestart(
+            Time.seconds(1),    // initial backoff
+            Time.minutes(5),    // max backoff
+            2.0,                // multiplier
+            Time.hours(1),      // reset backoff after stable for 1 hour
+            0.1                 // jitter
+        ));
+
+        return env;
+    }
+}
+        </code></pre>
+
+        <h3>Idempotent Sink Implementation (JDBC)</h3>
+        <pre><code class="language-java">
+import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
+import org.apache.flink.configuration.Configuration;
+import java.sql.*;
+
+/**
+ * Idempotent JDBC sink that uses upserts for exactly-once delivery.
+ * Handles duplicates gracefully via ON CONFLICT clause.
+ */
+public class IdempotentJdbcSink extends RichSinkFunction&lt;PaymentResult&gt; {
+
+    private final String jdbcUrl;
+    private final String upsertSql;
+    private transient Connection connection;
+    private transient PreparedStatement statement;
+    private int batchCount = 0;
+    private static final int BATCH_SIZE = 500;
+
+    public IdempotentJdbcSink(String jdbcUrl) {
+        this.jdbcUrl = jdbcUrl;
+        this.upsertSql =
+            "INSERT INTO payment_results " +
+            "(event_id, payment_id, customer_id, amount, status, " +
+            " source_partition, source_offset, processed_at) " +
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NOW()) " +
+            "ON CONFLICT (event_id) DO UPDATE SET " +
+            "  status = EXCLUDED.status, " +
+            "  processed_at = EXCLUDED.processed_at " +
+            "WHERE payment_results.source_offset < EXCLUDED.source_offset";
+    }
+
+    @Override
+    public void open(Configuration parameters) throws Exception {
+        connection = DriverManager.getConnection(jdbcUrl);
+        connection.setAutoCommit(false);
+        statement = connection.prepareStatement(upsertSql);
+    }
+
+    @Override
+    public void invoke(PaymentResult result, Context context) throws Exception {
+        statement.setString(1, result.getEventId());
+        statement.setString(2, result.getPaymentId());
+        statement.setString(3, result.getCustomerId());
+        statement.setBigDecimal(4, result.getAmount());
+        statement.setString(5, result.getStatus());
+        statement.setInt(6, result.getSourcePartition());
+        statement.setLong(7, result.getSourceOffset());
+        statement.addBatch();
+        batchCount++;
+
+        if (batchCount >= BATCH_SIZE) {
+            flush();
+        }
+    }
+
+    private void flush() throws SQLException {
+        if (batchCount > 0) {
+            statement.executeBatch();
+            connection.commit();
+            batchCount = 0;
+        }
+    }
+
+    @Override
+    public void close() throws Exception {
+        flush();
+        if (statement != null) statement.close();
+        if (connection != null) connection.close();
+    }
+}
+        </code></pre>
+
+        <h3>Deduplication with Flink Keyed State</h3>
+        <pre><code class="language-java">
+import org.apache.flink.api.common.state.*;
+import org.apache.flink.api.common.time.Time;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.util.Collector;
+import org.apache.flink.util.OutputTag;
+
+/**
+ * Stateful deduplication using Flink keyed state with TTL.
+ * Events are keyed by event_id; duplicates within the TTL window are filtered.
+ */
+public class StatefulDeduplication
+    extends KeyedProcessFunction&lt;String, PaymentEvent, PaymentEvent&gt; {
+
+    private static final OutputTag&lt;PaymentEvent&gt; DUPLICATE_TAG =
+        new OutputTag&lt;PaymentEvent&gt;("duplicates") {};
+
+    private transient ValueState&lt;Long&gt; firstSeenState;
+
+    @Override
+    public void open(Configuration parameters) {
+        // State descriptor with TTL
+        ValueStateDescriptor&lt;Long&gt; descriptor =
+            new ValueStateDescriptor&lt;&gt;("first-seen-timestamp", Long.class);
+
+        // Auto-expire after 24 hours (matches max expected replay window)
+        StateTtlConfig ttlConfig = StateTtlConfig.newBuilder(Time.hours(24))
+            .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+            .setStateVisibility(
+                StateTtlConfig.StateVisibility.NeverReturnExpired)
+            .cleanupFullSnapshot()
+            .cleanupInRocksdbCompactFilter(1000)
+            .build();
+
+        descriptor.enableTimeToLive(ttlConfig);
+        firstSeenState = getRuntimeContext().getState(descriptor);
+    }
+
+    @Override
+    public void processElement(PaymentEvent event, Context ctx,
+        Collector&lt;PaymentEvent&gt; out) throws Exception {
+
+        Long firstSeen = firstSeenState.value();
+
+        if (firstSeen != null) {
+            // Duplicate detected - route to side output for monitoring
+            ctx.output(DUPLICATE_TAG, event);
+            // Increment duplicate counter metric
+            getRuntimeContext()
+                .getMetricGroup()
+                .counter("duplicates-filtered")
+                .inc();
+            return;
+        }
+
+        // First time seeing this event - record and emit
+        firstSeenState.update(ctx.timerService().currentProcessingTime());
+        out.collect(event);
+    }
+}
+
+// Usage in pipeline
+SingleOutputStreamOperator&lt;PaymentEvent&gt; deduplicated = inputStream
+    .keyBy(PaymentEvent::getEventId)
+    .process(new StatefulDeduplication())
+    .name("Deduplication Filter");
+
+// Monitor duplicates via side output
+DataStream&lt;PaymentEvent&gt; duplicates = deduplicated.getSideOutput(DUPLICATE_TAG);
+duplicates.addSink(new DuplicateMonitoringSink());
+        </code></pre>
+      </section>
+
+
+      <!-- Section 13: Common Mistakes -->
+      <section id="common-mistakes" class="section">
+        <h2>Common Mistakes</h2>
+
+        <div class="mistakes-list">
+          <div class="mistake">
+            <h4>1. Assuming Checkpointing Alone Provides End-to-End Exactly-Once</h4>
+            <p>
+              <strong>The mistake:</strong> Engineers configure Flink with EXACTLY_ONCE checkpoint mode
+              and assume the entire pipeline has exactly-once guarantees, ignoring the sink behavior.
+            </p>
+            <p>
+              <strong>The reality:</strong> Checkpointing guarantees exactly-once for internal state only.
+              If the sink is not idempotent or transactional, replayed events after recovery will create
+              duplicates in the external system.
+            </p>
+            <p>
+              <strong>Fix:</strong> Always pair checkpointing with either an idempotent sink (upserts)
+              or a two-phase commit sink. Test by manually killing the job and verifying no duplicates
+              appear in the sink after restart.
+            </p>
+          </div>
+
+          <div class="mistake">
+            <h4>2. Using Non-Deterministic Logic in Processing</h4>
+            <p>
+              <strong>The mistake:</strong> Using <code>System.currentTimeMillis()</code>,
+              <code>UUID.randomUUID()</code>, or calling external APIs with side effects in the
+              processing function.
+            </p>
+            <p>
+              <strong>The reality:</strong> On replay, non-deterministic operations produce different
+              results. A payment that was marked "processed at 14:05" will now be "processed at 14:20"
+              (the replay time), causing inconsistencies or bypassing deduplication logic that relies
+              on deterministic IDs.
+            </p>
+            <p>
+              <strong>Fix:</strong> Derive all output values deterministically from the input event.
+              Use event timestamps instead of wall-clock time. Generate IDs using
+              <code>UUID.nameUUIDFromBytes()</code> with event content as input.
+            </p>
+          </div>
+
+          <div class="mistake">
+            <h4>3. Setting transaction.timeout.ms Too Low</h4>
+            <p>
+              <strong>The mistake:</strong> Using the default Kafka transaction timeout (60s) with
+              a Flink checkpoint interval of 60s or higher.
+            </p>
+            <p>
+              <strong>The reality:</strong> If the checkpoint takes longer than the transaction timeout,
+              Kafka aborts the transaction and all uncommitted messages are lost. This silently converts
+              your exactly-once pipeline to at-most-once.
+            </p>
+            <p>
+              <strong>Fix:</strong> Set <code>transaction.timeout.ms</code> to at least 2x the checkpoint
+              interval. Ensure the broker's <code>transaction.max.timeout.ms</code> is high enough to
+              accommodate this value.
+            </p>
+          </div>
+
+          <div class="mistake">
+            <h4>4. Ignoring the Deduplication Table Size</h4>
+            <p>
+              <strong>The mistake:</strong> Creating a dedup table that tracks all event IDs forever,
+              leading to unbounded growth that degrades query performance and increases storage costs.
+            </p>
+            <p>
+              <strong>The reality:</strong> A dedup table processing 10K events/second will accumulate
+              864M rows per day. Without pruning, lookups become slow and the table becomes a
+              bottleneck.
+            </p>
+            <p>
+              <strong>Fix:</strong> Partition the dedup table by time. Set TTL based on the maximum
+              replay window (e.g., Kafka retention period + buffer). Use efficient indexes on
+              (event_id, processed_at).
+            </p>
+          </div>
+
+          <div class="mistake">
+            <h4>5. Not Testing Failure Recovery</h4>
+            <p>
+              <strong>The mistake:</strong> Developing and testing the happy path only. Never
+              simulating failures to verify exactly-once behavior under crash-recovery scenarios.
+            </p>
+            <p>
+              <strong>The reality:</strong> Exactly-once bugs only manifest during failures. Your
+              pipeline may work perfectly for months and then produce duplicates on the first
+              checkpoint failure.
+            </p>
+            <p>
+              <strong>Fix:</strong> Build chaos testing into your CI/CD pipeline. Regularly kill Flink
+              TaskManagers, pause Kafka brokers, and inject S3 latency. Verify output correctness
+              after each simulated failure with automated duplicate detection queries.
+            </p>
+          </div>
+
+          <div class="mistake">
+            <h4>6. Confusing Kafka Idempotent Producer with End-to-End Exactly-Once</h4>
+            <p>
+              <strong>The mistake:</strong> Setting <code>enable.idempotence=true</code> and believing
+              the entire pipeline now has exactly-once guarantees.
+            </p>
+            <p>
+              <strong>The reality:</strong> Idempotent producer only deduplicates producer retries
+              to Kafka. It does not provide exactly-once for the consume-process-produce cycle.
+              You still need transactions for read-process-write atomicity.
+            </p>
+            <p>
+              <strong>Fix:</strong> Understand the scope: idempotent producer prevents duplicate
+              <em>writes to Kafka</em>. Transactions provide atomic <em>read + write + offset commit</em>.
+              End-to-end exactly-once requires both plus sink-side guarantees.
+            </p>
+          </div>
+
+          <div class="mistake">
+            <h4>7. Using read_uncommitted Consumers Downstream</h4>
+            <p>
+              <strong>The mistake:</strong> Configuring transactional producers but forgetting to set
+              <code>isolation.level=read_committed</code> on all downstream consumers.
+            </p>
+            <p>
+              <strong>The reality:</strong> The default isolation level is <code>read_uncommitted</code>.
+              Consumers with this setting will read messages from aborted transactions, completely
+              negating the exactly-once guarantee.
+            </p>
+            <p>
+              <strong>Fix:</strong> Set <code>isolation.level=read_committed</code> on every consumer
+              that reads from topics written by transactional producers. Add integration tests that
+              verify aborted transactions are not visible.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section 14: Trade-offs -->
+      <section id="trade-offs" class="section">
+        <h2>Trade-offs</h2>
+
+        <div class="comparison-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Dimension</th>
+                <th>Exactly-Once</th>
+                <th>At-Least-Once + Dedup</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Latency</strong></td>
+                <td>Higher (checkpoint interval adds delay for 2PC sinks; transaction commit overhead)</td>
+                <td>Lower (writes immediately visible; dedup is async or at read time)</td>
+              </tr>
+              <tr>
+                <td><strong>Throughput</strong></td>
+                <td>Lower (transaction overhead: ~3-5% for Kafka; barrier alignment pauses for Flink)</td>
+                <td>Higher (no transaction coordination; batching without atomicity constraints)</td>
+              </tr>
+              <tr>
+                <td><strong>Complexity</strong></td>
+                <td>Higher (transactions, 2PC, checkpoint tuning, state backend management)</td>
+                <td>Medium (idempotent sinks, dedup tables, but simpler failure recovery)</td>
+              </tr>
+              <tr>
+                <td><strong>Operational Burden</strong></td>
+                <td>Higher (monitor checkpoints, manage savepoints, tune timeouts, handle in-doubt txns)</td>
+                <td>Lower (fewer moving parts; dedup table is the main operational concern)</td>
+              </tr>
+              <tr>
+                <td><strong>Storage Cost</strong></td>
+                <td>Higher (checkpoint state in S3/HDFS; transaction logs; RocksDB local state)</td>
+                <td>Medium (dedup table storage; potential for temporary duplicates in sink)</td>
+              </tr>
+              <tr>
+                <td><strong>Cross-System Compatibility</strong></td>
+                <td>Limited (requires transactional support in all systems involved)</td>
+                <td>Broad (works with any system that supports upserts or conditional writes)</td>
+              </tr>
+              <tr>
+                <td><strong>Recovery Time</strong></td>
+                <td>Faster (restore from checkpoint = instant correct state)</td>
+                <td>Slower (replay + dedup = reprocessing time proportional to replay window)</td>
+              </tr>
+              <tr>
+                <td><strong>Correctness Guarantee</strong></td>
+                <td>Stronger (system-enforced; no application-level bugs can cause duplicates)</td>
+                <td>Depends on implementation (application must correctly implement dedup logic)</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>When Exactly-Once Is Worth the Cost</h3>
+        <ul>
+          <li>
+            <strong>Financial transactions:</strong> Double-charging, duplicate payments, or
+            incorrect balances have direct monetary impact and regulatory consequences.
+          </li>
+          <li>
+            <strong>Inventory management:</strong> Duplicate decrements cause phantom stock-outs;
+            duplicate increments cause overselling.
+          </li>
+          <li>
+            <strong>User-facing notifications:</strong> Sending duplicate emails, SMS, or push
+            notifications erodes user trust.
+          </li>
+          <li>
+            <strong>Compliance and audit trails:</strong> Regulatory requirements may mandate
+            exactly-once processing for transaction recording.
+          </li>
+        </ul>
+
+        <h3>When At-Least-Once + Dedup Is Sufficient</h3>
+        <ul>
+          <li>
+            <strong>Analytics and metrics:</strong> Small counting errors from occasional
+            duplicates are acceptable in dashboards and reports.
+          </li>
+          <li>
+            <strong>Event archival:</strong> Storing raw events where downstream consumers
+            can deduplicate at query time (e.g., SELECT DISTINCT).
+          </li>
+          <li>
+            <strong>Heterogeneous sinks:</strong> When writing to systems that don't support
+            transactions (S3, Elasticsearch, most NoSQL stores without conditional writes).
+          </li>
+          <li>
+            <strong>High-throughput, low-value events:</strong> IoT sensor data, clickstream,
+            application logs where individual event loss or duplication is acceptable.
+          </li>
+        </ul>
+
+        <h3>Performance Impact Numbers</h3>
+        <div class="comparison-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Mechanism</th>
+                <th>Latency Overhead</th>
+                <th>Throughput Impact</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Kafka idempotent producer</td>
+                <td>~1-2ms per batch</td>
+                <td>~1-2% reduction</td>
+                <td>Minimal; sequence number check is lightweight</td>
+              </tr>
+              <tr>
+                <td>Kafka transactions</td>
+                <td>~5-15ms per commit</td>
+                <td>~3-5% reduction</td>
+                <td>Amortized over batch; more partitions = higher cost</td>
+              </tr>
+              <tr>
+                <td>Flink aligned checkpoints</td>
+                <td>Checkpoint duration (100ms-10s)</td>
+                <td>~5-10% (barrier alignment)</td>
+                <td>Worse with data skew; unaligned mitigates</td>
+              </tr>
+              <tr>
+                <td>Flink unaligned checkpoints</td>
+                <td>~50-200ms</td>
+                <td>~2-5%</td>
+                <td>Larger snapshots but no alignment wait</td>
+              </tr>
+              <tr>
+                <td>2PC sink (PostgreSQL)</td>
+                <td>Checkpoint interval (visibility delay)</td>
+                <td>~10-20% (lock contention)</td>
+                <td>Prepared transactions hold row locks</td>
+              </tr>
+              <tr>
+                <td>Redis dedup lookup</td>
+                <td>~0.5-2ms per event</td>
+                <td>Minimal with pipelining</td>
+                <td>Network hop; batch with PIPELINE</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Section 15: Follow-up Questions -->
+      <section id="follow-up-questions" class="section">
+        <h2>Follow-up Questions</h2>
+
+        <div class="questions-list">
+          <div class="question">
+            <h4>Q: How would you handle exactly-once when writing to a system that doesn't support transactions or upserts?</h4>
+            <p>
+              <strong>Strong answer:</strong> Use an append-only write with a dedup layer. Write events with
+              their event_id to the append-only store. Add a compaction or dedup process that runs
+              periodically to remove duplicates. For S3, use a staging → commit pattern: write to a
+              staging prefix, and on checkpoint completion, atomically rename/move to the final prefix.
+              For systems like Elasticsearch, leverage document IDs (PUT with the same ID is idempotent).
+            </p>
+          </div>
+
+          <div class="question">
+            <h4>Q: What happens if your Flink job needs to be redeployed with a code change that modifies the state schema?</h4>
+            <p>
+              <strong>Strong answer:</strong> Take a savepoint before stopping. For compatible schema changes
+              (adding fields with defaults), Flink handles migration automatically with Avro or POJO
+              serializers. For incompatible changes, use the State Processor API to read the old savepoint,
+              transform state to the new schema, and write a new savepoint. Then start the new job version
+              from the migrated savepoint. Always test schema evolution in a staging environment first.
+            </p>
+          </div>
+
+          <div class="question">
+            <h4>Q: How do you guarantee exactly-once across multiple microservices communicating via Kafka?</h4>
+            <p>
+              <strong>Strong answer:</strong> Use the transactional outbox pattern: each service writes its
+              output to a local outbox table in the same database transaction as its state change. A CDC
+              connector (Debezium) tails the outbox and publishes to Kafka. Downstream services use
+              idempotent consumers keyed on the event_id. This gives you per-service exactly-once without
+              distributed transactions spanning multiple services. For the consuming side, each service
+              maintains its own dedup state.
+            </p>
+          </div>
+
+          <div class="question">
+            <h4>Q: How do you monitor whether your exactly-once guarantees are actually holding in production?</h4>
+            <p>
+              <strong>Strong answer:</strong> Multiple layers: (1) Track checkpoint success rate and duration
+              in Flink metrics; alert on failures. (2) Monitor consumer lag to detect replay windows.
+              (3) Add a "duplicate hit" counter in the idempotent sink that increments on ON CONFLICT
+              matches. (4) Run periodic reconciliation queries comparing source event counts with sink
+              row counts. (5) Inject synthetic events with known IDs and verify exactly one instance
+              appears in the sink. (6) Monitor the dedup table hit rate—a sudden spike indicates
+              unexpected replays.
+            </p>
+          </div>
+
+          <div class="question">
+            <h4>Q: Can you achieve exactly-once with Apache Spark Structured Streaming? How does it differ from Flink?</h4>
+            <p>
+              <strong>Strong answer:</strong> Yes, through micro-batch processing. Spark achieves exactly-once
+              by tracking committed offsets and batch IDs in the checkpoint directory. If a batch fails,
+              it's re-executed from the same offsets. The key difference: Spark's micro-batch model processes
+              data in discrete batches (not continuous), so latency is bounded by the trigger interval
+              (typically seconds). Flink processes event-by-event with lower latency. For sinks, Spark
+              relies on idempotent writes or the <code>foreachBatch</code> API with manual transaction
+              management. Delta Lake's MERGE provides built-in dedup for Spark.
+            </p>
+          </div>
+
+          <div class="question">
+            <h4>Q: How would you handle exactly-once processing with out-of-order events and late arrivals?</h4>
+            <p>
+              <strong>Strong answer:</strong> Separate concerns: (1) Use event-time processing with watermarks
+              to handle ordering—events before the watermark are processed normally, late events trigger
+              allowed-lateness logic. (2) For exactly-once, the dedup key should be the event_id regardless
+              of arrival order. (3) For aggregations, use retraction/update streams: when a late event
+              arrives and changes a window result, emit a retraction of the old result and the corrected
+              value. (4) The sink must handle retractions (e.g., subtract old value, add new value) or
+              use upserts that overwrite with the latest computation.
+            </p>
+          </div>
+
+          <div class="question">
+            <h4>Q: What's the difference between Kafka's exactly-once and Flink's exactly-once?</h4>
+            <p>
+              <strong>Strong answer:</strong> Kafka's EOS is about atomic read-process-write within the
+              Kafka ecosystem—it guarantees that consuming from topic A, processing, and producing to
+              topic B happens atomically via transactions. It's limited to Kafka-to-Kafka pipelines.
+              Flink's EOS is broader: it maintains consistent internal state via distributed snapshots
+              and can coordinate with external systems through 2PC sinks. Flink can guarantee exactly-once
+              to PostgreSQL, S3, or any system with an appropriate sink connector. Flink uses Kafka
+              transactions as one possible sink mechanism but extends beyond Kafka.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section 16: Summary -->
+      <section id="summary" class="section">
+        <h2>Summary</h2>
+
+        <div class="summary-box">
+          <h3>Key Takeaways</h3>
+          <ol>
+            <li>
+              <strong>True exactly-once delivery is impossible</strong> in distributed systems.
+              What we achieve is "effectively exactly-once" through at-least-once delivery
+              combined with idempotent processing.
+            </li>
+            <li>
+              <strong>End-to-end exactly-once requires three layers:</strong> a replayable source
+              (Kafka), consistent checkpointing in the processing engine (Flink/Spark), and an
+              idempotent or transactional sink.
+            </li>
+            <li>
+              <strong>Kafka transactions</strong> provide atomic read-process-write within the
+              Kafka ecosystem using transactional producers, read_committed consumers, and
+              producer fencing via transactional.id.
+            </li>
+            <li>
+              <strong>Flink checkpointing</strong> (Chandy-Lamport algorithm) creates consistent
+              distributed snapshots that enable exactly-once for internal state. Pair with 2PC
+              or idempotent sinks for external systems.
+            </li>
+            <li>
+              <strong>Idempotent sinks</strong> are the most practical approach for most systems:
+              database upserts, conditional writes, and deduplication tables handle replayed
+              events without additional coordination overhead.
+            </li>
+            <li>
+              <strong>Two-phase commit</strong> extends exactly-once to external systems that
+              support distributed transactions, but adds latency and operational complexity.
+            </li>
+            <li>
+              <strong>Deduplication patterns</strong> (event ID tracking, bloom filters, Redis,
+              time-windowed dedup) provide defense-in-depth and work across heterogeneous systems.
+            </li>
+            <li>
+              <strong>Trade-offs are significant:</strong> exactly-once costs 3-20% throughput,
+              adds latency, and increases operational complexity. Choose it only when duplicate
+              effects have real business impact (payments, inventory, compliance).
+            </li>
+            <li>
+              <strong>Test failure recovery:</strong> exactly-once bugs only manifest during
+              failures. Chaos testing and automated duplicate detection are essential for
+              validating guarantees in production.
+            </li>
+            <li>
+              <strong>Monitor continuously:</strong> track checkpoint health, consumer lag,
+              dedup hit rates, and run periodic reconciliation to verify guarantees hold.
+            </li>
+          </ol>
+        </div>
+
+        <h3>Interview Answer Structure</h3>
+        <p>
+          When answering this question in an interview, structure your response as follows:
+        </p>
+        <ol>
+          <li>
+            <strong>Acknowledge the impossibility</strong> — True exactly-once delivery is
+            impossible; we achieve "effectively exactly-once" through at-least-once + idempotency.
+          </li>
+          <li>
+            <strong>Explain the three-layer model</strong> — Source (replayable), engine
+            (checkpointing), sink (idempotent/transactional).
+          </li>
+          <li>
+            <strong>Describe specific mechanisms</strong> — Kafka transactions, Flink checkpoints,
+            idempotent upserts. Pick 1-2 and go deep.
+          </li>
+          <li>
+            <strong>Discuss trade-offs</strong> — Latency vs correctness, complexity vs simplicity.
+            Show you understand when NOT to use exactly-once.
+          </li>
+          <li>
+            <strong>Share production experience</strong> — A real incident, monitoring strategy,
+            or design decision that demonstrates hands-on expertise.
+          </li>
+        </ol>
+      </section>
+
+      <!-- Chapter Navigation (Bottom) -->
+      <div class="chapter-nav chapter-nav-bottom">
+        <a href="ch14-realtime-pipeline.html" class="nav-prev">Previous: Real-Time Pipeline</a>
+        <a href="ch16-etl-pipeline-slow.html" class="nav-next">Next: ETL Pipeline Slow</a>
+      </div>
+
+    </main>
+  </div>
+
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

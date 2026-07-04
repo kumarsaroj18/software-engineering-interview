@@ -1,0 +1,1924 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ch 4 — Why Does Joining a Small Table with a Large Table Usually Perform Better? | Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">Ch 4 / Small Joins Big</div>
+    <nav class="sidebar-nav">
+      <a href="#interviewer-intent">Interviewer Intent</a>
+      <a href="#quick-answer">Quick Answer</a>
+      <a href="#hash-join-mechanics">Hash Join Mechanics</a>
+      <a href="#broadcast-join">Broadcast Join</a>
+      <a href="#intermediate-results">Intermediate Results</a>
+      <a href="#memory-pressure">Memory Pressure &amp; Spill</a>
+      <a href="#shuffle-cost">Shuffle/Network Cost</a>
+      <a href="#adaptive-execution">Adaptive Execution</a>
+      <a href="#engine-specifics">Engine-Specific Behavior</a>
+      <a href="#production-incident">Production Incident</a>
+      <a href="#code-examples">Code Examples</a>
+      <a href="#common-mistakes">Common Mistakes</a>
+      <a href="#trade-offs">Trade-offs</a>
+      <a href="#follow-up-questions">Follow-up Questions</a>
+      <a href="#summary">Summary</a>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="print">🖨️ Print</button>
+      <button data-action="bookmark">🔖 Bookmark</button>
+      <button data-action="share">🔗 Share</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo; <a href="../index.html#part-i">Part I — SQL &amp; Query Processing Internals</a> &rsaquo; <span>Chapter 4</span>
+    </nav>
+
+    <header class="chapter-header">
+      <h1>Why Does Joining a Small Table with a Large Table Usually Perform Better?</h1>
+      <span class="badge badge-medium">Medium</span>
+      <div class="topics">
+        <span class="topic-tag">Hash Join</span>
+        <span class="topic-tag">Broadcast</span>
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="search" placeholder="Search this chapter..." aria-label="Search" />
+    </div>
+
+
+    <!-- ========== SECTION 1: INTERVIEWER INTENT ========== -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>Why interviewers ask this question</summary>
+        <p>
+          This question probes whether a candidate understands <strong>physical join execution</strong>
+          at the engine level — not just SQL syntax. Senior Data Engineers must reason about:
+        </p>
+        <ul>
+          <li>How query optimizers choose build vs. probe sides in hash joins</li>
+          <li>When and why broadcast joins are selected over shuffle joins</li>
+          <li>Memory budget implications of hash table materialization</li>
+          <li>Network cost models in distributed engines (Spark, BigQuery, Snowflake)</li>
+          <li>What happens when assumptions about "small" tables break in production</li>
+        </ul>
+        <p>
+          The interviewer expects you to connect optimizer heuristics → physical execution →
+          resource consumption → production failure modes. A textbook answer about "less data
+          to scan" is insufficient at the staff/principal level.
+        </p>
+      </details>
+      <details>
+        <summary>Signals of a strong answer</summary>
+        <ul>
+          <li>Distinguishes build-side vs. probe-side semantics</li>
+          <li>Quantifies broadcast threshold trade-offs (e.g., Spark's 10 MB default)</li>
+          <li>Discusses adaptive query execution and runtime strategy switches</li>
+          <li>Mentions real failure modes: OOM from broadcast of a "small" table that grew</li>
+          <li>References specific engine behaviors, not just generic theory</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- ========== SECTION 2: QUICK ANSWER ========== -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <details>
+        <summary>30-second executive summary</summary>
+        <p>
+          Joining a small table with a large table performs better because the optimizer can:
+        </p>
+        <ol>
+          <li><strong>Build a compact hash table</strong> on the small side that fits in memory,
+              then stream the large table through it in a single pass (O(n) probe phase).</li>
+          <li><strong>Broadcast the small table</strong> to all worker nodes, eliminating expensive
+              shuffle/repartitioning of the large table across the network.</li>
+          <li><strong>Minimize intermediate result cardinality</strong> — unlike big-joins-big where
+              Cartesian-like explosions are possible, a bounded small side caps the amplification factor.</li>
+        </ol>
+        <p>
+          The net effect: lower memory pressure, reduced network I/O, fewer disk spills,
+          and more predictable query runtimes.
+        </p>
+      </details>
+      <details>
+        <summary>One-liner for the impatient</summary>
+        <p>
+          The small table becomes the hash-table build side (fits in RAM) and can be broadcast
+          to avoid shuffling terabytes of the large table across the cluster.
+        </p>
+      </details>
+    </section>
+
+
+    <!-- ========== SECTION 3: HASH JOIN MECHANICS ========== -->
+    <section id="hash-join-mechanics">
+      <h2>Hash Join Build/Probe Mechanics</h2>
+      <details>
+        <summary>Build phase — materializing the hash table</summary>
+        <p>
+          In a hash join, the optimizer designates one input as the <strong>build side</strong>
+          and the other as the <strong>probe side</strong>. The build side is fully read into
+          memory and organized into a hash table keyed on the join column(s).
+        </p>
+        <pre><code class="language-bash">
+# ┌─────────────────────────────────────────────────────────────────┐
+# │              HASH JOIN: BUILD / PROBE PHASES                     │
+# ├─────────────────────────────────────────────────────────────────┤
+# │                                                                  │
+# │  Phase 1: BUILD                    Phase 2: PROBE               │
+# │  ─────────────────                 ─────────────────            │
+# │                                                                  │
+# │  ┌──────────────┐                  ┌──────────────┐             │
+# │  │ Small Table  │                  │ Large Table  │             │
+# │  │  (dim_store) │                  │ (fact_sales) │             │
+# │  │   50K rows   │                  │   2B rows    │             │
+# │  └──────┬───────┘                  └──────┬───────┘             │
+# │         │                                  │                     │
+# │         ▼                                  ▼                     │
+# │  ┌──────────────┐                  ┌──────────────┐             │
+# │  │  Hash Table  │◄─────────────────│  Stream rows │             │
+# │  │  in Memory   │   lookup O(1)    │  one-by-one  │             │
+# │  │              │                  │              │             │
+# │  │ key → row(s) │                  │ hash(key) →  │             │
+# │  │ 101 → {..}  │                  │ bucket probe │             │
+# │  │ 102 → {..}  │                  │              │             │
+# │  │ ...          │                  │ Match? Emit  │             │
+# │  └──────────────┘                  └──────────────┘             │
+# │                                                                  │
+# │  Memory: ~50K × row_width          CPU: 2B hash lookups         │
+# │  ≈ few MB                          I/O: sequential scan         │
+# │                                                                  │
+# └─────────────────────────────────────────────────────────────────┘
+        </code></pre>
+        <p>
+          The build phase is <code>O(|small|)</code> in both time and memory. Each row from
+          the small table is hashed on the join key and inserted into an in-memory hash map.
+          Modern engines (PostgreSQL 11+, Spark) use open-addressing or chained bucket designs.
+        </p>
+      </details>
+      <details>
+        <summary>Probe phase — streaming the large side</summary>
+        <p>
+          Once the hash table is built, the large table is scanned sequentially. For each row,
+          the engine computes <code>hash(join_key)</code> and probes the hash table. Matches
+          produce output rows; misses are discarded.
+        </p>
+        <ul>
+          <li><strong>Time complexity:</strong> O(|large|) — one hash computation + one probe per row</li>
+          <li><strong>Memory:</strong> Only the current row of the large table is in flight</li>
+          <li><strong>I/O pattern:</strong> Sequential scan of the large table (cache-friendly)</li>
+        </ul>
+        <p>
+          Total cost: <code>O(|small| + |large|)</code> — linear in the sum of both inputs.
+          Compare this to a nested-loop join at <code>O(|small| × |large|)</code>.
+        </p>
+      </details>
+      <details>
+        <summary>Why build on the small side?</summary>
+        <p>
+          The hash table must fit in the executor's memory budget. Building on the large side
+          would require materializing billions of rows — exceeding available RAM and triggering
+          expensive spill-to-disk (grace hash join / hybrid hash join).
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Scenario</th>
+              <th>Build Side Size</th>
+              <th>Fits in Memory?</th>
+              <th>Performance</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Small builds, large probes</td>
+              <td>50 MB</td>
+              <td>✅ Yes</td>
+              <td>Single-pass, no spill</td>
+            </tr>
+            <tr>
+              <td>Large builds, small probes</td>
+              <td>200 GB</td>
+              <td>❌ No</td>
+              <td>Multi-pass, disk spill</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>Hash table memory estimation</summary>
+        <p>
+          A practical formula for estimating hash table memory:
+        </p>
+        <pre><code class="language-python">
+# Hash table memory estimation
+def estimate_hash_table_memory(num_rows, avg_key_bytes, avg_payload_bytes, load_factor=0.7):
+    """
+    Estimates memory for an in-memory hash table.
+    
+    Parameters:
+        num_rows: number of rows in the build side
+        avg_key_bytes: average size of the join key(s) in bytes
+        avg_payload_bytes: average size of projected columns carried along
+        load_factor: hash table load factor (typically 0.5-0.75)
+    
+    Returns:
+        estimated memory in bytes
+    """
+    # Per-entry overhead: pointer (8 bytes) + hash value (4 bytes) + alignment
+    entry_overhead = 16  # conservative for 64-bit systems
+    
+    entry_size = avg_key_bytes + avg_payload_bytes + entry_overhead
+    
+    # Account for load factor (unused buckets)
+    num_buckets = int(num_rows / load_factor)
+    bucket_array = num_buckets * 8  # pointer per bucket
+    
+    total = (num_rows * entry_size) + bucket_array
+    return total
+
+# Example: dim_store with 50,000 rows
+mem = estimate_hash_table_memory(
+    num_rows=50_000,
+    avg_key_bytes=8,       # INT64 store_id
+    avg_payload_bytes=120, # store_name, region, manager, etc.
+    load_factor=0.7
+)
+print(f"Estimated hash table size: {mem / (1024**2):.1f} MB")
+# Output: Estimated hash table size: ~7.6 MB
+        </code></pre>
+      </details>
+      <details>
+        <summary>PostgreSQL EXPLAIN showing build/probe sides</summary>
+        <pre><code class="language-sql">
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT s.sale_id, s.amount, d.store_name
+FROM fact_sales s
+JOIN dim_store d ON s.store_id = d.store_id;
+
+-- Output:
+-- Hash Join  (cost=1.56..458932.00 rows=10000000 width=52)
+--            (actual time=2.1..12450.3 rows=9874521 loops=1)
+--   Hash Cond: (s.store_id = d.store_id)
+--   -> Seq Scan on fact_sales s          ← PROBE SIDE (large)
+--        (cost=0.00..325000.00 rows=10000000 width=20)
+--        Buffers: shared hit=125000
+--   -> Hash                               ← BUILD SIDE (small)
+--        (cost=1.25..1.25 rows=50000 width=36)
+--        Buckets: 65536  Batches: 1  Memory Usage: 3842kB
+--        -> Seq Scan on dim_store d
+--           Buffers: shared hit=250
+-- Planning Time: 0.8 ms
+-- Execution Time: 13200.5 ms
+        </code></pre>
+        <p>
+          Key observations: <code>Batches: 1</code> means the entire hash table fit in memory
+          without partitioning. <code>Memory Usage: 3842kB</code> confirms it's a small build side.
+          If batches > 1, the engine is spilling to disk (grace hash join).
+        </p>
+      </details>
+    </section>
+
+
+    <!-- ========== SECTION 4: BROADCAST JOIN ========== -->
+    <section id="broadcast-join">
+      <h2>Broadcast Join in Distributed Systems</h2>
+      <details>
+        <summary>Broadcast vs. Shuffle — the fundamental trade-off</summary>
+        <pre><code class="language-bash">
+# ┌───────────────────────────────────────────────────────────────────────┐
+# │          BROADCAST JOIN vs. SHUFFLE JOIN                               │
+# ├───────────────────────────────────────────────────────────────────────┤
+# │                                                                        │
+# │  BROADCAST JOIN                       SHUFFLE (SORT-MERGE) JOIN        │
+# │  ──────────────                       ─────────────────────────        │
+# │                                                                        │
+# │  Small table (10 MB)                  Both tables shuffled by key      │
+# │       │                                                                │
+# │       ├──► copy to Node 1            Large (500 GB)    Small (10 MB)   │
+# │       ├──► copy to Node 2              │                   │           │
+# │       ├──► copy to Node 3              ├── hash(key) ──►  partition 1  │
+# │       └──► copy to Node N              ├── hash(key) ──►  partition 2  │
+# │                                        ├── hash(key) ──►  partition 3  │
+# │  Network cost: N × 10 MB              └── hash(key) ──►  partition N  │
+# │  = 10 nodes × 10 MB = 100 MB                                          │
+# │                                        Network cost: 500 GB + 10 MB    │
+# │  Large table: NO MOVEMENT             = ~500 GB shuffled              │
+# │  Stays on local partitions                                             │
+# │                                                                        │
+# │  Total network: ~100 MB               Total network: ~500 GB          │
+# │  Winner: ████████████████             Loser by 5000×                  │
+# │                                                                        │
+# └───────────────────────────────────────────────────────────────────────┘
+        </code></pre>
+        <p>
+          In a broadcast join, the small table is replicated to every executor node. Each node
+          then joins its local partition of the large table against the complete small table
+          — no shuffling of the large table required.
+        </p>
+      </details>
+      <details>
+        <summary>Spark broadcast join mechanics</summary>
+        <p>
+          Apache Spark uses broadcast join (BroadcastHashJoin) when:
+        </p>
+        <ul>
+          <li>One side is below <code>spark.sql.autoBroadcastJoinThreshold</code> (default: 10 MB)</li>
+          <li>The user provides an explicit <code>broadcast()</code> hint</li>
+          <li>Adaptive Query Execution determines at runtime that a side is small enough</li>
+        </ul>
+        <pre><code class="language-python">
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import broadcast
+
+spark = SparkSession.builder \
+    .config("spark.sql.autoBroadcastJoinThreshold", "50m") \
+    .getOrCreate()
+
+# Explicit broadcast hint — overrides threshold
+result = fact_sales.join(
+    broadcast(dim_store),
+    on="store_id",
+    how="inner"
+)
+
+# Physical plan will show:
+# == Physical Plan ==
+# *(2) BroadcastHashJoin [store_id#0], [store_id#5], Inner, BuildRight
+# :- *(2) ColumnarToRow
+# :  +- FileScan parquet fact_sales[...]
+# +- BroadcastExchange HashedRelationBroadcastMode(List(store_id#5))
+#    +- *(1) FileScan parquet dim_store[...]
+        </code></pre>
+      </details>
+      <details>
+        <summary>BigQuery broadcast join behavior</summary>
+        <p>
+          BigQuery uses a broadcast join (called "hash join" in the execution plan) automatically
+          when the optimizer determines one side is small enough to fit in worker memory. Unlike
+          Spark, there is no user-configurable threshold — the optimizer decides based on:
+        </p>
+        <ul>
+          <li>Table statistics and cardinality estimates</li>
+          <li>Available slot memory per worker</li>
+          <li>Whether the small table can be replicated within the shuffle budget</li>
+        </ul>
+        <pre><code class="language-json">
+{
+  "stages": [
+    {
+      "id": "S01:Input",
+      "inputStages": [],
+      "steps": [
+        {"kind": "READ", "substeps": ["FROM dim_store", "scan 50000 rows"]}
+      ]
+    },
+    {
+      "id": "S02:Input+HashJoin",
+      "inputStages": ["S01"],
+      "steps": [
+        {"kind": "READ", "substeps": ["FROM fact_sales", "scan 2B rows"]},
+        {"kind": "HASH_JOIN", "substeps": [
+          "Build hash table on dim_store.store_id (broadcast)",
+          "Probe with fact_sales.store_id"
+        ]}
+      ]
+    }
+  ]
+}
+        </code></pre>
+      </details>
+      <details>
+        <summary>When the optimizer chooses broadcast</summary>
+        <p>Decision criteria across engines:</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Engine</th>
+              <th>Default Threshold</th>
+              <th>Config Parameter</th>
+              <th>Override Mechanism</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Spark</td>
+              <td>10 MB</td>
+              <td><code>spark.sql.autoBroadcastJoinThreshold</code></td>
+              <td><code>broadcast()</code> hint</td>
+            </tr>
+            <tr>
+              <td>BigQuery</td>
+              <td>Automatic (no exposed threshold)</td>
+              <td>N/A</td>
+              <td>None — optimizer only</td>
+            </tr>
+            <tr>
+              <td>Snowflake</td>
+              <td>Automatic (based on micro-partition count)</td>
+              <td>N/A</td>
+              <td>None — optimizer only</td>
+            </tr>
+            <tr>
+              <td>Trino/Presto</td>
+              <td>100 MB</td>
+              <td><code>join-distribution-type</code></td>
+              <td>Session property</td>
+            </tr>
+            <tr>
+              <td>Databricks</td>
+              <td>10 MB (inherits Spark)</td>
+              <td>Same as Spark + runtime AQE</td>
+              <td><code>broadcast()</code> hint</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>Broadcast join anti-patterns</summary>
+        <ul>
+          <li><strong>Broadcasting the large side:</strong> OOM on driver/executors trying to collect
+              and replicate a multi-GB table.</li>
+          <li><strong>Stale statistics:</strong> Optimizer thinks table is 5 MB (last ANALYZE was
+              6 months ago) but it's now 2 GB → broadcast OOM.</li>
+          <li><strong>Broadcast + skew:</strong> Even with broadcast, if the join key has extreme
+              skew (one key has 1B matches), individual tasks still explode.</li>
+          <li><strong>Broadcast in streaming:</strong> The broadcast table is static for the micro-batch
+              lifetime — updates require stream restart or structured streaming state management.</li>
+        </ul>
+      </details>
+    </section>
+
+
+    <!-- ========== SECTION 5: INTERMEDIATE RESULT EXPLOSION ========== -->
+    <section id="intermediate-results">
+      <h2>Intermediate Result Explosion</h2>
+      <details>
+        <summary>Why big-joins-big creates massive intermediates</summary>
+        <pre><code class="language-bash">
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │        INTERMEDIATE RESULT EXPLOSION VISUALIZATION                   │
+# ├─────────────────────────────────────────────────────────────────────┤
+# │                                                                      │
+# │  CASE A: Small × Large (bounded amplification)                       │
+# │  ─────────────────────────────────────────────                       │
+# │                                                                      │
+# │  dim_store (50K unique keys)  ×  fact_sales (2B rows)                │
+# │                                                                      │
+# │  Max output cardinality: 2B (1:N relationship)                       │
+# │  Each fact row matches at most 1 dimension row                       │
+# │  Amplification factor: 1×                                            │
+# │                                                                      │
+# │  Input: 2B rows  ──────►  Output: ≤ 2B rows                         │
+# │                                                                      │
+# │  ────────────────────────────────────────────────────────────────    │
+# │                                                                      │
+# │  CASE B: Large × Large (unbounded explosion)                         │
+# │  ───────────────────────────────────────────                         │
+# │                                                                      │
+# │  user_events (500M)  ×  user_sessions (800M)                         │
+# │  Join key: user_id (duplicated on BOTH sides)                        │
+# │                                                                      │
+# │  User "power_user_42": 10,000 events × 5,000 sessions               │
+# │  = 50,000,000 output rows from ONE user                             │
+# │                                                                      │
+# │  Input: 1.3B rows  ──────►  Output: potentially TRILLIONS           │
+# │                                                                      │
+# │  ┌───────┐     M:N      ┌──────────┐                                │
+# │  │  500M │─────────────►│ 500M ×   │  Each left row can match       │
+# │  │ events│     JOIN     │  avg(K)  │  K rows on the right           │
+# │  └───────┘              │  rows    │  K can be thousands            │
+# │                          └──────────┘                                │
+# │                                                                      │
+# │  Memory for intermediates: UNBOUNDED                                 │
+# │  Network shuffle: BOTH sides must be repartitioned                   │
+# │  Disk spill: GUARANTEED for large clusters                           │
+# │                                                                      │
+# └─────────────────────────────────────────────────────────────────────┘
+        </code></pre>
+      </details>
+      <details>
+        <summary>Cardinality math: the multiplication problem</summary>
+        <p>
+          For a join between tables A and B on key <code>k</code>:
+        </p>
+        <pre><code class="language-python">
+# Cardinality estimation for join output
+def join_cardinality(card_a, card_b, distinct_keys_a, distinct_keys_b):
+    """
+    Simplified join cardinality estimate (independence assumption).
+    
+    |A ⋈ B| ≈ |A| × |B| / max(distinct_keys_a, distinct_keys_b)
+    
+    This is the classic formula used by most optimizers.
+    """
+    return (card_a * card_b) / max(distinct_keys_a, distinct_keys_b)
+
+# Case A: Small (unique keys) joins Large
+small_large = join_cardinality(
+    card_a=50_000,           # dim_store rows
+    card_b=2_000_000_000,    # fact_sales rows
+    distinct_keys_a=50_000,  # store_id is PK
+    distinct_keys_b=50_000   # 50K distinct store_ids in fact table
+)
+print(f"Small × Large output: {small_large:,.0f}")
+# Output: 2,000,000,000 (bounded by larger table)
+
+# Case B: Large joins Large (many duplicates)
+large_large = join_cardinality(
+    card_a=500_000_000,     # user_events
+    card_b=800_000_000,     # user_sessions
+    distinct_keys_a=10_000_000,   # 10M distinct users in events
+    distinct_keys_b=10_000_000    # 10M distinct users in sessions
+)
+print(f"Large × Large output: {large_large:,.0f}")
+# Output: 40,000,000,000,000 (40 TRILLION — catastrophic)
+        </code></pre>
+        <p>
+          When the small side has a <strong>primary key</strong> (unique join key), the output
+          cardinality is bounded by the large side. This is why fact-dimension joins are
+          inherently safer than fact-fact joins.
+        </p>
+      </details>
+      <details>
+        <summary>Impact on downstream operators</summary>
+        <p>
+          Intermediate result explosion cascades through the query plan:
+        </p>
+        <ul>
+          <li><strong>Sort operators:</strong> Must sort the exploded result — O(n log n) where n is now trillions</li>
+          <li><strong>Aggregations:</strong> Hash aggregation buffers grow proportionally</li>
+          <li><strong>Network transfers:</strong> Shuffling trillions of rows between stages</li>
+          <li><strong>Spill to disk:</strong> Each operator independently spills, creating I/O storms</li>
+          <li><strong>Query timeout:</strong> SLA breaches from what looks like a "simple" join</li>
+        </ul>
+      </details>
+    </section>
+
+
+    <!-- ========== SECTION 6: MEMORY PRESSURE & SPILL ========== -->
+    <section id="memory-pressure">
+      <h2>Memory Pressure &amp; Spill</h2>
+      <details>
+        <summary>Hash table sizing and memory budgets</summary>
+        <p>
+          Every hash join operator is allocated a memory budget from the executor's working memory.
+          When the build-side hash table exceeds this budget, the engine must spill.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Engine</th>
+              <th>Memory Pool</th>
+              <th>Hash Join Budget</th>
+              <th>Spill Mechanism</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>PostgreSQL</td>
+              <td><code>work_mem</code> (per-operation)</td>
+              <td>Typically 256 MB–1 GB per sort/hash</td>
+              <td>Grace hash join (partition to temp files)</td>
+            </tr>
+            <tr>
+              <td>Spark</td>
+              <td>Unified Memory (execution + storage)</td>
+              <td>60% of <code>(heap - 300MB)</code></td>
+              <td>External sort-based shuffle + spill</td>
+            </tr>
+            <tr>
+              <td>BigQuery</td>
+              <td>Per-slot memory (managed)</td>
+              <td>~1 GB per slot typical</td>
+              <td>Transparent spill to Colossus</td>
+            </tr>
+            <tr>
+              <td>Snowflake</td>
+              <td>Warehouse memory pool</td>
+              <td>Automatic, per-query</td>
+              <td>Spill to local SSD, then remote storage</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>Grace hash join — spilling gracefully</summary>
+        <p>
+          When the build side exceeds memory, engines use a <strong>Grace hash join</strong>
+          (or hybrid hash join) strategy:
+        </p>
+        <ol>
+          <li>Partition both build and probe sides into N buckets using a secondary hash function</li>
+          <li>Keep partition 0 of the build side in memory (as much as fits)</li>
+          <li>Spill remaining partitions to disk</li>
+          <li>Probe: rows for partition 0 are joined in memory; others are spilled to matching partition files</li>
+          <li>Recursively process each spilled partition pair</li>
+        </ol>
+        <pre><code class="language-sql">
+-- PostgreSQL: detecting spill in EXPLAIN
+EXPLAIN (ANALYZE, BUFFERS) 
+SELECT * FROM large_a JOIN large_b ON large_a.id = large_b.id;
+
+-- Hash Join (actual time=45000..128000 rows=500000000)
+--   -> Hash
+--      Buckets: 1048576  Batches: 16  Memory Usage: 262144kB
+--                         ^^^^^^^^^^
+--                         Batches > 1 = SPILL TO DISK
+--      -> Seq Scan on large_b (rows=200000000)
+--
+-- Batches: 16 means the hash table was partitioned into 16 chunks
+-- Only 1/16 fits in work_mem at a time → 16 passes over probe side
+        </code></pre>
+      </details>
+      <details>
+        <summary>Partition-wise join to reduce memory per executor</summary>
+        <p>
+          In distributed engines, partition-wise join (co-partitioned join) avoids building
+          a full hash table by ensuring matching keys are already co-located:
+        </p>
+        <pre><code class="language-sql">
+-- Both tables pre-partitioned on the same key with same bucket count
+-- Spark: bucketed tables
+CREATE TABLE fact_sales
+USING parquet
+CLUSTERED BY (store_id) INTO 256 BUCKETS
+LOCATION '/warehouse/fact_sales';
+
+CREATE TABLE dim_store
+USING parquet
+CLUSTERED BY (store_id) INTO 256 BUCKETS
+LOCATION '/warehouse/dim_store';
+
+-- Join is partition-wise: each executor handles bucket_i from both tables
+-- No shuffle required, hash table per partition is tiny
+-- Memory per executor: size(dim_store) / 256 ≈ negligible
+        </code></pre>
+        <p>
+          Partition-wise joins turn a global memory problem into 256 independent local problems,
+          each requiring 1/256th of the memory.
+        </p>
+      </details>
+      <details>
+        <summary>Spark memory pressure indicators</summary>
+        <pre><code class="language-python">
+# Detecting memory pressure in Spark UI / metrics
+# Key metrics to monitor:
+
+# 1. Spill (Memory) vs Spill (Disk) in Stage details
+#    - Spill (Memory): data serialized to in-memory buffer before disk write
+#    - Spill (Disk): actual bytes written to local disk
+#    - Ratio > 2:1 (memory:disk) indicates compression is effective
+
+# 2. GC time percentage
+#    - > 10% of task time in GC = memory pressure
+#    - Indicates hash table is thrashing the JVM heap
+
+# 3. Peak Execution Memory per task
+#    spark.sql.execution.arrow.maxRecordsPerBatch  # tune batch sizes
+
+# Configuration to mitigate:
+spark.conf.set("spark.sql.shuffle.partitions", "2000")  # more partitions = smaller hash tables
+spark.conf.set("spark.sql.adaptive.enabled", "true")    # let AQE optimize
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.memory.fraction", "0.6")          # execution memory ratio
+spark.conf.set("spark.memory.storageFraction", "0.5")   # storage vs execution split
+        </code></pre>
+      </details>
+    </section>
+
+
+    <!-- ========== SECTION 7: SHUFFLE/NETWORK COST ========== -->
+    <section id="shuffle-cost">
+      <h2>Shuffle/Network Cost</h2>
+      <details>
+        <summary>Data movement in distributed engines</summary>
+        <p>
+          In distributed query engines, a shuffle (exchange) redistributes data across the cluster
+          so that rows with the same join key land on the same executor. This is the single
+          most expensive operation in distributed joins.
+        </p>
+        <pre><code class="language-bash">
+# Cost model for shuffle join vs broadcast join:
+#
+# Shuffle Join:
+#   Network bytes = |table_A| + |table_B|     (BOTH sides redistributed)
+#   Disk I/O     = serialize + write + read for each shuffle partition
+#   Latency      = max(partition_size) / network_bandwidth + sort_time
+#
+# Broadcast Join:
+#   Network bytes = N_executors × |small_table|  (only small side moves)
+#   Disk I/O     = 0 (broadcast stays in memory)
+#   Latency      = |small_table| / min(network_bandwidth_to_any_executor)
+#
+# Example with 100 executors:
+#   Large table: 500 GB, Small table: 50 MB
+#
+#   Shuffle:   500 GB + 50 MB ≈ 500 GB network transfer
+#   Broadcast: 100 × 50 MB   = 5 GB network transfer
+#
+#   Ratio: 100× less network I/O with broadcast
+        </code></pre>
+      </details>
+      <details>
+        <summary>Shuffle internals: map-side and reduce-side</summary>
+        <p>
+          A shuffle in Spark (and similar engines like Flink, Trino) has two phases:
+        </p>
+        <ol>
+          <li><strong>Map side (shuffle write):</strong> Each task partitions its output by
+              <code>hash(join_key) % num_partitions</code>, serializes, and writes to local disk
+              (shuffle files).</li>
+          <li><strong>Reduce side (shuffle read):</strong> Each downstream task fetches its
+              partition from all upstream tasks via network (pull-based in Spark, push-based
+              in some newer engines).</li>
+        </ol>
+        <p>
+          For a 500 GB table across 200 partitions, each reduce task fetches ~2.5 GB from
+          200 different sources — creating 200 × 200 = 40,000 network connections. This is
+          the "shuffle storm" that kills cluster performance.
+        </p>
+      </details>
+      <details>
+        <summary>Co-location and partition pruning</summary>
+        <p>
+          The best shuffle is no shuffle. Strategies to eliminate shuffle:
+        </p>
+        <ul>
+          <li><strong>Bucketing/Clustering:</strong> Pre-partition tables by join key at write time.
+              If both tables have the same number of buckets on the same key, no shuffle needed.</li>
+          <li><strong>Partition pruning:</strong> If the large table is partitioned by date and
+              the query filters to one partition, the effective "large" size shrinks dramatically.</li>
+          <li><strong>Sort-merge join on sorted data:</strong> If both inputs arrive pre-sorted on
+              the join key (from bucketing or upstream sort), merge join avoids both hash table
+              and shuffle.</li>
+        </ul>
+        <pre><code class="language-sql">
+-- Snowflake: micro-partition pruning reduces effective join size
+SELECT f.*, d.store_name
+FROM fact_sales f
+JOIN dim_store d ON f.store_id = d.store_id
+WHERE f.sale_date BETWEEN '2024-01-01' AND '2024-01-31';
+
+-- Without pruning: scan all 2B rows of fact_sales
+-- With pruning on sale_date partition:
+--   Only scans ~55M rows (one month's data)
+--   The "large" side effectively becomes medium
+--   Snowflake query profile shows:
+--     Partitions scanned: 1,250 out of 45,000
+--     Partition pruning: 97.2%
+        </code></pre>
+      </details>
+      <details>
+        <summary>Network cost comparison table</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Join Strategy</th>
+              <th>Large Table Movement</th>
+              <th>Small Table Movement</th>
+              <th>Total Network</th>
+              <th>When to Use</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Broadcast Hash Join</td>
+              <td>0 (stays local)</td>
+              <td>N × |small|</td>
+              <td>N × |small|</td>
+              <td>|small| &lt; threshold</td>
+            </tr>
+            <tr>
+              <td>Shuffle Hash Join</td>
+              <td>|large| (repartitioned)</td>
+              <td>|small| (repartitioned)</td>
+              <td>|large| + |small|</td>
+              <td>Neither fits broadcast</td>
+            </tr>
+            <tr>
+              <td>Sort-Merge Join</td>
+              <td>|large| (repartitioned + sorted)</td>
+              <td>|small| (repartitioned + sorted)</td>
+              <td>|large| + |small| + sort cost</td>
+              <td>Both large, need robustness</td>
+            </tr>
+            <tr>
+              <td>Co-located Join</td>
+              <td>0</td>
+              <td>0</td>
+              <td>0</td>
+              <td>Both pre-bucketed on join key</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+
+    <!-- ========== SECTION 8: ADAPTIVE QUERY EXECUTION ========== -->
+    <section id="adaptive-execution">
+      <h2>Adaptive Query Execution</h2>
+      <details>
+        <summary>Spark AQE overview</summary>
+        <p>
+          Adaptive Query Execution (AQE) in Spark 3.0+ re-optimizes the query plan at runtime
+          based on actual shuffle statistics. This is critical for small-joins-big because
+          compile-time size estimates can be wildly wrong.
+        </p>
+        <pre><code class="language-python">
+# Enable AQE (default in Databricks, opt-in in OSS Spark 3.x)
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+
+# Key AQE features for join optimization:
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+spark.conf.set("spark.sql.adaptive.localShuffleReader.enabled", "true")
+
+# AQE broadcast threshold (can differ from static threshold)
+spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "30m")
+        </code></pre>
+      </details>
+      <details>
+        <summary>Runtime join strategy switch</summary>
+        <p>
+          AQE can switch from a shuffle join to a broadcast join at runtime:
+        </p>
+        <ol>
+          <li>Initial plan uses SortMergeJoin (compile-time estimate says both sides are large)</li>
+          <li>Shuffle writes complete — Spark now knows actual partition sizes</li>
+          <li>AQE discovers one side is actually 8 MB (below adaptive threshold)</li>
+          <li>Plan is re-optimized mid-execution to use BroadcastHashJoin</li>
+          <li>The small side's shuffle output is broadcast instead of fetched partition-by-partition</li>
+        </ol>
+        <pre><code class="language-sql">
+-- Before AQE (static plan):
+== Physical Plan ==
+SortMergeJoin [customer_id], [customer_id], Inner
+:- Sort [customer_id ASC]
+:  +- Exchange hashpartitioning(customer_id, 200)
+:     +- FileScan parquet filtered_events  -- estimated 50GB, actual 5MB after filter
++- Sort [customer_id ASC]
+   +- Exchange hashpartitioning(customer_id, 200)
+      +- FileScan parquet customers
+
+-- After AQE re-optimization:
+== Physical Plan ==
+BroadcastHashJoin [customer_id], [customer_id], Inner, BuildLeft
+:- BroadcastExchange HashedRelationBroadcastMode
+:  +- CustomShuffleReader (coalesced)      -- actual size: 5MB
+:     +- ShuffleQueryStage (filtered_events)
++- ShuffleQueryStage (customers)           -- no change needed
+        </code></pre>
+      </details>
+      <details>
+        <summary>Partition coalescing</summary>
+        <p>
+          After a shuffle, many partitions may be nearly empty (especially after filtering).
+          AQE coalesces small partitions to reduce task overhead:
+        </p>
+        <pre><code class="language-python">
+# Before coalescing: 200 partitions, most nearly empty
+# Partition sizes: [2MB, 0.1MB, 0.05MB, 3MB, 0.01MB, ...]
+# 180 out of 200 partitions have < 1MB
+
+# AQE coalescing settings:
+spark.conf.set("spark.sql.adaptive.coalescePartitions.minPartitionSize", "1m")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.initialPartitionNum", "200")
+spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "64m")
+
+# After coalescing: 200 partitions → 12 partitions
+# Each ~64MB, balanced workload, fewer tasks to schedule
+        </code></pre>
+      </details>
+      <details>
+        <summary>Skew handling in AQE</summary>
+        <p>
+          Even in a small-joins-big scenario, skew on the large side can cause stragglers.
+          AQE detects and splits skewed partitions:
+        </p>
+        <pre><code class="language-python">
+# Skew detection settings
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256m")
+
+# How it works:
+# 1. After shuffle write, AQE checks partition sizes
+# 2. Partition P is "skewed" if:
+#    size(P) > median_partition_size × skewedPartitionFactor
+#    AND size(P) > skewedPartitionThresholdInBytes
+#
+# 3. Skewed partition is split into sub-partitions
+# 4. The corresponding partition from the other side is replicated
+#    (essentially a local broadcast for that key range)
+#
+# Example:
+#   Partition for store_id=42 has 500M rows (mega-store)
+#   Other partitions average 2M rows
+#   AQE splits store_id=42 into 250 sub-tasks
+#   dim_store row for store_id=42 is replicated to all 250 sub-tasks
+        </code></pre>
+      </details>
+      <details>
+        <summary>AQE limitations and gotchas</summary>
+        <ul>
+          <li><strong>Only works at shuffle boundaries:</strong> AQE cannot re-optimize within a
+              single stage. The initial scan/filter must complete before re-optimization.</li>
+          <li><strong>Broadcast conversion requires shuffle:</strong> AQE can only convert to broadcast
+              AFTER seeing shuffle write statistics — meaning the shuffle write already happened
+              (wasted work).</li>
+          <li><strong>No help for first stage:</strong> The initial read plan is still based on
+              catalog statistics. If those are wrong, AQE only helps after the first exchange.</li>
+          <li><strong>Cost of re-planning:</strong> Multiple re-optimizations add latency for
+              fast queries (sub-second queries pay relatively more overhead).</li>
+        </ul>
+      </details>
+    </section>
+
+
+    <!-- ========== SECTION 9: ENGINE-SPECIFIC BEHAVIOR ========== -->
+    <section id="engine-specifics">
+      <h2>Engine-Specific Behavior</h2>
+      <details>
+        <summary>PostgreSQL hash join internals</summary>
+        <p>
+          PostgreSQL uses a classic hybrid hash join implementation:
+        </p>
+        <ul>
+          <li><strong>work_mem:</strong> Controls maximum memory for the hash table. Default 4 MB
+              is often too low for analytical workloads. Production DWH settings: 256 MB–2 GB.</li>
+          <li><strong>Batch splitting:</strong> When the build side exceeds work_mem, PostgreSQL
+              splits into batches (powers of 2). Each batch requires a full re-scan of the
+              probe side — O(batches × |probe|).</li>
+          <li><strong>Parallel hash join (PG 11+):</strong> Multiple workers build a shared hash
+              table using atomic operations. Build phase parallelizes well; probe phase is
+              embarrassingly parallel.</li>
+          <li><strong>Statistics dependency:</strong> <code>pg_statistic</code> stores histogram
+              and MCV (most common values) for join selectivity estimation. Stale stats →
+              wrong build-side choice.</li>
+        </ul>
+        <pre><code class="language-sql">
+-- Force PostgreSQL to choose hash join for testing
+SET enable_nestloop = off;
+SET enable_mergejoin = off;
+SET work_mem = '512MB';
+
+-- Check if hash join is being used and estimate accuracy
+EXPLAIN (ANALYZE, COSTS, BUFFERS, TIMING)
+SELECT o.order_id, c.customer_name
+FROM orders o                        -- 100M rows
+JOIN customers c ON o.cust_id = c.id -- 500K rows (build side)
+WHERE o.order_date >= '2024-01-01';
+
+-- Good plan: customers is build side (500K rows, ~40MB hash table)
+-- Bad plan: orders is build side (100M rows, won't fit in work_mem)
+        </code></pre>
+      </details>
+      <details>
+        <summary>BigQuery slot-based execution</summary>
+        <p>
+          BigQuery's architecture differs fundamentally from traditional MPP databases:
+        </p>
+        <ul>
+          <li><strong>Slots:</strong> Virtual CPUs with ~1 GB memory each. A project gets
+              a pool of slots (2000 for on-demand, custom for flat-rate).</li>
+          <li><strong>Shuffle tier (Dremel shuffle):</strong> Persistent, distributed shuffle
+              service — not ephemeral like Spark. Data is shuffled via a dedicated storage
+              layer, reducing memory pressure on compute slots.</li>
+          <li><strong>Broadcast decision:</strong> The optimizer chooses broadcast when the small
+              side can be replicated within the per-slot memory budget. There's no user-facing
+              threshold to configure.</li>
+          <li><strong>Execution stages:</strong> Each stage runs as a set of slot tasks. A broadcast
+              join appears as a single stage (no shuffle boundary between build and probe).</li>
+        </ul>
+        <pre><code class="language-json">
+{
+  "queryPlan": [
+    {
+      "name": "S00: Input",
+      "status": "COMPLETE",
+      "steps": [
+        {"kind": "READ", "substeps": ["$1:store_id, $2:store_name FROM dim_store"]},
+        {"kind": "COMPUTE", "substeps": ["$10 := hash($1)"]}
+      ],
+      "slotMs": "452",
+      "recordsRead": "50000",
+      "shuffleOutputBytes": "2400000"
+    },
+    {
+      "name": "S01: Join+Output",
+      "status": "COMPLETE",
+      "steps": [
+        {"kind": "READ", "substeps": ["$3:sale_id, $4:store_id, $5:amount FROM fact_sales"]},
+        {"kind": "HASH_JOIN", "substeps": [
+          "INNER JOIN EACH WITH ALL ON $4 = $1",
+          "Build side: S00 (broadcast)"
+        ]},
+        {"kind": "WRITE", "substeps": ["$3, $5, $2 TO __output"]}
+      ],
+      "slotMs": "8500000",
+      "recordsRead": "2000000000",
+      "shuffleOutputBytes": "0"
+    }
+  ],
+  "totalSlotMs": "8500452",
+  "totalBytesProcessed": "45000000000"
+}
+        </code></pre>
+        <p>
+          Note: <code>"JOIN EACH WITH ALL"</code> indicates broadcast — "EACH" is the large
+          (partitioned) side, "ALL" is the small (broadcast) side.
+        </p>
+      </details>
+      <details>
+        <summary>Snowflake micro-partition join optimization</summary>
+        <p>
+          Snowflake's unique architecture uses micro-partitions (50–500 MB compressed) and
+          the optimization is driven by:
+        </p>
+        <ul>
+          <li><strong>Pruning:</strong> Join key ranges from the small table are used to prune
+              micro-partitions of the large table before reading them.</li>
+          <li><strong>Local caching:</strong> The small table's data is cached in the SSD
+              layer of warehouse nodes, making repeated probes essentially free.</li>
+          <li><strong>Spill hierarchy:</strong> Memory → Local SSD → Remote storage (S3/GCS/Azure).
+              Small build sides never leave memory; large ones cascade through the hierarchy.</li>
+          <li><strong>Automatic clustering:</strong> If the large table is clustered on the join key,
+              the optimizer can perform partition-wise joins across co-located micro-partitions.</li>
+        </ul>
+        <pre><code class="language-sql">
+-- Snowflake: checking join performance via query profile
+-- Look for these in the query profile:
+--   - "Join" operator: Shows build vs probe sides
+--   - "Bytes spilled to local storage": Non-zero = memory pressure
+--   - "Bytes spilled to remote storage": Critical performance issue
+--   - "Partitions scanned" vs "Partitions total": Pruning effectiveness
+
+ALTER SESSION SET USE_CACHED_RESULT = FALSE;  -- force re-execution
+
+SELECT f.sale_id, f.amount, d.store_name, d.region
+FROM fact_sales f
+INNER JOIN dim_store d ON f.store_id = d.store_id
+WHERE f.sale_date BETWEEN '2024-06-01' AND '2024-06-30';
+
+-- Query Profile metrics:
+-- Partitions scanned: 890 / 42000 (97.9% pruned via date filter)
+-- Bytes spilled: 0 (small build side fits in memory)
+-- Join type: Hash Join
+-- Build side: dim_store (50K rows, 4.2 MB)
+-- Probe side: fact_sales (filtered to 58M rows)
+        </code></pre>
+      </details>
+      <details>
+        <summary>Spark broadcast threshold tuning</summary>
+        <pre><code class="language-python">
+# Default threshold: 10 MB (very conservative)
+# This is the SIZE IN BYTES of the DataFrame (estimated from catalog stats)
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "10m")  # default
+
+# Common production overrides:
+# - Data teams with large executor memory (16GB+): set to 500MB–1GB
+# - Streaming jobs with small lookups: set to 100MB
+# - Disable broadcast entirely (force shuffle): set to -1
+
+# CRITICAL: The threshold compares against the ESTIMATED size from stats
+# If stats are stale, Spark may:
+#   - Broadcast a 5GB table it thinks is 8MB → OOM
+#   - Shuffle a 2MB table it thinks is 500MB → unnecessary network I/O
+
+# Fix: compute statistics before join-heavy queries
+spark.sql("ANALYZE TABLE dim_store COMPUTE STATISTICS FOR ALL COLUMNS")
+spark.sql("ANALYZE TABLE fact_sales COMPUTE STATISTICS FOR COLUMNS store_id, sale_date")
+
+# Verify: check the estimated size Spark sees
+dim_store_df = spark.table("dim_store")
+print(f"Estimated size: {dim_store_df.queryExecution.optimizedPlan.stats.sizeInBytes}")
+# Should show actual size, not Long.MaxValue (unknown)
+        </code></pre>
+      </details>
+    </section>
+
+
+    <!-- ========== SECTION 10: PRODUCTION INCIDENT ========== -->
+    <section id="production-incident">
+      <h2>Production Incident: Broadcast Threshold Breach</h2>
+      <details>
+        <summary>Context: dimension table growth breaks broadcast assumption</summary>
+        <p>
+          <strong>Company:</strong> Large e-commerce platform (top-10 US retailer)<br/>
+          <strong>Pipeline:</strong> Daily revenue aggregation joining <code>fact_orders</code>
+          (3B rows) with <code>dim_product</code> (product catalog)<br/>
+          <strong>Engine:</strong> Spark 3.2 on EMR, 200 executors (r5.4xlarge, 128GB each)<br/>
+          <strong>Threshold:</strong> <code>autoBroadcastJoinThreshold = 100MB</code>
+        </p>
+      </details>
+      <details>
+        <summary>Timeline of the incident</summary>
+        <ol>
+          <li>
+            <strong>Month 0 (initial deployment):</strong> dim_product has 1M rows (80 MB serialized).
+            Optimizer broadcasts it. Query runs in 12 minutes. Everyone is happy.
+          </li>
+          <li>
+            <strong>Month 6:</strong> Marketplace launch adds 3rd-party products. dim_product grows
+            to 15M rows (1.2 GB). Still broadcast because <code>ANALYZE TABLE</code> hasn't been
+            re-run — catalog stats say 80 MB.
+          </li>
+          <li>
+            <strong>Month 6, Day 1 (incident):</strong> Broadcast of 1.2 GB to 200 executors.
+            Driver attempts to collect entire table (1.2 GB to driver memory). Driver OOM.
+            Pipeline fails at 3 AM. On-call paged.
+          </li>
+          <li>
+            <strong>Month 6, Day 1 (hotfix):</strong> On-call disables broadcast with
+            <code>-1</code> threshold. Query switches to SortMergeJoin. Runtime goes from
+            12 minutes to 90 minutes. Revenue reports delayed by 4 hours.
+          </li>
+          <li>
+            <strong>Month 6, Day 2:</strong> dim_product grows to 50M rows after full marketplace
+            catalog sync (4 GB). Even sort-merge join struggles due to skew on popular products.
+          </li>
+        </ol>
+      </details>
+      <details>
+        <summary>Root cause analysis</summary>
+        <pre><code class="language-bash">
+# Root cause chain:
+#
+# 1. ANALYZE TABLE was not in the pipeline DAG
+#    → Catalog statistics permanently showed Month 0 sizes
+#
+# 2. No monitoring on table growth vs broadcast threshold
+#    → Silent degradation for 6 months
+#
+# 3. Marketplace onboarding had no data engineering review
+#    → Nobody assessed impact on downstream joins
+#
+# 4. broadcast() hint was hardcoded in the Spark job
+#    → Even if stats were correct, the hint overrode the optimizer
+#
+# 5. No memory guardrails on broadcast size
+#    → Spark < 3.4 doesn't validate actual size vs threshold before broadcast
+        </code></pre>
+      </details>
+      <details>
+        <summary>Resolution and preventive measures</summary>
+        <pre><code class="language-python">
+# 1. Remove hardcoded broadcast hints — let optimizer decide
+# BEFORE (dangerous):
+result = fact_orders.join(broadcast(dim_product), on="product_id")
+
+# AFTER (safe):
+result = fact_orders.join(dim_product, on="product_id")
+
+# 2. Add ANALYZE TABLE to pipeline DAG (runs before join)
+spark.sql("ANALYZE TABLE dim_product COMPUTE STATISTICS FOR ALL COLUMNS")
+
+# 3. Add pre-join size validation
+dim_size = spark.table("dim_product").count()
+dim_bytes = spark.sql(
+    "DESCRIBE DETAIL dim_product"
+).select("sizeInBytes").collect()[0][0]
+
+BROADCAST_THRESHOLD = 100 * 1024 * 1024  # 100 MB
+if dim_bytes > BROADCAST_THRESHOLD:
+    logger.warning(
+        f"dim_product size ({dim_bytes / 1e6:.0f} MB) exceeds broadcast "
+        f"threshold ({BROADCAST_THRESHOLD / 1e6:.0f} MB). "
+        f"Using shuffle join. Consider re-evaluating join strategy."
+    )
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+
+# 4. Add monitoring alerts
+# - Alert when any dimension table grows > 50% of broadcast threshold
+# - Alert when pipeline runtime increases > 2× baseline
+# - Alert when shuffle bytes exceed historical p95
+
+# 5. Enable AQE as safety net
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "100m")
+        </code></pre>
+      </details>
+      <details>
+        <summary>Lessons learned</summary>
+        <ul>
+          <li><strong>Dimension tables grow.</strong> "Small" is a temporal property, not a permanent one.
+              Build pipelines that adapt to size changes.</li>
+          <li><strong>Catalog statistics must be part of the DAG.</strong> Stale stats are worse
+              than no stats (no stats at least trigger conservative plans).</li>
+          <li><strong>Hardcoded hints are tech debt.</strong> They encode assumptions that rot.
+              Use dynamic hints or let the optimizer + AQE handle it.</li>
+          <li><strong>Monitor intermediate metrics, not just final runtime.</strong> Shuffle bytes,
+              spill bytes, and broadcast sizes are leading indicators of failure.</li>
+          <li><strong>Cross-team data changes need engineering review.</strong> The marketplace team
+              had no idea their catalog expansion would break a revenue-critical pipeline.</li>
+        </ul>
+      </details>
+    </section>
+
+
+    <!-- ========== SECTION 11: CODE EXAMPLES ========== -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Spark broadcast hints — explicit and dynamic</summary>
+        <pre><code class="language-python">
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import broadcast, col
+
+spark = SparkSession.builder \
+    .appName("BroadcastJoinExamples") \
+    .config("spark.sql.adaptive.enabled", "true") \
+    .config("spark.sql.autoBroadcastJoinThreshold", "50m") \
+    .getOrCreate()
+
+# ─────────────────────────────────────────────
+# Method 1: Explicit broadcast() hint
+# ─────────────────────────────────────────────
+dim_store = spark.table("catalog.dim_store")      # 50K rows, ~4 MB
+fact_sales = spark.table("catalog.fact_sales")    # 2B rows, ~400 GB
+
+result = fact_sales.join(
+    broadcast(dim_store),   # Force broadcast regardless of threshold
+    on="store_id",
+    how="inner"
+).select(
+    "sale_id", "amount", "store_name", "region"
+)
+
+# ─────────────────────────────────────────────
+# Method 2: SQL hint syntax
+# ─────────────────────────────────────────────
+spark.sql("""
+    SELECT /*+ BROADCAST(d) */
+        f.sale_id, f.amount, d.store_name, d.region
+    FROM fact_sales f
+    INNER JOIN dim_store d ON f.store_id = d.store_id
+""")
+
+# ─────────────────────────────────────────────
+# Method 3: Dynamic broadcast decision
+# ─────────────────────────────────────────────
+def smart_join(large_df, small_df, join_key, broadcast_threshold_mb=100):
+    """
+    Dynamically decide whether to broadcast based on actual size.
+    Falls back to shuffle join if small side exceeds threshold.
+    """
+    # Get actual size (requires statistics or a count + schema estimate)
+    small_count = small_df.count()
+    avg_row_bytes = 200  # estimate from schema
+    estimated_size_mb = (small_count * avg_row_bytes) / (1024 * 1024)
+    
+    if estimated_size_mb <= broadcast_threshold_mb:
+        print(f"Using broadcast join (estimated {estimated_size_mb:.1f} MB)")
+        return large_df.join(broadcast(small_df), on=join_key)
+    else:
+        print(f"Using shuffle join (estimated {estimated_size_mb:.1f} MB > {broadcast_threshold_mb} MB)")
+        return large_df.join(small_df, on=join_key)
+
+result = smart_join(fact_sales, dim_store, "store_id")
+        </code></pre>
+      </details>
+      <details>
+        <summary>EXPLAIN plans showing build/probe sides</summary>
+        <pre><code class="language-sql">
+-- ═══════════════════════════════════════════════════════════════════
+-- PostgreSQL: EXPLAIN ANALYZE showing hash join details
+-- ═══════════════════════════════════════════════════════════════════
+
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT f.sale_id, f.amount, d.store_name
+FROM fact_sales f
+JOIN dim_store d ON f.store_id = d.store_id
+WHERE f.sale_date >= '2024-01-01';
+
+/*
+Hash Join  (cost=1892.50..2458932.00 rows=50000000 width=52)
+           (actual time=15.2..45230.1 rows=48721350 loops=1)
+  Hash Cond: (f.store_id = d.store_id)
+  -> Index Scan using idx_sales_date on fact_sales f   ← PROBE (large, filtered)
+       (cost=0.57..2100000.00 rows=50000000 width=20)
+       (actual time=0.03..32100.5 rows=48721350 loops=1)
+       Index Cond: (sale_date >= '2024-01-01')
+       Buffers: shared hit=890234 read=45123
+  -> Hash                                               ← BUILD (small)
+       (cost=1250.00..1250.00 rows=50000 width=36)
+       (actual time=14.8..14.8 rows=50000 loops=1)
+       Buckets: 65536  Batches: 1  Memory Usage: 3842kB
+       -> Seq Scan on dim_store d
+            Buffers: shared hit=250
+Planning Time: 1.2 ms
+Execution Time: 47500.3 ms
+*/
+
+-- Key indicators:
+-- ✅ Batches: 1 → entire hash table in memory (no spill)
+-- ✅ Memory Usage: 3842kB → well within work_mem
+-- ✅ Build side (dim_store): 50K rows, sequential scan
+-- ✅ Probe side (fact_sales): uses index for date filter
+        </code></pre>
+      </details>
+      <details>
+        <summary>Spark physical plan interpretation</summary>
+        <pre><code class="language-python">
+# Generate and interpret Spark physical plans
+result = fact_sales.join(broadcast(dim_store), on="store_id")
+result.explain(mode="formatted")
+
+# Output:
+"""
+== Physical Plan ==
+*(2) BroadcastHashJoin [store_id#12L], [store_id#45L], Inner, BuildRight, false
+:- *(2) ColumnarToRow
+:  +- FileScan parquet default.fact_sales
+:     [sale_id#10L, store_id#12L, amount#13]
+:     Batched: true, DataFilters: [], Format: Parquet,
+:     PushedFilters: [], ReadSchema: struct<...>
++- BroadcastExchange HashedRelationBroadcastMode(List(store_id#45L), false)
+   +- *(1) Filter isnotnull(store_id#45L)
+      +- *(1) ColumnarToRow
+         +- FileScan parquet default.dim_store
+            [store_id#45L, store_name#46, region#47]
+            Batched: true, Format: Parquet, ReadSchema: struct<...>
+
+Key elements:
+- BroadcastHashJoin: Confirms broadcast strategy was chosen
+- BuildRight: dim_store is the build side (right input)
+- BroadcastExchange: Shows the broadcast operation
+- HashedRelationBroadcastMode: Hash table is broadcast (not the raw data)
+- *(1), *(2): WholeStageCodegen stages
+"""
+
+# Check actual execution metrics
+result.write.format("noop").mode("overwrite").save()
+
+# In Spark UI → SQL tab → query details:
+# - BroadcastExchange: data size, time
+# - number of output rows at each stage
+# - peak memory per task
+        </code></pre>
+      </details>
+      <details>
+        <summary>BigQuery execution stages analysis</summary>
+        <pre><code class="language-sql">
+-- BigQuery: Query execution details via INFORMATION_SCHEMA
+SELECT
+  job_id,
+  creation_time,
+  total_bytes_processed,
+  total_slot_ms,
+  -- Calculate effective parallelism
+  SAFE_DIVIDE(total_slot_ms, 
+    TIMESTAMP_DIFF(end_time, start_time, MILLISECOND)) AS avg_slots_used
+FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+WHERE job_id = 'your-job-id-here';
+
+-- Execution plan from BigQuery (via bq CLI):
+-- bq show --format=prettyjson -j job_id | jq '.statistics.query.queryPlan'
+
+-- Stage analysis for small-joins-big:
+-- Stage 0 (READ dim_store):
+--   recordsRead: 50,000
+--   shuffleOutputBytes: 2,400,000 (2.4 MB broadcast payload)
+--   slotMs: 452
+--
+-- Stage 1 (READ fact_sales + HASH JOIN):
+--   recordsRead: 2,000,000,000
+--   shuffleOutputBytes: 0 (no shuffle of large table!)
+--   slotMs: 8,500,000
+--   computeRatio: 0.98 (almost all time in computation, not I/O)
+--
+-- Total improvement vs shuffle join:
+--   Broadcast: 8.5M slot-ms, 2.4 MB network
+--   Shuffle:   45M slot-ms, 480 GB network
+--   Savings:   5.3× compute, 200,000× network
+        </code></pre>
+      </details>
+      <details>
+        <summary>Monitoring join performance in production</summary>
+        <pre><code class="language-python">
+# Production monitoring script for Spark join health
+import json
+from datetime import datetime
+
+def check_join_health(spark, query_name):
+    """
+    Extract join metrics from the last completed query.
+    Raises alerts if thresholds are breached.
+    """
+    metrics = spark.sparkContext.statusTracker
+    
+    # Parse from Spark listener or query execution
+    last_execution = spark.sql(f"""
+        SELECT * FROM spark_catalog.system.query_history
+        WHERE query_name = '{query_name}'
+        ORDER BY start_time DESC LIMIT 1
+    """).collect()[0]
+    
+    alerts = []
+    
+    # Check 1: Broadcast size approaching threshold
+    broadcast_bytes = last_execution["broadcast_bytes"]
+    threshold = spark.conf.get("spark.sql.autoBroadcastJoinThreshold")
+    threshold_bytes = parse_bytes(threshold)
+    ratio = broadcast_bytes / threshold_bytes
+    if ratio > 0.7:
+        alerts.append(
+            f"⚠️ Broadcast size at {ratio:.0%} of threshold "
+            f"({broadcast_bytes/1e6:.0f}MB / {threshold_bytes/1e6:.0f}MB)"
+        )
+    
+    # Check 2: Spill bytes
+    spill_bytes = last_execution["spill_bytes_disk"]
+    if spill_bytes > 0:
+        alerts.append(
+            f"🔴 Disk spill detected: {spill_bytes/1e9:.1f} GB. "
+            f"Consider increasing executor memory or broadcast threshold."
+        )
+    
+    # Check 3: Shuffle bytes relative to input
+    shuffle_read = last_execution["shuffle_read_bytes"]
+    input_bytes = last_execution["input_bytes"]
+    shuffle_ratio = shuffle_read / max(input_bytes, 1)
+    if shuffle_ratio > 2.0:
+        alerts.append(
+            f"⚠️ Shuffle amplification: {shuffle_ratio:.1f}× input size. "
+            f"Check for join explosion or missing broadcast."
+        )
+    
+    # Check 4: Runtime regression
+    runtime_ms = last_execution["runtime_ms"]
+    baseline_ms = get_baseline(query_name)  # from metrics store
+    if runtime_ms > baseline_ms * 2:
+        alerts.append(
+            f"🔴 Runtime regression: {runtime_ms/1000:.0f}s vs "
+            f"baseline {baseline_ms/1000:.0f}s (>{200}%)"
+        )
+    
+    return alerts
+        </code></pre>
+      </details>
+    </section>
+
+
+    <!-- ========== SECTION 12: COMMON MISTAKES ========== -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Mistake 1: Hardcoding broadcast() hints without size guards</summary>
+        <p>
+          Developers add <code>broadcast(dim_table)</code> during development when the table is
+          small, then never revisit. As the table grows, the hint forces OOM errors because
+          it overrides the optimizer's size-based decision.
+        </p>
+        <p><strong>Fix:</strong> Use dynamic broadcast decisions (check actual size before hinting)
+          or rely on AQE to make runtime decisions. If you must hint, add a size assertion upstream.</p>
+      </details>
+      <details>
+        <summary>Mistake 2: Stale catalog statistics</summary>
+        <p>
+          The optimizer relies on table/column statistics to choose join strategies. If
+          <code>ANALYZE TABLE</code> hasn't run since the table was 10× smaller, the optimizer
+          makes catastrophically wrong decisions.
+        </p>
+        <p><strong>Fix:</strong> Include <code>ANALYZE TABLE ... COMPUTE STATISTICS</code> as a
+          step in your pipeline DAG, immediately after data loads and before join-heavy queries.</p>
+      </details>
+      <details>
+        <summary>Mistake 3: Ignoring join key cardinality</summary>
+        <p>
+          A table can be "small" in row count but produce a massive intermediate result if
+          the join key has low cardinality. Example: joining a 100-row <code>dim_country</code>
+          with a 5B-row event table — but 40% of events are from one country, creating a
+          2B-row skewed partition.
+        </p>
+        <p><strong>Fix:</strong> Analyze key distribution before choosing join strategy. Enable
+          AQE skew handling. Consider salting skewed keys.</p>
+      </details>
+      <details>
+        <summary>Mistake 4: Broadcasting to the driver first</summary>
+        <p>
+          In Spark's default broadcast implementation, the broadcast table is collected to the
+          driver, then distributed to executors. If the table is larger than
+          <code>spark.driver.maxResultSize</code> (default 1 GB), the job fails before the
+          join even starts.
+        </p>
+        <p><strong>Fix:</strong> Set <code>spark.sql.autoBroadcastJoinThreshold</code> below
+          <code>spark.driver.maxResultSize</code>. In Spark 3.4+, use direct executor-to-executor
+          broadcast to bypass the driver bottleneck.</p>
+      </details>
+      <details>
+        <summary>Mistake 5: Not filtering before joining</summary>
+        <p>
+          Joining first, then filtering is a classic anti-pattern. If you filter the large table
+          first, the "large" side may become small enough for a broadcast join — completely
+          changing the execution strategy.
+        </p>
+        <pre><code class="language-sql">
+-- BAD: Join first, filter later (processes all 2B rows)
+SELECT f.*, d.store_name
+FROM fact_sales f
+JOIN dim_store d ON f.store_id = d.store_id
+WHERE f.sale_date = '2024-06-15';  -- filter after join
+
+-- GOOD: Filter first (predicate pushdown)
+-- Most optimizers push this down automatically, but verify with EXPLAIN
+-- If using views or complex subqueries, pushdown may not happen
+
+-- EXPLICIT: filter in subquery to guarantee pushdown
+SELECT f.*, d.store_name
+FROM (SELECT * FROM fact_sales WHERE sale_date = '2024-06-15') f
+JOIN dim_store d ON f.store_id = d.store_id;
+        </code></pre>
+      </details>
+      <details>
+        <summary>Mistake 6: Using SELECT * in join queries</summary>
+        <p>
+          Selecting all columns increases the hash table size (more payload per entry) and
+          the shuffle size. The build-side hash table carries ALL projected columns, not just
+          the join key.
+        </p>
+        <p><strong>Fix:</strong> Project only needed columns before the join. This is especially
+          impactful for wide dimension tables (100+ columns where you need 3).</p>
+      </details>
+      <details>
+        <summary>Mistake 7: Assuming "small" is permanent</summary>
+        <p>
+          Dimension tables grow. Product catalogs expand. User tables scale with business.
+          A table that's 5 MB today may be 5 GB in 18 months. Join strategies that assume
+          static sizes are ticking time bombs.
+        </p>
+        <p><strong>Fix:</strong> Monitor table sizes over time. Set alerts at 50%, 75%, and 90%
+          of broadcast threshold. Design pipelines that degrade gracefully (fallback to shuffle
+          join, not crash).</p>
+      </details>
+    </section>
+
+    <!-- ========== SECTION 13: TRADE-OFFS ========== -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Broadcast join: speed vs. memory risk</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Advantage</th>
+              <th>Disadvantage</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Eliminates shuffle of large table</td>
+              <td>Requires small table to fit in memory on every executor</td>
+            </tr>
+            <tr>
+              <td>O(1) network latency (single broadcast)</td>
+              <td>Driver can become bottleneck (collect + distribute)</td>
+            </tr>
+            <tr>
+              <td>No disk I/O for shuffle files</td>
+              <td>OOM if table grows beyond executor memory</td>
+            </tr>
+            <tr>
+              <td>Works with any join type (inner, left, right)</td>
+              <td>Full outer joins cannot use broadcast (need both sides)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>Hash join vs. sort-merge join</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>Hash Join</th>
+              <th>Sort-Merge Join</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Memory</td>
+              <td>O(|build side|) — entire build in memory</td>
+              <td>O(1) — streaming merge, no materialization</td>
+            </tr>
+            <tr>
+              <td>CPU</td>
+              <td>O(|build| + |probe|) — hash + probe</td>
+              <td>O(|A| log|A| + |B| log|B|) — sort dominates</td>
+            </tr>
+            <tr>
+              <td>Pre-sorted input</td>
+              <td>No benefit (still builds hash table)</td>
+              <td>Huge benefit (skip sort phase entirely)</td>
+            </tr>
+            <tr>
+              <td>Skew tolerance</td>
+              <td>Poor (hot buckets → imbalance)</td>
+              <td>Better (streaming, no hot buckets)</td>
+            </tr>
+            <tr>
+              <td>Spill behavior</td>
+              <td>Grace hash join (recursive partitioning)</td>
+              <td>External merge sort (well-understood)</td>
+            </tr>
+            <tr>
+              <td>Best for small×large</td>
+              <td>✅ Ideal (small build, large probe)</td>
+              <td>Overkill (sort cost not justified)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>Shuffle cost vs. broadcast replication cost</summary>
+        <p>
+          The crossover point where broadcast becomes more expensive than shuffle:
+        </p>
+        <pre><code class="language-python">
+# When does broadcast become MORE expensive than shuffle?
+# 
+# Broadcast network cost: N_executors × |small_table|
+# Shuffle network cost:   |large_table| + |small_table|
+#
+# Broadcast wins when:
+#   N × |small| < |large| + |small|
+#   N × |small| < |large|           (approximation, |small| << |large|)
+#   |small| < |large| / N
+#
+# Example: 200 executors, 500 GB large table
+#   Breakeven: |small| < 500 GB / 200 = 2.5 GB
+#   But memory constraint usually kicks in much earlier (~100 MB-1 GB)
+#
+# In practice, memory is the binding constraint, not network cost.
+# You'd run out of executor memory before broadcast network > shuffle network.
+        </code></pre>
+      </details>
+      <details>
+        <summary>Correctness vs. performance: outer joins and broadcast</summary>
+        <p>
+          Not all join types support broadcast on both sides:
+        </p>
+        <ul>
+          <li><strong>INNER JOIN:</strong> Either side can be broadcast ✅</li>
+          <li><strong>LEFT JOIN:</strong> Only the RIGHT (lookup) side can be broadcast ✅</li>
+          <li><strong>RIGHT JOIN:</strong> Only the LEFT (lookup) side can be broadcast ✅</li>
+          <li><strong>FULL OUTER JOIN:</strong> Neither side can be broadcast ❌ (must see all rows from both)</li>
+          <li><strong>LEFT SEMI / ANTI:</strong> Right side can be broadcast ✅</li>
+        </ul>
+        <p>
+          Attempting to broadcast the "preserved" side of an outer join produces incorrect results
+          (missing NULLs for non-matching rows). Most optimizers prevent this, but hints can
+          override safety checks in some engines.
+        </p>
+      </details>
+    </section>
+
+    <!-- ========== SECTION 14: FOLLOW-UP QUESTIONS ========== -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Q1: What happens when both tables are large?</summary>
+        <p>
+          When neither side fits in memory for a broadcast, engines fall back to:
+        </p>
+        <ol>
+          <li><strong>Shuffle Hash Join:</strong> Both sides repartitioned by join key, then hash
+              join per partition (each partition's build side must fit in memory).</li>
+          <li><strong>Sort-Merge Join:</strong> Both sides repartitioned AND sorted by join key,
+              then streaming merge. No memory constraint on either side.</li>
+          <li><strong>Partition-wise join:</strong> If both tables are pre-bucketed on the join key
+              with matching bucket counts, each executor handles its local pair without shuffle.</li>
+        </ol>
+        <p>
+          For truly massive joins (TB × TB), sort-merge is preferred because it has
+          bounded memory usage and predictable spill behavior.
+        </p>
+      </details>
+      <details>
+        <summary>Q2: How does the optimizer estimate which side is "small"?</summary>
+        <p>
+          Optimizers use a combination of:
+        </p>
+        <ul>
+          <li><strong>Catalog statistics:</strong> Row count, avg row size, total bytes (from ANALYZE TABLE)</li>
+          <li><strong>Column statistics:</strong> NDV (number of distinct values), histograms, null fraction</li>
+          <li><strong>Filter selectivity:</strong> Estimated reduction from WHERE clauses applied before join</li>
+          <li><strong>Derived statistics:</strong> For subqueries/CTEs, propagated through the plan tree</li>
+        </ul>
+        <p>
+          When statistics are unavailable, engines use heuristics: file size for Parquet, row count
+          from metadata, or worst-case defaults (assume large). This is why stale stats are dangerous.
+        </p>
+      </details>
+      <details>
+        <summary>Q3: Can you force a specific build side in PostgreSQL?</summary>
+        <p>
+          PostgreSQL doesn't have a direct "build side" hint, but you can influence it:
+        </p>
+        <pre><code class="language-sql">
+-- Indirect control via enable/disable flags + work_mem
+SET work_mem = '1GB';           -- allow larger hash tables
+SET enable_nestloop = off;      -- force hash or merge join
+SET enable_mergejoin = off;     -- force hash join
+
+-- The optimizer chooses the smaller estimated input as build side.
+-- To "force" a specific build side:
+-- 1. Ensure statistics are accurate (ANALYZE both tables)
+-- 2. Use CTEs or subqueries to present a pre-filtered "small" side
+-- 3. Adjust random_page_cost / seq_page_cost to influence cost model
+
+-- In PostgreSQL 14+, you can use pg_hint_plan extension:
+/*+ HashJoin(f d) Leading(d f) */
+SELECT f.*, d.store_name
+FROM fact_sales f
+JOIN dim_store d ON f.store_id = d.store_id;
+        </code></pre>
+      </details>
+      <details>
+        <summary>Q4: How does data skew interact with small-joins-big?</summary>
+        <p>
+          Even with a small build side, skew on the <strong>probe side</strong> causes problems:
+        </p>
+        <ul>
+          <li>One partition has 100× more rows than others → one task runs 100× longer</li>
+          <li>The hash table probe is O(1) per row, but that one task processes 100× more rows</li>
+          <li>Result: 199 tasks finish in 2 minutes, 1 task runs for 200 minutes (straggler)</li>
+        </ul>
+        <p>
+          <strong>Mitigations:</strong> AQE skew handling, salted keys (add random suffix to
+          skewed key, replicate small-side rows for each salt value), or pre-aggregation to
+          reduce the skewed partition size.
+        </p>
+      </details>
+      <details>
+        <summary>Q5: What's the relationship between join order and build-side selection?</summary>
+        <p>
+          Join order (the sequence of multi-way joins) and build-side selection (within a single
+          join) are related but distinct optimizer decisions:
+        </p>
+        <ul>
+          <li><strong>Join order:</strong> Determines WHICH tables join first, affecting intermediate
+              result sizes. Solved by dynamic programming or greedy heuristics.</li>
+          <li><strong>Build-side selection:</strong> Within a chosen join pair, determines which
+              input materializes the hash table. Always the smaller estimated side.</li>
+          <li><strong>Interaction:</strong> A good join order produces small intermediates that
+              become build sides for subsequent joins. Bad order produces large intermediates
+              that can't be broadcast or fit in hash tables.</li>
+        </ul>
+        <p>
+          See <a href="ch03-join-order-optimization.html">Chapter 3: Join Order Optimization</a>
+          for detailed coverage of multi-way join ordering.
+        </p>
+      </details>
+      <details>
+        <summary>Q6: How do map-side joins in Hive/MapReduce relate to broadcast joins?</summary>
+        <p>
+          Map-side joins in Hive are the MapReduce-era equivalent of broadcast joins:
+        </p>
+        <ul>
+          <li>The small table is loaded into a distributed cache (HDFS → local disk on each mapper)</li>
+          <li>Each mapper reads its split of the large table and probes the local copy of the small table</li>
+          <li>No reduce phase needed → significant performance improvement</li>
+        </ul>
+        <pre><code class="language-sql">
+-- Hive map-side join (legacy syntax)
+SET hive.auto.convert.join = true;
+SET hive.mapjoin.smalltable.filesize = 25000000;  -- 25 MB threshold
+
+SELECT /*+ MAPJOIN(d) */ f.*, d.store_name
+FROM fact_sales f
+JOIN dim_store d ON f.store_id = d.store_id;
+        </code></pre>
+        <p>
+          Modern Spark's broadcast join is the evolution of this concept — same principle,
+          better implementation (in-memory hash table vs. file-based lookup).
+        </p>
+      </details>
+    </section>
+
+    <!-- ========== SECTION 15: SUMMARY ========== -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Key takeaways</summary>
+        <ul>
+          <li>Small-joins-big performs better because the small side can be materialized as an
+              in-memory hash table (build side) while the large side streams through (probe side)
+              in O(n) time.</li>
+          <li>In distributed systems, the small table can be broadcast to all executors, eliminating
+              the need to shuffle the large table across the network — often a 100-1000× reduction
+              in network I/O.</li>
+          <li>Big-joins-big risks intermediate result explosion (M:N relationships), unbounded
+              memory requirements, and massive shuffle volumes.</li>
+          <li>Adaptive Query Execution (AQE) in Spark provides runtime safety nets: converting
+              shuffle joins to broadcast when actual sizes are small, and splitting skewed partitions.</li>
+          <li>Production reliability requires: fresh statistics, size monitoring, dynamic broadcast
+              decisions, and graceful fallback strategies.</li>
+        </ul>
+      </details>
+      <details>
+        <summary>Mental model for interviews</summary>
+        <pre><code class="language-bash">
+# Decision tree for "small joins big":
+#
+#                    ┌─ Is one side small enough to broadcast?
+#                    │
+#              YES ──┤                              NO ──┐
+#                    │                                    │
+#         ┌─────────▼──────────┐              ┌─────────▼──────────┐
+#         │  Broadcast Hash    │              │  Are both sides     │
+#         │  Join              │              │  pre-bucketed on    │
+#         │                    │              │  join key?          │
+#         │  • No shuffle of   │              │                    │
+#         │    large side      │         YES ─┤               NO ──┐
+#         │  • Build hash on   │              │                    │
+#         │    small side      │    ┌─────────▼────────┐  ┌───────▼────────┐
+#         │  • O(N×small)      │    │  Co-located      │  │  Shuffle +     │
+#         │    network         │    │  Join            │  │  Hash or       │
+#         └────────────────────┘    │  (no shuffle)    │  │  Sort-Merge    │
+#                                    └──────────────────┘  └────────────────┘
+        </code></pre>
+      </details>
+      <details>
+        <summary>One-page cheat sheet</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Concept</th>
+              <th>Key Point</th>
+              <th>Danger Zone</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Hash Join Build/Probe</td>
+              <td>Build on small side → fits in memory</td>
+              <td>Build on large side → spill to disk</td>
+            </tr>
+            <tr>
+              <td>Broadcast Join</td>
+              <td>Replicate small to all nodes</td>
+              <td>Broadcast large → OOM everywhere</td>
+            </tr>
+            <tr>
+              <td>Intermediate Results</td>
+              <td>1:N join → bounded output</td>
+              <td>M:N join → Cartesian explosion</td>
+            </tr>
+            <tr>
+              <td>Memory Pressure</td>
+              <td>Small hash table = single pass</td>
+              <td>Large hash table = grace hash + spill</td>
+            </tr>
+            <tr>
+              <td>Shuffle Cost</td>
+              <td>Broadcast: N × small_table</td>
+              <td>Shuffle: entire large table moved</td>
+            </tr>
+            <tr>
+              <td>AQE</td>
+              <td>Runtime strategy switch</td>
+              <td>Only helps after first shuffle boundary</td>
+            </tr>
+            <tr>
+              <td>Statistics</td>
+              <td>Fresh stats → correct decisions</td>
+              <td>Stale stats → wrong join strategy</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- ========== CHAPTER NAVIGATION ========== -->
+    <nav class="chapter-nav">
+      <a href="ch03-join-order-optimization.html" class="prev">&larr; Chapter 3: Join Order Optimization</a>
+      <a href="ch05-predicate-projection-pruning.html" class="next">Chapter 5: Predicate &amp; Projection Pruning &rarr;</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

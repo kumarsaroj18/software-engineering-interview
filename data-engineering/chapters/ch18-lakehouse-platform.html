@@ -1,0 +1,2744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ch 18 — Design a Modern Lakehouse Platform | Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <span class="brand"><a href="../index.html">DE Interview Handbook</a></span>
+      <button class="sidebar-close" id="sidebar-close" aria-label="Close sidebar">✕</button>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-number">Ch 18</span>
+      <span class="chapter-title">Lakehouse Platform</span>
+    </div>
+    <nav class="sidebar-nav">
+      <a href="#interviewer-intent">Interviewer Intent</a>
+      <a href="#quick-answer">Quick Answer</a>
+      <a href="#lake-vs-warehouse">Lake vs Warehouse vs Lakehouse</a>
+      <a href="#table-formats">Open Table Formats</a>
+      <a href="#medallion-architecture">Medallion Architecture</a>
+      <a href="#governance">Data Governance</a>
+      <a href="#metadata-catalog">Metadata &amp; Discovery</a>
+      <a href="#ingestion-patterns">Ingestion Patterns</a>
+      <a href="#cost-optimization">Cost Optimization</a>
+      <a href="#production-incident">Production Incident</a>
+      <a href="#code-examples">Code Examples</a>
+      <a href="#common-mistakes">Common Mistakes</a>
+      <a href="#trade-offs">Trade-offs</a>
+      <a href="#follow-up-questions">Follow-up Questions</a>
+      <a href="#summary">Summary</a>
+    </nav>
+    <div class="sidebar-actions">
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">☀️</button>
+    </div>
+  </aside>
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <button class="menu-toggle" id="menu-toggle" aria-label="Open sidebar">☰</button>
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <a href="../index.html#part-vi">Part VI — Platform &amp; Architecture</a> &gt;
+      <span>Chapter 18</span>
+    </nav>
+    <button class="theme-toggle" id="theme-toggle-mobile" aria-label="Toggle theme">☀️</button>
+  </header>
+
+  <main class="content">
+    <!-- Chapter Header -->
+    <div class="chapter-header">
+      <span class="badge badge-hard">Hard</span>
+      <h1>Design a Modern Lakehouse Platform for a Global Organization</h1>
+      <div class="chapter-topics">
+        <span class="topic-tag">Lakehouse</span>
+        <span class="topic-tag">Iceberg</span>
+      </div>
+    </div>
+
+
+    <!-- Section 1: Interviewer Intent -->
+    <section id="interviewer-intent" class="section">
+      <h2>Interviewer Intent</h2>
+      <p>When a FAANG interviewer asks you to design a modern lakehouse platform, they are evaluating your ability to synthesize multiple complex domains into a cohesive architecture:</p>
+      <ul>
+        <li><strong>Architectural reasoning:</strong> Can you articulate why lakehouses emerged and how they resolve the data lake vs data warehouse dichotomy?</li>
+        <li><strong>Open table format mastery:</strong> Do you understand the internals of Delta Lake, Apache Iceberg, and Apache Hudi — not just surface-level features but the mechanics of metadata layers, transaction logs, and file organization?</li>
+        <li><strong>Data platform design:</strong> Can you design a multi-layer architecture (medallion) that balances raw data preservation with performance for analytics?</li>
+        <li><strong>Governance at scale:</strong> How do you handle access control, PII masking, lineage tracking, and compliance across petabytes of data spread globally?</li>
+        <li><strong>Cost consciousness:</strong> Senior engineers must reason about storage tiering, compute elasticity, and operational costs — not just technical elegance.</li>
+        <li><strong>Production maturity:</strong> Have you dealt with real lakehouse problems — small files, partition explosions, schema drift, catalog inconsistencies?</li>
+        <li><strong>Vendor strategy:</strong> Can you make and defend decisions about open-source vs managed services, single-vendor vs multi-vendor, cloud-specific vs cloud-agnostic?</li>
+      </ul>
+      <p>This question separates senior data engineers who have operated platforms at scale from those who have only consumed them. The interviewer expects you to drive the conversation proactively, covering ingestion, storage, compute, governance, and operations without prompting.</p>
+    </section>
+
+
+    <!-- Section 2: Quick Answer -->
+    <section id="quick-answer" class="section">
+      <h2>Quick Answer</h2>
+      <div class="callout callout-summary">
+        <p>A production lakehouse platform for a global organization consists of:</p>
+        <ol>
+          <li><strong>Storage layer:</strong> Object storage (S3/GCS/ADLS) as the single source of truth, with an open table format (Iceberg/Delta/Hudi) providing ACID transactions, schema evolution, and time travel on top of Parquet/ORC files.</li>
+          <li><strong>Medallion architecture:</strong> Bronze (raw ingestion, append-only), Silver (cleansed, conformed, deduplicated), Gold (business-level aggregates, dimensional models) — with data contracts enforcing quality between layers.</li>
+          <li><strong>Compute layer:</strong> Decoupled engines (Spark, Trino, Flink, dbt) querying the same tables through a shared catalog — no data duplication across tools.</li>
+          <li><strong>Catalog &amp; governance:</strong> Centralized metadata catalog (Unity Catalog, Hive Metastore, Nessie) with fine-grained access control, column-level masking, and automated lineage tracking.</li>
+          <li><strong>Ingestion:</strong> Hybrid batch + streaming pipelines using CDC (Debezium), file drops, and API connectors — all landing in Bronze with full schema preservation.</li>
+          <li><strong>Operations:</strong> Automated compaction, partition lifecycle management, storage tiering, and data quality monitoring to keep the platform healthy at petabyte scale.</li>
+        </ol>
+      </div>
+      <p>The key insight: <strong>a lakehouse is not a product — it is an architecture pattern</strong> that combines the low-cost, schema-flexible storage of a data lake with the ACID transactions, performance optimizations, and governance features traditionally exclusive to data warehouses. The open table format is the technology that makes this convergence possible.</p>
+    </section>
+
+
+    <!-- Section 3: Data Lake vs Data Warehouse vs Lakehouse -->
+    <section id="lake-vs-warehouse" class="section">
+      <h2>Data Lake vs Data Warehouse vs Lakehouse</h2>
+
+      <h3>The Historical Divide</h3>
+      <p>For two decades, organizations maintained two separate systems with fundamentally different philosophies:</p>
+
+      <pre><code class="language-bash"># The Two-System World (2000-2018):
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │                     Source Systems                               │
+# │  (OLTP DBs, APIs, Files, Streams, IoT, Clickstream)            │
+# └───────────────────────────┬─────────────────────────────────────┘
+#                             │
+#              ┌──────────────┴──────────────┐
+#              │                             │
+#              ▼                             ▼
+# ┌────────────────────────┐   ┌────────────────────────────┐
+# │     DATA WAREHOUSE     │   │        DATA LAKE           │
+# │                        │   │                            │
+# │ • Schema-on-write      │   │ • Schema-on-read           │
+# │ • ETL before loading   │   │ • ELT / raw dump           │
+# │ • Structured only      │   │ • All data types           │
+# │ • Expensive storage    │   │ • Cheap storage (S3)       │
+# │ • Fast BI queries      │   │ • ML / exploration         │
+# │ • Strong governance    │   │ • Weak governance          │
+# │ • ACID transactions    │   │ • No transactions          │
+# │ • Teradata/Redshift    │   │ • Hadoop/S3 + Spark        │
+# │                        │   │                            │
+# │ Users: BI Analysts     │   │ Users: Data Scientists     │
+# └────────────────────────┘   └────────────────────────────┘
+#
+# Problems:
+# 1. Data duplication between systems (2x storage cost)
+# 2. ETL pipelines to sync lake → warehouse (operational overhead)
+# 3. Stale warehouse data (batch lag)
+# 4. Data swamp (no governance on the lake)
+# 5. Inconsistent metrics (two versions of truth)</code></pre>
+
+      <h3>Why Data Lakes Failed as Platforms</h3>
+      <p>Data lakes solved the cost and flexibility problem but introduced critical gaps that prevented them from replacing warehouses:</p>
+      <ul>
+        <li><strong>No ACID transactions:</strong> Concurrent writes could corrupt data. A failed job left partial results with no rollback mechanism.</li>
+        <li><strong>No schema enforcement:</strong> "Schema-on-read" became "schema-never" — consumers discovered data quality issues at query time.</li>
+        <li><strong>No time travel:</strong> Overwritten data was gone forever. Debugging pipeline issues required expensive re-ingestion.</li>
+        <li><strong>No indexing or statistics:</strong> Every query was a full scan. Performance was unpredictable and slow for interactive workloads.</li>
+        <li><strong>Governance vacuum:</strong> No row/column-level security, no audit logs, no lineage — compliance was manual and error-prone.</li>
+      </ul>
+
+      <h3>The Lakehouse Convergence</h3>
+      <p>The lakehouse architecture resolves this divide by adding a <strong>transactional metadata layer</strong> on top of object storage:</p>
+
+      <pre><code class="language-bash"># The Lakehouse Architecture (2020+):
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │                     Source Systems                               │
+# └───────────────────────────┬─────────────────────────────────────┘
+#                             │
+#                             ▼
+# ┌─────────────────────────────────────────────────────────────────┐
+# │                    LAKEHOUSE PLATFORM                            │
+# │                                                                 │
+# │  ┌───────────────────────────────────────────────────────────┐  │
+# │  │              COMPUTE LAYER (Decoupled)                    │  │
+# │  │  Spark │ Trino │ Flink │ dbt │ Presto │ Dremio │ StarRocks│  │
+# │  └───────────────────────────┬───────────────────────────────┘  │
+# │                              │                                  │
+# │  ┌───────────────────────────┴───────────────────────────────┐  │
+# │  │         OPEN TABLE FORMAT (Iceberg/Delta/Hudi)            │  │
+# │  │                                                           │  │
+# │  │  • ACID transactions    • Schema evolution                │  │
+# │  │  • Time travel          • Partition evolution             │  │
+# │  │  • Column statistics    • Row-level deletes               │  │
+# │  │  • Snapshot isolation   • File-level metadata             │  │
+# │  └───────────────────────────┬───────────────────────────────┘  │
+# │                              │                                  │
+# │  ┌───────────────────────────┴───────────────────────────────┐  │
+# │  │           OBJECT STORAGE (S3 / GCS / ADLS)                │  │
+# │  │                                                           │  │
+# │  │  Parquet / ORC files organized in open formats            │  │
+# │  │  Cheap, durable, infinitely scalable                      │  │
+# │  └───────────────────────────────────────────────────────────┘  │
+# │                                                                 │
+# │  Users: BI Analysts + Data Scientists + ML Engineers             │
+# │         (single system, multiple engines, one truth)            │
+# └─────────────────────────────────────────────────────────────────┘</code></pre>
+
+      <h3>Comparison Table</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Dimension</th>
+            <th>Data Warehouse</th>
+            <th>Data Lake</th>
+            <th>Lakehouse</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Storage cost</td>
+            <td>$$$$ (proprietary format)</td>
+            <td>$ (object storage)</td>
+            <td>$ (object storage)</td>
+          </tr>
+          <tr>
+            <td>ACID transactions</td>
+            <td>Yes</td>
+            <td>No</td>
+            <td>Yes (table format)</td>
+          </tr>
+          <tr>
+            <td>Schema enforcement</td>
+            <td>Strict (on-write)</td>
+            <td>None (on-read)</td>
+            <td>Flexible (evolution)</td>
+          </tr>
+          <tr>
+            <td>Query performance</td>
+            <td>Excellent (indexes, caching)</td>
+            <td>Poor (full scans)</td>
+            <td>Good (stats, pruning, Z-ORDER)</td>
+          </tr>
+          <tr>
+            <td>Data types</td>
+            <td>Structured only</td>
+            <td>All (structured, semi, unstructured)</td>
+            <td>All (structured, semi, unstructured)</td>
+          </tr>
+          <tr>
+            <td>Governance</td>
+            <td>Strong (built-in)</td>
+            <td>Weak (DIY)</td>
+            <td>Strong (catalog-based)</td>
+          </tr>
+          <tr>
+            <td>Compute-storage coupling</td>
+            <td>Coupled (scale together)</td>
+            <td>Decoupled</td>
+            <td>Decoupled</td>
+          </tr>
+          <tr>
+            <td>Time travel</td>
+            <td>Limited (vendor-specific)</td>
+            <td>None</td>
+            <td>Full (snapshot-based)</td>
+          </tr>
+          <tr>
+            <td>Open format</td>
+            <td>No (vendor lock-in)</td>
+            <td>Partially (files are open, no metadata)</td>
+            <td>Yes (Iceberg/Delta/Hudi)</td>
+          </tr>
+          <tr>
+            <td>Real-time support</td>
+            <td>Limited</td>
+            <td>Yes (append)</td>
+            <td>Yes (streaming + ACID)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Why Lakehouse Emerged Now</h3>
+      <p>Three technological developments converged around 2018-2020:</p>
+      <ol>
+        <li><strong>Open table formats matured:</strong> Delta Lake (2019), Apache Iceberg (2018 from Netflix), Apache Hudi (2016 from Uber) — all reached production readiness, proving ACID transactions on object storage were possible.</li>
+        <li><strong>Object storage became fast enough:</strong> S3 request rates went from 100 rps per prefix to 5,500+ (2018 improvement). High-throughput columnar reads became viable.</li>
+        <li><strong>Compute engines decoupled:</strong> Spark, Trino, Flink, and Dremio all adopted catalog-based access patterns, making engine interoperability practical through shared metadata.</li>
+      </ol>
+
+      <div class="callout callout-warning">
+        <p><strong>Important nuance:</strong> A lakehouse does not replace a data warehouse for all use cases. Sub-second interactive dashboards with thousands of concurrent users may still benefit from a serving layer (StarRocks, ClickHouse, Pinot) fed from the lakehouse. The lakehouse is the platform; specialized engines are acceleration layers.</p>
+      </div>
+    </section>
+
+
+    <!-- Section 4: Open Table Formats -->
+    <section id="table-formats" class="section">
+      <h2>Open Table Formats</h2>
+      <p>Open table formats are the core technology enabling the lakehouse pattern. They add a metadata layer between compute engines and physical files, providing ACID semantics, schema management, and performance optimizations without proprietary lock-in.</p>
+
+      <h3>Delta Lake</h3>
+      <p>Created by Databricks (2019), Delta Lake uses a JSON-based transaction log stored alongside data files in the same directory.</p>
+
+      <h4>Transaction Log Architecture</h4>
+      <pre><code class="language-bash"># Delta Lake directory structure:
+#
+# s3://lakehouse/tables/orders/
+# ├── _delta_log/
+# │   ├── 00000000000000000000.json    ← initial commit
+# │   ├── 00000000000000000001.json    ← add files
+# │   ├── 00000000000000000002.json    ← update operation
+# │   ├── ...
+# │   ├── 00000000000000000010.checkpoint.parquet  ← checkpoint every 10 commits
+# │   └── _last_checkpoint                         ← pointer to latest checkpoint
+# ├── part-00000-abc123.snappy.parquet
+# ├── part-00001-def456.snappy.parquet
+# └── year=2024/month=01/
+#     ├── part-00000-ghi789.snappy.parquet
+#     └── part-00001-jkl012.snappy.parquet
+#
+# Each JSON log entry contains:
+# {
+#   "add": {"path": "part-00000-abc.parquet", "size": 1048576,
+#           "partitionValues": {"year": "2024"}, "stats": {...}},
+#   "remove": {"path": "old-file.parquet", "deletionTimestamp": 1700000000},
+#   "metaData": {"schemaString": "...", "partitionColumns": [...]}
+# }</code></pre>
+
+      <h4>Key Delta Lake Features</h4>
+      <ul>
+        <li><strong>ACID transactions:</strong> Optimistic concurrency control using the transaction log. Conflicting writes are detected at commit time (not at read time) using file-level conflict resolution.</li>
+        <li><strong>Time travel:</strong> Query any historical version by snapshot ID or timestamp. Retention controlled by <code>delta.logRetentionDuration</code> (default 30 days).</li>
+        <li><strong>Z-ORDER clustering:</strong> Co-locates related data in the same files using space-filling curves (Z-order or Hilbert curves), dramatically improving multi-dimensional filter performance.</li>
+        <li><strong>Change Data Feed (CDF):</strong> Tracks row-level changes (insert/update/delete) between versions, enabling efficient incremental reads without scanning all files.</li>
+        <li><strong>Liquid Clustering (v3.0+):</strong> Replaces static partitioning and Z-ORDER with adaptive, incremental clustering that rebalances data as write patterns change.</li>
+      </ul>
+
+      <pre><code class="language-sql">-- Delta Lake time travel examples
+-- Query table as of specific version
+SELECT * FROM orders VERSION AS OF 42;
+
+-- Query table as of timestamp
+SELECT * FROM orders TIMESTAMP AS OF '2024-01-15T10:00:00Z';
+
+-- Show table history
+DESCRIBE HISTORY orders;
+
+-- Restore table to previous version
+RESTORE TABLE orders TO VERSION AS OF 42;
+
+-- Z-ORDER optimization
+OPTIMIZE orders
+ZORDER BY (customer_id, order_date);
+
+-- This physically reorganizes files so that rows with similar
+-- customer_id AND order_date values are co-located.
+-- Queries filtering on these columns skip 80-95% of files.</code></pre>
+
+      <h3>Apache Iceberg</h3>
+      <p>Created at Netflix (2018), donated to Apache. Iceberg uses a tree-structured metadata hierarchy that provides O(1) snapshot access and hidden partitioning.</p>
+
+      <h4>Metadata Layer Architecture</h4>
+      <pre><code class="language-bash"># Iceberg metadata hierarchy:
+#
+#                    ┌──────────────────┐
+#                    │  Catalog         │  (Hive Metastore, Nessie,
+#                    │  (current-table) │   REST, Glue)
+#                    └────────┬─────────┘
+#                             │ points to
+#                             ▼
+#                    ┌──────────────────┐
+#                    │  Metadata File   │  metadata/v3.metadata.json
+#                    │  (table state)   │
+#                    │                  │  • schema (current + history)
+#                    │                  │  • partition spec (current + history)
+#                    │                  │  • snapshot list
+#                    │                  │  • properties
+#                    └────────┬─────────┘
+#                             │ current-snapshot-id
+#                             ▼
+#                    ┌──────────────────┐
+#                    │  Snapshot        │  snap-12345-abc.avro
+#                    │                  │
+#                    │  • snapshot-id   │
+#                    │  • timestamp     │
+#                    │  • manifest-list │
+#                    └────────┬─────────┘
+#                             │
+#                             ▼
+#                    ┌──────────────────┐
+#                    │  Manifest List   │  snap-12345-manifests.avro
+#                    │                  │
+#                    │  Array of:       │
+#                    │  • manifest path │
+#                    │  • partition info│
+#                    │  • added files   │
+#                    │  • deleted files │
+#                    └────────┬─────────┘
+#                             │
+#                     ┌───────┴───────┐
+#                     ▼               ▼
+#            ┌─────────────┐  ┌─────────────┐
+#            │ Manifest 1  │  │ Manifest 2  │
+#            │             │  │             │
+#            │ Data files: │  │ Data files: │
+#            │ • path      │  │ • path      │
+#            │ • partition │  │ • partition │
+#            │ • record cnt│  │ • record cnt│
+#            │ • col stats │  │ • col stats │
+#            │   (min/max) │  │   (min/max) │
+#            └─────────────┘  └─────────────┘
+#
+# Key insight: Manifest files store per-file statistics
+# (min/max per column), enabling partition pruning AND
+# file pruning within partitions without listing S3.</code></pre>
+
+      <h4>Hidden Partitioning</h4>
+      <p>Unlike Hive-style partitioning where users must know the partition scheme, Iceberg applies <strong>partition transforms</strong> transparently:</p>
+      <pre><code class="language-sql">-- Iceberg hidden partitioning: users query naturally,
+-- engine applies partition pruning automatically
+
+-- Table definition with partition transforms
+CREATE TABLE events (
+  event_id    BIGINT,
+  event_time  TIMESTAMP,
+  user_id     BIGINT,
+  event_type  STRING,
+  payload     STRING
+)
+USING iceberg
+PARTITIONED BY (
+  days(event_time),     -- partition by day (derived from timestamp)
+  bucket(16, user_id)   -- hash-bucket user_id into 16 buckets
+);
+
+-- User writes a simple filter — NO partition column reference needed:
+SELECT * FROM events
+WHERE event_time BETWEEN '2024-03-01' AND '2024-03-07'
+  AND user_id = 42;
+
+-- Iceberg automatically:
+-- 1. Converts date range → partition values (days 19783-19789)
+-- 2. Converts user_id=42 → bucket(16, 42) = bucket 10
+-- 3. Prunes manifests that don't contain these partitions
+-- 4. Prunes data files using column-level min/max stats</code></pre>
+
+      <h4>Schema Evolution &amp; Partition Evolution</h4>
+      <pre><code class="language-sql">-- Schema evolution (non-breaking, no rewrite required)
+ALTER TABLE events ADD COLUMNS (
+  device_type STRING AFTER event_type,
+  geo_country STRING
+);
+
+-- Rename column (uses internal IDs, not names)
+ALTER TABLE events RENAME COLUMN payload TO event_payload;
+
+-- Partition evolution: change partition scheme WITHOUT rewriting data
+-- Old data keeps old partitioning; new data uses new scheme
+ALTER TABLE events
+SET PARTITION SPEC (
+  months(event_time),    -- changed from days() to months()
+  bucket(32, user_id)    -- changed from 16 to 32 buckets
+);
+
+-- Both old (daily) and new (monthly) partitions coexist
+-- Query engine handles both transparently</code></pre>
+
+      <h3>Apache Hudi</h3>
+      <p>Created at Uber (2016) for incremental data processing. Hudi's key differentiator is native support for record-level upserts and incremental queries — designed for CDC workloads from the start.</p>
+
+      <h4>Copy-on-Write vs Merge-on-Read</h4>
+      <pre><code class="language-bash"># Hudi storage types:
+#
+# COPY-ON-WRITE (CoW):
+# ┌─────────────────────────────────────────────────────────────┐
+# │ Write path: Update → Read existing file → Merge → Write    │
+# │             new complete file → Mark old as replaced        │
+# │                                                             │
+# │ Pros: Read-optimized (no merge at query time)              │
+# │ Cons: Write amplification (rewrite entire file for 1 row)  │
+# │ Best for: Read-heavy workloads, BI dashboards              │
+# │                                                             │
+# │ File layout:                                                │
+# │ base/  → [file1_v2.parquet] [file2_v3.parquet]            │
+# │          (always up-to-date, no log files)                 │
+# └─────────────────────────────────────────────────────────────┘
+#
+# MERGE-ON-READ (MoR):
+# ┌─────────────────────────────────────────────────────────────┐
+# │ Write path: Update → Append delta to log file              │
+# │             (periodically compact log into base file)       │
+# │                                                             │
+# │ Pros: Fast writes (append-only logs)                       │
+# │ Cons: Slower reads (must merge base + logs at query time)  │
+# │ Best for: Write-heavy workloads, CDC ingestion             │
+# │                                                             │
+# │ File layout:                                                │
+# │ base/  → [file1_v1.parquet] + [.file1_v1.log.1.avro]     │
+# │          (base file)           (delta log — updates)       │
+# │                                                             │
+# │ Read paths:                                                 │
+# │ • Snapshot query: merge base + all logs (freshest, slower) │
+# │ • Read-optimized: base files only (stale, faster)          │
+# └─────────────────────────────────────────────────────────────┘</code></pre>
+
+      <h4>Hudi Timeline</h4>
+      <p>Hudi maintains a timeline of all operations (commits, compactions, cleans) as metadata, enabling incremental processing:</p>
+      <pre><code class="language-bash"># Hudi timeline example:
+# .hoodie/
+# ├── 20240101120000.commit           ← completed commit
+# ├── 20240101130000.commit
+# ├── 20240101140000.deltacommit      ← MoR delta commit
+# ├── 20240101150000.compaction.requested
+# ├── 20240101150000.compaction.completed
+# ├── 20240101160000.clean.requested
+# └── 20240101160000.clean.completed
+#
+# Incremental query: "give me all changes since 20240101130000"
+# → Returns only records that changed (inserts, updates, deletes)
+# → Perfect for downstream ETL that needs to process only new data</code></pre>
+
+      <pre><code class="language-python"># Hudi incremental read in PySpark
+df_incremental = spark.read.format("hudi") \
+    .option("hoodie.datasource.query.type", "incremental") \
+    .option("hoodie.datasource.read.begin.instanttime", "20240101130000") \
+    .option("hoodie.datasource.read.end.instanttime", "20240101160000") \
+    .load("s3://lakehouse/tables/orders/")
+
+# Returns only rows that changed between those two instants
+# Columns include: _hoodie_commit_time, _hoodie_operation (INSERT/UPDATE/DELETE)</code></pre>
+
+      <h3>Comparison: Delta Lake vs Apache Iceberg vs Apache Hudi</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Feature</th>
+            <th>Delta Lake</th>
+            <th>Apache Iceberg</th>
+            <th>Apache Hudi</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Origin</td>
+            <td>Databricks (2019)</td>
+            <td>Netflix (2018)</td>
+            <td>Uber (2016)</td>
+          </tr>
+          <tr>
+            <td>Metadata format</td>
+            <td>JSON transaction log + Parquet checkpoints</td>
+            <td>Avro manifests + JSON metadata files</td>
+            <td>Timeline (commit files) + Avro logs</td>
+          </tr>
+          <tr>
+            <td>ACID transactions</td>
+            <td>Yes (optimistic concurrency)</td>
+            <td>Yes (optimistic concurrency)</td>
+            <td>Yes (timeline-based)</td>
+          </tr>
+          <tr>
+            <td>Schema evolution</td>
+            <td>Add/rename columns, merge schema</td>
+            <td>Full evolution (ID-based columns)</td>
+            <td>Add/rename columns</td>
+          </tr>
+          <tr>
+            <td>Partition evolution</td>
+            <td>No (must rewrite)</td>
+            <td>Yes (coexisting schemes)</td>
+            <td>No (must rewrite)</td>
+          </tr>
+          <tr>
+            <td>Hidden partitioning</td>
+            <td>No (Hive-style)</td>
+            <td>Yes (transform-based)</td>
+            <td>No (Hive-style)</td>
+          </tr>
+          <tr>
+            <td>Time travel</td>
+            <td>Yes (version/timestamp)</td>
+            <td>Yes (snapshot ID/timestamp)</td>
+            <td>Yes (instant time)</td>
+          </tr>
+          <tr>
+            <td>Record-level upserts</td>
+            <td>MERGE INTO (Spark-only until recently)</td>
+            <td>Row-level deletes (v2), merge-on-read (v3)</td>
+            <td>Native (primary design goal)</td>
+          </tr>
+          <tr>
+            <td>Incremental queries</td>
+            <td>Change Data Feed (opt-in)</td>
+            <td>Incremental scan (snapshot diff)</td>
+            <td>Native incremental (core feature)</td>
+          </tr>
+          <tr>
+            <td>Engine support</td>
+            <td>Spark (primary), expanding</td>
+            <td>Broadest (Spark, Trino, Flink, Dremio, StarRocks)</td>
+            <td>Spark (primary), Flink, Trino</td>
+          </tr>
+          <tr>
+            <td>Clustering</td>
+            <td>Z-ORDER, Liquid Clustering</td>
+            <td>Sort orders + compaction</td>
+            <td>Clustering on arbitrary columns</td>
+          </tr>
+          <tr>
+            <td>Vendor alignment</td>
+            <td>Databricks ecosystem</td>
+            <td>Vendor-neutral (broadest adoption)</td>
+            <td>AWS ecosystem (EMR, Athena)</td>
+          </tr>
+          <tr>
+            <td>Community momentum</td>
+            <td>Strong (Databricks backing)</td>
+            <td>Strongest (Apple, Netflix, LinkedIn, AWS, Snowflake)</td>
+            <td>Growing (Uber, AWS)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-info">
+        <p><strong>Industry trend (2024+):</strong> Iceberg is emerging as the de facto standard for multi-engine lakehouses. Snowflake (Iceberg tables), AWS (native Iceberg in Athena/EMR/Glue), Databricks (UniForm for Iceberg compatibility), and Google (BigLake) have all converged on Iceberg interoperability. If starting a new lakehouse from scratch, Iceberg offers the broadest engine support and least vendor lock-in.</p>
+      </div>
+    </section>
+
+
+    <!-- Section 5: Medallion Architecture Deep Dive -->
+    <section id="medallion-architecture" class="section">
+      <h2>Medallion Architecture Deep Dive</h2>
+      <p>The medallion (multi-hop) architecture organizes data in progressive layers of refinement, from raw ingestion to business-ready aggregates. Each layer has distinct responsibilities, quality guarantees, and access patterns.</p>
+
+      <h3>Architecture Overview</h3>
+      <pre><code class="language-bash"># Medallion Architecture:
+#
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │                         SOURCE SYSTEMS                              │
+# │  [OLTP DBs] [APIs] [Files] [Streams] [SaaS] [IoT] [Clickstream]   │
+# └──────────────────────────────────┬──────────────────────────────────┘
+#                                    │
+#                                    ▼
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  BRONZE (Raw / Landing)                                             │
+# │                                                                     │
+# │  • Append-only ingestion (never modify source data)                │
+# │  • Full fidelity: preserve original schema, NULLs, duplicates      │
+# │  • Add metadata: _ingested_at, _source_system, _batch_id           │
+# │  • Format: Parquet (from structured) or JSON (from semi-structured)│
+# │  • Retention: Long (1-7 years) — this is your reprocessing safety  │
+# │  • Quality: None enforced (raw dump)                               │
+# │                                                                     │
+# │  s3://lakehouse/bronze/orders/                                     │
+# │  s3://lakehouse/bronze/clickstream/                                │
+# │  s3://lakehouse/bronze/payments/                                   │
+# └──────────────────────────────────┬──────────────────────────────────┘
+#                                    │ Data Contract: schema registered,
+#                                    │ freshness SLA, completeness check
+#                                    ▼
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  SILVER (Cleansed / Conformed)                                      │
+# │                                                                     │
+# │  • Deduplicated (exactly-once semantics via merge/upsert)          │
+# │  • Schema enforced and validated                                    │
+# │  • Data types standardized (timestamps → UTC, currencies → USD)    │
+# │  • Nulls handled (defaults, imputation, or filtered)               │
+# │  • Cross-source joins (enrich orders with customer master data)    │
+# │  • Slowly Changing Dimensions applied (SCD Type 2)                 │
+# │  • PII tagged/masked at this layer                                 │
+# │  • Retention: Medium (2-5 years)                                   │
+# │  • Quality: Validated (Great Expectations / Soda / dbt tests)      │
+# │                                                                     │
+# │  s3://lakehouse/silver/orders/                                     │
+# │  s3://lakehouse/silver/customers/  (SCD2)                          │
+# │  s3://lakehouse/silver/events/                                     │
+# └──────────────────────────────────┬──────────────────────────────────┘
+#                                    │ Data Contract: column-level tests,
+#                                    │ freshness ≤ 15min, zero duplicates
+#                                    ▼
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  GOLD (Business / Aggregated)                                       │
+# │                                                                     │
+# │  • Business-level aggregates (daily revenue, user cohorts, KPIs)   │
+# │  • Dimensional models (star schemas for BI consumption)            │
+# │  • Pre-computed metrics (no complex joins at query time)           │
+# │  • Optimized for BI tools (Tableau, Looker, Power BI)             │
+# │  • Domain-owned data products                                      │
+# │  • Retention: Based on business need (1-3 years)                   │
+# │  • Quality: Business-validated, reconciled with source systems     │
+# │                                                                     │
+# │  s3://lakehouse/gold/finance/daily_revenue/                        │
+# │  s3://lakehouse/gold/marketing/user_cohorts/                       │
+# │  s3://lakehouse/gold/product/feature_usage/                        │
+# └─────────────────────────────────────────────────────────────────────┘</code></pre>
+
+      <h3>Data Contracts Between Layers</h3>
+      <p>Data contracts are formal agreements that define the expectations between producers and consumers at each layer boundary:</p>
+
+      <pre><code class="language-yaml"># Example data contract: Bronze → Silver for orders
+# File: contracts/silver/orders.contract.yaml
+
+contract:
+  name: silver_orders
+  version: 2.1.0
+  owner: data-platform-team
+  domain: commerce
+
+schema:
+  type: iceberg
+  fields:
+    - name: order_id
+      type: bigint
+      nullable: false
+      description: "Unique order identifier"
+      tests:
+        - unique
+        - not_null
+    - name: customer_id
+      type: bigint
+      nullable: false
+      foreign_key: silver.customers.customer_id
+    - name: order_date
+      type: timestamp
+      nullable: false
+      tests:
+        - not_null
+        - accepted_range:
+            min: "2020-01-01"
+            max: "{{ current_date }}"
+    - name: total_amount
+      type: decimal(18,2)
+      nullable: false
+      tests:
+        - positive
+    - name: currency
+      type: string
+      nullable: false
+      tests:
+        - accepted_values: [USD, EUR, GBP, JPY]
+    - name: status
+      type: string
+      nullable: false
+      tests:
+        - accepted_values: [pending, confirmed, shipped, delivered, cancelled]
+
+quality:
+  freshness:
+    max_delay: 15m
+    check_column: _ingested_at
+  completeness:
+    min_row_count: 1000  # at least 1000 new orders per batch
+    max_null_percentage:
+      customer_id: 0%
+      total_amount: 0%
+  uniqueness:
+    columns: [order_id]
+    scope: full_table
+  consistency:
+    - type: referential
+      column: customer_id
+      reference: silver.customers.customer_id
+      max_orphan_percentage: 0.1%
+
+sla:
+  update_frequency: every_15_minutes
+  availability: 99.9%
+  notification_channel: "#data-quality-alerts"
+
+breaking_changes:
+  policy: "versioned"
+  notification: 7_days_advance
+  migration_window: 30_days</code></pre>
+
+      <h3>Bronze Layer Patterns</h3>
+      <pre><code class="language-python"># Bronze ingestion pattern: append-only with metadata enrichment
+from pyspark.sql import functions as F
+from datetime import datetime
+
+def ingest_to_bronze(
+    spark,
+    source_df,
+    target_path: str,
+    source_system: str,
+    batch_id: str
+):
+    """
+    Ingest raw data to Bronze layer with metadata enrichment.
+    Never modifies data — append only with provenance tracking.
+    """
+    bronze_df = source_df \
+        .withColumn("_ingested_at", F.current_timestamp()) \
+        .withColumn("_source_system", F.lit(source_system)) \
+        .withColumn("_batch_id", F.lit(batch_id)) \
+        .withColumn("_ingest_date", F.current_date()) \
+        .withColumn("_raw_filename", F.input_file_name())
+
+    # Write as append-only (never overwrite Bronze)
+    bronze_df.writeTo(target_path) \
+        .using("iceberg") \
+        .partitionedBy("_ingest_date") \
+        .append()
+
+    return bronze_df.count()
+
+
+# CDC Bronze ingestion (Debezium format)
+def ingest_cdc_to_bronze(spark, kafka_df, target_path: str):
+    """
+    Ingest CDC events from Debezium via Kafka to Bronze.
+    Preserves the full CDC envelope (before/after/op/ts_ms).
+    """
+    parsed_df = kafka_df \
+        .selectExpr("CAST(value AS STRING) as json_payload") \
+        .select(
+            F.from_json("json_payload", cdc_schema).alias("cdc")
+        ) \
+        .select(
+            "cdc.payload.before",
+            "cdc.payload.after",
+            "cdc.payload.op",        # c=create, u=update, d=delete
+            "cdc.payload.ts_ms",
+            "cdc.payload.source.table",
+            "cdc.payload.source.db"
+        ) \
+        .withColumn("_ingested_at", F.current_timestamp()) \
+        .withColumn("_kafka_offset", F.col("offset")) \
+        .withColumn("_kafka_partition", F.col("partition"))
+
+    parsed_df.writeTo(target_path) \
+        .using("iceberg") \
+        .append()</code></pre>
+
+      <h3>Silver Layer Patterns</h3>
+      <pre><code class="language-python"># Silver layer: deduplication, cleansing, and conforming
+def bronze_to_silver_orders(spark, bronze_path: str, silver_path: str):
+    """
+    Transform Bronze orders to Silver:
+    1. Deduplicate by order_id (keep latest by _ingested_at)
+    2. Validate and cast types
+    3. Standardize timestamps to UTC
+    4. Upsert into Silver (MERGE for idempotency)
+    """
+    # Read incremental Bronze data (since last checkpoint)
+    bronze_df = spark.read.format("iceberg") \
+        .option("start-snapshot-id", last_processed_snapshot) \
+        .load(bronze_path)
+
+    # Deduplicate within batch (keep latest ingestion)
+    from pyspark.sql.window import Window
+    dedup_window = Window.partitionBy("order_id") \
+        .orderBy(F.desc("_ingested_at"))
+
+    cleansed_df = bronze_df \
+        .withColumn("_row_num", F.row_number().over(dedup_window)) \
+        .filter("_row_num = 1") \
+        .drop("_row_num") \
+        .select(
+            F.col("order_id").cast("bigint"),
+            F.col("customer_id").cast("bigint"),
+            F.to_utc_timestamp("order_date", "source_timezone").alias("order_date"),
+            F.col("total_amount").cast("decimal(18,2)"),
+            F.upper("currency").alias("currency"),
+            F.lower("status").alias("status"),
+            F.current_timestamp().alias("_processed_at")
+        ) \
+        .filter("order_id IS NOT NULL") \
+        .filter("total_amount > 0")
+
+    # MERGE into Silver (upsert: insert new, update existing)
+    silver_table = spark.table(silver_path)
+    silver_table.alias("target").merge(
+        cleansed_df.alias("source"),
+        "target.order_id = source.order_id"
+    ).whenMatchedUpdate(
+        condition="source._processed_at > target._processed_at",
+        set={
+            "status": "source.status",
+            "total_amount": "source.total_amount",
+            "_processed_at": "source._processed_at"
+        }
+    ).whenNotMatchedInsertAll() \
+     .execute()</code></pre>
+
+      <h3>Gold Layer Patterns</h3>
+      <pre><code class="language-sql">-- Gold layer: business-level aggregates (dbt model)
+-- models/gold/finance/daily_revenue.sql
+
+{{ config(
+    materialized='incremental',
+    unique_key='revenue_date || region',
+    partition_by='revenue_date',
+    file_format='iceberg'
+) }}
+
+WITH order_facts AS (
+    SELECT
+        DATE(o.order_date) AS revenue_date,
+        c.region,
+        c.country,
+        o.currency,
+        o.total_amount,
+        o.status
+    FROM {{ ref('silver_orders') }} o
+    INNER JOIN {{ ref('silver_customers') }} c
+        ON o.customer_id = c.customer_id
+    WHERE o.status IN ('confirmed', 'shipped', 'delivered')
+    {% if is_incremental() %}
+        AND o._processed_at > (SELECT MAX(_processed_at) FROM {{ this }})
+    {% endif %}
+),
+
+daily_agg AS (
+    SELECT
+        revenue_date,
+        region,
+        country,
+        currency,
+        COUNT(*)              AS order_count,
+        SUM(total_amount)     AS gross_revenue,
+        AVG(total_amount)     AS avg_order_value,
+        PERCENTILE(total_amount, 0.5) AS median_order_value
+    FROM order_facts
+    GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+    revenue_date,
+    region,
+    country,
+    currency,
+    order_count,
+    gross_revenue,
+    avg_order_value,
+    median_order_value,
+    CURRENT_TIMESTAMP() AS _computed_at
+FROM daily_agg</code></pre>
+
+      <div class="callout callout-tip">
+        <p><strong>Best practice:</strong> Gold tables should be optimized for specific consumption patterns. If BI tools query by date and region, partition by date and cluster by region. If ML models need full scans, a flat denormalized table with minimal partitioning is better. One Silver table can feed multiple Gold tables optimized for different access patterns.</p>
+      </div>
+    </section>
+
+
+    <!-- Section 6: Data Governance -->
+    <section id="governance" class="section">
+      <h2>Data Governance</h2>
+      <p>Governance in a lakehouse is harder than in a traditional warehouse because data is distributed across open formats with multiple engines accessing it. A centralized governance layer must enforce policy consistently regardless of which engine reads the data.</p>
+
+      <h3>Governance Architecture</h3>
+      <pre><code class="language-bash"># Lakehouse Governance Stack:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │                    GOVERNANCE LAYER                              │
+# │                                                                 │
+# │  ┌────────────────────────────────────────────────────────────┐ │
+# │  │  CATALOG (Unity Catalog / Polaris / Gravitino)             │ │
+# │  │  • Table registration &amp; discovery                         │ │
+# │  │  • Schema management                                       │ │
+# │  │  • Access control policies                                 │ │
+# │  │  • Audit logging                                           │ │
+# │  └────────────────────────────────────────────────────────────┘ │
+# │                                                                 │
+# │  ┌───────────────┐  ┌───────────────┐  ┌────────────────────┐ │
+# │  │ ACCESS CONTROL│  │   LINEAGE     │  │   DATA QUALITY     │ │
+# │  │               │  │               │  │                    │ │
+# │  │ • RBAC/ABAC   │  │ • Column-level│  │ • Great Expect.    │ │
+# │  │ • Row filters │  │ • Job-level   │  │ • Soda Core        │ │
+# │  │ • Col masking │  │ • OpenLineage │  │ • dbt tests        │ │
+# │  │ • Tag-based   │  │ • Marquez     │  │ • Monte Carlo      │ │
+# │  └───────────────┘  └───────────────┘  └────────────────────┘ │
+# │                                                                 │
+# │  ┌───────────────┐  ┌───────────────┐  ┌────────────────────┐ │
+# │  │ CLASSIFICATION│  │  COMPLIANCE   │  │   DISCOVERY        │ │
+# │  │               │  │               │  │                    │ │
+# │  │ • PII tagging │  │ • GDPR        │  │ • DataHub          │ │
+# │  │ • Sensitivity │  │ • CCPA        │  │ • Amundsen         │ │
+# │  │ • Auto-detect │  │ • HIPAA       │  │ • OpenMetadata     │ │
+# │  │ • Propagation │  │ • Retention   │  │ • Atlan            │ │
+# │  └───────────────┘  └───────────────┘  └────────────────────┘ │
+# └─────────────────────────────────────────────────────────────────┘</code></pre>
+
+      <h3>Unity Catalog (Databricks)</h3>
+      <p>Unity Catalog provides a three-level namespace (catalog.schema.table) with centralized governance:</p>
+      <pre><code class="language-sql">-- Unity Catalog hierarchy
+-- catalog → schema → table/view/function/model
+
+-- Create catalog for a business domain
+CREATE CATALOG IF NOT EXISTS finance;
+USE CATALOG finance;
+
+-- Create schema within catalog
+CREATE SCHEMA IF NOT EXISTS reporting
+COMMENT 'Finance reporting gold layer tables'
+MANAGED LOCATION 's3://lakehouse/gold/finance/';
+
+-- Grant access at catalog/schema/table level
+GRANT USE CATALOG ON CATALOG finance TO `data-analysts`;
+GRANT USE SCHEMA ON SCHEMA finance.reporting TO `data-analysts`;
+GRANT SELECT ON TABLE finance.reporting.daily_revenue TO `data-analysts`;
+
+-- Column-level masking
+CREATE FUNCTION mask_email(email STRING)
+RETURNS STRING
+RETURN CASE
+    WHEN is_member('pii-readers') THEN email
+    ELSE CONCAT(LEFT(email, 2), '***@', SPLIT(email, '@')[1])
+END;
+
+ALTER TABLE customers
+ALTER COLUMN email SET MASK mask_email;
+
+-- Row-level security
+CREATE FUNCTION region_filter(region STRING)
+RETURNS BOOLEAN
+RETURN (
+    is_member('global-access')
+    OR region = current_user_attribute('region')
+);
+
+ALTER TABLE orders SET ROW FILTER region_filter ON (region);</code></pre>
+
+      <h3>DataHub / Amundsen — Open Source Discovery</h3>
+      <pre><code class="language-python"># DataHub: programmatic metadata emission
+from datahub.emitter.mce_builder import make_dataset_urn
+from datahub.emitter.rest_emitter import DatahubRestEmitter
+from datahub.metadata.schema_classes import (
+    DatasetPropertiesClass,
+    SchemaMetadataClass,
+    TagAssociationClass,
+    GlobalTagsClass,
+)
+
+emitter = DatahubRestEmitter(gms_server="http://datahub-gms:8080")
+
+# Register a lakehouse table in DataHub
+dataset_urn = make_dataset_urn(
+    platform="iceberg",
+    name="lakehouse.silver.orders",
+    env="PROD"
+)
+
+# Emit dataset properties
+properties = DatasetPropertiesClass(
+    name="silver_orders",
+    description="Cleansed and deduplicated order records",
+    customProperties={
+        "table_format": "iceberg",
+        "layer": "silver",
+        "owner_team": "commerce-data",
+        "freshness_sla": "15m",
+        "pii_columns": "customer_email,phone",
+        "row_count": "2.4B",
+        "size_gb": "340"
+    }
+)
+
+# Tag PII columns
+pii_tag = TagAssociationClass(tag="urn:li:tag:PII")
+sensitive_tag = TagAssociationClass(tag="urn:li:tag:Sensitive")
+
+# Emit lineage (silver_orders depends on bronze_orders + bronze_customers)
+from datahub.metadata.schema_classes import UpstreamClass, UpstreamLineageClass
+
+lineage = UpstreamLineageClass(
+    upstreams=[
+        UpstreamClass(
+            dataset=make_dataset_urn("iceberg", "lakehouse.bronze.orders"),
+            type="TRANSFORMED"
+        ),
+        UpstreamClass(
+            dataset=make_dataset_urn("iceberg", "lakehouse.bronze.customers"),
+            type="TRANSFORMED"
+        )
+    ]
+)
+
+emitter.emit_mce(dataset_urn, lineage)</code></pre>
+
+      <h3>Lineage Tracking with OpenLineage</h3>
+      <pre><code class="language-python"># OpenLineage: standard lineage emission from Spark/Airflow
+# Automatically captures:
+# - Input datasets (which tables/files were read)
+# - Output datasets (which tables were written)
+# - Job metadata (who ran it, when, how long)
+# - Schema changes (columns added/removed)
+# - Data quality metrics (row counts, null rates)
+
+# Spark configuration for automatic OpenLineage emission
+# spark-defaults.conf:
+# spark.extraListeners=io.openlineage.spark.agent.OpenLineageSparkListener
+# spark.openlineage.transport.type=http
+# spark.openlineage.transport.url=http://marquez:5000/api/v1/lineage
+# spark.openlineage.namespace=lakehouse-prod
+
+# Example OpenLineage event emitted automatically:
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2024-03-15T10:30:00Z",
+  "job": {
+    "namespace": "lakehouse-prod",
+    "name": "silver_orders_transform"
+  },
+  "inputs": [
+    {
+      "namespace": "lakehouse-prod",
+      "name": "bronze.orders",
+      "facets": {
+        "schema": {
+          "fields": [
+            {"name": "order_id", "type": "BIGINT"},
+            {"name": "customer_id", "type": "BIGINT"}
+          ]
+        },
+        "dataQualityMetrics": {
+          "rowCount": 1500000,
+          "bytes": 2147483648
+        }
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "namespace": "lakehouse-prod",
+      "name": "silver.orders",
+      "facets": {
+        "outputStatistics": {
+          "rowCount": 1480000,
+          "size": 1932735283
+        }
+      }
+    }
+  ]
+}</code></pre>
+
+      <h3>PII Management</h3>
+      <pre><code class="language-python"># Automated PII detection and masking pipeline
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+
+# 1. Scan Bronze tables for PII
+analyzer = AnalyzerEngine()
+
+def scan_column_for_pii(sample_values: list) -> dict:
+    """Scan a sample of column values for PII entities."""
+    pii_results = {}
+    for value in sample_values:
+        if value is None:
+            continue
+        results = analyzer.analyze(text=str(value), language="en")
+        for result in results:
+            entity_type = result.entity_type
+            pii_results[entity_type] = pii_results.get(entity_type, 0) + 1
+    return pii_results
+
+# 2. Apply column-level tags based on detection
+PII_CLASSIFICATION = {
+    "EMAIL_ADDRESS": "pii:email",
+    "PHONE_NUMBER": "pii:phone",
+    "CREDIT_CARD": "pii:financial",
+    "US_SSN": "pii:ssn",
+    "PERSON": "pii:name",
+    "LOCATION": "pii:address"
+}
+
+# 3. Dynamic masking at query time (Iceberg + Trino)
+# Trino access control rules (rules.json):
+{
+  "catalogs": [
+    {
+      "catalog": "lakehouse",
+      "rules": [
+        {
+          "group": "pii-readers",
+          "privileges": ["SELECT"],
+          "columns": [{"name": ".*", "mask": null}]
+        },
+        {
+          "group": "analysts",
+          "privileges": ["SELECT"],
+          "columns": [
+            {"name": "email", "mask": "CAST(sha256(CAST(email AS VARBINARY)) AS VARCHAR)"},
+            {"name": "phone", "mask": "'***-***-' || RIGHT(phone, 4)"},
+            {"name": "ssn", "mask": "'***-**-' || RIGHT(ssn, 4)"}
+          ]
+        }
+      ]
+    }
+  ]
+}</code></pre>
+
+      <div class="callout callout-warning">
+        <p><strong>GDPR Right to Erasure:</strong> In a lakehouse, deleting a user's data requires row-level deletes across potentially thousands of files in multiple tables. Iceberg and Delta support row-level deletes, but the operation can be expensive. Design a <code>deletion_requests</code> table that queues requests, processes them in batch during off-peak hours, and verifies deletion across all layers (Bronze through Gold). Consider pseudonymization as an alternative where regulations allow.</p>
+      </div>
+    </section>
+
+
+    <!-- Section 7: Metadata & Discovery -->
+    <section id="metadata-catalog" class="section">
+      <h2>Metadata &amp; Discovery</h2>
+      <p>A lakehouse with thousands of tables across multiple domains needs a discovery layer that helps engineers and analysts find, understand, and trust data. Without it, teams create redundant datasets because they cannot find existing ones.</p>
+
+      <h3>Metadata Taxonomy</h3>
+      <pre><code class="language-bash"># Types of metadata in a lakehouse:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │                    METADATA LAYERS                               │
+# │                                                                 │
+# │  TECHNICAL METADATA (machine-generated, auto-collected)         │
+# │  ├── Schema: columns, types, nullability, nested structures     │
+# │  ├── Statistics: row count, file count, size, min/max/nulls     │
+# │  ├── Partitioning: partition spec, partition values             │
+# │  ├── File metadata: Parquet footer, column chunk stats          │
+# │  ├── Freshness: last modified, last commit timestamp            │
+# │  └── Lineage: upstream/downstream dependencies                 │
+# │                                                                 │
+# │  BUSINESS METADATA (human-curated, domain knowledge)            │
+# │  ├── Description: what does this table/column represent?        │
+# │  ├── Owner: who is responsible for data quality?                │
+# │  ├── Domain: which business area does this belong to?           │
+# │  ├── SLA: freshness guarantees, availability targets            │
+# │  ├── Classification: PII, confidential, public                  │
+# │  └── Glossary: business term → technical column mapping         │
+# │                                                                 │
+# │  OPERATIONAL METADATA (pipeline execution context)              │
+# │  ├── Job history: runs, durations, failures                     │
+# │  ├── Data quality: test results, anomaly scores                 │
+# │  ├── Cost: compute spend, storage spend per table               │
+# │  ├── Usage: query frequency, user access patterns               │
+# │  └── Incidents: past issues, root causes, resolutions          │
+# └─────────────────────────────────────────────────────────────────┘</code></pre>
+
+      <h3>Data Products</h3>
+      <p>In a data mesh-inspired lakehouse, each domain team publishes <strong>data products</strong> — self-contained, discoverable, and contractually defined datasets:</p>
+
+      <pre><code class="language-yaml"># Data product manifest: commerce/orders-data-product.yaml
+apiVersion: dataproduct/v1
+kind: DataProduct
+metadata:
+  name: orders
+  domain: commerce
+  owner: commerce-data-team
+  tier: tier-1  # critical business data
+  tags: [revenue, transactions, finance]
+
+description: |
+  Complete order lifecycle data from placement through delivery.
+  Source of truth for all order-related metrics across the organization.
+  Updated within 15 minutes of source system changes.
+
+ports:
+  # Output ports: how consumers access this data product
+  - name: orders_current
+    type: iceberg_table
+    location: "lakehouse.gold.commerce.orders_current"
+    description: "Current state of all orders (latest version)"
+    sla:
+      freshness: 15m
+      availability: 99.9%
+    schema_contract: contracts/gold/orders_current.yaml
+
+  - name: orders_history
+    type: iceberg_table
+    location: "lakehouse.silver.commerce.orders"
+    description: "Full order history with SCD2 tracking"
+    sla:
+      freshness: 15m
+      availability: 99.9%
+
+  - name: daily_order_metrics
+    type: iceberg_table
+    location: "lakehouse.gold.commerce.daily_order_metrics"
+    description: "Pre-aggregated daily order KPIs by region"
+    sla:
+      freshness: 1h
+      availability: 99.5%
+
+  - name: orders_stream
+    type: kafka_topic
+    location: "commerce.orders.events"
+    description: "Real-time order events for streaming consumers"
+    format: avro
+    schema_registry: "http://schema-registry:8081"
+
+inputs:
+  # Source systems feeding this data product
+  - name: orders_db
+    type: postgresql
+    connection: "jdbc:postgresql://orders-primary:5432/orders"
+    ingestion: cdc_debezium
+  - name: payments_api
+    type: rest_api
+    endpoint: "https://payments-service/api/v2/transactions"
+    ingestion: polling_5min
+
+quality:
+  tests:
+    - name: no_duplicate_orders
+      type: uniqueness
+      column: order_id
+    - name: valid_amounts
+      type: expression
+      expression: "total_amount > 0 AND total_amount < 1000000"
+    - name: referential_integrity
+      type: relationship
+      column: customer_id
+      reference: customers.customer_id
+      threshold: 99.9%
+  monitoring:
+    anomaly_detection: true
+    freshness_alert: "#commerce-data-alerts"
+    quality_dashboard: "https://grafana/d/orders-quality"
+
+consumers:
+  approved:
+    - team: finance
+      access: [orders_current, daily_order_metrics]
+      purpose: "Revenue reporting and forecasting"
+    - team: marketing
+      access: [orders_current]
+      purpose: "Customer segmentation"
+    - team: ml-platform
+      access: [orders_history]
+      purpose: "Demand forecasting model training"</code></pre>
+
+      <h3>Search and Discovery UX</h3>
+      <pre><code class="language-bash"># What a good discovery experience looks like:
+#
+# Search: "daily revenue by region"
+#
+# Results:
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ 🏆 gold.finance.daily_revenue                                   │
+# │    Owner: finance-data-team | Freshness: 12 min ago            │
+# │    Description: Daily revenue aggregated by region and currency │
+# │    Quality: ✅ All tests passing | Usage: 847 queries/week     │
+# │    Tags: [revenue] [finance] [tier-1] [gold]                   │
+# │    Columns: revenue_date, region, currency, gross_revenue, ...  │
+# ├─────────────────────────────────────────────────────────────────┤
+# │ 📊 gold.commerce.daily_order_metrics                            │
+# │    Owner: commerce-data-team | Freshness: 8 min ago            │
+# │    Description: Order KPIs including revenue, volume, AOV       │
+# │    Quality: ✅ All tests passing | Usage: 312 queries/week     │
+# │    Tags: [orders] [commerce] [tier-1] [gold]                   │
+# ├─────────────────────────────────────────────────────────────────┤
+# │ ⚠️  sandbox.analyst_joe.revenue_exploration                     │
+# │    Owner: joe@company.com | Freshness: 3 days ago              │
+# │    Description: (none)                                          │
+# │    Quality: ❌ No tests | Usage: 2 queries/week                │
+# │    Tags: [sandbox] [unvalidated]                                │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# A good catalog surfaces:
+# 1. Relevance ranking (gold > silver > sandbox)
+# 2. Trust signals (quality tests, freshness, usage)
+# 3. Ownership (who to ask questions)
+# 4. Lineage (where does this data come from?)
+# 5. Sample data / column profiles</code></pre>
+
+      <div class="callout callout-info">
+        <p><strong>Tool comparison:</strong> DataHub (LinkedIn) offers the richest API and extensibility. OpenMetadata provides the best out-of-box UX for smaller teams. Atlan and Alation are commercial options with better enterprise support. Unity Catalog is the best choice if already on Databricks. For multi-cloud/multi-engine lakehouses, DataHub or Apache Gravitino provide the broadest integration surface.</p>
+      </div>
+    </section>
+
+
+    <!-- Section 8: Ingestion Patterns -->
+    <section id="ingestion-patterns" class="section">
+      <h2>Ingestion Patterns</h2>
+      <p>A global lakehouse must support diverse ingestion patterns — from real-time CDC streams to daily bulk file drops. The ingestion layer is the most operationally demanding part of the platform because it interfaces with systems you do not control.</p>
+
+      <h3>Ingestion Spectrum</h3>
+      <pre><code class="language-bash"># Ingestion patterns by latency requirement:
+#
+# ┌───────────────────────────────────────────────────────────────────┐
+# │  REAL-TIME          │  MICRO-BATCH         │  BATCH               │
+# │  (seconds)          │  (minutes)           │  (hours/daily)       │
+# │                     │                      │                      │
+# │  • Kafka CDC        │  • Spark Structured  │  • Full table dump   │
+# │  • Flink ingestion  │    Streaming (5min)  │  • File drops (SFTP) │
+# │  • Direct Hudi MoR  │  • Delta auto-loader │  • API pagination    │
+# │  • Kinesis → Iceberg│  • Hudi deltastreamer│  • Database export   │
+# │                     │  • Airbyte/Fivetran  │  • Vendor data feeds │
+# │                     │                      │                      │
+# │  Use case:          │  Use case:           │  Use case:           │
+# │  Fraud detection,   │  Dashboard refresh,  │  Historical load,    │
+# │  real-time reco,    │  operational reports,│  data warehouse sync,│
+# │  alerting           │  ML feature refresh  │  compliance reports  │
+# └───────────────────────────────────────────────────────────────────┘</code></pre>
+
+      <h3>CDC with Debezium</h3>
+      <p>Change Data Capture (CDC) is the preferred pattern for database ingestion because it captures every change (insert, update, delete) without querying the source system:</p>
+
+      <pre><code class="language-json">// Debezium connector configuration for PostgreSQL → Kafka → Lakehouse
+{
+  "name": "orders-cdc-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "orders-primary.internal",
+    "database.port": "5432",
+    "database.user": "debezium_replication",
+    "database.password": "${secrets:debezium/orders-db-password}",
+    "database.dbname": "orders",
+    "database.server.name": "orders-prod",
+
+    "table.include.list": "public.orders,public.order_items,public.payments",
+    "column.exclude.list": "public.orders.internal_notes",
+
+    "plugin.name": "pgoutput",
+    "slot.name": "debezium_orders",
+    "publication.name": "debezium_publication",
+
+    "topic.prefix": "cdc.orders",
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "key.converter.schema.registry.url": "http://schema-registry:8081",
+    "value.converter.schema.registry.url": "http://schema-registry:8081",
+
+    "transforms": "route,unwrap",
+    "transforms.route.type": "io.debezium.transforms.ByLogicalTableRouter",
+    "transforms.route.topic.regex": "cdc\\.orders\\.(.*)",
+    "transforms.route.topic.replacement": "lakehouse.bronze.orders.$1",
+
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.add.fields": "op,ts_ms,source.ts_ms,db,table",
+    "transforms.unwrap.delete.handling.mode": "rewrite",
+
+    "snapshot.mode": "initial",
+    "heartbeat.interval.ms": "10000",
+    "tombstones.on.delete": "true",
+
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "dlq.cdc.orders",
+    "errors.deadletterqueue.context.headers.enable": "true"
+  }
+}</code></pre>
+
+      <pre><code class="language-python"># Flink CDC ingestion to Iceberg (real-time)
+from pyflink.table import EnvironmentSettings, TableEnvironment
+
+env_settings = EnvironmentSettings.in_streaming_mode()
+t_env = TableEnvironment.create(env_settings)
+
+# Source: Kafka topic with CDC events
+t_env.execute_sql("""
+    CREATE TABLE cdc_orders_source (
+        order_id BIGINT,
+        customer_id BIGINT,
+        order_date TIMESTAMP(3),
+        total_amount DECIMAL(18, 2),
+        status STRING,
+        _op STRING METADATA FROM 'value.op' VIRTUAL,
+        _ts_ms BIGINT METADATA FROM 'value.ts_ms' VIRTUAL,
+        PRIMARY KEY (order_id) NOT ENFORCED
+    ) WITH (
+        'connector' = 'kafka',
+        'topic' = 'lakehouse.bronze.orders.orders',
+        'properties.bootstrap.servers' = 'kafka:9092',
+        'properties.group.id' = 'lakehouse-cdc-orders',
+        'format' = 'debezium-avro-confluent',
+        'debezium-avro-confluent.url' = 'http://schema-registry:8081',
+        'scan.startup.mode' = 'earliest-offset'
+    )
+""")
+
+# Sink: Iceberg table with upsert semantics
+t_env.execute_sql("""
+    CREATE TABLE bronze_orders_iceberg (
+        order_id BIGINT,
+        customer_id BIGINT,
+        order_date TIMESTAMP(3),
+        total_amount DECIMAL(18, 2),
+        status STRING,
+        _cdc_operation STRING,
+        _cdc_timestamp BIGINT,
+        _ingested_at TIMESTAMP(3),
+        PRIMARY KEY (order_id) NOT ENFORCED
+    ) WITH (
+        'connector' = 'iceberg',
+        'catalog-name' = 'lakehouse',
+        'catalog-type' = 'rest',
+        'uri' = 'http://iceberg-catalog:8181',
+        'catalog-database' = 'bronze',
+        'catalog-table' = 'orders',
+        'write.upsert.enabled' = 'true',
+        'write.format.default' = 'parquet',
+        'write.target-file-size-bytes' = '134217728'
+    )
+""")
+
+# Execute streaming CDC to Iceberg
+t_env.execute_sql("""
+    INSERT INTO bronze_orders_iceberg
+    SELECT
+        order_id,
+        customer_id,
+        order_date,
+        total_amount,
+        status,
+        _op AS _cdc_operation,
+        _ts_ms AS _cdc_timestamp,
+        CURRENT_TIMESTAMP AS _ingested_at
+    FROM cdc_orders_source
+""")</code></pre>
+
+      <h3>File-Based Ingestion (Auto-Loader Pattern)</h3>
+      <pre><code class="language-python"># Delta Lake Auto Loader: automatic file discovery and ingestion
+# Monitors a cloud storage location and ingests new files as they arrive
+
+# Structured Streaming with Auto Loader
+stream_df = spark.readStream \
+    .format("cloudFiles") \
+    .option("cloudFiles.format", "json") \
+    .option("cloudFiles.schemaLocation", "s3://lakehouse/_schemas/vendor_feed") \
+    .option("cloudFiles.inferColumnTypes", "true") \
+    .option("cloudFiles.schemaEvolutionMode", "addNewColumns") \
+    .option("cloudFiles.maxFilesPerTrigger", 1000) \
+    .option("cloudFiles.useNotifications", "true") \  # Use S3 events (faster)
+    .load("s3://landing-zone/vendor-feeds/daily/")
+
+# Transform and write to Bronze
+bronze_stream = stream_df \
+    .withColumn("_source_file", F.input_file_name()) \
+    .withColumn("_ingested_at", F.current_timestamp()) \
+    .withColumn("_file_modification_time", F.col("_metadata.file_modification_time"))
+
+bronze_stream.writeStream \
+    .format("iceberg") \
+    .outputMode("append") \
+    .option("checkpointLocation", "s3://lakehouse/_checkpoints/vendor_feed") \
+    .option("fanout-enabled", "true") \
+    .toTable("lakehouse.bronze.vendor_feed") \
+    .start()</code></pre>
+
+      <h3>API-Based Ingestion</h3>
+      <pre><code class="language-python"># API ingestion with pagination, rate limiting, and idempotency
+import requests
+import time
+from datetime import datetime, timedelta
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+class APIIngester:
+    """Generic API ingestion with cursor-based pagination."""
+
+    def __init__(self, base_url: str, api_key: str, rate_limit_rps: int = 10):
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.session.headers["Authorization"] = f"Bearer {api_key}"
+        self.rate_limit_interval = 1.0 / rate_limit_rps
+        self.last_request_time = 0
+
+    def _rate_limit(self):
+        elapsed = time.time() - self.last_request_time
+        if elapsed < self.rate_limit_interval:
+            time.sleep(self.rate_limit_interval - elapsed)
+        self.last_request_time = time.time()
+
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=1, max=60))
+    def _fetch_page(self, endpoint: str, params: dict) -> dict:
+        self._rate_limit()
+        response = self.session.get(f"{self.base_url}/{endpoint}", params=params)
+        response.raise_for_status()
+        return response.json()
+
+    def ingest_incremental(
+        self,
+        endpoint: str,
+        since: datetime,
+        cursor_field: str = "updated_at",
+        page_size: int = 1000
+    ) -> list:
+        """Fetch all records updated since given timestamp."""
+        all_records = []
+        cursor = None
+        total_pages = 0
+
+        while True:
+            params = {
+                "since": since.isoformat(),
+                "limit": page_size,
+                "sort": cursor_field,
+                "order": "asc"
+            }
+            if cursor:
+                params["after"] = cursor
+
+            page = self._fetch_page(endpoint, params)
+            records = page.get("data", [])
+
+            if not records:
+                break
+
+            all_records.extend(records)
+            cursor = records[-1].get("id")
+            total_pages += 1
+
+            # Safety: prevent infinite loops
+            if total_pages > 10000:
+                raise RuntimeError(f"Too many pages ({total_pages}), possible infinite loop")
+
+        return all_records</code></pre>
+
+      <div class="callout callout-tip">
+        <p><strong>Ingestion framework selection:</strong> Use <strong>Debezium + Kafka</strong> for database CDC (lowest latency, most reliable). Use <strong>Auto Loader / file notifications</strong> for vendor file drops. Use <strong>Airbyte/Fivetran</strong> for SaaS API sources (reduces connector maintenance). Use <strong>custom code</strong> only for APIs with complex auth, pagination, or transformation needs that managed tools cannot handle.</p>
+      </div>
+    </section>
+
+
+    <!-- Section 9: Cost Optimization -->
+    <section id="cost-optimization" class="section">
+      <h2>Cost Optimization</h2>
+      <p>At petabyte scale, lakehouse costs are dominated by three factors: storage volume, compute hours, and API operations (S3 LIST/GET calls). A well-optimized platform can reduce costs by 60-80% without sacrificing performance.</p>
+
+      <h3>Storage Tiering</h3>
+      <pre><code class="language-bash"># S3 storage class cost comparison (us-east-1, per GB/month):
+#
+# ┌──────────────────────────────────────────────────────────────────┐
+# │ Storage Class        │ $/GB/mo │ Retrieval │ Min Duration │ Use  │
+# ├──────────────────────┼─────────┼───────────┼──────────────┼──────┤
+# │ S3 Standard          │ $0.023  │ Free      │ None         │ Hot  │
+# │ S3 Intelligent-Tier  │ $0.023* │ Free      │ None         │ Auto │
+# │ S3 Standard-IA       │ $0.0125 │ $0.01/GB  │ 30 days      │ Warm │
+# │ S3 One Zone-IA       │ $0.010  │ $0.01/GB  │ 30 days      │ Logs │
+# │ S3 Glacier Instant   │ $0.004  │ $0.03/GB  │ 90 days      │ Cold │
+# │ S3 Glacier Flexible  │ $0.0036 │ $0.03/GB  │ 90 days      │ Arch │
+# │ S3 Glacier Deep Arch │ $0.00099│ $0.02/GB  │ 180 days     │ Rare │
+# └──────────────────────────────────────────────────────────────────┘
+#
+# Lakehouse tiering strategy:
+# • Gold tables (queried daily)       → S3 Standard
+# • Silver tables (queried weekly)    → S3 Intelligent-Tiering
+# • Bronze tables (< 90 days)         → S3 Standard-IA
+# • Bronze tables (90-365 days)       → S3 Glacier Instant Retrieval
+# • Bronze tables (> 1 year)          → S3 Glacier Flexible
+# • Compliance archives (> 3 years)   → S3 Glacier Deep Archive
+#
+# Example: 500 TB lakehouse
+# Without tiering: 500 TB × $0.023 = $11,500/month
+# With tiering:    50 TB Hot + 100 TB IA + 200 TB Glacier-I + 150 TB Deep
+#                  = $1,150 + $1,250 + $800 + $148 = $3,348/month
+# Savings: 71%</code></pre>
+
+      <pre><code class="language-python"># Automated lifecycle policy for lakehouse storage tiering
+import boto3
+from datetime import datetime, timedelta
+
+def configure_lakehouse_lifecycle(bucket_name: str):
+    """Configure S3 lifecycle rules aligned with medallion architecture."""
+    s3 = boto3.client("s3")
+
+    lifecycle_config = {
+        "Rules": [
+            {
+                "ID": "bronze-to-ia-after-30d",
+                "Filter": {"Prefix": "bronze/"},
+                "Status": "Enabled",
+                "Transitions": [
+                    {
+                        "Days": 30,
+                        "StorageClass": "STANDARD_IA"
+                    },
+                    {
+                        "Days": 90,
+                        "StorageClass": "GLACIER_IR"  # Glacier Instant Retrieval
+                    },
+                    {
+                        "Days": 365,
+                        "StorageClass": "GLACIER"
+                    }
+                ]
+            },
+            {
+                "ID": "silver-intelligent-tiering",
+                "Filter": {"Prefix": "silver/"},
+                "Status": "Enabled",
+                "Transitions": [
+                    {
+                        "Days": 60,
+                        "StorageClass": "INTELLIGENT_TIERING"
+                    }
+                ]
+            },
+            {
+                "ID": "gold-keep-standard",
+                "Filter": {"Prefix": "gold/"},
+                "Status": "Enabled",
+                # Gold stays in Standard — actively queried
+                "Transitions": [
+                    {
+                        "Days": 180,
+                        "StorageClass": "STANDARD_IA"
+                    }
+                ]
+            },
+            {
+                "ID": "cleanup-orphaned-files",
+                "Filter": {"Prefix": "_orphaned/"},
+                "Status": "Enabled",
+                "Expiration": {"Days": 7}
+            },
+            {
+                "ID": "abort-incomplete-multipart",
+                "Filter": {"Prefix": ""},
+                "Status": "Enabled",
+                "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 3}
+            }
+        ]
+    }
+
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket_name,
+        LifecycleConfiguration=lifecycle_config
+    )</code></pre>
+
+      <h3>Compute Auto-Scaling</h3>
+      <pre><code class="language-python"># EMR on EKS: auto-scaling Spark compute for lakehouse workloads
+# Cluster scales 0 → N based on queued jobs, scales back to 0 when idle
+
+# Karpenter provisioner for Spark workloads (Kubernetes)
+"""
+apiVersion: karpenter.sh/v1alpha5
+kind: Provisioner
+metadata:
+  name: spark-compute
+spec:
+  requirements:
+    - key: node.kubernetes.io/instance-type
+      operator: In
+      values:
+        - r6g.4xlarge   # Memory-optimized (Spark)
+        - r6g.8xlarge
+        - r6gd.4xlarge  # With NVMe for shuffle
+    - key: karpenter.sh/capacity-type
+      operator: In
+      values:
+        - spot          # 60-80% cost savings
+        - on-demand     # Fallback for critical jobs
+  limits:
+    resources:
+      cpu: 2000         # Max 2000 vCPUs across all nodes
+      memory: 8000Gi
+  ttlSecondsAfterEmpty: 60  # Scale to zero after 60s idle
+  ttlSecondsUntilExpired: 86400  # Rotate nodes daily
+"""
+
+# Spark dynamic allocation config
+spark_config = {
+    "spark.dynamicAllocation.enabled": "true",
+    "spark.dynamicAllocation.minExecutors": "2",
+    "spark.dynamicAllocation.maxExecutors": "200",
+    "spark.dynamicAllocation.initialExecutors": "5",
+    "spark.dynamicAllocation.executorIdleTimeout": "60s",
+    "spark.dynamicAllocation.schedulerBacklogTimeout": "5s",
+    # Use spot instances for executors, on-demand for driver
+    "spark.kubernetes.node.selector.spark-role": "executor",
+    "spark.kubernetes.allocation.batch.size": "10",
+    # Graceful decommission for spot interruptions
+    "spark.decommission.enabled": "true",
+    "spark.storage.decommission.shuffleBlocks.enabled": "true",
+    "spark.storage.decommission.rddBlocks.enabled": "true",
+}</code></pre>
+
+      <h3>Partition Lifecycle &amp; Compaction</h3>
+      <pre><code class="language-python"># Automated partition lifecycle management
+from pyspark.sql import SparkSession
+from datetime import datetime, timedelta
+
+def manage_partition_lifecycle(spark: SparkSession, table: str):
+    """
+    Manage table lifecycle:
+    1. Expire old snapshots (free metadata)
+    2. Remove orphaned files (free storage)
+    3. Compact small files (improve query perf)
+    4. Rewrite old partitions to cold storage format
+    """
+
+    # 1. Expire snapshots older than 7 days
+    spark.sql(f"""
+        CALL lakehouse.system.expire_snapshots(
+            table => '{table}',
+            older_than => TIMESTAMP '{(datetime.now() - timedelta(days=7)).isoformat()}',
+            retain_last => 10
+        )
+    """)
+
+    # 2. Remove orphaned files (files not referenced by any snapshot)
+    spark.sql(f"""
+        CALL lakehouse.system.remove_orphan_files(
+            table => '{table}',
+            older_than => TIMESTAMP '{(datetime.now() - timedelta(days=3)).isoformat()}'
+        )
+    """)
+
+    # 3. Compact small files (target 128-256 MB per file)
+    spark.sql(f"""
+        CALL lakehouse.system.rewrite_data_files(
+            table => '{table}',
+            strategy => 'binpack',
+            options => map(
+                'target-file-size-bytes', '134217728',
+                'min-file-size-bytes', '67108864',
+                'max-file-size-bytes', '268435456',
+                'min-input-files', '5',
+                'partial-progress.enabled', 'true',
+                'partial-progress.max-commits', '10'
+            )
+        )
+    """)
+
+    # 4. Sort-compact for frequently filtered columns
+    spark.sql(f"""
+        CALL lakehouse.system.rewrite_data_files(
+            table => '{table}',
+            strategy => 'sort',
+            sort_order => 'order_date ASC NULLS LAST, customer_id ASC',
+            where => 'order_date >= current_date() - INTERVAL 30 DAYS',
+            options => map(
+                'target-file-size-bytes', '134217728',
+                'min-input-files', '3'
+            )
+        )
+    """)</code></pre>
+
+      <h3>Cost Monitoring Dashboard</h3>
+      <pre><code class="language-sql">-- Cost attribution: compute spend per table/team/pipeline
+-- Query against Spark event logs stored in lakehouse
+
+WITH job_costs AS (
+    SELECT
+        job_name,
+        owning_team,
+        target_table,
+        SUM(executor_hours) AS total_executor_hours,
+        SUM(executor_hours * cost_per_hour) AS compute_cost_usd,
+        SUM(bytes_scanned) / POWER(1024, 4) AS tb_scanned,
+        SUM(bytes_written) / POWER(1024, 4) AS tb_written,
+        SUM(shuffle_bytes) / POWER(1024, 3) AS gb_shuffled,
+        COUNT(*) AS run_count
+    FROM lakehouse.ops.spark_job_metrics
+    WHERE run_date >= CURRENT_DATE - INTERVAL 30 DAYS
+    GROUP BY job_name, owning_team, target_table
+),
+
+storage_costs AS (
+    SELECT
+        table_name,
+        SUM(file_size_bytes) / POWER(1024, 4) AS size_tb,
+        COUNT(*) AS file_count,
+        SUM(file_size_bytes) / POWER(1024, 4) * 23.0 AS monthly_storage_usd
+    FROM lakehouse.ops.table_file_inventory
+    GROUP BY table_name
+)
+
+SELECT
+    j.owning_team,
+    j.target_table,
+    j.compute_cost_usd,
+    s.monthly_storage_usd,
+    j.compute_cost_usd + s.monthly_storage_usd AS total_monthly_cost,
+    j.tb_scanned,
+    j.run_count,
+    -- Cost efficiency metrics
+    j.compute_cost_usd / NULLIF(j.run_count, 0) AS cost_per_run,
+    j.compute_cost_usd / NULLIF(j.tb_scanned, 0) AS cost_per_tb_scanned
+FROM job_costs j
+LEFT JOIN storage_costs s ON j.target_table = s.table_name
+ORDER BY total_monthly_cost DESC
+LIMIT 50;</code></pre>
+
+      <div class="callout callout-warning">
+        <p><strong>Hidden cost trap — S3 API calls:</strong> A table with 2 million small files generates massive LIST and GET costs. A single <code>SELECT *</code> might issue 2M GetObject requests ($0.0004 per 1000 = $0.80 per query). At 1000 queries/day, that is $800/month just in API costs — more than the storage itself. This is why compaction is not optional; it is a cost requirement.</p>
+      </div>
+    </section>
+
+
+    <!-- Section 10: Production Incident -->
+    <section id="production-incident" class="section">
+      <h2>Production Incident: 2 Million Small Files</h2>
+      <div class="callout callout-danger">
+        <p><strong>Incident:</strong> Lakehouse platform accumulated 2M small files over 6 months, causing 30-minute query planning time until compaction was implemented.</p>
+      </div>
+
+      <h3>Timeline</h3>
+      <pre><code class="language-bash"># Incident Timeline:
+#
+# Month 1-2: Platform launch
+# ─────────────────────────────
+# • Ingestion pipelines write to Iceberg tables every 5 minutes
+# • Each micro-batch produces 10-50 small files (1-5 MB each)
+# • 6 source tables × 12 batches/hour × 24 hours = 1,728 files/day
+# • Everything works fine. Queries take 2-5 seconds.
+#
+# Month 3-4: Growing pains (unnoticed)
+# ─────────────────────────────────────
+# • File count: ~200,000 across key tables
+# • Query planning time: 15-30 seconds (was 1-2 seconds)
+# • Manifest files growing large (10,000+ entries each)
+# • Users complain queries are "a bit slow" — attributed to data growth
+# • No monitoring on file count or planning time
+#
+# Month 5: Performance degradation
+# ─────────────────────────────────
+# • File count: ~800,000
+# • Query planning: 2-5 minutes
+# • Spark driver OOM during planning (loading all manifest entries)
+# • BI dashboards timeout (30-second threshold)
+# • On-call engineer increases driver memory as band-aid
+#
+# Month 6: Critical incident (THE OUTAGE)
+# ──────────────────────────────────────────
+# • File count: 2,100,000 across 6 tables
+# • Query planning: 25-30 MINUTES
+# • Even simple COUNT(*) takes 30+ minutes to START
+# • Driver memory: 32 GB consumed just for planning metadata
+# • All BI dashboards completely broken
+# • Data science training jobs failing
+# • CEO cannot see daily revenue dashboard
+# • Incident declared: SEV-1
+#
+# 09:00 — BI team reports dashboard failures
+# 09:15 — Data platform on-call paged
+# 09:30 — Root cause identified: excessive file count
+# 09:45 — Attempted OPTIMIZE — job itself takes 30 min to plan
+# 10:30 — Emergency approach: compact one partition at a time
+# 12:00 — First compaction batch complete (20% of files reduced)
+# 14:00 — Query planning down to 5 minutes
+# 18:00 — Full compaction complete across all tables
+# 18:30 — Query planning back to normal (2-5 seconds)
+# 19:00 — Post-incident review scheduled</code></pre>
+
+      <h3>Root Cause Analysis</h3>
+      <pre><code class="language-bash"># Why did this happen?
+#
+# 1. MICRO-BATCH INGESTION WITHOUT COMPACTION
+#    • Writing every 5 minutes → 288 write operations per table per day
+#    • Each write creates files matching the parallelism level
+#    • 288 writes × 10 files avg = 2,880 files/day per table
+#    • 6 tables × 2,880 × 180 days = 3.1M files (theoretical max)
+#
+# 2. NO FILE SIZE MONITORING
+#    • Average file size: 2.3 MB (target should be 128-256 MB)
+#    • Total data volume: ~4.8 TB across 2.1M files
+#    • If properly compacted: ~38,000 files (at 128 MB each)
+#    • File count was 55x higher than optimal
+#
+# 3. MANIFEST BLOAT
+#    • Iceberg manifest files track every data file
+#    • 2.1M file entries = 2.1M rows in manifest metadata
+#    • Query planning must read ALL manifests to build scan plan
+#    • Even with partition pruning, manifest listing was the bottleneck
+#
+# 4. NO SNAPSHOT EXPIRATION
+#    • 180 days × 288 commits/day = 51,840 snapshots retained
+#    • Each snapshot references a manifest list
+#    • Metadata files alone consumed 12 GB
+#
+# 5. TEAM ASSUMED "OBJECT STORAGE HANDLES EVERYTHING"
+#    • No operational runbook for lakehouse maintenance
+#    • No alerts on file count, avg file size, or planning time
+#    • Compaction was "planned for Q3" but never prioritized</code></pre>
+
+      <h3>The Fix</h3>
+      <pre><code class="language-python"># Emergency compaction procedure (during incident)
+from pyspark.sql import SparkSession
+from concurrent.futures import ThreadPoolExecutor
+import logging
+
+logger = logging.getLogger("compaction-emergency")
+
+def emergency_compaction(spark: SparkSession, table: str):
+    """
+    Emergency compaction for severely fragmented tables.
+    Strategy: compact partition-by-partition to avoid OOM on full-table plan.
+    """
+
+    # Step 1: Get list of partitions with excessive file counts
+    partitions = spark.sql(f"""
+        SELECT partition, file_count, total_size_mb
+        FROM (
+            SELECT
+                partition,
+                COUNT(*) as file_count,
+                SUM(file_size_in_bytes) / 1048576 as total_size_mb
+            FROM lakehouse.{table}.files
+            GROUP BY partition
+        )
+        WHERE file_count > 100
+        ORDER BY file_count DESC
+    """).collect()
+
+    logger.info(f"Found {len(partitions)} partitions needing compaction")
+
+    # Step 2: Compact each partition individually (avoids full-table plan)
+    for idx, part in enumerate(partitions):
+        partition_filter = part["partition"]
+        file_count = part["file_count"]
+
+        logger.info(
+            f"[{idx+1}/{len(partitions)}] Compacting partition "
+            f"{partition_filter} ({file_count} files)"
+        )
+
+        try:
+            spark.sql(f"""
+                CALL lakehouse.system.rewrite_data_files(
+                    table => '{table}',
+                    strategy => 'binpack',
+                    where => "{partition_filter}",
+                    options => map(
+                        'target-file-size-bytes', '134217728',
+                        'min-input-files', '5',
+                        'max-concurrent-file-group-rewrites', '5',
+                        'partial-progress.enabled', 'true',
+                        'partial-progress.max-commits', '5'
+                    )
+                )
+            """)
+        except Exception as e:
+            logger.error(f"Failed to compact {partition_filter}: {e}")
+            continue
+
+    # Step 3: Expire old snapshots (free metadata bloat)
+    spark.sql(f"""
+        CALL lakehouse.system.expire_snapshots(
+            table => '{table}',
+            older_than => TIMESTAMP '2024-03-01T00:00:00Z',
+            retain_last => 5,
+            max_concurrent_deletes => 100
+        )
+    """)
+
+    # Step 4: Rewrite manifests (consolidate manifest files)
+    spark.sql(f"""
+        CALL lakehouse.system.rewrite_manifests(
+            table => '{table}'
+        )
+    """)
+
+    logger.info(f"Compaction complete for {table}")</code></pre>
+
+      <h3>Prevention: Automated Compaction Service</h3>
+      <pre><code class="language-python"># Production compaction service (runs continuously)
+# Monitors all tables and triggers compaction when thresholds are breached
+
+class CompactionService:
+    """
+    Automated compaction service for lakehouse tables.
+    Runs as a persistent service, monitoring table health metrics.
+    """
+
+    THRESHOLDS = {
+        "max_files_per_partition": 200,
+        "min_avg_file_size_mb": 64,
+        "max_snapshots": 100,
+        "max_orphan_age_days": 3,
+        "compaction_interval_hours": 4,
+    }
+
+    def __init__(self, spark: SparkSession, tables: list):
+        self.spark = spark
+        self.tables = tables
+
+    def check_table_health(self, table: str) -> dict:
+        """Assess table health and return metrics."""
+        metrics = self.spark.sql(f"""
+            SELECT
+                COUNT(*) as total_files,
+                AVG(file_size_in_bytes) / 1048576 as avg_file_size_mb,
+                MIN(file_size_in_bytes) / 1048576 as min_file_size_mb,
+                MAX(file_size_in_bytes) / 1048576 as max_file_size_mb,
+                SUM(CASE WHEN file_size_in_bytes < 16777216 THEN 1 ELSE 0 END) as small_files,
+                COUNT(DISTINCT partition) as partition_count
+            FROM lakehouse.{table}.files
+        """).first()
+
+        snapshot_count = self.spark.sql(f"""
+            SELECT COUNT(*) as cnt FROM lakehouse.{table}.snapshots
+        """).first()["cnt"]
+
+        return {
+            "table": table,
+            "total_files": metrics["total_files"],
+            "avg_file_size_mb": metrics["avg_file_size_mb"],
+            "small_files": metrics["small_files"],
+            "small_file_ratio": metrics["small_files"] / max(metrics["total_files"], 1),
+            "snapshot_count": snapshot_count,
+            "needs_compaction": (
+                metrics["avg_file_size_mb"] < self.THRESHOLDS["min_avg_file_size_mb"]
+                or metrics["small_files"] > 1000
+            ),
+            "needs_snapshot_expiry": snapshot_count > self.THRESHOLDS["max_snapshots"]
+        }
+
+    def run_maintenance_cycle(self):
+        """Run one maintenance cycle across all monitored tables."""
+        for table in self.tables:
+            health = self.check_table_health(table)
+
+            if health["needs_compaction"]:
+                logger.info(f"Compacting {table}: {health['small_files']} small files")
+                self._compact_table(table)
+
+            if health["needs_snapshot_expiry"]:
+                logger.info(f"Expiring snapshots for {table}: {health['snapshot_count']}")
+                self._expire_snapshots(table)
+
+            # Always remove orphans
+            self._remove_orphans(table)
+
+            # Emit metrics for monitoring
+            self._emit_metrics(health)</code></pre>
+
+      <h3>Monitoring &amp; Alerting (Post-Incident)</h3>
+      <pre><code class="language-yaml"># Prometheus alerts added after the incident
+groups:
+  - name: lakehouse_health
+    rules:
+      - alert: HighSmallFileCount
+        expr: lakehouse_table_small_files_total > 10000
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Table {{ $labels.table }} has {{ $value }} small files"
+          runbook: "https://wiki/runbooks/lakehouse-compaction"
+
+      - alert: CriticalSmallFileCount
+        expr: lakehouse_table_small_files_total > 100000
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "URGENT: {{ $labels.table }} has {{ $value }} small files - queries degraded"
+
+      - alert: QueryPlanningTimeTooHigh
+        expr: lakehouse_query_planning_seconds_p99 > 30
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Query planning p99 is {{ $value }}s for {{ $labels.table }}"
+
+      - alert: AvgFileSizeTooSmall
+        expr: lakehouse_table_avg_file_size_bytes < 16777216  # 16 MB
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Average file size for {{ $labels.table }} is {{ $value | humanizeBytes }}"
+
+      - alert: SnapshotCountExcessive
+        expr: lakehouse_table_snapshot_count > 500
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Table {{ $labels.table }} has {{ $value }} snapshots (metadata bloat risk)"</code></pre>
+
+      <div class="callout callout-info">
+        <p><strong>Key lesson:</strong> A lakehouse is not "set and forget." Object storage handles durability, but table health requires active maintenance. Compaction, snapshot expiration, and orphan cleanup must run automatically as part of the platform — not as a future roadmap item. Budget 10-15% of your compute capacity for maintenance operations.</p>
+      </div>
+    </section>
+
+
+    <!-- Section 11: Code Examples -->
+    <section id="code-examples" class="section">
+      <h2>Code Examples</h2>
+
+      <h3>Iceberg Table Creation (Complete)</h3>
+      <pre><code class="language-sql">-- Production Iceberg table with all best practices
+CREATE TABLE lakehouse.silver.orders (
+    -- Business columns
+    order_id        BIGINT       COMMENT 'Unique order identifier',
+    customer_id     BIGINT       COMMENT 'FK to customers table',
+    order_date      TIMESTAMP    COMMENT 'Order placement time (UTC)',
+    ship_date       TIMESTAMP    COMMENT 'Actual ship time (UTC)',
+    status          STRING       COMMENT 'Order lifecycle status',
+    total_amount    DECIMAL(18,2) COMMENT 'Order total in USD',
+    currency        STRING       COMMENT 'Original currency code',
+    region          STRING       COMMENT 'Geographic region',
+    country         STRING       COMMENT 'Country code (ISO 3166)',
+    items           ARRAY&lt;STRUCT&lt;
+        item_id: BIGINT,
+        product_id: BIGINT,
+        quantity: INT,
+        unit_price: DECIMAL(18,2)
+    &gt;&gt;                          COMMENT 'Order line items (nested)',
+
+    -- Metadata columns
+    _source_system  STRING       COMMENT 'Source system identifier',
+    _cdc_operation  STRING       COMMENT 'CDC op: INSERT/UPDATE/DELETE',
+    _processed_at   TIMESTAMP    COMMENT 'Silver layer processing time',
+    _batch_id       STRING       COMMENT 'Processing batch identifier'
+)
+USING iceberg
+PARTITIONED BY (
+    days(order_date),            -- Hidden partition: auto-derives day from timestamp
+    bucket(16, customer_id)      -- Hash distribution for join performance
+)
+TBLPROPERTIES (
+    'format-version' = '2',                          -- V2 for row-level deletes
+    'write.format.default' = 'parquet',
+    'write.parquet.compression-codec' = 'zstd',      -- Best compression ratio
+    'write.target-file-size-bytes' = '134217728',    -- 128 MB target
+    'write.distribution-mode' = 'hash',              -- Distribute by partition
+    'write.metadata.delete-after-commit.enabled' = 'true',
+    'write.metadata.previous-versions-max' = '100',
+    'history.expire.max-snapshot-age-ms' = '604800000',  -- 7 days
+    'read.split.target-size' = '134217728',
+    'commit.retry.num-retries' = '4',
+    'commit.retry.min-wait-ms' = '100',
+    'write.spark.fanout.enabled' = 'true'
+);
+
+-- Add sort order for query performance
+ALTER TABLE lakehouse.silver.orders
+WRITE ORDERED BY (order_date, customer_id);
+
+-- Verify table metadata
+SELECT * FROM lakehouse.silver.orders.snapshots;
+SELECT * FROM lakehouse.silver.orders.manifests;
+SELECT * FROM lakehouse.silver.orders.files WHERE file_size_in_bytes &lt; 16777216;</code></pre>
+
+      <h3>Delta Lake MERGE (Upsert Pattern)</h3>
+      <pre><code class="language-sql">-- Delta Lake MERGE: idempotent upsert from Bronze to Silver
+-- Handles inserts, updates, and soft deletes in a single statement
+
+MERGE INTO silver.orders AS target
+USING (
+    -- Source: deduplicated Bronze changes since last checkpoint
+    WITH ranked_changes AS (
+        SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY order_id
+                ORDER BY _ingested_at DESC, _cdc_timestamp DESC
+            ) AS _rank
+        FROM bronze.orders
+        WHERE _ingested_at > '{{ last_processed_timestamp }}'
+    )
+    SELECT * FROM ranked_changes WHERE _rank = 1
+) AS source
+ON target.order_id = source.order_id
+
+-- Update existing orders (only if source is newer)
+WHEN MATCHED
+    AND source._cdc_operation = 'UPDATE'
+    AND source._cdc_timestamp > target._cdc_timestamp
+THEN UPDATE SET
+    target.status = source.status,
+    target.total_amount = source.total_amount,
+    target.ship_date = source.ship_date,
+    target._cdc_operation = source._cdc_operation,
+    target._cdc_timestamp = source._cdc_timestamp,
+    target._processed_at = current_timestamp()
+
+-- Soft delete (mark as deleted, don't remove)
+WHEN MATCHED
+    AND source._cdc_operation = 'DELETE'
+THEN UPDATE SET
+    target.status = 'deleted',
+    target._cdc_operation = 'DELETE',
+    target._cdc_timestamp = source._cdc_timestamp,
+    target._processed_at = current_timestamp()
+
+-- Insert new orders
+WHEN NOT MATCHED
+    AND source._cdc_operation IN ('INSERT', 'UPDATE')
+THEN INSERT (
+    order_id, customer_id, order_date, ship_date,
+    status, total_amount, currency, region, country,
+    _source_system, _cdc_operation, _cdc_timestamp, _processed_at, _batch_id
+)
+VALUES (
+    source.order_id, source.customer_id, source.order_date, source.ship_date,
+    source.status, source.total_amount, source.currency, source.region, source.country,
+    source._source_system, source._cdc_operation, source._cdc_timestamp,
+    current_timestamp(), '{{ batch_id }}'
+);
+
+-- Post-merge: optimize recently written files
+OPTIMIZE silver.orders
+WHERE order_date >= current_date() - INTERVAL 7 DAYS
+ZORDER BY (customer_id, order_date);</code></pre>
+
+      <h3>Hudi Upsert Configuration (Spark)</h3>
+      <pre><code class="language-python"># Apache Hudi: production upsert configuration
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+    .config("spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.hudi.catalog.HoodieCatalog") \
+    .getOrCreate()
+
+# Hudi write configuration for CDC upsert workload
+hudi_options = {
+    # Table configuration
+    "hoodie.table.name": "orders",
+    "hoodie.datasource.write.table.type": "MERGE_ON_READ",  # MoR for CDC
+    "hoodie.datasource.write.recordkey.field": "order_id",
+    "hoodie.datasource.write.precombine.field": "_cdc_timestamp",
+    "hoodie.datasource.write.partitionpath.field": "order_date",
+    "hoodie.datasource.write.operation": "upsert",
+
+    # Write tuning
+    "hoodie.upsert.shuffle.parallelism": "200",
+    "hoodie.insert.shuffle.parallelism": "200",
+    "hoodie.bulkinsert.shuffle.parallelism": "200",
+
+    # Index configuration (for fast upsert lookups)
+    "hoodie.index.type": "BLOOM",
+    "hoodie.bloom.index.filter.type": "DYNAMIC_V0",
+    "hoodie.bloom.index.update.partition.path": "true",
+
+    # File sizing
+    "hoodie.parquet.max.file.size": str(128 * 1024 * 1024),  # 128 MB
+    "hoodie.parquet.small.file.limit": str(64 * 1024 * 1024),  # 64 MB
+    "hoodie.parquet.compression.codec": "zstd",
+
+    # Compaction (MoR: merge log files into base files)
+    "hoodie.compact.inline": "false",
+    "hoodie.compact.schedule.inline": "true",
+    "hoodie.compact.inline.max.delta.commits": "10",
+    "hoodie.compaction.strategy": "org.apache.hudi.table.action.compact."
+                                  "strategy.LogFileSizeBasedCompactionStrategy",
+    "hoodie.compaction.target.io": str(500 * 1024 * 1024),  # 500 MB
+
+    # Cleaning (remove old file versions)
+    "hoodie.clean.automatic": "true",
+    "hoodie.cleaner.policy": "KEEP_LATEST_COMMITS",
+    "hoodie.cleaner.commits.retained": "10",
+
+    # Metadata table (speeds up file listing)
+    "hoodie.metadata.enable": "true",
+    "hoodie.metadata.index.bloom.filter.enable": "true",
+    "hoodie.metadata.index.column.stats.enable": "true",
+
+    # Clustering (sort data for better query performance)
+    "hoodie.clustering.inline": "false",
+    "hoodie.clustering.schedule.inline": "true",
+    "hoodie.clustering.inline.max.commits": "4",
+    "hoodie.clustering.plan.strategy.sort.columns": "customer_id,order_date",
+    "hoodie.clustering.plan.strategy.target.file.max.bytes": str(256 * 1024 * 1024),
+}
+
+# Execute upsert
+incoming_df.write \
+    .format("hudi") \
+    .options(**hudi_options) \
+    .mode("append") \
+    .save("s3://lakehouse/silver/orders/")</code></pre>
+
+      <h3>dbt Models for Medallion Layers</h3>
+      <pre><code class="language-sql">-- models/silver/silver_orders.sql
+-- dbt incremental model: Bronze → Silver transformation
+
+{{ config(
+    materialized='incremental',
+    unique_key='order_id',
+    incremental_strategy='merge',
+    file_format='iceberg',
+    partition_by=['order_date_day'],
+    on_schema_change='append_new_columns',
+    tags=['silver', 'orders', 'hourly']
+) }}
+
+WITH bronze_raw AS (
+    SELECT *
+    FROM {{ source('bronze', 'orders') }}
+    {% if is_incremental() %}
+        WHERE _ingested_at > (SELECT MAX(_processed_at) FROM {{ this }})
+    {% endif %}
+),
+
+deduplicated AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY order_id
+            ORDER BY _ingested_at DESC
+        ) AS _dedup_rank
+    FROM bronze_raw
+),
+
+cleansed AS (
+    SELECT
+        CAST(order_id AS BIGINT)              AS order_id,
+        CAST(customer_id AS BIGINT)           AS customer_id,
+        TO_UTC_TIMESTAMP(order_date, 'UTC')   AS order_date,
+        DATE(order_date)                      AS order_date_day,
+        CAST(total_amount AS DECIMAL(18,2))   AS total_amount,
+        UPPER(TRIM(currency))                 AS currency,
+        LOWER(TRIM(status))                   AS status,
+        TRIM(region)                          AS region,
+        UPPER(TRIM(country))                  AS country,
+        _source_system,
+        _ingested_at,
+        CURRENT_TIMESTAMP()                   AS _processed_at
+    FROM deduplicated
+    WHERE _dedup_rank = 1
+      AND order_id IS NOT NULL
+      AND total_amount > 0
+      AND currency IS NOT NULL
+)
+
+SELECT * FROM cleansed</code></pre>
+
+      <pre><code class="language-sql">-- models/gold/gold_daily_revenue.sql
+-- dbt model: Silver → Gold aggregation
+
+{{ config(
+    materialized='incremental',
+    unique_key='surrogate_key',
+    incremental_strategy='merge',
+    file_format='iceberg',
+    partition_by=['revenue_date'],
+    tags=['gold', 'finance', 'daily']
+) }}
+
+WITH order_facts AS (
+    SELECT
+        o.order_date_day     AS revenue_date,
+        o.region,
+        o.country,
+        o.currency,
+        o.total_amount,
+        o.status,
+        c.customer_segment,
+        c.acquisition_channel
+    FROM {{ ref('silver_orders') }} o
+    INNER JOIN {{ ref('silver_customers') }} c
+        ON o.customer_id = c.customer_id
+    WHERE o.status NOT IN ('cancelled', 'deleted')
+    {% if is_incremental() %}
+        AND o._processed_at > (SELECT MAX(_computed_at) FROM {{ this }})
+    {% endif %}
+),
+
+aggregated AS (
+    SELECT
+        revenue_date,
+        region,
+        country,
+        currency,
+        customer_segment,
+        acquisition_channel,
+        COUNT(*)                             AS order_count,
+        COUNT(DISTINCT customer_id)          AS unique_customers,
+        SUM(total_amount)                    AS gross_revenue,
+        AVG(total_amount)                    AS avg_order_value,
+        PERCENTILE_APPROX(total_amount, 0.5) AS median_order_value,
+        MIN(total_amount)                    AS min_order_value,
+        MAX(total_amount)                    AS max_order_value
+    FROM order_facts
+    GROUP BY 1, 2, 3, 4, 5, 6
+)
+
+SELECT
+    {{ dbt_utils.generate_surrogate_key([
+        'revenue_date', 'region', 'country', 'currency',
+        'customer_segment', 'acquisition_channel'
+    ]) }}                                    AS surrogate_key,
+    *,
+    CURRENT_TIMESTAMP()                     AS _computed_at
+FROM aggregated</code></pre>
+
+      <pre><code class="language-yaml"># dbt project structure for medallion architecture
+# dbt_project.yml
+
+name: lakehouse_transforms
+version: '2.0.0'
+
+profile: lakehouse_iceberg
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+models:
+  lakehouse_transforms:
+    bronze:
+      +materialized: view    # Bronze is external (Iceberg source tables)
+      +tags: ['bronze']
+    silver:
+      +materialized: incremental
+      +file_format: iceberg
+      +tags: ['silver']
+      +on_schema_change: append_new_columns
+      +post-hook:
+        - "{{ optimize_iceberg(this) }}"
+    gold:
+      +materialized: incremental
+      +file_format: iceberg
+      +tags: ['gold']
+      +post-hook:
+        - "{{ optimize_iceberg(this) }}"
+
+vars:
+  silver_freshness_threshold: "INTERVAL 1 HOUR"
+  gold_freshness_threshold: "INTERVAL 4 HOURS"</code></pre>
+    </section>
+
+
+    <!-- Section 12: Common Mistakes -->
+    <section id="common-mistakes" class="section">
+      <h2>Common Mistakes</h2>
+
+      <h3>1. No Compaction Strategy</h3>
+      <p><strong>Mistake:</strong> Teams deploy ingestion pipelines without automated compaction, leading to millions of small files that degrade query performance exponentially over time.</p>
+      <p><strong>Fix:</strong> Implement compaction as a first-class service from day one. Schedule bin-packing to run every 4-6 hours on hot tables, with alerts on average file size and total file count.</p>
+
+      <h3>2. Over-Partitioning</h3>
+      <p><strong>Mistake:</strong> Partitioning by high-cardinality columns (e.g., <code>user_id</code>, <code>session_id</code>) creates thousands of partitions with tiny files in each.</p>
+      <p><strong>Fix:</strong> Partition by low-cardinality time dimensions (day/month). Use bucketing or Z-ORDER for high-cardinality filter columns. Rule of thumb: each partition should contain at least 128 MB of data.</p>
+
+      <h3>3. Treating Lakehouse Like a Database</h3>
+      <p><strong>Mistake:</strong> Running frequent single-row updates/deletes as you would with PostgreSQL. Each operation creates a new snapshot and potentially rewrites entire files.</p>
+      <p><strong>Fix:</strong> Batch mutations. Collect changes in a staging area and apply them as a single MERGE operation. For Hudi, use MoR storage type for write-heavy tables.</p>
+
+      <h3>4. Ignoring Schema Evolution</h3>
+      <p><strong>Mistake:</strong> Breaking downstream consumers by renaming columns, changing types, or dropping columns without coordination.</p>
+      <p><strong>Fix:</strong> Use data contracts. Iceberg's ID-based schema evolution allows safe renames. Define breaking vs non-breaking changes in your governance policy. Version your schemas.</p>
+
+      <h3>5. No Data Quality Gates Between Layers</h3>
+      <p><strong>Mistake:</strong> Propagating corrupt, incomplete, or duplicate data from Bronze through Silver to Gold without validation.</p>
+      <p><strong>Fix:</strong> Implement quality gates at each layer transition. Bronze→Silver requires deduplication checks, null validation, and type casting. Silver→Gold requires referential integrity, business rule validation, and reconciliation with source systems.</p>
+
+      <h3>6. Vendor Lock-In Through Proprietary Features</h3>
+      <p><strong>Mistake:</strong> Building deep dependencies on vendor-specific features (Databricks-only Delta features, Snowflake-specific SQL) that prevent multi-engine access.</p>
+      <p><strong>Fix:</strong> Use the open-source core of your table format. Test that tables are readable by at least two engines (e.g., Spark + Trino). Keep proprietary features at the compute layer, not the storage layer.</p>
+
+      <h3>7. Skipping Metadata Catalog</h3>
+      <p><strong>Mistake:</strong> Building a lakehouse with hundreds of tables but no discovery mechanism. Teams cannot find existing data and create redundant datasets.</p>
+      <p><strong>Fix:</strong> Deploy a metadata catalog (DataHub, Unity Catalog, OpenMetadata) early. Automate metadata collection from table format metadata, dbt docs, and pipeline orchestrators.</p>
+
+      <h3>8. No Cost Attribution</h3>
+      <p><strong>Mistake:</strong> Running a lakehouse at $500K/year in cloud costs with no visibility into which teams, tables, or pipelines drive the spend.</p>
+      <p><strong>Fix:</strong> Implement cost tagging from day one. Tag all resources (S3 prefixes, compute jobs, catalog entries) with team/domain ownership. Build cost dashboards that show spend per table and per pipeline.</p>
+
+      <h3>9. Mixing Governance Levels in One Table</h3>
+      <p><strong>Mistake:</strong> Storing PII and non-PII data in the same table without column-level access controls, making it impossible to grant broad read access.</p>
+      <p><strong>Fix:</strong> Design tables with governance boundaries in mind. Either use column-level masking (Unity Catalog, Trino access control) or separate sensitive columns into restricted tables joined by foreign key.</p>
+
+      <h3>10. Ignoring Time Zones</h3>
+      <p><strong>Mistake:</strong> Ingesting timestamps in local time zones without standardizing to UTC. This causes incorrect joins, duplicate windows, and wrong aggregation boundaries in a global organization.</p>
+      <p><strong>Fix:</strong> Convert all timestamps to UTC at the Bronze→Silver boundary. Store the original timezone as a separate column if needed for display. Use <code>event_time_utc</code> for all partitioning and windowing.</p>
+    </section>
+
+
+    <!-- Section 13: Trade-offs -->
+    <section id="trade-offs" class="section">
+      <h2>Trade-offs</h2>
+
+      <h3>Delta Lake vs Iceberg vs Hudi — Decision Matrix</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Scenario</th>
+            <th>Best Choice</th>
+            <th>Reasoning</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Multi-engine lakehouse (Spark + Trino + Flink)</td>
+            <td>Apache Iceberg</td>
+            <td>Broadest engine support, vendor-neutral, partition evolution eliminates lock-in to one query pattern</td>
+          </tr>
+          <tr>
+            <td>Databricks-centric platform</td>
+            <td>Delta Lake</td>
+            <td>Deepest integration with Databricks Runtime, best performance on their platform, UniForm for cross-format reads</td>
+          </tr>
+          <tr>
+            <td>CDC-heavy workload (1000s of source tables)</td>
+            <td>Apache Hudi</td>
+            <td>Native upsert performance, MoR for fast writes, incremental queries designed for CDC patterns</td>
+          </tr>
+          <tr>
+            <td>Petabyte-scale analytics (Netflix/Apple scale)</td>
+            <td>Apache Iceberg</td>
+            <td>Manifest-based metadata scales to millions of files, hidden partitioning avoids user errors, proven at largest scales</td>
+          </tr>
+          <tr>
+            <td>Simple batch ETL (Spark-only)</td>
+            <td>Delta Lake</td>
+            <td>Simplest API, best Spark integration, OPTIMIZE + Z-ORDER are one-liners, lowest learning curve</td>
+          </tr>
+          <tr>
+            <td>AWS-native stack (Athena, EMR, Glue)</td>
+            <td>Iceberg (primary) or Hudi</td>
+            <td>Both have deep AWS integration. Iceberg: better Athena support. Hudi: better EMR/Glue integration historically.</td>
+          </tr>
+          <tr>
+            <td>Streaming + batch unification</td>
+            <td>Apache Iceberg (with Flink)</td>
+            <td>Flink-Iceberg connector is production-ready, supports streaming writes with exactly-once semantics</td>
+          </tr>
+          <tr>
+            <td>Existing Hive ecosystem migration</td>
+            <td>Apache Iceberg</td>
+            <td>In-place table migration from Hive, no data rewrite needed, backward-compatible catalog integration</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Single Vendor vs Multi-Vendor</h3>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Dimension</th>
+            <th>Single Vendor (e.g., all-Databricks)</th>
+            <th>Multi-Vendor (open-source stack)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Time to production</td>
+            <td>Fast (integrated, pre-configured)</td>
+            <td>Slow (integration, compatibility testing)</td>
+          </tr>
+          <tr>
+            <td>Operational complexity</td>
+            <td>Low (managed services)</td>
+            <td>High (multiple systems to operate)</td>
+          </tr>
+          <tr>
+            <td>Cost at scale</td>
+            <td>High (vendor markup, DBU pricing)</td>
+            <td>Lower (open-source + cloud primitives)</td>
+          </tr>
+          <tr>
+            <td>Vendor lock-in risk</td>
+            <td>High (proprietary features, data gravity)</td>
+            <td>Low (open formats, portable)</td>
+          </tr>
+          <tr>
+            <td>Engineering hire difficulty</td>
+            <td>Medium (vendor-specific skills)</td>
+            <td>Low (broad open-source skills)</td>
+          </tr>
+          <tr>
+            <td>Feature velocity</td>
+            <td>High (vendor roadmap alignment)</td>
+            <td>Variable (community-driven)</td>
+          </tr>
+          <tr>
+            <td>Support</td>
+            <td>Enterprise SLA</td>
+            <td>Community + paid support options</td>
+          </tr>
+          <tr>
+            <td>Multi-cloud portability</td>
+            <td>Low (usually cloud-aligned)</td>
+            <td>High (run anywhere)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Key Architecture Trade-offs</h3>
+      <ul>
+        <li><strong>Freshness vs Cost:</strong> Real-time ingestion (Flink CDC every second) costs 5-10x more in compute than hourly micro-batch. Most BI use cases do not need sub-minute freshness. Match ingestion frequency to actual business SLAs, not aspirational ones.</li>
+        <li><strong>Normalization vs Denormalization:</strong> Silver layer should be normalized (single source of truth per entity). Gold layer should be denormalized (pre-joined for query performance). This increases storage slightly but dramatically reduces query complexity and cost.</li>
+        <li><strong>Open format vs Managed service:</strong> Open formats (Iceberg on S3) give maximum flexibility but require operational investment. Managed services (Snowflake, BigQuery) handle operations but lock you in. Hybrid approach: use open formats for the platform, with managed OLAP engines as acceleration layers.</li>
+        <li><strong>Governance strictness vs Developer velocity:</strong> Strict governance (every column tagged, every access approved, every change reviewed) slows innovation. Too-loose governance creates compliance risks and data quality issues. Implement governance in tiers: strict for Gold/PII, moderate for Silver, minimal for Bronze/sandbox.</li>
+        <li><strong>Compaction frequency vs Write amplification:</strong> Frequent compaction keeps files optimal but adds compute cost and write amplification. Infrequent compaction saves compute but degrades read performance. Balance: compact when small file ratio exceeds 30% or average file size drops below 64 MB.</li>
+      </ul>
+    </section>
+
+
+    <!-- Section 14: Follow-up Questions -->
+    <section id="follow-up-questions" class="section">
+      <h2>Follow-up Questions</h2>
+      <p>Senior candidates should be prepared for these deep-dive follow-ups:</p>
+
+      <h3>Architecture &amp; Design</h3>
+      <ul>
+        <li><strong>"How would you handle schema conflicts when 50 microservices are publishing to your Bronze layer?"</strong> — Schema registry (Confluent, Glue) with backward/forward compatibility rules. Schema-on-write validation at ingestion. Breaking changes require versioned topics.</li>
+        <li><strong>"Your CEO wants a real-time dashboard showing revenue by region, updated every 10 seconds. How do you architect this?"</strong> — Don't query the lakehouse at 10s intervals. Use a streaming pipeline (Flink) that maintains materialized state in a serving layer (Redis, ClickHouse, or Pinot). Lakehouse is the source of truth for reprocessing, not the serving layer.</li>
+        <li><strong>"How do you handle late-arriving data that needs to update already-computed Gold aggregates?"</strong> — Re-aggregate affected time windows. Use watermarks to define "late" cutoff. For extreme late arrivals, implement a reconciliation job that periodically recomputes Gold from Silver for the last N days.</li>
+      </ul>
+
+      <h3>Table Formats &amp; Storage</h3>
+      <ul>
+        <li><strong>"Explain how Iceberg handles concurrent writers without locks."</strong> — Optimistic concurrency: each writer reads the current metadata pointer, computes changes, and attempts an atomic swap of the metadata file reference in the catalog. If another writer committed first, the operation retries (validating no conflicting changes to the same files).</li>
+        <li><strong>"A table has 10 PB of data and you need to change the partition scheme. What are your options?"</strong> — Iceberg: partition evolution (coexist old + new schemes, zero rewrite). Delta/Hudi: must rewrite all data (prohibitively expensive at 10 PB). Alternative: create a new table with the new scheme and backfill incrementally over weeks.</li>
+        <li><strong>"How does Z-ORDER actually work? Why is it better than sorting on one column?"</strong> — Z-ORDER interleaves bits from multiple columns into a single value using a space-filling curve. This clusters data along multiple dimensions simultaneously, so filters on any subset of Z-ORDER columns benefit from data skipping (min/max statistics).</li>
+      </ul>
+
+      <h3>Operations &amp; Production</h3>
+      <ul>
+        <li><strong>"You deployed a bad transformation that corrupted Silver data for the last 3 hours. How do you recover?"</strong> — Time travel: restore the table to the last known-good snapshot. Replay the correction from Bronze (which is immutable). Notify downstream consumers via data quality alerts.</li>
+        <li><strong>"How do you test lakehouse pipeline changes before deploying to production?"</strong> — Iceberg branching (catalog-level branches/tags), or environment-level isolation with shared Bronze. Run the new pipeline version on a branch, compare outputs with production, promote once validated.</li>
+        <li><strong>"Your Spark job writing to Iceberg occasionally fails with 'CommitFailedException.' Why?"</strong> — Optimistic concurrency conflict. Two jobs modified overlapping files concurrently. Fix: increase retry count, reduce job overlap (schedule sequentially or partition workload), use Iceberg's conflict resolution policies.</li>
+      </ul>
+
+      <h3>Governance &amp; Compliance</h3>
+      <ul>
+        <li><strong>"A user exercises their GDPR Right to Erasure. Walk me through the technical implementation."</strong> — Queue deletion request → identify all tables containing user data (lineage graph) → execute row-level DELETE across Bronze/Silver/Gold → expire affected snapshots → verify deletion via audit query → generate compliance certificate.</li>
+        <li><strong>"How do you prevent a junior analyst from accidentally querying raw PII data?"</strong> — Catalog-enforced access control. PII columns tagged at ingestion. Default policy masks PII for all non-privileged roles. Column-level access grants require approval workflow with data steward review.</li>
+      </ul>
+
+      <h3>Cost &amp; Performance</h3>
+      <ul>
+        <li><strong>"Your lakehouse costs $2M/year and the CFO wants 40% reduction. Where do you cut?"</strong> — Audit: (1) Storage tiering for cold Bronze data (30-40% storage savings), (2) Spot instances for Spark jobs (60-70% compute savings), (3) Compaction to reduce API call costs, (4) Decommission unused Gold tables (usage-based cleanup), (5) Right-size compute clusters based on actual utilization.</li>
+        <li><strong>"Query A ran in 5 seconds last week but now takes 5 minutes. What changed?"</strong> — Check: (1) File count growth (compaction needed?), (2) Partition values (new data added to scanned partitions?), (3) Statistics stale (column stats not updated after schema change?), (4) Concurrent workload (resource contention?), (5) Plan regression (engine upgrade changed optimizer behavior?).</li>
+      </ul>
+    </section>
+
+
+    <!-- Section 15: Summary -->
+    <section id="summary" class="section">
+      <h2>Summary</h2>
+      <div class="callout callout-summary">
+        <h3>Key Takeaways</h3>
+        <ol>
+          <li><strong>A lakehouse is an architecture, not a product.</strong> It combines cheap object storage with open table formats (Iceberg/Delta/Hudi) to deliver warehouse-like capabilities without warehouse-like costs or lock-in.</li>
+          <li><strong>Open table formats are the enabling technology.</strong> They add ACID transactions, schema evolution, time travel, and performance optimizations on top of Parquet files in S3. Iceberg is emerging as the industry standard for multi-engine interoperability.</li>
+          <li><strong>Medallion architecture provides progressive refinement.</strong> Bronze preserves raw data for reprocessing. Silver cleanses and conforms. Gold aggregates for consumption. Data contracts enforce quality between layers.</li>
+          <li><strong>Governance must be designed in, not bolted on.</strong> Centralized catalog, column-level access control, PII tagging, lineage tracking, and audit logging are non-negotiable for a production platform.</li>
+          <li><strong>Operational excellence separates good lakehouses from data swamps.</strong> Automated compaction, snapshot expiration, orphan cleanup, and monitoring are not optional — they are required for the platform to function at scale.</li>
+          <li><strong>Cost optimization is a design concern.</strong> Storage tiering, compute auto-scaling (with spot instances), and file size management can reduce costs by 60-80% compared to naive configurations.</li>
+          <li><strong>Choose your table format based on ecosystem alignment.</strong> Iceberg for multi-engine/vendor-neutral. Delta for Databricks-centric. Hudi for CDC-heavy workloads. All three are converging in capability.</li>
+          <li><strong>Ingestion patterns must match business SLAs.</strong> Not everything needs real-time. Match CDC (seconds), micro-batch (minutes), and full-load (hours/daily) to actual freshness requirements.</li>
+          <li><strong>Plan for operations from day zero.</strong> The 2M small files incident is not hypothetical — it happens to every lakehouse that does not implement compaction proactively. Build the maintenance service before it becomes an emergency.</li>
+          <li><strong>The lakehouse does not replace everything.</strong> Use specialized serving engines (ClickHouse, Pinot, Redis) for sub-second interactive workloads. The lakehouse is the platform of record; serving layers are acceleration tiers.</li>
+        </ol>
+      </div>
+
+      <h3>Architecture Decision Checklist</h3>
+      <pre><code class="language-bash"># Before presenting your lakehouse design, ensure you've addressed:
+#
+# ☐ Table format choice with justification (Delta/Iceberg/Hudi)
+# ☐ Storage layout (medallion layers, naming conventions, partitioning)
+# ☐ Ingestion strategy per source type (CDC, batch, streaming, API)
+# ☐ Compute engine selection and multi-engine strategy
+# ☐ Catalog and governance (access control, PII, lineage)
+# ☐ Data quality framework (contracts, tests, monitoring)
+# ☐ Operational automation (compaction, expiration, lifecycle)
+# ☐ Cost model (storage tiering, compute scaling, budget)
+# ☐ Disaster recovery (time travel, cross-region replication)
+# ☐ Performance optimization (file sizing, clustering, caching)
+# ☐ Team ownership model (centralized platform vs domain ownership)
+# ☐ Migration path from existing systems</code></pre>
+    </section>
+
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch17-incorrect-dashboard-metrics.html" class="chapter-nav-prev">← Previous: Ch 17</a>
+      <a href="../index.html" class="chapter-nav-next">Back to Index →</a>
+    </nav>
+
+  </main>
+
+  <!-- Scripts -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

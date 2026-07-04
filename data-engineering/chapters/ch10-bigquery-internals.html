@@ -1,0 +1,2277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ch 10 — BigQuery Internals | Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/main.css">
+  <link rel="stylesheet" href="../../assets/css/chapters.css">
+  <link rel="stylesheet" href="../../assets/css/prism.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <span class="brand">Interview Handbook</span>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-number">Ch 10</span>
+      <span class="chapter-title">BigQuery Internals</span>
+    </div>
+    <nav class="sidebar-nav">
+      <a href="#interviewer-intent">Interviewer Intent</a>
+      <a href="#quick-answer">Quick Answer</a>
+      <a href="#serverless-architecture">Serverless Architecture</a>
+      <a href="#dremel-tree">Dremel Execution Tree</a>
+      <a href="#capacitor-storage">Capacitor Storage Format</a>
+      <a href="#shuffle-service">Shuffle Service</a>
+      <a href="#slot-scheduling">Slot Scheduling</a>
+      <a href="#query-stages">Query Stages &amp; Execution</a>
+      <a href="#nested-data">Nested &amp; Repeated Data</a>
+      <a href="#cost-model">BigQuery Cost Model</a>
+      <a href="#vs-postgresql">Key Differences from PostgreSQL</a>
+      <a href="#production-incident">Production Incident</a>
+      <a href="#code-examples">Code Examples</a>
+      <a href="#common-mistakes">Common Mistakes</a>
+      <a href="#trade-offs">Trade-offs</a>
+      <a href="#follow-up-questions">Follow-up Questions</a>
+      <a href="#summary">Summary</a>
+    </nav>
+    <div class="sidebar-actions">
+      <button class="btn-prev" onclick="location.href='ch09-warehouse-design.html'">Previous Chapter</button>
+      <button class="btn-next" onclick="location.href='ch11-snowflake-internals.html'">Next Chapter</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../../index.html">Home</a> &gt;
+      <a href="../index.html">Part III</a> &gt;
+      <span>Chapter 10</span>
+    </nav>
+
+    <header class="chapter-header">
+      <h1>How Does BigQuery Execute SQL Differently from PostgreSQL?</h1>
+      <span class="badge badge-hard">Hard</span>
+      <div class="topics">
+        <span class="topic-tag">BigQuery</span>
+        <span class="topic-tag">Dremel</span>
+      </div>
+    </header>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="ch09-warehouse-design.html">Previous: Warehouse Design</a>
+      <a class="next" href="ch11-snowflake-internals.html">Next: Snowflake Internals</a>
+    </nav>
+
+    <!-- ============================================================
+         SECTION 1: INTERVIEWER INTENT
+         ============================================================ -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <p>
+        When a FAANG interviewer asks "How does BigQuery execute SQL differently
+        from PostgreSQL?", they are probing for multiple layers of understanding:
+      </p>
+      <ul>
+        <li>
+          <strong>Distributed systems knowledge:</strong> Can you articulate how a
+          massively parallel processing (MPP) engine differs from a single-node
+          RDBMS at the architecture level?
+        </li>
+        <li>
+          <strong>Storage-compute separation:</strong> Do you understand why
+          BigQuery can scale independently and what trade-offs that introduces?
+        </li>
+        <li>
+          <strong>Columnar vs row-based execution:</strong> Can you explain how
+          Capacitor's columnar format changes I/O patterns, compression, and
+          query planning?
+        </li>
+        <li>
+          <strong>Cost awareness:</strong> Do you understand the pricing model and
+          how architectural decisions (partitioning, clustering, nested pruning)
+          directly impact cost?
+        </li>
+        <li>
+          <strong>Production experience:</strong> Have you debugged real BigQuery
+          performance issues, read execution plans, and optimized slot usage?
+        </li>
+        <li>
+          <strong>Trade-off articulation:</strong> Can you explain when PostgreSQL
+          is actually better than BigQuery and vice versa?
+        </li>
+      </ul>
+      <p>
+        This question separates candidates who have merely used BigQuery's SQL
+        interface from those who understand the distributed execution engine
+        underneath. A senior Data Engineer should be able to trace a query from
+        submission through Dremel's execution tree to final result materialization.
+      </p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 2: QUICK ANSWER
+         ============================================================ -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <p>
+        BigQuery is a serverless, columnar, massively parallel analytics engine
+        built on Google's Dremel technology. Unlike PostgreSQL — a single-node,
+        row-oriented OLTP database — BigQuery separates storage (Capacitor files
+        on Colossus/GCS) from compute (dynamically allocated slots), executes
+        queries via a multi-level serving tree (root → mixers → leaf nodes), and
+        prices queries by bytes scanned rather than compute time. It has no
+        indexes, no VACUUM, no connection limits, and no traditional query
+        optimizer with cost-based index selection. Instead, it relies on columnar
+        pruning, partitioning, clustering, and massive parallelism to achieve
+        sub-minute latency on petabyte-scale datasets.
+      </p>
+      <div class="key-insight">
+        <strong>One-liner:</strong> PostgreSQL optimizes single-node execution
+        with indexes and buffer pools; BigQuery optimizes distributed execution
+        with columnar storage, slot parallelism, and shuffle-based data movement.
+      </div>
+    </section>
+
+    <!-- ============================================================
+         SECTION 3: SERVERLESS ARCHITECTURE
+         ============================================================ -->
+    <section id="serverless-architecture">
+      <h2>Serverless Architecture</h2>
+      <p>
+        BigQuery's serverless model is fundamentally different from PostgreSQL's
+        process-per-connection architecture. Understanding this separation is
+        critical for senior engineers.
+      </p>
+
+      <h3>Separation of Compute and Storage</h3>
+      <p>
+        In PostgreSQL, data files live on the same machine as the query executor.
+        The buffer pool caches pages in shared memory, and sequential/random I/O
+        patterns directly affect query latency. Scaling requires either vertical
+        scaling (bigger machine) or read replicas.
+      </p>
+      <p>
+        BigQuery completely decouples these layers:
+      </p>
+      <ul>
+        <li>
+          <strong>Storage layer:</strong> Data is stored in Capacitor columnar
+          format on Google's distributed file system (Colossus). Storage is
+          managed, replicated, and encrypted automatically. You pay for storage
+          separately (~$0.02/GB/month for active, ~$0.01/GB/month for long-term).
+        </li>
+        <li>
+          <strong>Compute layer:</strong> Query execution uses dynamically
+          allocated "slots" — units of computational capacity that combine CPU,
+          memory, and network resources. Slots are drawn from a shared pool
+          (on-demand) or reserved capacity (flat-rate).
+        </li>
+        <li>
+          <strong>Network layer:</strong> Jupiter network fabric provides
+          petabit-scale bisection bandwidth between storage and compute, making
+          remote storage access nearly as fast as local disk for sequential reads.
+        </li>
+      </ul>
+
+      <h3>Slot-Based Execution</h3>
+      <p>
+        A "slot" in BigQuery is an abstraction over a unit of computational work.
+        Each slot represents approximately 0.5 CPU core with associated memory.
+        Key properties:
+      </p>
+      <ul>
+        <li>On-demand projects get up to 2,000 slots by default (burstable)</li>
+        <li>Flat-rate reservations guarantee dedicated slots (100+ slot increments)</li>
+        <li>Slots are allocated dynamically across query stages</li>
+        <li>A single query can use thousands of slots in parallel</li>
+        <li>Slots are stateless — they pull data from Colossus as needed</li>
+      </ul>
+      <pre><code class="language-text">
+┌─────────────────────────────────────────────────────────────┐
+│                    BigQuery Architecture                      │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌──────────┐    ┌──────────────────────────────────────┐   │
+│  │  Client  │───▶│  BigQuery API / Query Router          │   │
+│  └──────────┘    └──────────────┬───────────────────────┘   │
+│                                  │                            │
+│                                  ▼                            │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │              Dremel Execution Engine                   │   │
+│  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐    │   │
+│  │  │ Slot 1 │  │ Slot 2 │  │ Slot 3 │  │ Slot N │    │   │
+│  │  └────┬───┘  └────┬───┘  └────┬───┘  └────┬───┘    │   │
+│  └───────┼────────────┼──────────┼────────────┼────────┘   │
+│           │            │          │            │              │
+│           ▼            ▼          ▼            ▼              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │            Jupiter Network Fabric                     │   │
+│  └──────────────────────────┬───────────────────────────┘   │
+│                              │                                │
+│                              ▼                                │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │        Colossus Distributed File System               │   │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐             │   │
+│  │  │Capacitor│  │Capacitor│  │Capacitor│  ...         │   │
+│  │  │ File 1  │  │ File 2  │  │ File 3  │             │   │
+│  │  └─────────┘  └─────────┘  └─────────┘             │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+      </code></pre>
+
+      <h3>Multi-Tenancy</h3>
+      <p>
+        BigQuery serves thousands of projects simultaneously on shared
+        infrastructure. This multi-tenant model introduces important behaviors:
+      </p>
+      <ul>
+        <li>
+          <strong>Fair scheduling:</strong> On-demand queries share a slot pool.
+          During peak usage, individual queries may receive fewer slots, causing
+          slower execution but never failure.
+        </li>
+        <li>
+          <strong>Isolation via reservations:</strong> Flat-rate customers get
+          guaranteed slot capacity isolated from other tenants. Queries within a
+          reservation compete only with each other.
+        </li>
+        <li>
+          <strong>No "noisy neighbor" for storage:</strong> Since Colossus
+          handles storage separately, one tenant's heavy writes don't affect
+          another tenant's read performance.
+        </li>
+        <li>
+          <strong>Automatic scaling:</strong> Unlike PostgreSQL where you must
+          provision for peak load, BigQuery automatically scales compute to
+          match query complexity.
+        </li>
+      </ul>
+      <p>
+        <strong>PostgreSQL contrast:</strong> PostgreSQL uses a process-per-connection
+        model with shared buffers. Each connection consumes memory and a system
+        process. Typical limits are 100-500 concurrent connections before
+        requiring connection pooling (PgBouncer). There is no multi-tenancy —
+        resource isolation requires separate database clusters.
+      </p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 4: DREMEL EXECUTION TREE
+         ============================================================ -->
+    <section id="dremel-tree">
+      <h2>Dremel Execution Tree</h2>
+      <p>
+        BigQuery's execution engine is derived from Google's Dremel paper (2010).
+        Unlike PostgreSQL's single-process volcano-style iterator model, Dremel
+        uses a multi-level serving tree that distributes work across thousands of
+        nodes simultaneously.
+      </p>
+
+      <h3>Tree Structure</h3>
+      <pre><code class="language-text">
+                    ┌──────────────┐
+                    │  Root Server │  (Query coordination, final aggregation)
+                    └──────┬───────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+        ┌─────▼─────┐ ┌───▼─────┐ ┌───▼─────┐
+        │  Mixer 1  │ │ Mixer 2 │ │ Mixer 3 │  (Intermediate aggregation)
+        └─────┬─────┘ └────┬────┘ └────┬────┘
+              │             │           │
+     ┌────┬──┴──┐    ┌────┼───┐   ┌───┼───┐
+     │    │     │    │    │   │   │   │   │
+   ┌─▼─┐┌▼──┐┌─▼─┐┌▼──┐┌▼─┐┌▼─┐┌▼─┐┌▼─┐┌▼─┐
+   │L1 ││L2 ││L3 ││L4 ││L5││L6││L7││L8││L9│  (Leaf nodes: scan + filter)
+   └───┘└───┘└───┘└───┘└──┘└──┘└──┘└──┘└──┘
+      </code></pre>
+
+      <h3>Root Server</h3>
+      <p>
+        The root server is the entry point for query execution. Its
+        responsibilities include:
+      </p>
+      <ul>
+        <li>Receiving the parsed and optimized query plan</li>
+        <li>Distributing work to mixer nodes</li>
+        <li>Performing final aggregation (e.g., final GROUP BY merge)</li>
+        <li>Applying final ORDER BY and LIMIT operations</li>
+        <li>Returning results to the client</li>
+        <li>Coordinating query cancellation and timeout</li>
+      </ul>
+
+      <h3>Mixer Nodes</h3>
+      <p>
+        Mixers serve as intermediate aggregation layers. In a typical query:
+      </p>
+      <ul>
+        <li>
+          <strong>Partial aggregation:</strong> Leaf nodes compute local
+          aggregates (e.g., partial SUM, partial COUNT). Mixers combine these
+          partial results, reducing data volume before it reaches the root.
+        </li>
+        <li>
+          <strong>Multi-level fan-in:</strong> For extremely large queries,
+          multiple mixer levels can exist, creating a deeper tree that handles
+          higher cardinality aggregations efficiently.
+        </li>
+        <li>
+          <strong>Shuffle boundaries:</strong> Mixers handle data redistribution
+          when operations require repartitioning (e.g., JOIN, GROUP BY on
+          high-cardinality keys).
+        </li>
+      </ul>
+
+      <h3>Leaf Nodes</h3>
+      <p>
+        Leaf nodes perform the bulk of computation:
+      </p>
+      <ul>
+        <li>
+          <strong>Columnar scanning:</strong> Read only the required columns from
+          Capacitor files on Colossus. A query selecting 3 columns from a
+          200-column table reads ~1.5% of the data.
+        </li>
+        <li>
+          <strong>Predicate pushdown:</strong> Filters are applied during the scan
+          phase, eliminating rows before they enter memory. Capacitor metadata
+          (min/max values, bloom filters) enables skipping entire file segments.
+        </li>
+        <li>
+          <strong>Local computation:</strong> Projections, expressions, and
+          partial aggregations execute on the leaf before data is sent upstream.
+        </li>
+        <li>
+          <strong>Parallel execution:</strong> Thousands of leaf nodes process
+          different partitions of the data simultaneously.
+        </li>
+      </ul>
+
+      <h3>Multi-Level Aggregation Example</h3>
+      <p>
+        Consider a query: <code>SELECT country, COUNT(*) FROM events GROUP BY country</code>
+        on a 10TB table:
+      </p>
+      <ol>
+        <li>
+          <strong>Leaf nodes (3,000+):</strong> Each scans a portion of the
+          <code>country</code> column, computes a local hash map of
+          {country → count}, and sends partial results upstream.
+        </li>
+        <li>
+          <strong>Mixer nodes (50-100):</strong> Each receives partial maps from
+          ~30-60 leaf nodes, merges them into larger partial maps, reducing total
+          data from millions of entries to thousands.
+        </li>
+        <li>
+          <strong>Root server:</strong> Merges the final ~50-100 partial maps into
+          the complete result set (~200 countries).
+        </li>
+      </ol>
+      <p>
+        This multi-level approach means the root never processes raw data — it
+        only handles pre-aggregated results, keeping memory usage bounded regardless
+        of input size.
+      </p>
+
+      <h3>PostgreSQL Contrast</h3>
+      <p>
+        PostgreSQL executes queries in a single process using the volcano iterator
+        model. Each operator (SeqScan, HashJoin, Sort) pulls tuples from its child
+        operator one at a time. Parallelism is limited to Parallel Seq Scan with a
+        small number of workers (typically 2-8). There is no multi-level
+        aggregation tree — a parallel aggregate uses a single Gather node that
+        collects results from all workers.
+      </p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 5: CAPACITOR STORAGE FORMAT
+         ============================================================ -->
+    <section id="capacitor-storage">
+      <h2>Capacitor Storage Format</h2>
+      <p>
+        Capacitor is BigQuery's proprietary columnar storage format, evolved from
+        the encoding described in the Dremel paper. It is conceptually similar to
+        Apache Parquet but optimized for Google's infrastructure.
+      </p>
+
+      <h3>Columnar Layout</h3>
+      <p>
+        Unlike PostgreSQL's heap files where each page contains complete rows,
+        Capacitor stores each column independently:
+      </p>
+      <pre><code class="language-text">
+PostgreSQL Heap Page:                  Capacitor File:
+┌────────────────────────┐             ┌────────────────────┐
+│ Row 1: [A1,B1,C1,...Z1]│             │ Column A: [A1,A2,A3...]│
+│ Row 2: [A2,B2,C2,...Z2]│             │ Column B: [B1,B2,B3...]│
+│ Row 3: [A3,B3,C3,...Z3]│             │ Column C: [C1,C2,C3...]│
+│ ...                    │             │ ...                    │
+└────────────────────────┘             │ Column Z: [Z1,Z2,Z3...]│
+                                       └────────────────────────┘
+      </code></pre>
+      <p>
+        Benefits of columnar storage for analytics:
+      </p>
+      <ul>
+        <li>
+          <strong>I/O reduction:</strong> A query touching 5 of 200 columns reads
+          only 2.5% of the stored data.
+        </li>
+        <li>
+          <strong>Better compression:</strong> Values in a single column share the
+          same data type and often similar values, enabling 5-10x better
+          compression than row-oriented storage.
+        </li>
+        <li>
+          <strong>Vectorized processing:</strong> Columnar data can be processed
+          using SIMD instructions, operating on hundreds of values per CPU cycle.
+        </li>
+      </ul>
+
+      <h3>Nested Encoding: Repetition and Definition Levels</h3>
+      <p>
+        BigQuery natively supports nested and repeated data (STRUCT, ARRAY) without
+        requiring joins. Capacitor encodes this using the Dremel paper's repetition
+        and definition level scheme:
+      </p>
+      <ul>
+        <li>
+          <strong>Repetition level (r):</strong> Indicates which repeated field in
+          the path has repeated to produce this value. A value of 0 means a new
+          top-level record.
+        </li>
+        <li>
+          <strong>Definition level (d):</strong> Indicates how many optional/repeated
+          fields in the path are actually defined (not NULL). This distinguishes
+          between a NULL nested field vs a NULL leaf value.
+        </li>
+      </ul>
+      <pre><code class="language-text">
+Schema: record { name (required), links { forward (repeated) } }
+
+Data:
+  Record 1: { name: "Alice", links: { forward: [10, 20] } }
+  Record 2: { name: "Bob",   links: NULL }
+  Record 3: { name: "Carol", links: { forward: [30] } }
+
+Encoding of links.forward column:
+  Value   r   d
+  10      0   2    (new record, fully defined)
+  20      1   2    (repeated forward, fully defined)
+  NULL    0   0    (new record, links is NULL)
+  30      0   2    (new record, fully defined)
+      </code></pre>
+      <p>
+        This encoding allows BigQuery to store deeply nested JSON-like structures
+        in columnar format without flattening, and to reconstruct nested objects
+        efficiently during query execution.
+      </p>
+
+      <h3>Dictionary Encoding</h3>
+      <p>
+        Capacitor uses dictionary encoding for low-cardinality columns:
+      </p>
+      <ul>
+        <li>
+          A dictionary maps unique values to integer IDs (e.g., "US" → 0,
+          "UK" → 1, "DE" → 2).
+        </li>
+        <li>
+          The column data stores only the integer IDs, using minimal bits
+          (e.g., 8 bits for up to 256 unique values).
+        </li>
+        <li>
+          Predicates can be evaluated directly on dictionary IDs without
+          decoding string values.
+        </li>
+        <li>
+          For high-cardinality columns, Capacitor falls back to direct encoding
+          with run-length or bit-packing optimizations.
+        </li>
+      </ul>
+
+      <h3>File Metadata and Pruning</h3>
+      <p>
+        Each Capacitor file contains rich metadata that enables aggressive pruning:
+      </p>
+      <ul>
+        <li>
+          <strong>Min/max statistics:</strong> Per-column, per-block min and max
+          values allow the query engine to skip entire blocks that cannot satisfy
+          a predicate.
+        </li>
+        <li>
+          <strong>Null counts:</strong> Quick determination of whether a column
+          segment contains any non-null values.
+        </li>
+        <li>
+          <strong>Row counts:</strong> Used for optimizing COUNT(*) queries without
+          reading data.
+        </li>
+        <li>
+          <strong>Bloom filters:</strong> Probabilistic membership tests that
+          enable skipping blocks for equality predicates.
+        </li>
+      </ul>
+      <p>
+        <strong>PostgreSQL contrast:</strong> PostgreSQL stores data in 8KB heap
+        pages with optional TOAST for large values. It relies on indexes (B-tree,
+        GIN, GiST) for selective access. Without indexes, it performs sequential
+        scans reading all columns regardless of the query's SELECT list.
+      </p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 6: SHUFFLE SERVICE
+         ============================================================ -->
+    <section id="shuffle-service">
+      <h2>Shuffle Service</h2>
+      <p>
+        The shuffle is one of BigQuery's most critical differentiators from both
+        PostgreSQL and other MPP databases. It enables large-scale data
+        redistribution between query stages without writing to disk.
+      </p>
+
+      <h3>Jupiter Network Fabric</h3>
+      <p>
+        Google's Jupiter network provides over 1 Petabit/sec of bisection bandwidth
+        within a datacenter. This means:
+      </p>
+      <ul>
+        <li>
+          Any compute node can communicate with any other at near-local speeds.
+        </li>
+        <li>
+          Data movement between query stages does not require disk serialization
+          as an intermediate step.
+        </li>
+        <li>
+          The network is non-blocking — thousands of simultaneous shuffles from
+          different queries can proceed without congestion.
+        </li>
+      </ul>
+
+      <h3>In-Memory Shuffle</h3>
+      <p>
+        BigQuery's shuffle service operates as a distributed in-memory buffer:
+      </p>
+      <ol>
+        <li>
+          <strong>Producer stage:</strong> Slots that finish computing their
+          partition write shuffle output to the shuffle service's memory buffers,
+          tagged with destination partition keys.
+        </li>
+        <li>
+          <strong>Shuffle service:</strong> A distributed RAM-based storage layer
+          that holds intermediate data. It automatically manages memory pressure
+          and replication for fault tolerance.
+        </li>
+        <li>
+          <strong>Consumer stage:</strong> Slots in the next query stage pull their
+          assigned partitions from the shuffle service when they are ready to
+          process.
+        </li>
+      </ol>
+      <pre><code class="language-text">
+Query Stage 1 (Scan + Hash)          Query Stage 2 (Aggregate)
+┌──────────────────────┐             ┌──────────────────────┐
+│ Slot A: scan part 1  │──┐     ┌──▶│ Slot X: agg key=0-99 │
+│ Slot B: scan part 2  │──┤     │   │ Slot Y: agg key=100+ │
+│ Slot C: scan part 3  │──┤     │   └──────────────────────┘
+└──────────────────────┘  │     │
+                           ▼     │
+                  ┌─────────────────┐
+                  │  Shuffle Service │
+                  │  (In-Memory)     │
+                  │                   │
+                  │  Partition 0-99 ──┼───▶ Slot X
+                  │  Partition 100+ ──┼───▶ Slot Y
+                  └─────────────────┘
+      </code></pre>
+
+      <h3>No Disk Spill in Standard Path</h3>
+      <p>
+        Unlike Spark or Hadoop MapReduce, BigQuery's standard execution path does
+        not spill shuffle data to disk:
+      </p>
+      <ul>
+        <li>
+          The shuffle service has enough aggregate RAM to hold intermediate data
+          for concurrent queries across the cluster.
+        </li>
+        <li>
+          If a query's shuffle volume is exceptionally large, BigQuery may use
+          persistent shuffle (writing to Colossus), but this is rare and handled
+          transparently.
+        </li>
+        <li>
+          This no-spill design means shuffle-heavy operations (large JOINs,
+          high-cardinality GROUP BYs) complete much faster than equivalent
+          disk-based shuffles.
+        </li>
+      </ul>
+
+      <h3>Implications for Query Design</h3>
+      <ul>
+        <li>
+          <strong>JOIN performance:</strong> Large hash joins that would be
+          catastrophically slow in disk-based MPP systems are routine in BigQuery
+          because shuffle data stays in RAM.
+        </li>
+        <li>
+          <strong>Skew handling:</strong> BigQuery automatically detects shuffle
+          skew (one partition significantly larger than others) and can re-split
+          hot partitions across multiple slots.
+        </li>
+        <li>
+          <strong>Pipeline overlap:</strong> Producer and consumer stages can
+          overlap — consumers start pulling data as soon as producers begin
+          writing, creating a streaming pipeline effect.
+        </li>
+      </ul>
+      <p>
+        <strong>PostgreSQL contrast:</strong> PostgreSQL has no shuffle concept. For
+        parallel queries, Hash Join uses shared memory hash tables. A parallel
+        Gather node collects results from workers through shared memory queues.
+        Cross-node data movement does not exist in single-node PostgreSQL. In
+        Citus (distributed PostgreSQL), shuffles write to disk and are a major
+        performance bottleneck.
+      </p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 7: SLOT SCHEDULING
+         ============================================================ -->
+    <section id="slot-scheduling">
+      <h2>Slot Scheduling</h2>
+      <p>
+        BigQuery's slot scheduler determines how computational resources are
+        allocated to queries. Understanding slot behavior is essential for
+        performance tuning and capacity planning.
+      </p>
+
+      <h3>How Slots Map to Query Stages</h3>
+      <p>
+        A single query is decomposed into multiple stages, and each stage can
+        use a different number of slots:
+      </p>
+      <ul>
+        <li>
+          <strong>Scan stages:</strong> Typically use the most slots because
+          parallelism is limited only by the number of storage files to read.
+          A scan of a large table might use 2,000+ slots.
+        </li>
+        <li>
+          <strong>Compute stages:</strong> Slot count depends on data volume and
+          computational complexity. Aggregation stages may use fewer slots than
+          scan stages if data has been significantly reduced.
+        </li>
+        <li>
+          <strong>Write stages:</strong> Usually the fewest slots, as the final
+          result set is typically small.
+        </li>
+      </ul>
+      <pre><code class="language-text">
+Query: SELECT country, SUM(revenue) FROM sales
+       WHERE year = 2024 GROUP BY country ORDER BY 2 DESC LIMIT 10
+
+Stage 1 (Scan + Filter):     2,000 slots → Read year column, filter, read revenue+country
+Stage 2 (Partial Aggregate):   500 slots → Local GROUP BY per slot
+Stage 3 (Shuffle + Merge):     100 slots → Global GROUP BY, sort, limit
+Stage 4 (Write):                 1 slot  → Write final 10 rows to result buffer
+      </code></pre>
+
+      <h3>Fair Scheduling</h3>
+      <p>
+        When multiple queries compete for the same slot pool, BigQuery uses fair
+        scheduling:
+      </p>
+      <ul>
+        <li>
+          <strong>On-demand:</strong> All queries in a project share a burst pool.
+          During contention, slots are divided roughly equally among active
+          queries. A single large query cannot starve smaller ones.
+        </li>
+        <li>
+          <strong>Reservations:</strong> Queries within a reservation share that
+          reservation's guaranteed slots. An admin can create multiple
+          reservations with different slot counts for different workloads (e.g.,
+          ETL vs interactive analytics).
+        </li>
+        <li>
+          <strong>Priority tiers:</strong> Within a reservation, assignments can
+          have priority (INTERACTIVE vs BATCH). INTERACTIVE queries get
+          preferential slot access; BATCH queries use idle slots and can be
+          preempted.
+        </li>
+      </ul>
+
+      <h3>Reservations vs On-Demand</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Aspect</th>
+            <th>On-Demand</th>
+            <th>Flat-Rate (Reservations)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Pricing</td>
+            <td>$6.25 per TB scanned</td>
+            <td>~$2,000/month per 100 slots</td>
+          </tr>
+          <tr>
+            <td>Slot availability</td>
+            <td>Best-effort, burstable</td>
+            <td>Guaranteed allocation</td>
+          </tr>
+          <tr>
+            <td>Cost predictability</td>
+            <td>Variable (data-dependent)</td>
+            <td>Fixed monthly cost</td>
+          </tr>
+          <tr>
+            <td>Concurrency</td>
+            <td>Throttled under load</td>
+            <td>Controlled by reservation size</td>
+          </tr>
+          <tr>
+            <td>Best for</td>
+            <td>Ad-hoc queries, low volume</td>
+            <td>Predictable workloads, high volume</td>
+          </tr>
+          <tr>
+            <td>Idle cost</td>
+            <td>$0 when not querying</td>
+            <td>Paying for reserved slots 24/7</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Slot Utilization Monitoring</h3>
+      <p>
+        Senior engineers should monitor slot utilization to right-size reservations:
+      </p>
+      <ul>
+        <li>
+          <code>INFORMATION_SCHEMA.JOBS</code> shows <code>total_slot_ms</code>
+          per query — actual slot-milliseconds consumed.
+        </li>
+        <li>
+          Peak slot usage = <code>total_slot_ms / elapsed_ms</code> gives average
+          parallelism during execution.
+        </li>
+        <li>
+          Reservation admin views show slot utilization over time, helping identify
+          over-provisioning or under-provisioning.
+        </li>
+        <li>
+          A query's execution plan shows per-stage slot counts and wait times,
+          indicating contention.
+        </li>
+      </ul>
+      <p>
+        <strong>PostgreSQL contrast:</strong> PostgreSQL has no concept of slots.
+        Resource management uses <code>max_connections</code>,
+        <code>max_parallel_workers</code>, and <code>work_mem</code> settings.
+        There is no dynamic resource allocation — you must pre-provision for peak
+        load. Resource groups (available in some forks like Greenplum) provide
+        limited query-level resource isolation.
+      </p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 8: QUERY STAGES & EXECUTION
+         ============================================================ -->
+    <section id="query-stages">
+      <h2>Query Stages &amp; Execution</h2>
+      <p>
+        BigQuery decomposes every query into a directed acyclic graph (DAG) of
+        stages. Understanding stages is essential for reading execution plans and
+        diagnosing performance issues.
+      </p>
+
+      <h3>Reading Stages</h3>
+      <p>
+        The first stages in any query involve reading data from Colossus:
+      </p>
+      <ul>
+        <li>
+          <strong>Column selection:</strong> Only columns referenced in SELECT,
+          WHERE, JOIN, GROUP BY, and ORDER BY clauses are read.
+        </li>
+        <li>
+          <strong>Partition pruning:</strong> If the table is partitioned and the
+          query filters on the partition column, only relevant partitions are
+          scanned.
+        </li>
+        <li>
+          <strong>Cluster pruning:</strong> For clustered tables, block-level
+          metadata is used to skip blocks where the clustered column's range
+          doesn't match the filter.
+        </li>
+        <li>
+          <strong>Predicate pushdown:</strong> Simple predicates (equality,
+          range comparisons) are pushed into the storage layer and evaluated
+          during decompression.
+        </li>
+      </ul>
+
+      <h3>Compute Stages</h3>
+      <p>
+        After data is read, compute stages perform transformations:
+      </p>
+      <ul>
+        <li>
+          <strong>Filter evaluation:</strong> Complex predicates that cannot be
+          pushed to storage (e.g., UDF-based filters, cross-column comparisons).
+        </li>
+        <li>
+          <strong>Projection &amp; expression evaluation:</strong> Computing derived
+          columns, type casts, and function applications.
+        </li>
+        <li>
+          <strong>Aggregation:</strong> Partial and full GROUP BY operations,
+          window functions, and DISTINCT processing.
+        </li>
+        <li>
+          <strong>Join execution:</strong> Hash joins (broadcast or shuffle-based),
+          with the smaller table typically broadcast to all slots processing the
+          larger table.
+        </li>
+        <li>
+          <strong>Sort operations:</strong> ORDER BY processing, typically in the
+          final stages after data volume has been reduced.
+        </li>
+      </ul>
+
+      <h3>Write Stages</h3>
+      <p>
+        The final stage writes results:
+      </p>
+      <ul>
+        <li>
+          <strong>Result table:</strong> For <code>CREATE TABLE AS SELECT</code>
+          or <code>INSERT INTO</code>, data is written back to Capacitor files
+          on Colossus.
+        </li>
+        <li>
+          <strong>Temporary result:</strong> For interactive queries, results are
+          written to a temporary table cached for 24 hours.
+        </li>
+        <li>
+          <strong>Streaming buffer:</strong> For DML operations, mutations go
+          through a streaming buffer before being merged into base Capacitor files.
+        </li>
+      </ul>
+
+      <h3>Parallel Pipeline Execution</h3>
+      <p>
+        Unlike traditional batch processing where stages execute sequentially,
+        BigQuery pipelines stages:
+      </p>
+      <pre><code class="language-text">
+Time ──────────────────────────────────────────────────▶
+
+Stage 1 (Scan):    ████████████████░░░░░░░░░░░░░░░░░░░
+Stage 2 (Agg):    ░░░░░░░████████████████░░░░░░░░░░░░
+Stage 3 (Join):    ░░░░░░░░░░░░░████████████████░░░░░░
+Stage 4 (Write):   ░░░░░░░░░░░░░░░░░░░░░░░██████████░
+
+                   └─── Overlap! Stages don't wait for
+                        full completion before starting ──┘
+      </code></pre>
+      <p>
+        This pipelining means:
+      </p>
+      <ul>
+        <li>
+          Stage 2 begins processing as soon as Stage 1 starts producing output
+          via the shuffle service.
+        </li>
+        <li>
+          Total query time is less than the sum of individual stage times.
+        </li>
+        <li>
+          Memory pressure is reduced because not all intermediate data needs to
+          be materialized simultaneously.
+        </li>
+      </ul>
+
+      <h3>Execution Plan Reading</h3>
+      <p>
+        BigQuery's execution plan (visible in the Console UI or via
+        <code>INFORMATION_SCHEMA.JOBS</code>) shows:
+      </p>
+      <ul>
+        <li><strong>Stage ID:</strong> Sequential identifier for each stage</li>
+        <li><strong>Input/Output rows:</strong> How many rows entered and left each stage</li>
+        <li><strong>Slot time:</strong> Total compute time consumed (slot-milliseconds)</li>
+        <li><strong>Wait time:</strong> Time slots spent waiting (indicates contention)</li>
+        <li><strong>Shuffle bytes:</strong> Data volume sent between stages</li>
+        <li><strong>Parallelism:</strong> Number of workers active in each stage</li>
+      </ul>
+      <p>
+        <strong>PostgreSQL contrast:</strong> PostgreSQL's <code>EXPLAIN ANALYZE</code>
+        shows a single execution tree with per-operator timings. There are no
+        stages, no shuffle, and parallelism is represented by Gather/Gather Merge
+        nodes. The plan is a tree (not a DAG) and executes in a pull-based
+        iterator model rather than a push-based pipeline.
+      </p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 9: NESTED & REPEATED DATA
+         ============================================================ -->
+    <section id="nested-data">
+      <h2>Nested &amp; Repeated Data</h2>
+      <p>
+        BigQuery's first-class support for nested and repeated data is a key
+        differentiator from PostgreSQL. It fundamentally changes data modeling
+        patterns for analytics workloads.
+      </p>
+
+      <h3>STRUCT Type</h3>
+      <p>
+        A STRUCT groups related fields into a single column:
+      </p>
+      <pre><code class="language-sql">-- Table definition with nested STRUCTs
+CREATE TABLE analytics.events (
+  event_id STRING,
+  event_time TIMESTAMP,
+  user STRUCT&lt;
+    id STRING,
+    name STRING,
+    geo STRUCT&lt;
+      country STRING,
+      city STRING,
+      lat FLOAT64,
+      lng FLOAT64
+    &gt;
+  &gt;,
+  device STRUCT&lt;
+    type STRING,
+    os STRING,
+    browser STRING
+  &gt;,
+  page STRUCT&lt;
+    url STRING,
+    title STRING,
+    referrer STRING
+  &gt;
+);
+
+-- Querying nested fields
+SELECT
+  user.geo.country,
+  COUNT(*) as event_count
+FROM analytics.events
+WHERE device.type = 'mobile'
+GROUP BY user.geo.country;</code></pre>
+
+      <h3>ARRAY Type (Repeated Fields)</h3>
+      <p>
+        Arrays allow one-to-many relationships within a single row, eliminating
+        the need for joins:
+      </p>
+      <pre><code class="language-sql">-- Table with repeated fields
+CREATE TABLE analytics.orders (
+  order_id STRING,
+  customer_id STRING,
+  order_date DATE,
+  items ARRAY&lt;STRUCT&lt;
+    product_id STRING,
+    product_name STRING,
+    quantity INT64,
+    unit_price NUMERIC,
+    tags ARRAY&lt;STRING&gt;
+  &gt;&gt;,
+  shipping STRUCT&lt;
+    address STRING,
+    city STRING,
+    tracking_numbers ARRAY&lt;STRING&gt;
+  &gt;
+);
+
+-- Querying arrays with UNNEST
+SELECT
+  o.order_id,
+  item.product_name,
+  item.quantity * item.unit_price AS line_total
+FROM analytics.orders o,
+  UNNEST(o.items) AS item
+WHERE item.quantity > 5;</code></pre>
+
+      <h3>UNNEST Operations</h3>
+      <p>
+        <code>UNNEST</code> flattens an array into rows, enabling standard SQL
+        operations on repeated data:
+      </p>
+      <ul>
+        <li>
+          <strong>Cross join UNNEST:</strong> Produces one row per array element,
+          duplicating parent fields. Used for filtering or aggregating within
+          arrays.
+        </li>
+        <li>
+          <strong>Correlated UNNEST:</strong> Used in WHERE EXISTS or subqueries
+          to filter parent rows based on array contents.
+        </li>
+        <li>
+          <strong>UNNEST with OFFSET:</strong> Provides positional index of array
+          elements for order-dependent operations.
+        </li>
+      </ul>
+      <pre><code class="language-sql">-- Find orders containing a specific product
+SELECT order_id, order_date
+FROM analytics.orders
+WHERE EXISTS (
+  SELECT 1 FROM UNNEST(items) AS item
+  WHERE item.product_id = 'SKU-12345'
+);
+
+-- Aggregate within arrays
+SELECT
+  order_id,
+  (SELECT SUM(i.quantity * i.unit_price) FROM UNNEST(items) i) AS order_total,
+  ARRAY_LENGTH(items) AS item_count
+FROM analytics.orders;</code></pre>
+
+      <h3>Nested Pruning in Capacitor</h3>
+      <p>
+        This is where BigQuery's columnar storage shines with nested data:
+      </p>
+      <ul>
+        <li>
+          Each leaf field in a nested schema is stored as a separate column in
+          Capacitor. <code>user.geo.country</code> is an independent column from
+          <code>user.geo.city</code>.
+        </li>
+        <li>
+          Querying <code>SELECT user.geo.country FROM events</code> reads ONLY
+          the <code>user.geo.country</code> column — not the entire
+          <code>user</code> struct.
+        </li>
+        <li>
+          This nested pruning means wide, deeply nested schemas have minimal cost
+          when queries touch few fields.
+        </li>
+        <li>
+          Repeated fields (arrays) use repetition levels to reconstruct the array
+          structure without storing redundant parent data.
+        </li>
+      </ul>
+      <div class="key-insight">
+        <strong>Critical insight:</strong> Using <code>SELECT user.*</code> on a
+        struct with 50 sub-fields reads all 50 columns. Using
+        <code>SELECT user.geo.country</code> reads only 1 column. This difference
+        can mean scanning 200MB vs 10GB — directly affecting both performance and
+        cost.
+      </div>
+
+      <h3>PostgreSQL Contrast</h3>
+      <p>
+        PostgreSQL supports JSONB for semi-structured data, but with significant
+        differences:
+      </p>
+      <ul>
+        <li>
+          JSONB is stored as a single binary blob per row — there is no columnar
+          sub-field access. Accessing one key reads the entire JSONB value.
+        </li>
+        <li>
+          PostgreSQL arrays exist but lack BigQuery's deep integration with the
+          columnar storage engine.
+        </li>
+        <li>
+          GIN indexes on JSONB provide fast lookups but don't offer the I/O
+          savings of columnar nested pruning.
+        </li>
+        <li>
+          In PostgreSQL, the equivalent of BigQuery's nested modeling typically
+          requires normalized tables with JOINs — adding complexity and I/O.
+        </li>
+      </ul>
+    </section>
+
+    <!-- ============================================================
+         SECTION 10: BIGQUERY COST MODEL
+         ============================================================ -->
+    <section id="cost-model">
+      <h2>BigQuery Cost Model</h2>
+      <p>
+        Understanding BigQuery's cost model is essential for senior engineers
+        because architectural decisions directly translate to dollar costs.
+        This is fundamentally different from PostgreSQL where cost is fixed
+        (hardware + licenses) regardless of query patterns.
+      </p>
+
+      <h3>Bytes Scanned Pricing (On-Demand)</h3>
+      <p>
+        In on-demand mode, BigQuery charges based on the amount of data processed
+        (bytes read from storage):
+      </p>
+      <ul>
+        <li><strong>Rate:</strong> $6.25 per TB scanned (as of 2024)</li>
+        <li><strong>Minimum charge:</strong> 10 MB per query (even if less is read)</li>
+        <li><strong>Free tier:</strong> First 1 TB of processing per month is free</li>
+        <li><strong>Cached results:</strong> Queries that hit the 24-hour cache cost $0</li>
+        <li><strong>DML:</strong> INSERT, UPDATE, DELETE, MERGE charge for bytes processed</li>
+      </ul>
+
+      <h3>What Counts as "Bytes Scanned"</h3>
+      <ul>
+        <li>
+          <strong>Column selection:</strong> Only columns in your query are counted.
+          SELECT 2 of 100 columns = ~2% of table size billed.
+        </li>
+        <li>
+          <strong>Partition pruning:</strong> Filtered partitions are not scanned
+          and not billed.
+        </li>
+        <li>
+          <strong>Clustering:</strong> Blocks that don't match cluster key filters
+          are skipped and not billed.
+        </li>
+        <li>
+          <strong>Compressed size:</strong> You are billed on uncompressed logical
+          bytes, NOT the physical compressed size. A column compressed 10:1 still
+          bills for the full uncompressed size.
+        </li>
+      </ul>
+
+      <h3>LIMIT Does NOT Reduce Cost</h3>
+      <div class="key-insight">
+        <strong>Critical misconception:</strong> Adding <code>LIMIT 10</code> to a
+        query does NOT reduce bytes scanned. BigQuery must scan all matching data,
+        perform the full computation, and then return only 10 rows. The scan cost
+        is identical with or without LIMIT.
+      </div>
+      <pre><code class="language-sql">-- These two queries cost EXACTLY the same:
+SELECT * FROM bigdata.events;                    -- Scans 5 TB
+SELECT * FROM bigdata.events LIMIT 10;           -- STILL scans 5 TB
+
+-- To actually reduce cost, use partition/cluster filters:
+SELECT * FROM bigdata.events
+WHERE event_date = '2024-01-15'                  -- Partition prune: scans 50 GB
+  AND user_country = 'US'                        -- Cluster prune: scans 5 GB
+LIMIT 10;</code></pre>
+
+      <h3>Flat-Rate vs On-Demand Decision Framework</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Factor</th>
+            <th>Choose On-Demand</th>
+            <th>Choose Flat-Rate</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Monthly scan volume</td>
+            <td>&lt; 50 TB/month</td>
+            <td>&gt; 50 TB/month</td>
+          </tr>
+          <tr>
+            <td>Query patterns</td>
+            <td>Sporadic, ad-hoc</td>
+            <td>Continuous ETL pipelines</td>
+          </tr>
+          <tr>
+            <td>Budget requirement</td>
+            <td>Variable OK</td>
+            <td>Fixed budget required</td>
+          </tr>
+          <tr>
+            <td>Performance SLA</td>
+            <td>Best-effort acceptable</td>
+            <td>Guaranteed slots needed</td>
+          </tr>
+          <tr>
+            <td>Concurrency</td>
+            <td>Low (< 20 concurrent)</td>
+            <td>High (50+ concurrent)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Cost Control Strategies</h3>
+      <ol>
+        <li>
+          <strong>Partitioning:</strong> Time-based partitioning on event date
+          means queries with date filters only scan relevant days. A 3-year table
+          filtered to 1 day scans ~0.09% of total data.
+        </li>
+        <li>
+          <strong>Clustering:</strong> Within each partition, data is sorted by
+          cluster key columns. Filters on these columns skip entire blocks,
+          reducing scan by 50-90%.
+        </li>
+        <li>
+          <strong>Column projection:</strong> Select only needed columns.
+          <code>SELECT *</code> on a 200-column table is 100x more expensive than
+          selecting 2 columns.
+        </li>
+        <li>
+          <strong>Materialized views:</strong> Pre-compute expensive aggregations.
+          BigQuery automatically routes queries to MVs when applicable.
+        </li>
+        <li>
+          <strong>Query result caching:</strong> Identical queries within 24 hours
+          return cached results at $0 cost (unless underlying data changed).
+        </li>
+        <li>
+          <strong>Custom cost controls:</strong> Set per-user, per-project daily
+          byte quotas. Queries exceeding the limit are rejected.
+        </li>
+      </ol>
+      <pre><code class="language-sql">-- Estimate query cost before running (dry run)
+-- In bq CLI:
+-- bq query --dry_run --use_legacy_sql=false 'SELECT ...'
+
+-- Check bytes billed after execution
+SELECT
+  job_id,
+  total_bytes_billed,
+  total_bytes_billed / POW(1024, 4) * 6.25 AS estimated_cost_usd
+FROM `region-us`.INFORMATION_SCHEMA.JOBS
+WHERE creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+ORDER BY total_bytes_billed DESC
+LIMIT 20;</code></pre>
+
+      <h3>PostgreSQL Contrast</h3>
+      <p>
+        PostgreSQL has no per-query cost in monetary terms. You pay for the server
+        (or managed service like RDS/Aurora) regardless of query patterns. This
+        means:
+      </p>
+      <ul>
+        <li>A bad query doesn't cost more money — it costs time and blocks other queries</li>
+        <li>There's no financial incentive to select fewer columns (though I/O still matters)</li>
+        <li>Capacity planning is based on peak concurrent load, not data volume scanned</li>
+        <li>Cost optimization focuses on right-sizing instances, not query rewriting</li>
+      </ul>
+    </section>
+
+    <!-- ============================================================
+         SECTION 11: KEY DIFFERENCES FROM POSTGRESQL
+         ============================================================ -->
+    <section id="vs-postgresql">
+      <h2>Key Differences from PostgreSQL</h2>
+      <p>
+        This section provides a comprehensive comparison for engineers transitioning
+        between the two systems or designing architectures that use both.
+      </p>
+
+      <h3>No Indexes</h3>
+      <p>
+        BigQuery has no user-created indexes of any kind — no B-trees, no hash
+        indexes, no GIN/GiST indexes. Instead, it relies on:
+      </p>
+      <ul>
+        <li><strong>Partition pruning:</strong> Coarse-grained data skipping based on partition column values</li>
+        <li><strong>Cluster block pruning:</strong> Fine-grained skipping based on sorted block metadata</li>
+        <li><strong>Capacitor metadata:</strong> Per-column min/max, bloom filters, null counts</li>
+        <li><strong>Brute-force parallelism:</strong> Scanning 1TB across 2,000 slots takes seconds</li>
+      </ul>
+      <p>
+        This design works because BigQuery's workload is full-table analytics
+        where indexes would be counterproductive (reading an index for a query
+        returning 30% of rows is slower than a sequential scan).
+      </p>
+
+      <h3>No VACUUM</h3>
+      <p>
+        PostgreSQL requires VACUUM to reclaim dead tuple space from MVCC updates
+        and prevent transaction ID wraparound. BigQuery has no equivalent because:
+      </p>
+      <ul>
+        <li>
+          <strong>Immutable storage:</strong> Capacitor files are immutable. Updates
+          create new files; old versions are garbage collected automatically.
+        </li>
+        <li>
+          <strong>No MVCC overhead:</strong> BigQuery uses snapshot isolation at
+          the storage layer without per-row version tracking.
+        </li>
+        <li>
+          <strong>Automatic compaction:</strong> Background processes merge small
+          files and remove obsolete data without user intervention.
+        </li>
+        <li>
+          <strong>No bloat:</strong> Table size reflects actual live data, not
+          dead rows awaiting vacuum.
+        </li>
+      </ul>
+
+      <h3>No Connection Limits</h3>
+      <p>
+        PostgreSQL's process-per-connection model limits concurrent connections
+        (typically 100-500 before requiring PgBouncer). BigQuery:
+      </p>
+      <ul>
+        <li>Is API-based — no persistent connections to manage</li>
+        <li>Handles thousands of concurrent queries across a project</li>
+        <li>Has no connection pooling requirement</li>
+        <li>Rate-limits at the API level (100 concurrent queries default) rather than at connection level</li>
+      </ul>
+
+      <h3>Different Optimization Model</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Aspect</th>
+            <th>PostgreSQL</th>
+            <th>BigQuery</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Query planner</td>
+            <td>Cost-based optimizer with statistics</td>
+            <td>Rule-based + dynamic re-optimization during execution</td>
+          </tr>
+          <tr>
+            <td>Plan caching</td>
+            <td>Prepared statements cache plans</td>
+            <td>No plan caching; each query re-optimized</td>
+          </tr>
+          <tr>
+            <td>Join strategy selection</td>
+            <td>Nested loop, hash, merge based on row estimates</td>
+            <td>Broadcast or shuffle hash join based on table size</td>
+          </tr>
+          <tr>
+            <td>Statistics</td>
+            <td>pg_statistic, manual ANALYZE</td>
+            <td>Automatic, continuously updated column statistics</td>
+          </tr>
+          <tr>
+            <td>Hints</td>
+            <td>Not native (pg_hint_plan extension)</td>
+            <td>No hints — system decides execution strategy</td>
+          </tr>
+          <tr>
+            <td>Execution model</td>
+            <td>Pull-based (volcano iterator)</td>
+            <td>Push-based (DAG of stages)</td>
+          </tr>
+          <tr>
+            <td>Adaptive execution</td>
+            <td>No (plan fixed at execution start)</td>
+            <td>Yes (can re-partition mid-query on skew detection)</td>
+          </tr>
+          <tr>
+            <td>Point lookups</td>
+            <td>Sub-millisecond with index</td>
+            <td>~1-2 second minimum (query overhead)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Transaction Model</h3>
+      <ul>
+        <li>
+          <strong>PostgreSQL:</strong> Full ACID transactions with row-level
+          locking, serializable isolation, savepoints, and multi-statement
+          transactions spanning minutes or hours.
+        </li>
+        <li>
+          <strong>BigQuery:</strong> Single-statement transactions for DML. MERGE
+          is atomic. Multi-statement transactions exist but are limited (max 100
+          DML statements, 20-minute timeout). No row-level locking — uses
+          table-level snapshot isolation.
+        </li>
+      </ul>
+
+      <h3>When PostgreSQL Wins</h3>
+      <ul>
+        <li>Point lookups and OLTP workloads (sub-millisecond responses)</li>
+        <li>High-frequency small writes (thousands of individual INSERTs/sec)</li>
+        <li>Complex multi-table transactions with referential integrity</li>
+        <li>Low-latency requirement (&lt; 100ms query response)</li>
+        <li>Small dataset analytics (&lt; 100GB) where BigQuery's overhead dominates</li>
+        <li>Local development and testing without cloud dependency</li>
+      </ul>
+
+      <h3>When BigQuery Wins</h3>
+      <ul>
+        <li>Analytical queries on TB-PB scale data</li>
+        <li>Serverless operation with zero maintenance</li>
+        <li>Ad-hoc exploration of large datasets by non-DBA analysts</li>
+        <li>Semi-structured/nested data at scale (avoiding complex star schemas)</li>
+        <li>Variable workloads where pay-per-query is more efficient than provisioned capacity</li>
+        <li>Cross-dataset queries joining multiple data sources</li>
+      </ul>
+    </section>
+
+    <!-- ============================================================
+         SECTION 12: PRODUCTION INCIDENT
+         ============================================================ -->
+    <section id="production-incident">
+      <h2>Production Incident: Nested Data Scan Explosion</h2>
+      <p>
+        This real-world scenario demonstrates how understanding BigQuery internals
+        prevents costly mistakes. It illustrates the difference between scanning
+        2TB (wrong approach) vs 20GB (correct approach) for the same analytical
+        result.
+      </p>
+
+      <h3>Context</h3>
+      <p>
+        An e-commerce company stores clickstream events in BigQuery with the
+        following schema:
+      </p>
+      <pre><code class="language-sql">CREATE TABLE analytics.clickstream (
+  event_id STRING,
+  event_timestamp TIMESTAMP,
+  session_id STRING,
+  user STRUCT&lt;
+    user_id STRING,
+    account_type STRING,
+    preferences STRUCT&lt;
+      language STRING,
+      currency STRING,
+      notification_settings ARRAY&lt;STRUCT&lt;
+        channel STRING,
+        enabled BOOL,
+        frequency STRING
+      &gt;&gt;
+    &gt;,
+    purchase_history ARRAY&lt;STRUCT&lt;
+      order_id STRING,
+      amount NUMERIC,
+      items ARRAY&lt;STRUCT&lt;
+        sku STRING,
+        name STRING,
+        price NUMERIC,
+        attributes JSON
+      &gt;&gt;
+    &gt;&gt;
+  &gt;,
+  page STRUCT&lt;
+    url STRING,
+    title STRING,
+    content_hash STRING,
+    metadata JSON
+  &gt;,
+  device STRUCT&lt;
+    fingerprint STRING,
+    user_agent STRING,
+    screen_resolution STRING,
+    installed_plugins ARRAY&lt;STRING&gt;
+  &gt;
+)
+PARTITION BY DATE(event_timestamp)
+CLUSTER BY session_id;</code></pre>
+      <p>
+        The table contains 2 years of data, ~500 billion rows, totaling 80TB
+        uncompressed. The deeply nested <code>user.purchase_history</code> field
+        alone accounts for 40TB due to repeated item arrays with JSON attributes.
+      </p>
+
+      <h3>The Incident: 2TB Query</h3>
+      <p>
+        A data analyst needed to find the number of mobile sessions per country
+        for the last 30 days. They wrote:
+      </p>
+      <pre><code class="language-sql">-- BAD QUERY: Scans 2TB, costs ~$12.50
+SELECT
+  user.preferences.language AS country_proxy,
+  COUNT(DISTINCT session_id) AS unique_sessions
+FROM analytics.clickstream
+WHERE
+  DATE(event_timestamp) BETWEEN '2024-06-01' AND '2024-06-30'
+  AND device.type = 'mobile'  -- ERROR: device.type doesn't exist!
+GROUP BY 1;</code></pre>
+      <p>
+        The query failed because <code>device.type</code> doesn't exist in the
+        schema. The analyst then tried:
+      </p>
+      <pre><code class="language-sql">-- WORSE QUERY: Scans 2TB because of SELECT user.*
+SELECT
+  user.*,
+  session_id,
+  device.user_agent
+FROM analytics.clickstream
+WHERE
+  DATE(event_timestamp) BETWEEN '2024-06-01' AND '2024-06-30'
+  AND device.user_agent LIKE '%Mobile%'
+LIMIT 100;</code></pre>
+      <p>
+        <strong>Why this scans 2TB:</strong>
+      </p>
+      <ul>
+        <li>
+          <code>user.*</code> expands to ALL nested fields within the user struct,
+          including the massive <code>purchase_history</code> array with its
+          nested items and JSON attributes.
+        </li>
+        <li>
+          The 30-day partition filter reduces the scan from 80TB to ~3.3TB, but
+          reading all user sub-columns still processes 2TB of that partition range.
+        </li>
+        <li>
+          <code>LIMIT 100</code> does NOT reduce bytes scanned — BigQuery still
+          reads the full 2TB and returns only 100 rows.
+        </li>
+        <li>
+          This single query cost ~$12.50 and completed in 45 seconds.
+        </li>
+      </ul>
+
+      <h3>The Fix: 20GB Query with Nested Pruning</h3>
+      <pre><code class="language-sql">-- GOOD QUERY: Scans only 20GB, costs ~$0.12
+SELECT
+  user.preferences.language AS user_language,
+  COUNT(DISTINCT session_id) AS unique_sessions
+FROM analytics.clickstream
+WHERE
+  DATE(event_timestamp) BETWEEN '2024-06-01' AND '2024-06-30'
+  AND REGEXP_CONTAINS(device.user_agent, r'(?i)mobile|android|iphone')
+GROUP BY 1
+ORDER BY unique_sessions DESC;</code></pre>
+      <p>
+        <strong>Why this scans only 20GB:</strong>
+      </p>
+      <ul>
+        <li>
+          Partition pruning narrows to 30 days of data (~3.3TB total).
+        </li>
+        <li>
+          Column selection reads only 3 leaf columns:
+          <code>user.preferences.language</code>, <code>session_id</code>, and
+          <code>device.user_agent</code> — skipping the 40TB
+          <code>purchase_history</code> entirely.
+        </li>
+        <li>
+          These 3 columns in the 30-day partition total ~20GB uncompressed.
+        </li>
+        <li>
+          Cost reduction: 100x (from $12.50 to $0.12).
+        </li>
+        <li>
+          Performance improvement: from 45 seconds to 3 seconds.
+        </li>
+      </ul>
+
+      <h3>Root Cause Analysis</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Issue</th>
+            <th>Impact</th>
+            <th>Fix</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>SELECT user.*</code> on deeply nested struct</td>
+            <td>Reads all 15+ sub-columns including arrays</td>
+            <td>Select only specific leaf fields needed</td>
+          </tr>
+          <tr>
+            <td><code>LIMIT 100</code> used as cost control</td>
+            <td>Zero cost reduction, false sense of safety</td>
+            <td>Use partition filters and column selection</td>
+          </tr>
+          <tr>
+            <td>No dry-run before execution</td>
+            <td>No advance warning of 2TB scan</td>
+            <td>Always run dry-run for ad-hoc queries</td>
+          </tr>
+          <tr>
+            <td>Schema exploration via <code>SELECT *</code></td>
+            <td>Extremely expensive on wide nested tables</td>
+            <td>Use INFORMATION_SCHEMA.COLUMNS or bq show</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Prevention Measures Implemented</h3>
+      <ol>
+        <li>
+          <strong>Custom quota:</strong> Set per-user daily scan limit to 5TB,
+          rejecting queries that would exceed this.
+        </li>
+        <li>
+          <strong>Authorized views:</strong> Created flattened views that expose
+          only commonly-needed columns, preventing accidental <code>SELECT *</code>
+          on the raw table.
+        </li>
+        <li>
+          <strong>Query template library:</strong> Provided pre-written queries
+          for common analyses with correct column selection.
+        </li>
+        <li>
+          <strong>Monitoring alert:</strong> Set up alerts on
+          <code>INFORMATION_SCHEMA.JOBS</code> for queries scanning > 500GB.
+        </li>
+        <li>
+          <strong>Training:</strong> Documented that <code>SELECT struct.*</code>
+          reads all sub-columns and that LIMIT doesn't reduce cost.
+        </li>
+      </ol>
+    </section>
+
+    <!-- ============================================================
+         SECTION 13: CODE EXAMPLES
+         ============================================================ -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <p>
+        Practical BigQuery SQL that demonstrates internal behavior and optimization
+        techniques relevant to senior Data Engineers.
+      </p>
+
+      <h3>BigQuery-Specific SQL</h3>
+      <pre><code class="language-sql">-- 1. Approximate aggregation (HyperLogLog under the hood)
+SELECT
+  DATE(event_timestamp) AS event_date,
+  APPROX_COUNT_DISTINCT(user_id) AS approx_unique_users,
+  -- Exact count for comparison (much slower on large data)
+  COUNT(DISTINCT user_id) AS exact_unique_users
+FROM analytics.events
+WHERE DATE(event_timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+GROUP BY 1
+ORDER BY 1;
+
+-- 2. ARRAY aggregation (no equivalent in standard PostgreSQL)
+SELECT
+  customer_id,
+  ARRAY_AGG(STRUCT(order_id, order_date, total_amount)
+            ORDER BY order_date DESC
+            LIMIT 5) AS recent_orders
+FROM analytics.orders
+GROUP BY customer_id;
+
+-- 3. Table-valued functions with nested data
+SELECT
+  session_id,
+  event_name,
+  param.key,
+  param.value.string_value
+FROM analytics.ga4_events,
+  UNNEST(event_params) AS param
+WHERE param.key IN ('page_title', 'page_location')
+  AND DATE(event_timestamp) = CURRENT_DATE();
+
+-- 4. Scripting with DECLARE and loops
+DECLARE processing_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);
+DECLARE max_iterations INT64 DEFAULT 30;
+DECLARE i INT64 DEFAULT 0;
+
+WHILE i < max_iterations DO
+  INSERT INTO analytics.daily_aggregates
+  SELECT
+    processing_date,
+    user.geo.country,
+    COUNT(*) as event_count,
+    COUNT(DISTINCT session_id) as session_count
+  FROM analytics.events
+  WHERE DATE(event_timestamp) = processing_date
+  GROUP BY 1, 2;
+
+  SET processing_date = DATE_SUB(processing_date, INTERVAL 1 DAY);
+  SET i = i + 1;
+END WHILE;
+
+-- 5. MERGE (upsert) for slowly changing dimensions
+MERGE analytics.dim_customers AS target
+USING staging.customer_updates AS source
+ON target.customer_id = source.customer_id
+WHEN MATCHED AND source.updated_at > target.updated_at THEN
+  UPDATE SET
+    target.email = source.email,
+    target.name = source.name,
+    target.updated_at = source.updated_at
+WHEN NOT MATCHED THEN
+  INSERT (customer_id, email, name, created_at, updated_at)
+  VALUES (source.customer_id, source.email, source.name,
+          source.updated_at, source.updated_at);</code></pre>
+
+      <h3>INFORMATION_SCHEMA Queries</h3>
+      <pre><code class="language-sql">-- 1. Find most expensive queries in the last 24 hours
+SELECT
+  job_id,
+  user_email,
+  query,
+  total_bytes_billed,
+  ROUND(total_bytes_billed / POW(1024, 4), 4) AS tb_billed,
+  ROUND(total_bytes_billed / POW(1024, 4) * 6.25, 2) AS cost_usd,
+  total_slot_ms,
+  TIMESTAMP_DIFF(end_time, start_time, SECOND) AS duration_sec
+FROM `region-us`.INFORMATION_SCHEMA.JOBS
+WHERE
+  creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+  AND job_type = 'QUERY'
+  AND state = 'DONE'
+  AND error_result IS NULL
+ORDER BY total_bytes_billed DESC
+LIMIT 25;
+
+-- 2. Slot utilization analysis
+SELECT
+  TIMESTAMP_TRUNC(creation_time, HOUR) AS hour,
+  COUNT(*) AS query_count,
+  SUM(total_slot_ms) AS total_slot_ms,
+  SUM(total_slot_ms) / (3600 * 1000) AS avg_slots_used,
+  MAX(total_slot_ms / GREATEST(
+    TIMESTAMP_DIFF(end_time, start_time, MILLISECOND), 1
+  )) AS peak_parallelism
+FROM `region-us`.INFORMATION_SCHEMA.JOBS
+WHERE
+  creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+  AND job_type = 'QUERY'
+  AND state = 'DONE'
+GROUP BY 1
+ORDER BY 1 DESC;
+
+-- 3. Table storage analysis
+SELECT
+  table_name,
+  ROUND(total_logical_bytes / POW(1024, 3), 2) AS logical_gb,
+  ROUND(total_physical_bytes / POW(1024, 3), 2) AS physical_gb,
+  ROUND(total_logical_bytes / NULLIF(total_physical_bytes, 0), 2) AS compression_ratio,
+  row_count,
+  ROUND(total_logical_bytes / NULLIF(row_count, 0), 0) AS avg_row_bytes
+FROM `project_id`.`dataset_id`.INFORMATION_SCHEMA.TABLE_STORAGE
+ORDER BY total_logical_bytes DESC
+LIMIT 20;
+
+-- 4. Column-level storage breakdown (identify expensive columns)
+SELECT
+  table_name,
+  column_name,
+  data_type,
+  ROUND(SUM(total_physical_bytes) / POW(1024, 3), 2) AS physical_gb
+FROM `project_id`.`dataset_id`.INFORMATION_SCHEMA.COLUMN_FIELD_PATHS
+  JOIN `project_id`.`dataset_id`.INFORMATION_SCHEMA.TABLE_STORAGE
+  USING (table_name)
+GROUP BY 1, 2, 3
+ORDER BY 4 DESC
+LIMIT 30;
+
+-- 5. Identify queries not using partition filters
+SELECT
+  job_id,
+  user_email,
+  query,
+  total_bytes_billed,
+  referenced_tables
+FROM `region-us`.INFORMATION_SCHEMA.JOBS
+WHERE
+  creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+  AND job_type = 'QUERY'
+  AND total_bytes_billed > 100 * POW(1024, 3)  -- > 100GB
+  AND query NOT LIKE '%_PARTITIONTIME%'
+  AND query NOT LIKE '%_PARTITIONDATE%'
+  AND query NOT LIKE '%event_date%'
+ORDER BY total_bytes_billed DESC;</code></pre>
+
+      <h3>Execution Plan Reading</h3>
+      <pre><code class="language-sql">-- Get detailed execution statistics for a specific job
+SELECT
+  job_id,
+  creation_time,
+  total_bytes_processed,
+  total_slot_ms,
+  ARRAY(
+    SELECT AS STRUCT
+      stage.name,
+      stage.status,
+      stage.slot_ms,
+      stage.shuffle_output_bytes,
+      stage.records_read,
+      stage.records_written,
+      stage.parallel_inputs,
+      stage.completed_parallel_inputs,
+      ARRAY(
+        SELECT step.kind || ': ' || ARRAY_TO_STRING(step.substeps, ', ')
+        FROM UNNEST(stage.steps) AS step
+      ) AS step_details
+    FROM UNNEST(job_stages) AS stage
+  ) AS stages
+FROM `region-us`.INFORMATION_SCHEMA.JOBS
+WHERE job_id = 'your-job-id-here';
+
+-- Identify stages with high wait-to-compute ratio (slot contention)
+SELECT
+  job_id,
+  stage.name AS stage_name,
+  stage.slot_ms AS compute_ms,
+  stage.wait_ms_avg * stage.parallel_inputs AS total_wait_ms,
+  ROUND(
+    SAFE_DIVIDE(stage.wait_ms_avg * stage.parallel_inputs, stage.slot_ms) * 100,
+    1
+  ) AS wait_pct
+FROM `region-us`.INFORMATION_SCHEMA.JOBS,
+  UNNEST(job_stages) AS stage
+WHERE
+  creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+  AND stage.slot_ms > 10000  -- Only stages with significant compute
+ORDER BY wait_pct DESC
+LIMIT 20;</code></pre>
+
+      <h3>Slot Analysis for Capacity Planning</h3>
+      <pre><code class="language-sql">-- Calculate required flat-rate slots based on historical usage
+WITH hourly_usage AS (
+  SELECT
+    TIMESTAMP_TRUNC(creation_time, HOUR) AS hour,
+    SUM(total_slot_ms) / (3600 * 1000) AS avg_slots
+  FROM `region-us`.INFORMATION_SCHEMA.JOBS
+  WHERE
+    creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+    AND job_type = 'QUERY'
+    AND state = 'DONE'
+  GROUP BY 1
+)
+SELECT
+  -- P50 = baseline reservation
+  APPROX_QUANTILES(avg_slots, 100)[OFFSET(50)] AS p50_slots,
+  -- P90 = recommended reservation
+  APPROX_QUANTILES(avg_slots, 100)[OFFSET(90)] AS p90_slots,
+  -- P99 = peak (might need autoscaling)
+  APPROX_QUANTILES(avg_slots, 100)[OFFSET(99)] AS p99_slots,
+  MAX(avg_slots) AS max_slots,
+  -- Cost comparison
+  APPROX_QUANTILES(avg_slots, 100)[OFFSET(90)] * 20 AS monthly_cost_at_p90
+FROM hourly_usage;
+
+-- Per-project slot consumption (for chargeback)
+SELECT
+  project_id,
+  SUM(total_slot_ms) / 1000 / 3600 AS total_slot_hours,
+  COUNT(*) AS query_count,
+  ROUND(SUM(total_bytes_billed) / POW(1024, 4), 2) AS tb_scanned,
+  ROUND(SUM(total_bytes_billed) / POW(1024, 4) * 6.25, 2) AS on_demand_cost_usd
+FROM `region-us`.INFORMATION_SCHEMA.JOBS
+WHERE
+  creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  AND job_type = 'QUERY'
+  AND state = 'DONE'
+GROUP BY 1
+ORDER BY total_slot_hours DESC;</code></pre>
+    </section>
+
+    <!-- ============================================================
+         SECTION 14: COMMON MISTAKES
+         ============================================================ -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <p>
+        These are mistakes frequently made by engineers transitioning from
+        PostgreSQL to BigQuery, or by those who don't understand the execution
+        model.
+      </p>
+
+      <h3>1. Using SELECT * on Nested Tables</h3>
+      <ul>
+        <li><strong>Mistake:</strong> <code>SELECT * FROM events LIMIT 10</code> for "quick exploration"</li>
+        <li><strong>Impact:</strong> Reads every column including deeply nested arrays, costing 10-100x more than necessary</li>
+        <li><strong>Fix:</strong> Use <code>SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS WHERE table_name = 'events'</code> to explore schema, then select specific fields</li>
+      </ul>
+
+      <h3>2. Relying on LIMIT for Cost Control</h3>
+      <ul>
+        <li><strong>Mistake:</strong> Adding <code>LIMIT 100</code> thinking it reduces bytes scanned</li>
+        <li><strong>Impact:</strong> Full table scan occurs regardless; LIMIT only truncates output</li>
+        <li><strong>Fix:</strong> Use partition filters, column selection, and dry runs to control cost</li>
+      </ul>
+
+      <h3>3. Not Using Partition Filters</h3>
+      <ul>
+        <li><strong>Mistake:</strong> Querying a partitioned table without filtering on the partition column</li>
+        <li><strong>Impact:</strong> Full table scan across all partitions (potentially petabytes)</li>
+        <li><strong>Fix:</strong> Enable <code>require_partition_filter</code> on large tables; always include partition predicates</li>
+      </ul>
+      <pre><code class="language-sql">-- Enable mandatory partition filtering
+ALTER TABLE analytics.events
+SET OPTIONS (require_partition_filter = TRUE);</code></pre>
+
+      <h3>4. Treating BigQuery Like an OLTP Database</h3>
+      <ul>
+        <li><strong>Mistake:</strong> Running thousands of small queries per minute, single-row lookups</li>
+        <li><strong>Impact:</strong> Each query has 1-2 seconds of scheduling overhead; API rate limits hit quickly</li>
+        <li><strong>Fix:</strong> Batch small lookups into single queries; use Bigtable or Firestore for point lookups</li>
+      </ul>
+
+      <h3>5. Ignoring Clustering Opportunities</h3>
+      <ul>
+        <li><strong>Mistake:</strong> Partitioning a table but not clustering on frequently-filtered columns</li>
+        <li><strong>Impact:</strong> Queries that filter on non-partition columns still scan entire partitions</li>
+        <li><strong>Fix:</strong> Cluster on columns commonly used in WHERE/JOIN clauses (up to 4 columns)</li>
+      </ul>
+
+      <h3>6. Cross-Join from Improper UNNEST</h3>
+      <ul>
+        <li><strong>Mistake:</strong> Using <code>CROSS JOIN UNNEST(array1), UNNEST(array2)</code> without correlation</li>
+        <li><strong>Impact:</strong> Cartesian product between arrays; 100 x 100 elements = 10,000 rows per input row</li>
+        <li><strong>Fix:</strong> Use correlated subqueries or ensure UNNEST operations are properly scoped</li>
+      </ul>
+      <pre><code class="language-sql">-- BAD: Cartesian product between two arrays
+SELECT *
+FROM my_table,
+  UNNEST(array_a) AS a,
+  UNNEST(array_b) AS b;
+
+-- GOOD: Separate subqueries for each array
+SELECT
+  (SELECT SUM(a) FROM UNNEST(array_a) a) AS sum_a,
+  (SELECT SUM(b) FROM UNNEST(array_b) b) AS sum_b
+FROM my_table;</code></pre>
+
+      <h3>7. Not Understanding Slot Contention</h3>
+      <ul>
+        <li><strong>Mistake:</strong> Running 50 complex queries simultaneously on on-demand pricing</li>
+        <li><strong>Impact:</strong> Each query gets fewer slots, dramatically increasing wall-clock time</li>
+        <li><strong>Fix:</strong> Stagger heavy queries; use reservations for production pipelines; monitor slot utilization</li>
+      </ul>
+
+      <h3>8. Storing Data Inefficiently</h3>
+      <ul>
+        <li><strong>Mistake:</strong> Storing high-cardinality STRING columns that could be INT64; using JSON strings instead of native STRUCT/ARRAY</li>
+        <li><strong>Impact:</strong> Higher storage costs, worse compression, slower queries</li>
+        <li><strong>Fix:</strong> Use appropriate types; leverage native nested types instead of JSON strings; consider dictionary-friendly cardinality</li>
+      </ul>
+
+      <h3>9. Not Using Approximate Functions</h3>
+      <ul>
+        <li><strong>Mistake:</strong> Using <code>COUNT(DISTINCT x)</code> on high-cardinality columns across billions of rows</li>
+        <li><strong>Impact:</strong> Memory-intensive exact computation; possible slot OOM on extreme cardinality</li>
+        <li><strong>Fix:</strong> Use <code>APPROX_COUNT_DISTINCT(x)</code> for dashboards where ±1% error is acceptable</li>
+      </ul>
+
+      <h3>10. Joining Large Tables Without Filtering First</h3>
+      <ul>
+        <li><strong>Mistake:</strong> <code>SELECT * FROM table_a JOIN table_b ON ...</code> without WHERE clauses on either table</li>
+        <li><strong>Impact:</strong> Massive shuffle volume; both tables fully scanned; expensive and slow</li>
+        <li><strong>Fix:</strong> Apply filters (especially partition filters) before the JOIN; reduce data volume early</li>
+      </ul>
+    </section>
+
+    <!-- ============================================================
+         SECTION 15: TRADE-OFFS
+         ============================================================ -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <p>
+        Every architectural decision in BigQuery represents a trade-off. Senior
+        engineers should articulate these clearly in interviews.
+      </p>
+
+      <h3>Serverless vs Self-Managed</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Benefit</th>
+            <th>Trade-off</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Zero operational overhead</td>
+            <td>No control over execution environment, versions, or patches</td>
+          </tr>
+          <tr>
+            <td>Automatic scaling</td>
+            <td>Cannot guarantee latency SLAs for specific queries</td>
+          </tr>
+          <tr>
+            <td>Pay-per-query flexibility</td>
+            <td>Unpredictable costs if queries are not carefully controlled</td>
+          </tr>
+          <tr>
+            <td>Multi-tenant efficiency</td>
+            <td>Noisy neighbor effects on on-demand tier during peak</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Columnar vs Row Storage</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Benefit</th>
+            <th>Trade-off</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Excellent compression (5-10x)</td>
+            <td>Point lookups require reading and reconstructing from columns</td>
+          </tr>
+          <tr>
+            <td>Scan only needed columns</td>
+            <td>Writing individual rows is expensive (requires file rewrite)</td>
+          </tr>
+          <tr>
+            <td>Vectorized processing</td>
+            <td>Random access patterns perform poorly</td>
+          </tr>
+          <tr>
+            <td>Efficient for analytics</td>
+            <td>Inefficient for OLTP (single-row read/write)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>No Indexes vs Index-Based Access</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Benefit</th>
+            <th>Trade-off</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>No index maintenance overhead</td>
+            <td>Cannot achieve sub-millisecond point lookups</td>
+          </tr>
+          <tr>
+            <td>No index selection decisions</td>
+            <td>Every query pays scan cost proportional to data size</td>
+          </tr>
+          <tr>
+            <td>Write performance is predictable</td>
+            <td>Read performance depends on parallelism, not data structure</td>
+          </tr>
+          <tr>
+            <td>Simpler data management</td>
+            <td>Must rely on partitioning/clustering for selective access</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Nested Data vs Normalized Schema</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Benefit</th>
+            <th>Trade-off</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>No JOINs needed for related data</td>
+            <td>Data duplication across records (storage cost)</td>
+          </tr>
+          <tr>
+            <td>Single-table queries are simpler</td>
+            <td>Updates to nested data require full row rewrite</td>
+          </tr>
+          <tr>
+            <td>Better scan locality</td>
+            <td>Deeply nested schemas are harder to understand and query</td>
+          </tr>
+          <tr>
+            <td>Natural fit for event data</td>
+            <td>SELECT * becomes dangerous on wide nested tables</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>On-Demand vs Flat-Rate Pricing</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Benefit</th>
+            <th>Trade-off</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>On-demand: pay only when querying</td>
+            <td>Costs spike unpredictably with data growth or new analysts</td>
+          </tr>
+          <tr>
+            <td>Flat-rate: predictable budget</td>
+            <td>Paying for idle slots during off-hours</td>
+          </tr>
+          <tr>
+            <td>On-demand: no capacity planning</td>
+            <td>Burst slot availability not guaranteed</td>
+          </tr>
+          <tr>
+            <td>Flat-rate: guaranteed performance</td>
+            <td>Must right-size reservations or waste money</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Separation of Storage and Compute</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Benefit</th>
+            <th>Trade-off</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Scale compute independently of data size</td>
+            <td>Network latency between compute and storage (mitigated by Jupiter)</td>
+          </tr>
+          <tr>
+            <td>Storage never limits query concurrency</td>
+            <td>Cannot exploit data locality like co-located systems</td>
+          </tr>
+          <tr>
+            <td>Multiple compute engines can read same data</td>
+            <td>Cold start latency for first query (slot allocation)</td>
+          </tr>
+          <tr>
+            <td>Storage costs scale linearly, not with compute</td>
+            <td>Shuffle-heavy queries still need network bandwidth</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ============================================================
+         SECTION 16: FOLLOW-UP QUESTIONS
+         ============================================================ -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <p>
+        These are common follow-up questions an interviewer might ask after your
+        initial answer, along with concise response frameworks.
+      </p>
+
+      <h3>Q: "How would you debug a slow BigQuery query?"</h3>
+      <ol>
+        <li>Check the execution plan for stage-level timings and shuffle volumes</li>
+        <li>Look at bytes scanned — is partition/cluster pruning working?</li>
+        <li>Check slot utilization — is the query slot-starved (high wait time)?</li>
+        <li>Look for data skew — one stage taking 10x longer than others</li>
+        <li>Check for anti-patterns: SELECT *, missing partition filters, cross joins from UNNEST</li>
+        <li>Compare <code>total_slot_ms</code> vs wall clock time to assess parallelism efficiency</li>
+      </ol>
+
+      <h3>Q: "When would you NOT use BigQuery?"</h3>
+      <ul>
+        <li>Low-latency point lookups (&lt; 100ms) — use Bigtable or Spanner</li>
+        <li>High-frequency small writes (10K+ individual inserts/sec) — use Pub/Sub → streaming</li>
+        <li>Complex OLTP transactions — use Cloud SQL or Spanner</li>
+        <li>Small datasets (&lt; 1GB) where query overhead dominates</li>
+        <li>Workloads requiring exact row-level locking semantics</li>
+        <li>Real-time serving layer for web applications</li>
+      </ul>
+
+      <h3>Q: "How does BigQuery handle data skew in JOINs?"</h3>
+      <ul>
+        <li>Automatic skew detection during shuffle phase</li>
+        <li>Hot partitions are dynamically re-split across additional slots</li>
+        <li>For known skew, manual mitigation: filter out hot keys and process separately</li>
+        <li>Broadcast join for small tables (avoids shuffle entirely)</li>
+        <li>Approximate aggregate functions reduce memory pressure from skewed groups</li>
+      </ul>
+
+      <h3>Q: "Explain BigQuery's consistency model"</h3>
+      <ul>
+        <li>Strongly consistent for all read-after-write operations within the same region</li>
+        <li>DML operations are atomic at the statement level</li>
+        <li>Streaming inserts have a brief eventual consistency window (seconds)</li>
+        <li>Table snapshots provide point-in-time reads (time travel up to 7 days)</li>
+        <li>No dirty reads — snapshot isolation for concurrent queries</li>
+      </ul>
+
+      <h3>Q: "How would you migrate a PostgreSQL workload to BigQuery?"</h3>
+      <ol>
+        <li><strong>Schema redesign:</strong> Denormalize star schemas into nested tables where beneficial</li>
+        <li><strong>Remove index dependencies:</strong> Replace indexed lookup patterns with partition/cluster design</li>
+        <li><strong>Rewrite procedural logic:</strong> Convert stored procedures to BigQuery scripting or Dataflow pipelines</li>
+        <li><strong>Rethink ETL:</strong> Move from row-at-a-time processing to batch/streaming ingestion</li>
+        <li><strong>Query rewrite:</strong> Replace PostgreSQL-specific functions, adapt UNNEST patterns for arrays</li>
+        <li><strong>Cost modeling:</strong> Profile query patterns to choose on-demand vs flat-rate</li>
+      </ol>
+
+      <h3>Q: "What's the difference between BigQuery and Snowflake architecturally?"</h3>
+      <ul>
+        <li>Both separate storage and compute, but Snowflake uses virtual warehouses (user-managed clusters) vs BigQuery's fully serverless slots</li>
+        <li>Snowflake has explicit cluster suspend/resume; BigQuery is always-on with per-query billing</li>
+        <li>BigQuery's shuffle is in-memory (Jupiter); Snowflake uses remote disk for large shuffles</li>
+        <li>BigQuery natively supports nested/repeated data; Snowflake uses VARIANT (semi-structured)</li>
+        <li>BigQuery's pricing is per-byte-scanned or per-slot-second; Snowflake is per-credit (time-based)</li>
+      </ul>
+
+      <h3>Q: "How does BigQuery achieve fault tolerance?"</h3>
+      <ul>
+        <li>Data is stored with 3+ replicas on Colossus — no data loss from node failures</li>
+        <li>Query execution: if a slot fails, the stage is re-executed on a different slot</li>
+        <li>Shuffle service holds replicated copies of intermediate data</li>
+        <li>No single point of failure — root server, mixers, and leaves are all replaceable</li>
+        <li>Long-running queries checkpoint progress; partial re-execution on failure</li>
+      </ul>
+    </section>
+
+    <!-- ============================================================
+         SECTION 17: SUMMARY
+         ============================================================ -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <p>
+        BigQuery and PostgreSQL represent fundamentally different philosophies in
+        database design. Here are the key takeaways for your interview:
+      </p>
+
+      <h3>Architecture</h3>
+      <ul>
+        <li>BigQuery separates storage (Colossus) from compute (slots); PostgreSQL couples them on a single node</li>
+        <li>BigQuery uses a multi-level Dremel tree for massively parallel execution; PostgreSQL uses single-process volcano iteration with limited parallel workers</li>
+        <li>BigQuery's shuffle service enables in-memory data redistribution at petabit scale; PostgreSQL has no equivalent</li>
+      </ul>
+
+      <h3>Storage</h3>
+      <ul>
+        <li>BigQuery uses Capacitor columnar format with nested encoding (repetition/definition levels); PostgreSQL uses row-oriented heap files</li>
+        <li>BigQuery has no indexes — relies on partitioning, clustering, and parallel scan; PostgreSQL requires indexes for efficient selective access</li>
+        <li>BigQuery storage is immutable (no VACUUM needed); PostgreSQL requires regular VACUUM for MVCC cleanup</li>
+      </ul>
+
+      <h3>Execution</h3>
+      <ul>
+        <li>BigQuery decomposes queries into a DAG of stages with shuffle boundaries; PostgreSQL executes a single operator tree</li>
+        <li>BigQuery dynamically allocates thousands of slots per query; PostgreSQL is limited to configured parallel workers (typically 2-8)</li>
+        <li>BigQuery pipelines stages for overlap; PostgreSQL processes operators in a strict pull-based order</li>
+      </ul>
+
+      <h3>Cost &amp; Operations</h3>
+      <ul>
+        <li>BigQuery charges per byte scanned (on-demand) or per slot reserved (flat-rate); PostgreSQL has fixed infrastructure cost</li>
+        <li>BigQuery is fully serverless with zero maintenance; PostgreSQL requires tuning, vacuuming, connection management, and capacity planning</li>
+        <li>BigQuery cost optimization = fewer bytes scanned (columns, partitions, clusters); PostgreSQL cost optimization = right-sized instances and proper indexing</li>
+      </ul>
+
+      <h3>When to Choose Each</h3>
+      <ul>
+        <li><strong>BigQuery:</strong> Analytics on TB-PB data, serverless operation, variable workloads, nested data, ad-hoc exploration</li>
+        <li><strong>PostgreSQL:</strong> OLTP, sub-millisecond lookups, complex transactions, small-medium datasets, local development</li>
+        <li><strong>Both together:</strong> PostgreSQL as operational DB → Change Data Capture → BigQuery as analytical warehouse (common FAANG pattern)</li>
+      </ul>
+
+      <div class="key-insight">
+        <strong>Interview tip:</strong> Demonstrate that you understand WHY BigQuery
+        makes these architectural choices (massive parallelism over single-node
+        optimization), not just WHAT the differences are. Connect each design
+        decision to the workload it serves: BigQuery trades point-lookup latency
+        for aggregate-query throughput at any scale.
+      </div>
+    </section>
+
+    <nav class="chapter-nav chapter-nav-bottom">
+      <a class="prev" href="ch09-warehouse-design.html">Previous: Warehouse Design</a>
+      <a class="next" href="ch11-snowflake-internals.html">Next: Snowflake Internals</a>
+    </nav>
+  </main>
+
+  <script src="../../assets/js/prism.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>
