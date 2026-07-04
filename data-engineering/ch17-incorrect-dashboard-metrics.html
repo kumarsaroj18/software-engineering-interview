@@ -45,32 +45,26 @@
     </div>
   </aside>
 
-    <!-- Main Content -->
-    <main class="content">
-      <!-- Breadcrumb -->
-      <nav class="breadcrumb">
-        <a href="../../index.html">Home</a> &gt;
-        <a href="index.html">Part VI</a> &gt;
-        <span>Chapter 17</span>
-      </nav>
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="index.html">Home</a> &rsaquo;
+      <a href="index.html#part-vi">Part VI — Production Data Engineering</a> &rsaquo;
+      <span>Chapter 17</span>
+    </nav>
 
-      <!-- Chapter Header -->
-      <div class="chapter-header">
+    <header class="chapter-header">
+      <div class="chapter-meta">
         <span class="badge badge-medium">Medium</span>
-        <h1>Your Dashboard Shows Incorrect Metrics After Deployment. How Do You Debug It?</h1>
-        <div class="chapter-topics">
-          <span class="topic-tag">Data Quality</span>
-          <span class="topic-tag">Reconciliation</span>
-        </div>
+        <span class="badge badge-topic">Data Quality</span>
+        <span class="badge badge-topic">Reconciliation</span>
       </div>
+      <h1>Your Dashboard Shows Incorrect Metrics After Deployment. How Do You Debug It?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Incorrect dashboard metrics after deployment usually stem from JOIN type changes, NULL handling bugs, schema evolution, duplicate events, or late-arriving data — investigate systematically with reconciliation queries and data contracts.
+      </p>
+    </header>
 
-      <!-- Chapter Navigation -->
-      <div class="chapter-nav">
-        <a href="ch16-etl-pipeline-slow.html" class="nav-prev">Previous: ETL Pipeline Slow</a>
-        <a href="ch18-lakehouse-platform.html" class="nav-next">Next: Lakehouse Platform</a>
-      </div>
-
-      <div class="search-container">
+    <div class="search-container">
       <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
     </div>
 

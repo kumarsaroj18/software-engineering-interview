@@ -43,30 +43,27 @@
     </div>
   </aside>
 
-  <!-- Top bar -->
-  <header class="topbar">
-    <button class="menu-toggle" id="menu-toggle" aria-label="Open sidebar">☰</button>
+  <main class="content">
     <nav class="breadcrumb">
-      <a href="index.html">Home</a> &gt;
-      <a href="index.html#part-v">Part V — Streaming Systems</a> &gt;
+      <a href="index.html">Home</a> &rsaquo;
+      <a href="index.html#part-v">Part V — Streaming Systems</a> &rsaquo;
       <span>Chapter 14</span>
     </nav>
-    <button class="theme-toggle" id="theme-toggle-mobile" aria-label="Toggle theme">☀️</button>
-  </header>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Kafka</span>
+        <span class="badge badge-topic">Flink</span>
+      </div>
+      <h1>Design a Real-Time Event Processing Pipeline</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Real-time pipelines require reasoning about event time vs processing time, watermarks for completeness, stateful windowed aggregations, and exactly-once guarantees — all while handling backpressure and out-of-order data.
+      </p>
+    </header>
 
     <div class="search-container">
       <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
-    </div>
-
-  <main class="content">
-    <!-- Chapter Header -->
-    <div class="chapter-header">
-      <span class="badge badge-hard">Hard</span>
-      <h1>Design a Real-Time Event Processing Pipeline</h1>
-      <div class="chapter-topics">
-        <span class="topic-tag">Kafka</span>
-        <span class="topic-tag">Flink</span>
-      </div>
     </div>
 
 

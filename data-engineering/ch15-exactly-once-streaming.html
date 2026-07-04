@@ -44,32 +44,26 @@
     </div>
   </aside>
 
-    <!-- Main Content -->
-    <main class="content">
-      <!-- Breadcrumb -->
-      <nav class="breadcrumb">
-        <a href="../../index.html">Home</a> &gt;
-        <a href="index.html">Part V</a> &gt;
-        <span>Chapter 15</span>
-      </nav>
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="index.html">Home</a> &rsaquo;
+      <a href="index.html#part-v">Part V — Streaming Systems</a> &rsaquo;
+      <span>Chapter 15</span>
+    </nav>
 
-      <!-- Chapter Header -->
-      <div class="chapter-header">
+    <header class="chapter-header">
+      <div class="chapter-meta">
         <span class="badge badge-hard">Hard</span>
-        <h1>How Do You Guarantee Exactly-Once Processing?</h1>
-        <div class="chapter-topics">
-          <span class="topic-tag">Checkpointing</span>
-          <span class="topic-tag">Idempotency</span>
-        </div>
+        <span class="badge badge-topic">Checkpointing</span>
+        <span class="badge badge-topic">Idempotency</span>
       </div>
+      <h1>How Do You Guarantee Exactly-Once Processing?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> True exactly-once is impossible in distributed systems. We achieve "effectively exactly-once" through the combination of idempotent producers, transactional processing with checkpoints, and idempotent sinks — making duplicates invisible to the end result.
+      </p>
+    </header>
 
-      <!-- Chapter Navigation -->
-      <div class="chapter-nav">
-        <a href="ch14-realtime-pipeline.html" class="nav-prev">Previous: Real-Time Pipeline</a>
-        <a href="ch16-etl-pipeline-slow.html" class="nav-next">Next: ETL Pipeline Slow</a>
-      </div>
-
-      <div class="search-container">
+    <div class="search-container">
       <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
     </div>
 
