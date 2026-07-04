@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Senior Data Engineering Interview Handbook</title>
+  <meta name="description" content="FAANG-level Senior Data Engineer Interview Handbook — SQL Internals, Query Optimization, Spark, Kafka, BigQuery, Snowflake, Data Warehousing & Production Debugging">
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <style>
+    .hero {
+      text-align: center;
+      padding: 4rem 2rem 3rem;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 3rem;
+    }
+    .hero h1 {
+      font-size: 2.8rem;
+      margin-bottom: 0.5rem;
+      background: linear-gradient(135deg, var(--accent), var(--accent-teal));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .hero .subtitle {
+      font-size: 1.2rem;
+      color: var(--text-secondary);
+      max-width: 700px;
+      margin: 0 auto;
+      line-height: 1.6;
+    }
+    .hero .stats {
+      display: flex;
+      justify-content: center;
+      gap: 2rem;
+      margin-top: 2rem;
+      flex-wrap: wrap;
+    }
+    .hero .stat {
+      text-align: center;
+    }
+    .hero .stat-number {
+      font-size: 2rem;
+      font-weight: 700;
+      color: var(--accent);
+    }
+    .hero .stat-label {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .part-header {
+      margin: 3rem 0 1.5rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 2px solid var(--accent);
+    }
+    .part-header h2 {
+      margin: 0;
+      font-size: 1.5rem;
+      color: var(--text-heading);
+    }
+    .part-header p {
+      margin: 0.3rem 0 0;
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+    }
+    .chapter-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    .chapter-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 1.5rem;
+      text-decoration: none;
+      color: inherit;
+      transition: transform var(--transition-normal), box-shadow var(--transition-normal), border-color var(--transition-normal);
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .chapter-card:hover {
+      transform: translateY(-3px);
+      box-shadow: var(--shadow-lg);
+      border-color: var(--accent);
+    }
+    .chapter-card .chapter-number {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .chapter-card h3 {
+      margin: 0;
+      font-size: 1.1rem;
+      color: var(--text-heading);
+      line-height: 1.4;
+    }
+    .chapter-card .chapter-tags {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      margin-top: auto;
+    }
+    .chapter-card .badge {
+      font-size: 0.7rem;
+      padding: 0.2rem 0.6rem;
+      border-radius: 20px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .badge-hard {
+      background: rgba(239, 68, 68, 0.15);
+      color: #f87171;
+    }
+    .badge-medium {
+      background: rgba(232, 168, 56, 0.15);
+      color: var(--accent);
+    }
+    .badge-topic {
+      background: var(--accent-teal-subtle);
+      color: var(--accent-teal);
+    }
+    .index-container {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 2rem 4rem;
+    }
+    .back-link {
+      display: inline-block;
+      margin: 1.5rem 2rem;
+      color: var(--accent-teal);
+      text-decoration: none;
+      font-size: 0.9rem;
+    }
+    .back-link:hover {
+      text-decoration: underline;
+    }
+    @media (max-width: 768px) {
+      .hero h1 { font-size: 2rem; }
+      .chapter-grid { grid-template-columns: 1fr; }
+      .hero .stats { gap: 1rem; }
+    }
+  </style>
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+
+  <a href="../index.html" class="back-link">← Back to Main Handbook</a>
+
+  <div class="hero">
+    <h1>Senior Data Engineering Interview Handbook</h1>
+    <p class="subtitle">
+      18 real-world scenarios that FAANG interviewers ask Senior &amp; Staff Data Engineers.
+      Deep dives into SQL Internals, Query Optimization, Spark, Kafka, BigQuery, Snowflake, Data Warehousing &amp; Production Debugging.
+    </p>
+    <div class="stats">
+      <div class="stat">
+        <div class="stat-number">18</div>
+        <div class="stat-label">Chapters</div>
+      </div>
+      <div class="stat">
+        <div class="stat-number">200+</div>
+        <div class="stat-label">SQL Examples</div>
+      </div>
+      <div class="stat">
+        <div class="stat-number">100+</div>
+        <div class="stat-label">Spark Examples</div>
+      </div>
+      <div class="stat">
+        <div class="stat-number">150+</div>
+        <div class="stat-label">Diagrams</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="index-container">
+
+    <!-- Part I -->
+    <div class="part-header" id="part-i">
+      <h2>Part I — SQL &amp; Query Processing Internals</h2>
+      <p>How distributed query engines parse, optimize, and execute SQL at scale</p>
+    </div>
+    <div class="chapter-grid">
+      <a href="chapters/ch01-sql-query-execution.html" class="chapter-card">
+        <span class="chapter-number">Chapter 1</span>
+        <h3>How does a SQL query actually execute inside a distributed query engine?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Query Engine</span>
+          <span class="badge badge-topic">Optimizer</span>
+        </div>
+      </a>
+      <a href="chapters/ch02-full-table-scan-vs-index.html" class="chapter-card">
+        <span class="chapter-number">Chapter 2</span>
+        <h3>Why did the optimizer choose a full table scan instead of using an index?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Statistics</span>
+          <span class="badge badge-topic">Cost Model</span>
+        </div>
+      </a>
+      <a href="chapters/ch03-join-order-optimization.html" class="chapter-card">
+        <span class="chapter-number">Chapter 3</span>
+        <h3>How do query optimizers determine join order?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Join Algorithms</span>
+          <span class="badge badge-topic">Cardinality</span>
+        </div>
+      </a>
+      <a href="chapters/ch04-small-joins-big.html" class="chapter-card">
+        <span class="chapter-number">Chapter 4</span>
+        <h3>Why does joining a small table with a large table usually perform better?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-medium">Medium</span>
+          <span class="badge badge-topic">Hash Join</span>
+          <span class="badge badge-topic">Broadcast</span>
+        </div>
+      </a>
+      <a href="chapters/ch05-predicate-projection-pruning.html" class="chapter-card">
+        <span class="chapter-number">Chapter 5</span>
+        <h3>What is predicate pushdown, projection pushdown, and nested pruning?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Pushdown</span>
+          <span class="badge badge-topic">Columnar</span>
+        </div>
+      </a>
+    </div>
+
+    <!-- Part II -->
+    <div class="part-header" id="part-ii">
+      <h2>Part II — Storage Engines &amp; Database Internals</h2>
+      <p>MVCC, locking, vacuum, and why queries suddenly become slow</p>
+    </div>
+    <div class="chapter-grid">
+      <a href="chapters/ch06-mvcc.html" class="chapter-card">
+        <span class="chapter-number">Chapter 6</span>
+        <h3>Explain MVCC from first principles</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">MVCC</span>
+          <span class="badge badge-topic">PostgreSQL</span>
+        </div>
+      </a>
+      <a href="chapters/ch07-locking-mechanisms.html" class="chapter-card">
+        <span class="chapter-number">Chapter 7</span>
+        <h3>Explain database locking mechanisms</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-medium">Medium</span>
+          <span class="badge badge-topic">Locks</span>
+          <span class="badge badge-topic">Deadlocks</span>
+        </div>
+      </a>
+      <a href="chapters/ch08-query-suddenly-slow.html" class="chapter-card">
+        <span class="chapter-number">Chapter 8</span>
+        <h3>Why does a query suddenly become slow after months of working correctly?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Statistics Drift</span>
+          <span class="badge badge-topic">Plan Cache</span>
+        </div>
+      </a>
+    </div>
+
+    <!-- Part III -->
+    <div class="part-header" id="part-iii">
+      <h2>Part III — Data Warehousing</h2>
+      <p>Petabyte-scale analytics, BigQuery internals, Snowflake architecture</p>
+    </div>
+    <div class="chapter-grid">
+      <a href="chapters/ch09-warehouse-design.html" class="chapter-card">
+        <span class="chapter-number">Chapter 9</span>
+        <h3>How would you design a warehouse for petabyte-scale analytics?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Star Schema</span>
+          <span class="badge badge-topic">Modeling</span>
+        </div>
+      </a>
+      <a href="chapters/ch10-bigquery-internals.html" class="chapter-card">
+        <span class="chapter-number">Chapter 10</span>
+        <h3>How does BigQuery execute SQL differently from PostgreSQL?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">BigQuery</span>
+          <span class="badge badge-topic">Dremel</span>
+        </div>
+      </a>
+      <a href="chapters/ch11-snowflake-internals.html" class="chapter-card">
+        <span class="chapter-number">Chapter 11</span>
+        <h3>Explain how Snowflake works internally</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-medium">Medium</span>
+          <span class="badge badge-topic">Snowflake</span>
+          <span class="badge badge-topic">Micro-partitions</span>
+        </div>
+      </a>
+    </div>
+
+    <!-- Part IV -->
+    <div class="part-header" id="part-iv">
+      <h2>Part IV — Apache Spark</h2>
+      <p>Catalyst optimizer, shuffle internals, spill debugging, and AQE</p>
+    </div>
+    <div class="chapter-grid">
+      <a href="chapters/ch12-spark-execution.html" class="chapter-card">
+        <span class="chapter-number">Chapter 12</span>
+        <h3>Explain how Spark executes a job</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">DAG</span>
+          <span class="badge badge-topic">Catalyst</span>
+        </div>
+      </a>
+      <a href="chapters/ch13-spark-spill.html" class="chapter-card">
+        <span class="chapter-number">Chapter 13</span>
+        <h3>Why are Spark jobs spilling to disk?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Shuffle</span>
+          <span class="badge badge-topic">Memory</span>
+        </div>
+      </a>
+    </div>
+
+    <!-- Part V -->
+    <div class="part-header" id="part-v">
+      <h2>Part V — Streaming Systems</h2>
+      <p>Real-time pipelines, exactly-once semantics, windowing, and state</p>
+    </div>
+    <div class="chapter-grid">
+      <a href="chapters/ch14-realtime-pipeline.html" class="chapter-card">
+        <span class="chapter-number">Chapter 14</span>
+        <h3>Design a real-time event processing pipeline</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Kafka</span>
+          <span class="badge badge-topic">Flink</span>
+        </div>
+      </a>
+      <a href="chapters/ch15-exactly-once-streaming.html" class="chapter-card">
+        <span class="chapter-number">Chapter 15</span>
+        <h3>How do you guarantee exactly-once processing?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Checkpointing</span>
+          <span class="badge badge-topic">Idempotency</span>
+        </div>
+      </a>
+    </div>
+
+    <!-- Part VI -->
+    <div class="part-header" id="part-vi">
+      <h2>Part VI — Production Data Engineering</h2>
+      <p>ETL debugging, data quality, and lakehouse architecture</p>
+    </div>
+    <div class="chapter-grid">
+      <a href="chapters/ch16-etl-pipeline-slow.html" class="chapter-card">
+        <span class="chapter-number">Chapter 16</span>
+        <h3>A daily ETL pipeline suddenly takes three times longer. How do you investigate?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">ETL</span>
+          <span class="badge badge-topic">Debugging</span>
+        </div>
+      </a>
+      <a href="chapters/ch17-incorrect-dashboard-metrics.html" class="chapter-card">
+        <span class="chapter-number">Chapter 17</span>
+        <h3>Dashboard shows incorrect metrics after deployment. How do you debug it?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-medium">Medium</span>
+          <span class="badge badge-topic">Data Quality</span>
+          <span class="badge badge-topic">Reconciliation</span>
+        </div>
+      </a>
+      <a href="chapters/ch18-lakehouse-platform.html" class="chapter-card">
+        <span class="chapter-number">Chapter 18</span>
+        <h3>Design a modern lakehouse platform for a global organization</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Lakehouse</span>
+          <span class="badge badge-topic">Iceberg</span>
+        </div>
+      </a>
+    </div>
+
+  </div>
+
+  <footer style="text-align: center; padding: 2rem; color: var(--text-muted); border-top: 1px solid var(--border); font-size: 0.85rem;">
+    <p>Senior Data Engineering Interview Handbook &mdash; Built for engineers preparing for FAANG-level interviews</p>
+  </footer>
+
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>

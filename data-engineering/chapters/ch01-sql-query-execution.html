@@ -1,0 +1,2249 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 1: SQL Query Execution in Distributed Engines | Senior Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 1</span>
+      <span class="chapter-title">SQL Query Execution</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#sql-parsing">SQL Parsing &amp; AST</a></li>
+        <li><a href="#logical-plan">Logical Plan</a></li>
+        <li><a href="#query-rewriting">Query Rewriting</a></li>
+        <li><a href="#cost-based-optimizer">Cost-Based Optimizer</a></li>
+        <li><a href="#physical-plan">Physical Plan</a></li>
+        <li><a href="#execution-models">Execution Models</a></li>
+        <li><a href="#distributed-execution">Distributed Execution</a></li>
+        <li><a href="#runtime-optimizations">Runtime Optimizations</a></li>
+        <li><a href="#engines-compared">Engine Comparison</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-i">Part I — SQL &amp; Query Processing Internals</a> &rsaquo;
+      <span>Chapter 1</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Query Engine</span>
+        <span class="badge badge-topic">Optimizer</span>
+      </div>
+      <h1>How Does a SQL Query Actually Execute Inside a Distributed Query Engine?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> A SQL query traverses five major phases—parsing, logical planning, optimization, physical planning, and distributed execution—each offering distinct opportunities for performance tuning. Understanding this pipeline is critical for diagnosing why a query that "should be fast" runs slowly in production.
+      </p>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+    <!-- ============================================================
+         SECTION 1: INTERVIEWER INTENT
+         ============================================================ -->
+    <section id="interviewer-intent">
+      <h2>What the Interviewer Is Really Evaluating</h2>
+      <details>
+        <summary>Why this question separates senior from staff-level engineers</summary>
+        <div class="callout callout-info">
+          <p><strong>This question is a "depth probe."</strong> The interviewer wants to see whether you can go beyond surface-level SQL syntax and explain the machinery underneath. At the Senior/Staff level, you are expected to troubleshoot query performance across distributed systems—and that requires understanding the full execution pipeline.</p>
+        </div>
+        <p>The interviewer is assessing:</p>
+        <ul>
+          <li><strong>Systems thinking:</strong> Can you trace a query from text to distributed execution across hundreds of nodes?</li>
+          <li><strong>Optimizer intuition:</strong> Do you understand why the engine chose a hash join over a sort-merge join?</li>
+          <li><strong>Debugging skill:</strong> When a query regresses from 30 seconds to 5 minutes, can you pinpoint the root cause?</li>
+          <li><strong>Cross-engine literacy:</strong> Can you contrast how BigQuery, Snowflake, Spark SQL, and PostgreSQL handle the same query differently?</li>
+          <li><strong>Production awareness:</strong> Do you know how statistics staleness, data skew, and partition pruning affect real workloads?</li>
+        </ul>
+        <p>A strong answer demonstrates the full pipeline with concrete examples from at least two engines, discusses trade-offs at each phase, and connects theory to production debugging scenarios.</p>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 2: QUICK ANSWER
+         ============================================================ -->
+    <section id="quick-answer">
+      <h2>60-Second Interview Answer</h2>
+      <details>
+        <summary>Concise answer you can deliver under pressure</summary>
+        <div class="callout callout-tip">
+          <blockquote>
+            <p>"A SQL query goes through five phases. First, the <strong>parser</strong> tokenizes the SQL text and builds an Abstract Syntax Tree, validating syntax. Second, a <strong>logical plan</strong> is generated—a tree of relational algebra operators like Scan, Filter, Project, Join, and Aggregate. Third, the <strong>optimizer</strong> rewrites this plan using heuristic rules (predicate pushdown, constant folding) and then a cost-based optimizer enumerates candidate plans, using table statistics and cardinality estimates to pick the cheapest. Fourth, the <strong>physical plan</strong> maps logical operators to concrete algorithms—hash join vs. sort-merge join, hash aggregate vs. sort aggregate. Finally, in a distributed engine, the <strong>execution layer</strong> partitions the plan into stages separated by shuffle/exchange boundaries, distributes fragments across worker nodes, and executes them using either a Volcano iterator model, vectorized batch processing, or compiled push-based execution. Runtime optimizations like Adaptive Query Execution in Spark can re-optimize mid-flight based on actual data statistics observed during shuffles."</p>
+          </blockquote>
+        </div>
+        <p>This answer hits all five phases in under 60 seconds. Now let's go deep on each.</p>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 3: SQL PARSING & AST
+         ============================================================ -->
+    <section id="sql-parsing">
+      <h2>SQL Parsing &amp; Abstract Syntax Tree</h2>
+      <details>
+        <summary>Tokenization, grammar rules, and AST construction</summary>
+        <h3>The Full Query Execution Pipeline</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SQL QUERY EXECUTION PIPELINE                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐         │
+│  │  SQL     │    │  Logical │    │  Optimiz │    │ Physical │         │
+│  │  Text    │───▶│  Plan    │───▶│  ed Plan │───▶│  Plan    │───┐     │
+│  │          │    │          │    │          │    │          │   │     │
+│  └──────────┘    └──────────┘    └──────────┘    └──────────┘   │     │
+│       │                                                          │     │
+│       ▼                                                          ▼     │
+│  ┌──────────┐                                          ┌──────────┐   │
+│  │ Tokenizer│                                          │Distributed│   │
+│  │ + Parser │                                          │ Execution │   │
+│  │ (AST)    │                                          │  Engine   │   │
+│  └──────────┘                                          └──────────┘   │
+│                                                              │         │
+│                                                              ▼         │
+│                                                        ┌──────────┐   │
+│                                                        │  Results  │   │
+│                                                        └──────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Detailed phase breakdown:
+
+  SQL Text ──▶ [Lexer/Tokenizer] ──▶ Token Stream
+                                          │
+                                          ▼
+                                   [Parser (LALR/PEG)]
+                                          │
+                                          ▼
+                                   [Abstract Syntax Tree]
+                                          │
+                                          ▼
+                              [Semantic Analysis / Binding]
+                                   (resolve tables, columns, types)
+                                          │
+                                          ▼
+                                   [Logical Plan]
+                                          │
+                                          ▼
+                              [Rule-Based Rewriting]
+                                   (predicate pushdown, constant folding)
+                                          │
+                                          ▼
+                              [Cost-Based Optimization]
+                                   (statistics, cardinality estimation)
+                                          │
+                                          ▼
+                                   [Physical Plan]
+                                   (algorithm selection)
+                                          │
+                                          ▼
+                              [Distributed Plan / DAG]
+                                   (partition, shuffle, exchange)
+                                          │
+                                          ▼
+                              [Execution on Worker Nodes]
+                                          │
+                                          ▼
+                                   [Result Assembly]
+        </pre>
+
+        <h3>Tokenization (Lexical Analysis)</h3>
+        <p>The lexer breaks raw SQL text into tokens—keywords, identifiers, literals, operators, and punctuation. Each token carries type and positional metadata for error reporting.</p>
+        <pre><code class="language-sql">-- Input SQL
+SELECT o.order_id, c.name, SUM(o.amount)
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE o.created_at >= '2024-01-01'
+GROUP BY o.order_id, c.name
+HAVING SUM(o.amount) > 1000;</code></pre>
+
+        <p>Token stream (simplified):</p>
+        <pre><code class="language-json">[
+  {"type": "KEYWORD", "value": "SELECT"},
+  {"type": "IDENTIFIER", "value": "o"},
+  {"type": "DOT", "value": "."},
+  {"type": "IDENTIFIER", "value": "order_id"},
+  {"type": "COMMA", "value": ","},
+  {"type": "IDENTIFIER", "value": "c"},
+  {"type": "DOT", "value": "."},
+  {"type": "IDENTIFIER", "value": "name"},
+  {"type": "COMMA", "value": ","},
+  {"type": "FUNCTION", "value": "SUM"},
+  {"type": "LPAREN", "value": "("},
+  {"type": "IDENTIFIER", "value": "o"},
+  {"type": "DOT", "value": "."},
+  {"type": "IDENTIFIER", "value": "amount"},
+  {"type": "RPAREN", "value": ")"},
+  {"type": "KEYWORD", "value": "FROM"},
+  {"type": "IDENTIFIER", "value": "orders"},
+  {"type": "ALIAS", "value": "o"}
+]</code></pre>
+
+        <h3>Parsing &amp; Grammar</h3>
+        <p>The parser applies SQL grammar rules (typically LALR(1) or recursive descent) to build a tree structure. PostgreSQL uses a Bison-generated parser with ~200 grammar rules. Spark SQL uses ANTLR4.</p>
+        <div class="callout callout-info">
+          <p><strong>Engine Parsers:</strong> PostgreSQL uses <code>gram.y</code> (Bison/Yacc). Spark SQL uses ANTLR4 with <code>SqlBase.g4</code>. BigQuery and Snowflake use proprietary parsers that extend standard SQL with their dialect-specific extensions (QUALIFY, PIVOT, FLATTEN).</p>
+        </div>
+
+        <h3>Abstract Syntax Tree (AST)</h3>
+        <pre class="diagram">
+                    SELECT Statement
+                    /      |       \
+                   /       |        \
+            SELECT-list  FROM-clause  WHERE-clause
+            /    |   \       |              |
+           /     |    \      |              |
+      o.order_id |  SUM(o.amount)    o.created_at >= '2024-01-01'
+              c.name   |
+                       |
+                 JOIN-clause ─── ON o.customer_id = c.id
+                 /         \
+            orders o    customers c
+        </pre>
+
+        <h3>Semantic Analysis (Binding Phase)</h3>
+        <p>After parsing, the analyzer resolves identifiers against the catalog:</p>
+        <ul>
+          <li>Resolves table names to physical storage locations</li>
+          <li>Resolves column names and checks type compatibility</li>
+          <li>Expands <code>SELECT *</code> to explicit column lists</li>
+          <li>Validates function signatures and return types</li>
+          <li>Resolves implicit type casts (e.g., <code>INT</code> compared to <code>BIGINT</code>)</li>
+        </ul>
+        <div class="callout callout-warning">
+          <p><strong>Interview trap:</strong> Candidates often skip the binding phase. Without catalog resolution, the engine cannot determine column types, which are required for choosing comparison operators and hash functions downstream.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 4: LOGICAL PLAN
+         ============================================================ -->
+    <section id="logical-plan">
+      <h2>Logical Plan</h2>
+      <details>
+        <summary>Relational algebra operators: Scan, Filter, Project, Join, Aggregate</summary>
+        <p>The logical plan represents the query as a tree of relational algebra operators, independent of any physical implementation. This abstraction allows the optimizer to reason about equivalences and transformations.</p>
+
+        <h3>Core Relational Operators</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Operator</th>
+              <th>Symbol</th>
+              <th>Description</th>
+              <th>SQL Equivalent</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Scan (TableScan)</td>
+              <td>R</td>
+              <td>Read all rows from a relation</td>
+              <td>FROM table</td>
+            </tr>
+            <tr>
+              <td>Selection (Filter)</td>
+              <td>σ</td>
+              <td>Filter rows by predicate</td>
+              <td>WHERE / HAVING</td>
+            </tr>
+            <tr>
+              <td>Projection</td>
+              <td>π</td>
+              <td>Select specific columns</td>
+              <td>SELECT col1, col2</td>
+            </tr>
+            <tr>
+              <td>Join</td>
+              <td>⋈</td>
+              <td>Combine rows from two relations</td>
+              <td>JOIN ... ON</td>
+            </tr>
+            <tr>
+              <td>Aggregation</td>
+              <td>γ</td>
+              <td>Group and compute aggregates</td>
+              <td>GROUP BY + SUM/COUNT</td>
+            </tr>
+            <tr>
+              <td>Sort</td>
+              <td>τ</td>
+              <td>Order tuples</td>
+              <td>ORDER BY</td>
+            </tr>
+            <tr>
+              <td>Limit</td>
+              <td>λ</td>
+              <td>Restrict output cardinality</td>
+              <td>LIMIT / TOP</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Logical Plan Tree (for our example query)</h3>
+        <pre class="diagram">
+            π (order_id, name, sum_amount)           ← Project
+            │
+            σ (sum_amount > 1000)                    ← Having Filter
+            │
+            γ (GROUP BY order_id, name;              ← Aggregate
+               SUM(amount) AS sum_amount)
+            │
+            σ (created_at >= '2024-01-01')           ← Where Filter
+            │
+            ⋈ (customer_id = id)                     ← Join
+           / \
+          /   \
+    Scan(orders)  Scan(customers)                    ← Table Scans
+        </pre>
+
+        <h3>Spark Catalyst Logical Plan</h3>
+        <p>In Spark SQL, you can inspect the logical plan directly:</p>
+        <pre><code class="language-python"># Spark SQL - inspect logical plan
+df = spark.sql("""
+    SELECT o.order_id, c.name, SUM(o.amount) as total
+    FROM orders o
+    JOIN customers c ON o.customer_id = c.id
+    WHERE o.created_at >= '2024-01-01'
+    GROUP BY o.order_id, c.name
+    HAVING SUM(o.amount) > 1000
+""")
+
+# Unresolved logical plan (before catalog binding)
+print(df.queryExecution.logical)
+
+# Analyzed logical plan (after binding)
+print(df.queryExecution.analyzed)
+
+# Optimized logical plan (after rule-based rewrites)
+print(df.queryExecution.optimizedPlan)</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Key insight:</strong> The logical plan is <em>declarative</em>—it specifies WHAT to compute, not HOW. The same logical plan can map to dozens of different physical execution strategies. This separation of concerns is what makes query optimizers possible.</p>
+        </div>
+
+        <h3>Unresolved vs. Resolved Plans</h3>
+        <p>Spark Catalyst distinguishes between:</p>
+        <ul>
+          <li><strong>Unresolved Plan:</strong> References column names as strings, tables not yet looked up</li>
+          <li><strong>Analyzed Plan:</strong> All references resolved, types assigned, implicit casts added</li>
+          <li><strong>Optimized Plan:</strong> Rule-based transformations applied</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 5: QUERY REWRITING
+         ============================================================ -->
+    <section id="query-rewriting">
+      <h2>Query Rewriting (Rule-Based Optimization)</h2>
+      <details>
+        <summary>Constant folding, predicate pushdown, common subexpression elimination</summary>
+        <p>Before the cost-based optimizer runs, a series of heuristic rewrite rules transform the logical plan. These rules are always beneficial regardless of data distribution or table sizes.</p>
+
+        <h3>Key Rewrite Rules</h3>
+
+        <h4>1. Predicate Pushdown</h4>
+        <p>Move filter predicates as close to the data source as possible, reducing the number of rows flowing through the plan.</p>
+        <pre class="diagram">
+BEFORE:                              AFTER:
+─────────                            ─────────
+  Filter(created_at >= '2024-01-01')   Join
+      │                                 / \
+    Join                               /   \
+    / \                        Filter(≥)  Scan(customers)
+   /   \                           │
+Scan(orders) Scan(customers)   Scan(orders)
+        </pre>
+        <pre><code class="language-sql">-- Before pushdown: filter applied AFTER join (processes all rows)
+-- After pushdown: filter applied BEFORE join (eliminates rows early)
+
+-- In BigQuery, partition pruning is a form of predicate pushdown:
+SELECT * FROM `project.dataset.events`
+WHERE _PARTITIONDATE >= '2024-01-01'  -- Pushed to storage layer
+  AND event_type = 'purchase';         -- Pushed to column reader</code></pre>
+
+        <h4>2. Constant Folding</h4>
+        <p>Evaluate constant expressions at compile time:</p>
+        <pre><code class="language-sql">-- Before constant folding
+WHERE created_at >= CAST('2024-01-01' AS DATE) + INTERVAL '7' DAY
+
+-- After constant folding
+WHERE created_at >= '2024-01-08'</code></pre>
+
+        <h4>3. Projection Pruning (Column Pruning)</h4>
+        <p>Only read columns that are actually referenced downstream. Critical for columnar formats (Parquet, ORC) where entire column chunks can be skipped.</p>
+        <pre class="diagram">
+BEFORE: Scan(orders) → reads ALL 50 columns
+AFTER:  Scan(orders[order_id, customer_id, amount, created_at]) → reads 4 columns
+
+Impact on Parquet: Skip 46 column chunks per row group
+Typical speedup: 5-20x for wide tables
+        </pre>
+
+        <h4>4. Common Subexpression Elimination</h4>
+        <pre><code class="language-sql">-- Before
+SELECT
+  UPPER(TRIM(name)) AS display_name,
+  LENGTH(UPPER(TRIM(name))) AS name_length
+FROM customers;
+
+-- After (internally): compute UPPER(TRIM(name)) once, reuse
+-- The optimizer creates a temporary reference for the shared expression</code></pre>
+
+        <h4>5. Boolean Expression Simplification</h4>
+        <pre><code class="language-sql">-- Before
+WHERE (status = 'active' AND status = 'active') OR (1 = 0)
+-- After
+WHERE status = 'active'</code></pre>
+
+        <h4>6. Subquery Decorrelation</h4>
+        <p>Transform correlated subqueries into joins—one of the most impactful rewrites:</p>
+        <pre><code class="language-sql">-- Before (correlated subquery - executes once per outer row)
+SELECT * FROM orders o
+WHERE o.amount > (
+  SELECT AVG(amount) FROM orders WHERE customer_id = o.customer_id
+);
+
+-- After (decorrelated - single pass with window or join)
+SELECT o.* FROM orders o
+JOIN (
+  SELECT customer_id, AVG(amount) as avg_amt
+  FROM orders GROUP BY customer_id
+) agg ON o.customer_id = agg.customer_id
+WHERE o.amount > agg.avg_amt;</code></pre>
+
+        <h3>Spark Catalyst Optimization Rules</h3>
+        <p>Spark applies ~70 built-in optimization rules in a fixed-point iteration (rules repeat until no more changes):</p>
+        <pre class="diagram">
+Catalyst Optimization Phases:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Batch 1: "Finish Analysis"
+  └─ EliminateSubqueryAliases
+  └─ ReplaceExpressions
+
+Batch 2: "Union" (max 1 iteration)
+  └─ CombineUnions
+
+Batch 3: "Operator Optimization" (max 100 iterations / fixed-point)
+  └─ PushDownPredicates
+  └─ ColumnPruning
+  └─ CollapseProject
+  └─ ConstantFolding
+  └─ BooleanSimplification
+  └─ EliminateSorts
+  └─ PruneFilters
+  └─ ReorderJoin (heuristic)
+  └─ EliminateOuterJoin
+  └─ NullPropagation
+  └─ OptimizeIn
+  └─ ReplaceIntersectWithSemiJoin
+
+Batch 4: "Join Reorder" (CBO, if enabled)
+  └─ CostBasedJoinReorder
+
+Batch 5: "Decimal Optimization"
+  └─ DecimalAggregates
+        </pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Production gotcha:</strong> Predicate pushdown does NOT happen across non-deterministic functions. If you wrap a column in <code>RAND()</code> or a UDF, the optimizer cannot push predicates past it, leading to full scans.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 6: COST-BASED OPTIMIZER
+         ============================================================ -->
+    <section id="cost-based-optimizer">
+      <h2>Cost-Based Optimizer (CBO)</h2>
+      <details>
+        <summary>Statistics, cardinality estimation, plan enumeration, cost models</summary>
+        <p>While rule-based rewrites are "always good," the CBO must choose between alternatives that depend on data characteristics. A hash join is better for large unsorted inputs; a merge join is better when both sides are pre-sorted. The CBO uses statistics to make these decisions.</p>
+
+        <h3>Statistics Collection</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Statistic</th>
+              <th>PostgreSQL</th>
+              <th>Spark SQL</th>
+              <th>BigQuery</th>
+              <th>Snowflake</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Row count</td>
+              <td>pg_class.reltuples</td>
+              <td>ANALYZE TABLE</td>
+              <td>Automatic</td>
+              <td>Automatic</td>
+            </tr>
+            <tr>
+              <td>Column NDV</td>
+              <td>pg_statistic.stadistinct</td>
+              <td>ANALYZE TABLE ... FOR COLUMNS</td>
+              <td>Automatic</td>
+              <td>Automatic</td>
+            </tr>
+            <tr>
+              <td>Histograms</td>
+              <td>Equi-depth (100 buckets)</td>
+              <td>Equi-height (254 buckets)</td>
+              <td>Proprietary</td>
+              <td>Micro-partitions metadata</td>
+            </tr>
+            <tr>
+              <td>Null fraction</td>
+              <td>pg_statistic.stanullfrac</td>
+              <td>Yes (3.0+)</td>
+              <td>Automatic</td>
+              <td>Automatic</td>
+            </tr>
+            <tr>
+              <td>Min/Max</td>
+              <td>Via histogram bounds</td>
+              <td>Yes</td>
+              <td>Column metadata</td>
+              <td>Zone maps</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Cardinality Estimation</h3>
+        <p>The most critical (and error-prone) component. Estimates how many rows each operator will produce.</p>
+        <pre class="diagram">
+Selectivity Estimation Formulas:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Equality predicate:    sel(col = value) = 1 / NDV(col)
+Range predicate:       sel(col > value) = (max - value) / (max - min)
+AND combination:       sel(A AND B) = sel(A) × sel(B)  [independence assumption]
+OR combination:        sel(A OR B) = sel(A) + sel(B) - sel(A) × sel(B)
+JOIN selectivity:      sel(R.a = S.b) = 1 / max(NDV(R.a), NDV(S.b))
+LIKE prefix:           sel(col LIKE 'abc%') ≈ 1 / NDV(col)  [heuristic]
+
+Cardinality after filter:
+  |σ_p(R)| = |R| × sel(p)
+
+Cardinality after join:
+  |R ⋈ S| = (|R| × |S|) / max(NDV(R.join_col), NDV(S.join_col))
+        </pre>
+
+        <div class="callout callout-danger">
+          <p><strong>The Independence Assumption is often WRONG.</strong> If you filter on <code>city = 'Seattle' AND state = 'WA'</code>, the optimizer estimates sel = (1/1000) × (1/50) = 1/50000. The real selectivity is ~1/1000 because city implies state. This causes massive underestimates leading to nested-loop joins on large datasets. PostgreSQL 10+ added extended statistics (<code>CREATE STATISTICS</code>) to handle correlated columns.</p>
+        </div>
+
+        <h3>Cost Model</h3>
+        <p>The optimizer assigns a numeric cost to each physical plan and picks the minimum. Costs model three resource dimensions:</p>
+        <pre class="diagram">
+Total Cost = w_io × C_io + w_cpu × C_cpu + w_net × C_network
+
+Where:
+━━━━━━
+
+C_io (I/O Cost):
+  Sequential scan:  C_io = pages × seq_page_cost
+  Random I/O:       C_io = pages × random_page_cost
+  (PostgreSQL: seq_page_cost = 1.0, random_page_cost = 4.0)
+
+C_cpu (CPU Cost):
+  Per-tuple:        C_cpu = tuples × cpu_tuple_cost
+  Per-operator:     C_cpu += tuples × cpu_operator_cost
+  (PostgreSQL: cpu_tuple_cost = 0.01, cpu_operator_cost = 0.0025)
+
+C_network (Distributed Only):
+  Shuffle cost:     C_net = rows × avg_row_size × network_cost_per_byte
+  Broadcast cost:   C_net = |small_table| × num_nodes × network_cost_per_byte
+
+Hash Join Cost:
+  Build phase:  C = |build_side| × (cpu_tuple_cost + cpu_operator_cost)
+  Probe phase:  C = |probe_side| × (cpu_tuple_cost + cpu_operator_cost)
+  Total:        C = C_build + C_probe + C_io(read both tables)
+
+Sort-Merge Join Cost:
+  Sort phase:   C = |R| × log(|R|) + |S| × log(|S|) [if not pre-sorted]
+  Merge phase:  C = |R| + |S|
+  Total:        C = C_sort_R + C_sort_S + C_merge
+        </pre>
+
+        <h3>Plan Enumeration</h3>
+        <p>For N tables, there are (2N-2)! / (N-1)! possible join orderings. With N=10 tables, that's ~17 billion plans. Optimizers use:</p>
+        <ul>
+          <li><strong>Dynamic Programming (PostgreSQL, Spark):</strong> Bottom-up, optimal for ≤12 tables. Considers all pair-wise joins, memoizes sub-plans.</li>
+          <li><strong>Greedy/Heuristic (large queries):</strong> PostgreSQL switches to GEQO (Genetic Query Optimizer) for &gt;12 tables.</li>
+          <li><strong>Cascades Framework (SQL Server, newer engines):</strong> Top-down, rule-based exploration with memoization. More extensible.</li>
+        </ul>
+
+        <pre><code class="language-sql">-- PostgreSQL: force the optimizer to show its work
+SET enable_hashjoin = off;  -- disable hash joins to see alternatives
+SET enable_mergejoin = off; -- force nested loop
+
+-- Check if CBO is using histograms
+SELECT * FROM pg_stats
+WHERE tablename = 'orders' AND attname = 'created_at';
+
+-- Spark SQL: enable CBO (off by default in older versions)
+SET spark.sql.cbo.enabled = true;
+SET spark.sql.cbo.joinReorder.enabled = true;
+
+-- Collect statistics for CBO
+ANALYZE TABLE orders COMPUTE STATISTICS FOR ALL COLUMNS;</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Staff-level insight:</strong> In Snowflake, you never manually collect statistics—the system maintains them automatically via micro-partition metadata (min/max, NDV, null count per micro-partition). This is why Snowflake doesn't expose ANALYZE TABLE or histogram commands.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 7: PHYSICAL PLAN
+         ============================================================ -->
+    <section id="physical-plan">
+      <h2>Physical Plan (Operator Selection)</h2>
+      <details>
+        <summary>Hash join vs merge join vs nested loop; sort vs hash aggregate</summary>
+        <p>The physical plan maps each logical operator to a concrete algorithm. This is where the "rubber meets the road"—choosing the wrong algorithm can mean 100x performance difference.</p>
+
+        <h3>Join Algorithm Selection</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Algorithm</th>
+              <th>Best When</th>
+              <th>Memory</th>
+              <th>Complexity</th>
+              <th>Pre-sorted?</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Nested Loop</strong></td>
+              <td>Small outer + indexed inner; cross joins; inequality joins</td>
+              <td>O(1)</td>
+              <td>O(N × M)</td>
+              <td>No</td>
+            </tr>
+            <tr>
+              <td><strong>Hash Join</strong></td>
+              <td>Equi-joins; one side fits in memory; unsorted data</td>
+              <td>O(|build|)</td>
+              <td>O(N + M)</td>
+              <td>No</td>
+            </tr>
+            <tr>
+              <td><strong>Sort-Merge Join</strong></td>
+              <td>Both sides sorted (index); large-large equi-joins; need sorted output</td>
+              <td>O(sort buffer)</td>
+              <td>O(N log N + M log M)</td>
+              <td>Exploits existing</td>
+            </tr>
+            <tr>
+              <td><strong>Broadcast Hash Join</strong></td>
+              <td>One side very small (fits in memory of each node)</td>
+              <td>O(|small| × nodes)</td>
+              <td>O(N)</td>
+              <td>No</td>
+            </tr>
+            <tr>
+              <td><strong>Shuffle Hash Join</strong></td>
+              <td>Both sides large; no pre-partitioning</td>
+              <td>O(partition)</td>
+              <td>O(N + M + shuffle)</td>
+              <td>No</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Hash Join Internals</h3>
+        <pre class="diagram">
+Hash Join (Build + Probe):
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Phase 1: BUILD (smaller relation)
+┌─────────────────────────────────────┐
+│  For each row in build_table:       │
+│    hash(join_key) → bucket_index    │
+│    insert row into hash_table[idx]  │
+└─────────────────────────────────────┘
+         │
+         ▼
+  Hash Table (in memory):
+  ┌─────┬────────────────┐
+  │ 0   │ → row3 → row7  │
+  │ 1   │ → row1          │
+  │ 2   │ → (empty)       │
+  │ 3   │ → row4 → row9  │
+  │ ... │                  │
+  └─────┴────────────────┘
+
+Phase 2: PROBE (larger relation)
+┌─────────────────────────────────────┐
+│  For each row in probe_table:       │
+│    hash(join_key) → bucket_index    │
+│    scan bucket for matching rows    │
+│    emit joined result               │
+└─────────────────────────────────────┘
+
+Memory pressure → Grace Hash Join (spill to disk):
+  - Partition both sides by hash into N partitions
+  - Process one partition pair at a time
+  - Only one partition needs to fit in memory
+        </pre>
+
+        <h3>Aggregate Algorithm Selection</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Algorithm</th>
+              <th>Best When</th>
+              <th>Output Order</th>
+              <th>Memory</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Hash Aggregate</strong></td>
+              <td>High cardinality groups; no ORDER BY needed</td>
+              <td>Unordered</td>
+              <td>O(groups)</td>
+            </tr>
+            <tr>
+              <td><strong>Sort Aggregate</strong></td>
+              <td>Input pre-sorted on GROUP BY key; low memory available</td>
+              <td>Sorted</td>
+              <td>O(1) streaming</td>
+            </tr>
+            <tr>
+              <td><strong>Partial + Final Aggregate</strong></td>
+              <td>Distributed: reduce shuffle by pre-aggregating locally</td>
+              <td>Depends</td>
+              <td>O(local groups)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <pre class="diagram">
+Distributed Aggregation (Partial + Shuffle + Final):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Node 1 (Partition A):              Node 2 (Partition B):
+┌──────────────────────┐          ┌──────────────────────┐
+│ Partial Aggregate:   │          │ Partial Aggregate:   │
+│  Seattle: count=500  │          │  Seattle: count=300  │
+│  Portland: count=200 │          │  Portland: count=150 │
+└──────────┬───────────┘          └──────────┬───────────┘
+           │                                  │
+           └──────────┬───────────────────────┘
+                      │ SHUFFLE (by city hash)
+                      ▼
+         Node 3 (Final Aggregate):
+         ┌──────────────────────┐
+         │  Seattle: count=800  │ (500 + 300)
+         │  Portland: count=350 │ (200 + 150)
+         └──────────────────────┘
+        </pre>
+
+        <div class="callout callout-info">
+          <p><strong>Spark Physical Plan Operators:</strong> <code>BroadcastHashJoin</code>, <code>SortMergeJoin</code>, <code>ShuffledHashJoin</code>, <code>BroadcastNestedLoopJoin</code>, <code>CartesianProduct</code>. The threshold for broadcast is controlled by <code>spark.sql.autoBroadcastJoinThreshold</code> (default: 10MB).</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 8: EXECUTION MODELS
+         ============================================================ -->
+    <section id="execution-models">
+      <h2>Execution Models</h2>
+      <details>
+        <summary>Volcano/Iterator, Vectorized, and Compiled/Push-based models</summary>
+        <p>How operators actually process data at runtime. This is the execution engine's inner loop—where CPU cycles are spent.</p>
+
+        <h3>Model Comparison</h3>
+        <pre class="diagram">
+┌────────────────────┬──────────────────────┬─────────────────────────┐
+│   VOLCANO/PULL     │    VECTORIZED        │    PUSH/COMPILED        │
+│   (Iterator)       │    (Batch)           │    (Code Generation)    │
+├────────────────────┼──────────────────────┼─────────────────────────┤
+│                    │                      │                         │
+│  Agg.next()        │  Agg.nextBatch()     │  Generated code:        │
+│    │               │    │                 │  for row in scan():     │
+│    ▼               │    ▼                 │    if filter(row):      │
+│  Join.next()       │  Join.nextBatch()    │      agg.update(row)    │
+│    │               │    │                 │                         │
+│    ▼               │    ▼                 │  (fused pipeline,       │
+│  Filter.next()     │  Filter.nextBatch()  │   no virtual calls)     │
+│    │               │    │                 │                         │
+│    ▼               │    ▼                 │                         │
+│  Scan.next()       │  Scan.nextBatch()    │                         │
+│    │               │    │                 │                         │
+│  [1 row]           │  [1024 rows]         │  [N rows streamed]      │
+│                    │                      │                         │
+├────────────────────┼──────────────────────┼─────────────────────────┤
+│ Used by:           │ Used by:             │ Used by:                │
+│ PostgreSQL,        │ DuckDB, Snowflake,   │ Spark (WholeStage       │
+│ MySQL, older       │ ClickHouse,          │ CodeGen), HyPer,        │
+│ systems            │ Velox (Meta),        │ Apache DataFusion       │
+│                    │ BigQuery             │                         │
+├────────────────────┼──────────────────────┼─────────────────────────┤
+│ Overhead:          │ Overhead:            │ Overhead:               │
+│ Virtual fn call    │ Amortized over       │ Minimal - tight         │
+│ per row per        │ batch. SIMD          │ loop, CPU-cache         │
+│ operator           │ friendly             │ friendly                │
+└────────────────────┴──────────────────────┴─────────────────────────┘
+        </pre>
+
+        <h3>1. Volcano / Iterator Model</h3>
+        <p>Each operator implements a <code>next()</code> method that returns one tuple at a time. The root operator "pulls" data by calling <code>next()</code> on its child, which recursively calls its children.</p>
+        <pre><code class="language-java">// Pseudo-code: Volcano Iterator Model
+interface Operator {
+    void open();
+    Row next();    // Returns null when exhausted
+    void close();
+}
+
+class FilterOperator implements Operator {
+    Operator child;
+    Predicate predicate;
+
+    Row next() {
+        while (true) {
+            Row row = child.next();
+            if (row == null) return null;  // exhausted
+            if (predicate.evaluate(row)) return row;
+        }
+    }
+}
+
+class HashJoinOperator implements Operator {
+    Operator buildChild, probeChild;
+    HashMap&lt;Key, List&lt;Row&gt;&gt; hashTable;
+
+    void open() {
+        // Build phase: materialize entire build side
+        buildChild.open();
+        Row row;
+        while ((row = buildChild.next()) != null) {
+            Key k = extractKey(row);
+            hashTable.computeIfAbsent(k, ArrayList::new).add(row);
+        }
+        probeChild.open();
+    }
+
+    Row next() {
+        // Probe phase: stream probe side
+        Row probeRow = probeChild.next();
+        if (probeRow == null) return null;
+        Key k = extractKey(probeRow);
+        List&lt;Row&gt; matches = hashTable.get(k);
+        // ... emit joined rows
+    }
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Volcano model bottleneck:</strong> For a query with 5 operators processing 100M rows, that's 500M virtual function calls just for <code>next()</code>. Each call causes instruction cache misses and branch mispredictions. This overhead dominates for in-memory workloads.</p>
+        </div>
+
+        <h3>2. Vectorized Execution (Batch Processing)</h3>
+        <p>Process data in batches (typically 1024-4096 rows). Each batch is a columnar array, enabling SIMD instructions and better cache utilization.</p>
+        <pre><code class="language-python"># Pseudo-code: Vectorized Execution
+class VectorizedFilter:
+    def next_batch(self):
+        batch = self.child.next_batch()  # Returns ColumnBatch(1024 rows)
+        if batch is None:
+            return None
+
+        # Evaluate predicate on entire column at once (SIMD)
+        # Selection vector: indices of rows that pass
+        sel_vector = evaluate_predicate_vectorized(
+            batch.column("created_at"),
+            operator=">=",
+            value="2024-01-01"
+        )
+
+        # Filter batch using selection vector (no branching)
+        return batch.filter(sel_vector)
+
+class ColumnBatch:
+    """Columnar batch - cache-friendly layout"""
+    def __init__(self, size=1024):
+        self.columns = {}  # name -> numpy-like array
+        self.size = size
+        # Example: 1024 int64 values packed contiguously
+        # Enables: AVX-512 can process 8 int64 comparisons per instruction</code></pre>
+
+        <pre class="diagram">
+Memory Layout Comparison:
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Row-oriented (Volcano):          Columnar (Vectorized):
+┌───┬───┬───┬───┐               ┌───┬───┬───┬───┬───┐
+│id │nm │amt│dt │  row 1        │id1│id2│id3│id4│...│  id column
+├───┼───┼───┼───┤               ├───┼───┼───┼───┼───┤
+│id │nm │amt│dt │  row 2        │a1 │a2 │a3 │a4 │...│  amount column
+├───┼───┼───┼───┤               ├───┼───┼───┼───┼───┤
+│id │nm │amt│dt │  row 3        │d1 │d2 │d3 │d4 │...│  date column
+└───┴───┴───┴───┘               └───┴───┴───┴───┴───┘
+
+Cache line (64 bytes):           Cache line (64 bytes):
+  Contains mixed columns           Contains 8 values of SAME column
+  → poor utilization if            → perfect for sequential scan
+    only 1 column needed           → SIMD can process 8 at once
+        </pre>
+
+        <h3>3. Compiled / Push-Based (Whole-Stage Code Generation)</h3>
+        <p>Instead of interpreting a tree of operators, generate actual code (Java bytecode in Spark, LLVM IR in HyPer) that fuses multiple operators into a single tight loop.</p>
+        <pre><code class="language-java">// Spark Whole-Stage CodeGen output (simplified)
+// Instead of: Scan → Filter → Project → Aggregate (4 operator calls per row)
+// Generates a single fused function:
+
+public void processPartition(Iterator&lt;InternalRow&gt; input) {
+    // All operators fused into one loop - no virtual dispatch
+    long sum = 0;
+    int count = 0;
+
+    while (input.hasNext()) {
+        InternalRow row = input.next();
+
+        // Filter (inlined)
+        long created_at = row.getLong(3);
+        if (created_at < 1704067200000L) continue;  // 2024-01-01 epoch ms
+
+        // Project + Aggregate (inlined)
+        long amount = row.getLong(2);
+        sum += amount;
+        count++;
+    }
+
+    // Emit aggregate result
+    output.write(sum, count);
+}</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Spark CodeGen in practice:</strong> Check your Spark UI's "Details" for any stage. If you see <code>WholeStageCodegen</code> wrapping your operators, code generation is active. Operators that break codegen: <code>SortMergeJoin</code> (needs materialization), <code>External Sort</code>, any operator that spills to disk.</p>
+        </div>
+
+        <h3>Performance Comparison</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Volcano</th>
+              <th>Vectorized</th>
+              <th>Compiled</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Function calls / row</td>
+              <td>N (one per operator)</td>
+              <td>N / batch_size</td>
+              <td>~0 (inlined)</td>
+            </tr>
+            <tr>
+              <td>Branch mispredictions</td>
+              <td>High</td>
+              <td>Low (selection vectors)</td>
+              <td>Low (straight-line code)</td>
+            </tr>
+            <tr>
+              <td>SIMD utilization</td>
+              <td>None</td>
+              <td>High</td>
+              <td>Moderate</td>
+            </tr>
+            <tr>
+              <td>Compilation overhead</td>
+              <td>None</td>
+              <td>None</td>
+              <td>50-500ms per query</td>
+            </tr>
+            <tr>
+              <td>Adaptability</td>
+              <td>High (easy to add operators)</td>
+              <td>Medium</td>
+              <td>Low (complex to implement)</td>
+            </tr>
+            <tr>
+              <td>Throughput (TPC-H)</td>
+              <td>1x baseline</td>
+              <td>5-10x</td>
+              <td>10-50x</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 9: DISTRIBUTED EXECUTION
+         ============================================================ -->
+    <section id="distributed-execution">
+      <h2>Distributed Execution</h2>
+      <details>
+        <summary>Partitioning, shuffle, exchange operators, pipelining vs materializing</summary>
+        <p>In a distributed engine, the physical plan is split into <strong>stages</strong> (Spark) or <strong>fragments</strong> (BigQuery/Snowflake) that run in parallel across worker nodes. Stage boundaries occur at <strong>exchange operators</strong> where data must be redistributed (shuffled).</p>
+
+        <h3>Plan Fragmentation</h3>
+        <pre class="diagram">
+Single-Node Physical Plan:           Distributed Plan (3 Stages):
+━━━━━━━━━━━━━━━━━━━━━━━              ━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  HashAggregate                       STAGE 3 (Final Aggregate):
+      │                               ┌─────────────────────┐
+  HashJoin                            │  FinalHashAggregate  │
+    /    \                            │        │             │
+ Scan(O)  Scan(C)                     │   ShuffleRead       │
+                                      └────────┬────────────┘
+                                               │ shuffle (by group key)
+                                      ─────────┼────────────────────
+                                      STAGE 2 (Partial Agg + Join):
+                                      ┌─────────────────────┐
+                                      │ PartialHashAggregate │
+                                      │        │             │
+                                      │   HashJoin           │
+                                      │     /      \         │
+                                      │ Scan(O)  BcastRead   │
+                                      └────────┬────────────┘
+                                               │ broadcast
+                                      ─────────┼────────────────────
+                                      STAGE 1 (Broadcast Build):
+                                      ┌─────────────────────┐
+                                      │ BroadcastExchange    │
+                                      │        │             │
+                                      │   Scan(customers)    │
+                                      └─────────────────────┘
+        </pre>
+
+        <h3>Data Distribution Strategies</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>When Used</th>
+              <th>Network Cost</th>
+              <th>Parallelism</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Hash Partitioning</strong></td>
+              <td>Shuffle for joins/aggregates on key</td>
+              <td>O(data_size)</td>
+              <td>High (N partitions)</td>
+            </tr>
+            <tr>
+              <td><strong>Broadcast</strong></td>
+              <td>Small table (&lt;10MB) joined with large table</td>
+              <td>O(small × nodes)</td>
+              <td>No shuffle of large side</td>
+            </tr>
+            <tr>
+              <td><strong>Range Partitioning</strong></td>
+              <td>Global sort (ORDER BY + LIMIT)</td>
+              <td>O(data_size)</td>
+              <td>Ordered partitions</td>
+            </tr>
+            <tr>
+              <td><strong>Round-Robin</strong></td>
+              <td>Redistribute for load balancing</td>
+              <td>O(data_size)</td>
+              <td>Even distribution</td>
+            </tr>
+            <tr>
+              <td><strong>Single Partition</strong></td>
+              <td>Final result collection to driver</td>
+              <td>O(result_size)</td>
+              <td>1 (bottleneck)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Shuffle Deep Dive</h3>
+        <pre class="diagram">
+Shuffle (Hash Exchange) in Spark:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MAP SIDE (Stage N):                    REDUCE SIDE (Stage N+1):
+
+Executor 1:                            Executor 1:
+┌────────────────────┐                 ┌────────────────────┐
+│ Task output rows   │                 │ ShuffleRead:       │
+│   → hash(key) % P  │                 │  Fetch partition 0 │
+│   → sort by (pid,  │                 │  from ALL mappers  │
+│     key) within    │                 │  → merge → process │
+│     partition      │                 └────────────────────┘
+│   → write shuffle  │
+│     files (1 per   │                 Executor 2:
+│     partition)     │                 ┌────────────────────┐
+└────────────────────┘                 │ ShuffleRead:       │
+                                       │  Fetch partition 1 │
+Executor 2:                            │  from ALL mappers  │
+┌────────────────────┐                 │  → merge → process │
+│ Same as above      │                 └────────────────────┘
+│ (parallel)         │
+└────────────────────┘                 Total network: every mapper
+                                       sends data to every reducer
+Shuffle files on disk:                 = M × R connections
+  shuffle_0_0.data (mapper 0, part 0)
+  shuffle_0_1.data (mapper 0, part 1)
+  shuffle_1_0.data (mapper 1, part 0)
+  shuffle_1_1.data (mapper 1, part 1)
+        </pre>
+
+        <h3>Pipelining vs. Materializing</h3>
+        <ul>
+          <li><strong>Pipelining (streaming):</strong> Rows flow from one operator to the next without full materialization. Filter → Project can pipeline. Lower memory, lower latency.</li>
+          <li><strong>Materializing (blocking):</strong> Operator must consume ALL input before producing output. Sort, Hash Join build side, Aggregate. Creates stage boundaries.</li>
+        </ul>
+        <pre class="diagram">
+Pipeline-able operators:          Materializing (blocking) operators:
+  • Filter                          • Sort (must see all rows)
+  • Project                         • Hash Join BUILD side
+  • Limit (can short-circuit)       • Hash Aggregate (full)
+  • Union All                       • Window functions
+                                    • Exchange/Shuffle
+        </pre>
+
+        <h3>BigQuery Execution Architecture</h3>
+        <pre class="diagram">
+BigQuery Dremel Execution Tree:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+         ┌───────────┐
+         │   Root    │  ← Assembles final result
+         │  Server   │
+         └─────┬─────┘
+               │
+      ┌────────┼────────┐
+      ▼        ▼        ▼
+┌──────────┐┌──────────┐┌──────────┐
+│ Mixer    ││ Mixer    ││ Mixer    │  ← Intermediate aggregation
+│ (Level 1)││ (Level 1)││ (Level 1)│
+└────┬─────┘└────┬─────┘└────┬─────┘
+     │           │           │
+  ┌──┼──┐     ┌──┼──┐     ┌──┼──┐
+  ▼  ▼  ▼     ▼  ▼  ▼     ▼  ▼  ▼
+┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐
+│L ││L ││L ││L ││L ││L ││L ││L ││L │  ← Leaf Servers
+│e ││e ││e ││e ││e ││e ││e ││e ││e │     (read from Colossus)
+│af││af││af││af││af││af││af││af││af│
+└──┘└──┘└──┘└──┘└──┘└──┘└──┘└──┘└──┘
+
+• Leaf servers read columnar data from Colossus (GFS)
+• Each leaf handles a set of file shards
+• Mixers perform partial aggregation/sorting
+• Tree structure allows massive fan-out (thousands of leaves)
+• Shuffle between stages uses Google's internal shuffle service (Dremel Shuffle)
+        </pre>
+
+        <div class="callout callout-info">
+          <p><strong>Snowflake's approach:</strong> Snowflake uses "virtual warehouses" — clusters of EC2/GCE nodes with local SSD cache. Data is read from cloud storage (S3/GCS), cached locally, and processed. Unlike Spark, Snowflake automatically scales the number of workers per query based on data volume (multi-cluster warehouses).</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 10: RUNTIME OPTIMIZATIONS
+         ============================================================ -->
+    <section id="runtime-optimizations">
+      <h2>Runtime Optimizations</h2>
+      <details>
+        <summary>Runtime filters, Adaptive Query Execution (AQE), dynamic partition pruning</summary>
+        <p>Traditional optimizers make all decisions at compile time based on statistics. Runtime optimizations adjust the plan <em>during execution</em> based on actual observed data.</p>
+
+        <h3>Spark Adaptive Query Execution (AQE)</h3>
+        <p>Introduced in Spark 3.0, AQE re-optimizes the plan at shuffle boundaries (materialization points) when actual row counts differ from estimates.</p>
+        <pre class="diagram">
+AQE Optimization Points:
+━━━━━━━━━━━━━━━━━━━━━━━
+
+Compile time:  Statistics say Table A has 1M rows, Table B has 100 rows
+               → Plan: BroadcastHashJoin (broadcast B)
+
+Runtime (after Stage 1 shuffle):
+  Actual: Table A after filter = 500 rows, Table B = 50M rows (stats were stale!)
+  AQE detects: "B is way larger than expected, A is tiny"
+  Re-plan: BroadcastHashJoin (broadcast A instead!)
+
+┌─────────────────────────────────────────────────────────┐
+│ AQE Re-optimization Triggers:                           │
+│                                                         │
+│ 1. Coalescing shuffle partitions                        │
+│    - After shuffle, many partitions are tiny (<64KB)    │
+│    - AQE merges adjacent small partitions               │
+│    - Reduces task overhead (1000 → 50 partitions)       │
+│                                                         │
+│ 2. Switching join strategy                              │
+│    - Post-filter, one side is now small enough to       │
+│      broadcast (< autoBroadcastJoinThreshold)           │
+│    - Converts SortMergeJoin → BroadcastHashJoin        │
+│                                                         │
+│ 3. Handling skewed joins                                │
+│    - Detects partitions 5x larger than median           │
+│    - Splits skewed partition into sub-partitions        │
+│    - Replicates the other side for those sub-partitions │
+└─────────────────────────────────────────────────────────┘
+        </pre>
+        <pre><code class="language-sql">-- Enable AQE in Spark
+SET spark.sql.adaptive.enabled = true;
+SET spark.sql.adaptive.coalescePartitions.enabled = true;
+SET spark.sql.adaptive.skewJoin.enabled = true;
+
+-- Skew join threshold
+SET spark.sql.adaptive.skewJoin.skewedPartitionFactor = 5;
+SET spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes = 256MB;</code></pre>
+
+        <h3>Dynamic Partition Pruning (DPP)</h3>
+        <p>When a dimension table filter can eliminate partitions from a fact table at runtime:</p>
+        <pre><code class="language-sql">-- Query: find orders for "Electronics" category
+SELECT o.* FROM fact_orders o
+JOIN dim_products p ON o.product_id = p.id
+WHERE p.category = 'Electronics';
+
+-- Without DPP: scan ALL partitions of fact_orders, join, then filter
+-- With DPP:
+--   1. Execute dimension side first: get product_ids for Electronics
+--   2. Use those IDs as a runtime filter on fact_orders scan
+--   3. Skip partitions that don't contain those product_ids</code></pre>
+
+        <pre class="diagram">
+Dynamic Partition Pruning Flow:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Without DPP:                        With DPP:
+┌──────────────────┐               ┌──────────────────┐
+│ Scan fact_orders │ (ALL parts)   │ Scan fact_orders │ (3 partitions)
+│   100 partitions │               │   3 partitions   │ ← pruned at runtime
+│   500GB read     │               │   15GB read      │
+└────────┬─────────┘               └────────┬─────────┘
+         │                                  │
+         ▼                                  ▼
+┌──────────────────┐               ┌──────────────────┐
+│ Join + Filter    │               │ Join             │
+│ (discard 97%)    │               │ (most rows match)│
+└──────────────────┘               └──────────────────┘
+
+Result: 33x less I/O with DPP
+        </pre>
+
+        <h3>Runtime Bloom Filters</h3>
+        <p>BigQuery and Spark use bloom filters built during the join's build phase to filter the probe side at scan time:</p>
+        <ul>
+          <li>Build a bloom filter from the smaller join side's keys</li>
+          <li>Push the bloom filter down to the scan of the larger side</li>
+          <li>Skip row groups / micro-partitions whose keys are definitely not in the filter</li>
+          <li>False positive rate ~1% with typical sizing</li>
+        </ul>
+
+        <div class="callout callout-tip">
+          <p><strong>Snowflake's runtime pruning:</strong> Snowflake uses "pruning" extensively — each micro-partition (50-500MB compressed) has min/max metadata for every column. At runtime, the engine checks join keys against micro-partition ranges to skip irrelevant data without bloom filters.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 11: ENGINE COMPARISON
+         ============================================================ -->
+    <section id="engines-compared">
+      <h2>Engine Comparison</h2>
+      <details>
+        <summary>PostgreSQL vs BigQuery vs Snowflake vs Spark SQL execution differences</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>PostgreSQL</th>
+              <th>BigQuery</th>
+              <th>Snowflake</th>
+              <th>Spark SQL</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Architecture</strong></td>
+              <td>Single-node, shared-nothing processes</td>
+              <td>Serverless, multi-tenant Dremel tree</td>
+              <td>Multi-cluster shared-data (cloud storage)</td>
+              <td>Driver + Executors on cluster (YARN/K8s)</td>
+            </tr>
+            <tr>
+              <td><strong>Execution Model</strong></td>
+              <td>Volcano (pull, row-at-a-time)</td>
+              <td>Vectorized columnar (batches)</td>
+              <td>Vectorized push-based</td>
+              <td>Whole-Stage CodeGen + Volcano fallback</td>
+            </tr>
+            <tr>
+              <td><strong>Storage Format</strong></td>
+              <td>Heap tuples (row-oriented pages)</td>
+              <td>Capacitor (columnar, proprietary)</td>
+              <td>Micro-partitions (columnar, PAX-style)</td>
+              <td>Parquet/ORC/Delta (columnar)</td>
+            </tr>
+            <tr>
+              <td><strong>Optimizer</strong></td>
+              <td>Bottom-up DP + GEQO for large joins</td>
+              <td>Proprietary CBO (automatic stats)</td>
+              <td>Proprietary CBO (micro-partition metadata)</td>
+              <td>Catalyst: rule-based + optional CBO</td>
+            </tr>
+            <tr>
+              <td><strong>Statistics</strong></td>
+              <td>ANALYZE (manual/autovacuum)</td>
+              <td>Automatic, always fresh</td>
+              <td>Automatic (zone maps per micro-partition)</td>
+              <td>ANALYZE TABLE (manual) + AQE runtime</td>
+            </tr>
+            <tr>
+              <td><strong>Shuffle/Exchange</strong></td>
+              <td>N/A (single node)</td>
+              <td>Dremel Shuffle Service (disaggregated)</td>
+              <td>Internal distributed shuffle</td>
+              <td>Sort-based shuffle with local disk spill</td>
+            </tr>
+            <tr>
+              <td><strong>Concurrency</strong></td>
+              <td>MVCC, process-per-connection</td>
+              <td>Thousands of concurrent queries (slots)</td>
+              <td>Virtual warehouse isolation</td>
+              <td>Limited by cluster resources</td>
+            </tr>
+            <tr>
+              <td><strong>Join Algorithms</strong></td>
+              <td>Hash, Merge, Nested Loop</td>
+              <td>Hash, Broadcast, Shuffle</td>
+              <td>Hash (local + distributed)</td>
+              <td>Broadcast Hash, Sort-Merge, Shuffle Hash</td>
+            </tr>
+            <tr>
+              <td><strong>Runtime Adaptation</strong></td>
+              <td>None (plan fixed at compile time)</td>
+              <td>Dynamic work rebalancing</td>
+              <td>Automatic scaling, adaptive pruning</td>
+              <td>AQE (Spark 3.0+)</td>
+            </tr>
+            <tr>
+              <td><strong>Memory Management</strong></td>
+              <td>work_mem per operation (sorts, hashes)</td>
+              <td>Managed (serverless, quota-based)</td>
+              <td>Managed (warehouse-level)</td>
+              <td>Unified memory (execution + storage) per executor</td>
+            </tr>
+            <tr>
+              <td><strong>Spill-to-Disk</strong></td>
+              <td>Yes (temp files for large sorts/hashes)</td>
+              <td>Transparent (shuffle service handles)</td>
+              <td>Yes (local SSD cache)</td>
+              <td>Yes (shuffle writes, external sort)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>How the Same Query Executes Differently</h3>
+        <pre><code class="language-sql">-- Same logical query on each engine
+SELECT customer_id, SUM(amount) as total
+FROM orders
+WHERE created_at >= '2024-01-01'
+GROUP BY customer_id
+HAVING SUM(amount) > 10000
+ORDER BY total DESC
+LIMIT 100;</code></pre>
+
+        <h4>PostgreSQL Execution</h4>
+        <pre class="diagram">
+Limit (100 rows)
+  → Top-N HeapSort (sort on total DESC, keep top 100)
+    → HashAggregate (group by customer_id, filter sum > 10000)
+      → Seq Scan on orders (filter: created_at >= '2024-01-01')
+         OR
+      → Index Scan using idx_orders_created_at
+         (if selectivity < ~5% of table)
+
+Single process, single thread. work_mem bounds hash table size.
+If hash table exceeds work_mem → spill to disk (batch mode).
+        </pre>
+
+        <h4>BigQuery Execution</h4>
+        <pre class="diagram">
+Stage 1 (Leaf Servers - thousands parallel):
+  → Column scan from Colossus (only amount, customer_id, created_at)
+  → Partition pruning via _PARTITIONDATE
+  → Partial aggregate per shard
+
+Stage 2 (Mixer/Shuffle):
+  → Shuffle by hash(customer_id)
+  → Final aggregate
+  → Filter HAVING
+  → Top-100 sort
+
+Slots dynamically allocated. No disk spill visible to user.
+Charged by bytes scanned (amount + customer_id + created_at columns only).
+        </pre>
+
+        <h4>Snowflake Execution</h4>
+        <pre class="diagram">
+1. Query compilation (cloud services layer)
+2. Micro-partition pruning:
+   → Zone maps eliminate partitions where max(created_at) < '2024-01-01'
+   → Example: 1000 micro-partitions → 200 remain after pruning
+3. Scan + partial aggregate (parallel across warehouse nodes)
+   → Each node handles a subset of micro-partitions
+   → Columnar scan: only read 3 columns
+4. Redistribute by hash(customer_id) across nodes
+5. Final aggregate + HAVING filter
+6. Top-100 sort + return to client
+
+Result cache checked first — if same query ran recently, instant return.
+        </pre>
+
+        <h4>Spark SQL Execution</h4>
+        <pre class="diagram">
+Stage 1 (Map tasks - one per Parquet file/partition):
+  → FileScan parquet [customer_id, amount, created_at]
+  → Filter (pushed to Parquet reader: row group pruning)
+  → Partial HashAggregate (per partition)
+  → WholeStageCodegen wraps all above
+
+--- Shuffle (hash on customer_id, 200 partitions default) ---
+
+Stage 2 (Reduce tasks):
+  → ShuffleRead
+  → Final HashAggregate
+  → Filter (HAVING)
+  → TakeOrderedAndProject (top 100 by total DESC)
+  → WholeStageCodegen wraps all above
+
+With AQE: if partitions are skewed or too small, coalesce/split dynamically.
+        </pre>
+
+        <div class="callout callout-info">
+          <p><strong>Key difference:</strong> PostgreSQL uses a single-threaded execution with no parallelism for most queries. BigQuery and Snowflake automatically parallelize across hundreds of nodes. Spark requires explicit cluster provisioning but gives you control over parallelism (number of executors, cores, memory).</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 12: PRODUCTION INCIDENT
+         ============================================================ -->
+    <section id="production-incident">
+      <h2>Production Incident: The Cardinality Estimation Cliff</h2>
+      <details>
+        <summary>Query ran fine for 6 months, then suddenly took 10x longer</summary>
+        <div class="callout callout-danger">
+          <p><strong>Real incident pattern</strong> — this scenario appears regularly at FAANG companies and is a common interview discussion topic.</p>
+        </div>
+
+        <h3>Timeline</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Event</th>
+              <th>Query Runtime</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Jan 2024</td>
+              <td>Pipeline deployed. Orders table: 50M rows. Statistics fresh.</td>
+              <td>45 seconds</td>
+            </tr>
+            <tr>
+              <td>Feb-Jun 2024</td>
+              <td>Table grows to 200M rows. Stats updated weekly via ANALYZE.</td>
+              <td>50-70 seconds</td>
+            </tr>
+            <tr>
+              <td>Jul 1, 2024</td>
+              <td>Marketing campaign drives 3x order volume for electronics category.</td>
+              <td>65 seconds</td>
+            </tr>
+            <tr>
+              <td>Jul 8, 2024</td>
+              <td>Statistics updated. NDV for product_category unchanged (50 categories). But distribution changed: "electronics" went from 5% to 35% of rows.</td>
+              <td>65 seconds</td>
+            </tr>
+            <tr>
+              <td>Jul 15, 2024</td>
+              <td><strong>INCIDENT:</strong> Histogram bucket for "electronics" overflows. Optimizer estimates 5% selectivity (old histogram) but actual is 35%.</td>
+              <td><strong>8 minutes</strong></td>
+            </tr>
+            <tr>
+              <td>Jul 15, 2024 +2h</td>
+              <td>Root cause identified: CBO chose Nested Loop Join (expected 2.5M rows from fact table) instead of Hash Join (actual 70M rows).</td>
+              <td>—</td>
+            </tr>
+            <tr>
+              <td>Jul 15, 2024 +3h</td>
+              <td>Fix: ANALYZE with increased statistics target. Plan switches to Hash Join.</td>
+              <td>55 seconds</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Root Cause Analysis</h3>
+        <pre class="diagram">
+What the optimizer "saw" (stale histogram):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Category Distribution (histogram from June):
+┌──────────────┬───────────┬──────────┐
+│ Category     │ Estimated │  Actual  │
+├──────────────┼───────────┼──────────┤
+│ electronics  │    5%     │   35%    │  ← 7x underestimate!
+│ clothing     │   15%     │   12%    │
+│ food         │   20%     │   15%    │
+│ other (47)   │   60%     │   38%    │
+└──────────────┴───────────┴──────────┘
+
+Optimizer's reasoning:
+  "orders WHERE category = 'electronics'" → 200M × 0.05 = 10M rows (estimated)
+  Actual: 200M × 0.35 = 70M rows
+
+  With 10M estimated rows on probe side:
+    → Nested Loop with Index Scan on dimension table seems cheap
+    → Cost = 10M × (index_lookup_cost) = 10M × 4.0 = 40M
+
+  With 70M actual rows:
+    → Nested Loop = 70M × 4.0 = 280M cost (7x worse!)
+    → Hash Join would be: 70M + 100K (build dim) = 70.1M cost
+        </pre>
+
+        <h3>The Fix (and Prevention)</h3>
+        <pre><code class="language-sql">-- Immediate fix: update statistics with higher granularity
+-- PostgreSQL
+ALTER TABLE orders ALTER COLUMN product_category
+  SET STATISTICS 1000;  -- default is 100, increase histogram buckets
+ANALYZE orders;
+
+-- Verify the plan changed
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT o.*, p.name FROM orders o
+JOIN products p ON o.product_id = p.id
+WHERE o.product_category = 'electronics';
+
+-- Spark SQL: if CBO is enabled, recompute
+ANALYZE TABLE orders COMPUTE STATISTICS FOR COLUMNS product_category;
+
+-- Long-term prevention:
+-- 1. Schedule ANALYZE after large batch loads
+-- 2. Monitor plan changes with pg_stat_statements
+-- 3. Use extended statistics for correlated columns
+CREATE STATISTICS orders_category_date (dependencies)
+  ON product_category, created_at FROM orders;</code></pre>
+
+        <h3>How Each Engine Would Handle This</h3>
+        <ul>
+          <li><strong>PostgreSQL:</strong> Plan fixed at compile time. Stale stats → wrong plan. Must re-ANALYZE.</li>
+          <li><strong>BigQuery:</strong> Auto-maintains stats. Less likely to hit this, but can still occur with heavily skewed data. Slot-based execution means even a "bad" plan just uses more slots.</li>
+          <li><strong>Snowflake:</strong> Zone maps updated per micro-partition automatically. Unlikely to hit this for partition pruning. Join strategy might still be suboptimal.</li>
+          <li><strong>Spark SQL (AQE):</strong> After Stage 1 shuffle materializes, AQE observes actual row count (70M vs estimated 10M) and re-optimizes. The join strategy switches at runtime. <strong>This is the ideal behavior.</strong></li>
+        </ul>
+
+        <div class="callout callout-tip">
+          <p><strong>Interview gold:</strong> Telling this story demonstrates you've debugged real production issues. Key signals: knowing that statistics go stale, understanding the cascading effect on plan choice, and knowing engine-specific mitigations (AQE, extended statistics, auto-ANALYZE).</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 13: DEBUGGING WORKFLOW
+         ============================================================ -->
+    <section id="debugging-workflow">
+      <h2>Debugging Query Execution</h2>
+      <details>
+        <summary>EXPLAIN ANALYZE, Spark UI, BigQuery Execution Details, Snowflake Query Profile</summary>
+
+        <h3>PostgreSQL: EXPLAIN ANALYZE</h3>
+        <pre><code class="language-sql">-- Full diagnostic output
+EXPLAIN (ANALYZE, BUFFERS, COSTS, TIMING, FORMAT TEXT)
+SELECT o.order_id, c.name, SUM(o.amount) as total
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE o.created_at >= '2024-01-01'
+GROUP BY o.order_id, c.name
+HAVING SUM(o.amount) > 1000
+ORDER BY total DESC
+LIMIT 50;</code></pre>
+
+        <h4>Real EXPLAIN ANALYZE Output</h4>
+        <pre><code class="language-sql">Limit  (cost=45892.33..45892.46 rows=50 width=52)
+       (actual time=1247.381..1247.402 rows=50 loops=1)
+  ->  Sort  (cost=45892.33..45917.33 rows=10000 width=52)
+            (actual time=1247.379..1247.391 rows=50 loops=1)
+        Sort Key: (sum(o.amount)) DESC
+        Sort Method: top-N heapsort  Memory: 32kB
+        ->  HashAggregate  (cost=45234.00..45584.00 rows=10000 width=52)
+                           (actual time=1198.422..1232.567 rows=28493 loops=1)
+              Group Key: o.order_id, c.name
+              Filter: (sum(o.amount) > 1000)
+              Rows Removed by Filter: 171507
+              Batches: 1  Memory Usage: 14353kB
+              ->  Hash Join  (cost=3412.00..38984.00 rows=500000 width=24)
+                             (actual time=45.891..687.234 rows=498721 loops=1)
+                    Hash Cond: (o.customer_id = c.id)
+                    ->  Seq Scan on orders o  (cost=0.00..32145.00 rows=500000 width=20)
+                                              (actual time=0.021..312.456 rows=498721 loops=1)
+                          Filter: (created_at >= '2024-01-01'::date)
+                          Rows Removed by Filter: 1501279
+                    ->  Hash  (cost=2137.00..2137.00 rows=102000 width=20)
+                              (actual time=45.234..45.235 rows=102000 loops=1)
+                          Buckets: 131072  Batches: 1  Memory Usage: 5765kB
+                          ->  Seq Scan on customers c  (cost=0.00..2137.00 rows=102000 width=20)
+                                                       (actual time=0.012..18.345 rows=102000 loops=1)
+Planning Time: 2.341 ms
+Execution Time: 1248.012 ms</code></pre>
+
+        <h4>How to Read This Output</h4>
+        <table>
+          <thead>
+            <tr>
+              <th>Field</th>
+              <th>Meaning</th>
+              <th>Red Flags</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>cost=X..Y</code></td>
+              <td>Estimated startup..total cost (arbitrary units)</td>
+              <td>Large gap between estimated and actual rows</td>
+            </tr>
+            <tr>
+              <td><code>rows=N</code></td>
+              <td>Estimated rows output (compare with actual)</td>
+              <td>Off by &gt;10x → stale statistics</td>
+            </tr>
+            <tr>
+              <td><code>actual time=X..Y</code></td>
+              <td>Wall-clock ms for first row..all rows</td>
+              <td>Large first-row time → blocking operator upstream</td>
+            </tr>
+            <tr>
+              <td><code>loops=N</code></td>
+              <td>How many times this node was executed</td>
+              <td>High loops with Nested Loop → bad plan</td>
+            </tr>
+            <tr>
+              <td><code>Rows Removed by Filter</code></td>
+              <td>Rows that didn't pass the predicate</td>
+              <td>High value → predicate should be pushed further down</td>
+            </tr>
+            <tr>
+              <td><code>Buffers: shared hit=N read=M</code></td>
+              <td>Pages from cache vs disk</td>
+              <td>High reads → cold cache or large scan</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Spark UI Debugging</h3>
+        <pre class="diagram">
+Spark UI Navigation for Query Debugging:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SQL Tab → Query Details:
+┌────────────────────────────────────────────┐
+│ Query 42: SELECT o.order_id, c.name...     │
+│                                            │
+│ Duration: 4.2 min                          │
+│ Stages: 3                                  │
+│                                            │
+│ Physical Plan (click "Details"):           │
+│ ┌────────────────────────────────────┐     │
+│ │ WholeStageCodegen (3)              │     │
+│ │  └─ HashAggregate (final)          │     │
+│ │     └─ ShuffleReader               │     │
+│ │────────── shuffle ──────────────│  │     │
+│ │ WholeStageCodegen (2)              │     │
+│ │  └─ HashAggregate (partial)        │     │
+│ │     └─ BroadcastHashJoin           │     │
+│ │        ├─ FileScan parquet orders   │     │
+│ │        └─ BroadcastExchange         │     │
+│ │────────── broadcast ────────────│  │     │
+│ │ WholeStageCodegen (1)              │     │
+│ │  └─ FileScan parquet customers     │     │
+│ └────────────────────────────────────┘     │
+│                                            │
+│ Key Metrics per Stage:                     │
+│  • Shuffle Write: 2.3 GB                  │
+│  • Shuffle Read: 2.3 GB                   │
+│  • Spill (Memory): 0                      │
+│  • Spill (Disk): 0                        │
+│  • Input Size: 45 GB (orders)             │
+│  • Rows Output: 498,721                   │
+└────────────────────────────────────────────┘
+
+Red Flags in Spark UI:
+  ✗ Spill (Disk) > 0     → increase executor memory
+  ✗ Skewed tasks         → one task takes 10x longer than median
+  ✗ Shuffle write large  → consider broadcast or bucketing
+  ✗ GC Time > 10%        → too many objects, reduce executor memory fraction
+        </pre>
+
+        <h3>BigQuery Execution Details</h3>
+        <pre><code class="language-sql">-- BigQuery: view execution details via INFORMATION_SCHEMA
+SELECT
+  stage_id,
+  stage_name,
+  start_ms,
+  end_ms,
+  input_stages,
+  parallel_inputs,
+  records_read,
+  records_written,
+  shuffle_output_bytes,
+  slot_ms
+FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT,
+  UNNEST(job_stages)
+WHERE job_id = 'bquxjob_abc123_xyz'
+ORDER BY stage_id;</code></pre>
+
+        <h3>Snowflake Query Profile</h3>
+        <pre class="diagram">
+Snowflake Query Profile (Web UI):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────┐
+│ Query ID: 01a12345-0001-abcd-000-1234567890│
+│ Duration: 12.4s                            │
+│ Bytes Scanned: 3.2 GB                     │
+│ Partitions Scanned: 234 / 1,891 (12%)     │  ← good pruning!
+│ Bytes Spilled (local): 0                  │
+│ Bytes Spilled (remote): 0                 │
+│                                            │
+│ Operator Tree:                             │
+│  Result [1]                                │
+│   └─ Limit [2] (50 rows)                  │
+│      └─ Sort [3] (total DESC)             │
+│         └─ Filter [4] (sum > 1000)        │
+│            └─ Aggregate [5] (group by)    │
+│               └─ Join [6] (hash)          │
+│                  ├─ TableScan [7] orders   │
+│                  │   Partitions: 234/1891  │
+│                  └─ TableScan [8] customers│
+│                      Partitions: 12/12    │
+│                                            │
+│ Most Expensive Operator: Aggregate [5]     │
+│  → 67% of total time                      │
+│  → Spill: None                            │
+└─────────────────────────────────────────────┘
+
+Key metrics to check:
+  • Partitions scanned vs total → pruning effectiveness
+  • Bytes spilled to local/remote → memory pressure
+  • % time in each operator → bottleneck identification
+  • "Queued" time → warehouse contention
+        </pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Debugging checklist:</strong> (1) Is the plan using the expected join type? (2) Are estimated vs actual rows close? (3) Is there unexpected spill to disk? (4) Are partitions being pruned effectively? (5) Is there data skew in any stage?</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 14: CODE EXAMPLES
+         ============================================================ -->
+    <section id="code-examples">
+      <h2>Code Examples: Same Query, Different Plans</h2>
+      <details>
+        <summary>SQL examples showing how different structures produce different execution plans</summary>
+
+        <h3>Example 1: JOIN Order Matters</h3>
+        <pre><code class="language-sql">-- Query A: Small table driving large table (optimal)
+SELECT c.name, COUNT(*) as order_count
+FROM customers c                          -- 100K rows (driving table)
+JOIN orders o ON c.id = o.customer_id     -- 200M rows
+WHERE c.country = 'US'                    -- filters customers to ~30K
+GROUP BY c.name;
+
+-- Plan: BroadcastHashJoin
+--   Build side: customers filtered to 30K rows (broadcast to all executors)
+--   Probe side: orders (200M rows, partitioned across executors)
+--   No shuffle needed for orders!
+
+-- Query B: Same result, but written differently
+SELECT c.name, COUNT(*) as order_count
+FROM orders o                             -- 200M rows (driving table)
+JOIN customers c ON o.customer_id = c.id  -- 100K rows
+WHERE c.country = 'US'
+GROUP BY c.name;
+
+-- Smart optimizer: produces same plan (join reordering)
+-- Naive executor: might shuffle orders first → 200M row shuffle!</code></pre>
+
+        <h3>Example 2: Subquery vs JOIN vs EXISTS</h3>
+        <pre><code class="language-sql">-- Version A: Correlated subquery (potentially N+1 execution)
+SELECT * FROM orders o
+WHERE o.amount > (
+  SELECT AVG(amount) FROM orders WHERE customer_id = o.customer_id
+);
+
+-- PostgreSQL plan (may use):
+-- Seq Scan on orders
+--   Filter: amount > (SubPlan 1)
+--   SubPlan 1: Aggregate (executes ONCE PER ROW of outer query!)
+-- Danger: 200M rows × 1 subplan execution = 200M aggregate queries
+
+-- Version B: Window function (single pass)
+SELECT * FROM (
+  SELECT *, AVG(amount) OVER (PARTITION BY customer_id) as avg_amt
+  FROM orders
+) sub
+WHERE amount > avg_amt;
+
+-- Plan: Single Seq Scan → Window (Sort + Running Avg) → Filter
+-- Much better: one pass through the data
+
+-- Version C: Self-join with pre-aggregation
+SELECT o.* FROM orders o
+JOIN (
+  SELECT customer_id, AVG(amount) as avg_amt
+  FROM orders GROUP BY customer_id
+) agg ON o.customer_id = agg.customer_id
+WHERE o.amount > agg.avg_amt;
+
+-- Plan: HashAggregate (build) → HashJoin (probe with full orders table)
+-- Good for distributed: aggregate can be done with partial+final pattern</code></pre>
+
+        <h3>Example 3: Partition Pruning Effectiveness</h3>
+        <pre><code class="language-sql">-- Query A: Partition column in WHERE (excellent pruning)
+SELECT * FROM events
+WHERE event_date = '2024-06-15'  -- Prunes to 1 partition
+  AND user_id = 12345;
+
+-- BigQuery: scans ~1/365th of the table
+-- Snowflake: scans micro-partitions where min(event_date) <= '2024-06-15'
+--            AND max(event_date) >= '2024-06-15'
+
+-- Query B: Function on partition column (NO pruning!)
+SELECT * FROM events
+WHERE YEAR(event_date) = 2024 AND MONTH(event_date) = 6
+  AND DAY(event_date) = 15
+  AND user_id = 12345;
+
+-- Disaster: wrapping partition column in a function prevents pruning
+-- Full table scan even though logically equivalent to Query A!
+
+-- Query C: Expression that DOES allow pruning (engine-dependent)
+SELECT * FROM events
+WHERE event_date BETWEEN '2024-06-15' AND '2024-06-15'
+  AND user_id = 12345;
+-- Most engines handle BETWEEN correctly for pruning</code></pre>
+
+        <h3>Example 4: EXPLAIN Plan Interpretation (PostgreSQL)</h3>
+        <pre><code class="language-sql">-- Setup
+CREATE TABLE orders (
+  id BIGINT PRIMARY KEY,
+  customer_id BIGINT,
+  amount DECIMAL(10,2),
+  created_at TIMESTAMP,
+  status VARCHAR(20)
+);
+CREATE INDEX idx_orders_customer ON orders(customer_id);
+CREATE INDEX idx_orders_created ON orders(created_at);
+ANALYZE orders;
+
+-- Query with index usage
+EXPLAIN (COSTS, FORMAT TEXT)
+SELECT * FROM orders WHERE customer_id = 42 AND created_at > '2024-01-01';
+
+-- Possible plans:
+-- Plan A (if customer 42 has few orders):
+--   Index Scan using idx_orders_customer on orders
+--     Index Cond: (customer_id = 42)
+--     Filter: (created_at > '2024-01-01')
+--
+-- Plan B (if customer 42 has many orders and date range is selective):
+--   Bitmap Heap Scan on orders
+--     Recheck Cond: (customer_id = 42 AND created_at > '2024-01-01')
+--     -> BitmapAnd
+--        -> Bitmap Index Scan on idx_orders_customer
+--             Index Cond: (customer_id = 42)
+--        -> Bitmap Index Scan on idx_orders_created
+--             Index Cond: (created_at > '2024-01-01')
+--
+-- Plan C (if both conditions are unselective):
+--   Seq Scan on orders
+--     Filter: (customer_id = 42 AND created_at > '2024-01-01')</code></pre>
+
+        <h3>Example 5: Spark SQL Physical Plan Inspection</h3>
+        <pre><code class="language-python"># Inspect full physical plan in Spark
+df = spark.sql("""
+    SELECT o.order_id, c.name, SUM(o.amount) as total
+    FROM orders o
+    JOIN customers c ON o.customer_id = c.id
+    WHERE o.created_at >= '2024-01-01'
+    GROUP BY o.order_id, c.name
+    HAVING SUM(o.amount) > 1000
+""")
+
+# Show physical plan with statistics
+df.explain(mode="cost")
+
+# Output:
+# == Optimized Logical Plan ==
+# Filter (sum(amount)#45L > 1000)  (sizeInBytes=12.4 MiB, rowCount=28493)
+# +- Aggregate [order_id, name], [order_id, name, sum(amount) AS total]
+#    +- Join Inner, (customer_id = id)  (sizeInBytes=8.2 GiB, rowCount=498721)
+#       :- Filter (created_at >= 2024-01-01)  (sizeInBytes=8.1 GiB, rowCount=498721)
+#       :  +- Relation[order_id,customer_id,amount,created_at] parquet
+#       +- Relation[id,name] parquet  (sizeInBytes=4.2 MiB, rowCount=102000)
+#
+# == Physical Plan ==
+# AdaptiveSparkPlan isFinalPlan=false
+# +- HashAggregate(keys=[order_id, name], functions=[sum(amount)], filter=[sum > 1000])
+#    +- Exchange hashpartitioning(order_id, name, 200)
+#       +- HashAggregate(keys=[order_id, name], functions=[partial_sum(amount)])
+#          +- BroadcastHashJoin [customer_id], [id], Inner, BuildRight
+#             :- Filter (created_at >= 2024-01-01)
+#             :  +- FileScan parquet [order_id,customer_id,amount,created_at]
+#             :       PushedFilters: [GreaterThanOrEqual(created_at, 2024-01-01)]
+#             +- BroadcastExchange HashedRelationBroadcastMode(List(id))
+#                +- FileScan parquet [id,name]</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Key observation:</strong> Notice <code>PushedFilters</code> in the FileScan — this means the predicate was pushed all the way down to the Parquet reader, which uses it for row-group-level filtering via column statistics. Rows are eliminated before they even enter the Spark execution pipeline.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 15: COMMON MISTAKES
+         ============================================================ -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Pitfalls that trip up even experienced engineers</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Mistake</th>
+              <th>Why It Happens</th>
+              <th>Impact</th>
+              <th>Fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>Function on partition/index column</td>
+              <td><code>WHERE YEAR(dt) = 2024</code> prevents pruning</td>
+              <td>Full table scan instead of partition scan</td>
+              <td>Rewrite as range: <code>WHERE dt >= '2024-01-01' AND dt < '2025-01-01'</code></td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>Implicit type cast on join key</td>
+              <td><code>ON a.id = b.id</code> where one is STRING, other INT</td>
+              <td>Prevents hash join optimization; may cause full scan</td>
+              <td>Ensure matching types; explicit CAST on smaller side</td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>SELECT * with columnar storage</td>
+              <td>Reads all columns from Parquet/ORC</td>
+              <td>10-50x more I/O than needed</td>
+              <td>Explicitly list only needed columns</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Stale statistics after large load</td>
+              <td>Batch ETL loads millions of rows without ANALYZE</td>
+              <td>Wrong join order, wrong algorithm choice</td>
+              <td>ANALYZE after bulk loads; use AQE in Spark</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>Cross join due to missing ON clause</td>
+              <td>Comma-separated FROM without WHERE join condition</td>
+              <td>Cartesian product: 1M × 1M = 1T rows</td>
+              <td>Always use explicit JOIN...ON syntax</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>Non-deterministic UDF preventing pushdown</td>
+              <td>UDF on filter column blocks predicate pushdown</td>
+              <td>Filter applied after full scan + join</td>
+              <td>Pre-compute UDF result in a subquery or materialized column</td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td>Too many shuffle partitions</td>
+              <td>Default 200 partitions in Spark for small datasets</td>
+              <td>Thousands of tiny tasks (scheduling overhead)</td>
+              <td>Set <code>spark.sql.shuffle.partitions</code> based on data size; use AQE coalescing</td>
+            </tr>
+            <tr>
+              <td>8</td>
+              <td>Skewed join key</td>
+              <td>One customer has 50% of all orders (null keys, popular entities)</td>
+              <td>One task processes 50% of data while others finish instantly</td>
+              <td>Salted joins, AQE skew handling, or pre-filter hot keys</td>
+            </tr>
+            <tr>
+              <td>9</td>
+              <td>ORDER BY without LIMIT in distributed engines</td>
+              <td>Forces global sort across all data</td>
+              <td>Single-node bottleneck for final merge sort</td>
+              <td>Always pair ORDER BY with LIMIT; use window functions for top-N per group</td>
+            </tr>
+            <tr>
+              <td>10</td>
+              <td>Ignoring query plan in development</td>
+              <td>"It works" in dev with 1000 rows, fails at 1B rows</td>
+              <td>Nested loops fine at 1K rows, catastrophic at 1B</td>
+              <td>Always check EXPLAIN before deploying to production; test with production-scale data</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 16: TRADE-OFFS
+         ============================================================ -->
+    <section id="trade-offs">
+      <h2>Trade-offs in Query Execution Design</h2>
+      <details>
+        <summary>Key architectural decisions and their implications</summary>
+
+        <h3>1. Compile Time vs. Runtime Optimization</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Pros</th>
+              <th>Cons</th>
+              <th>Used By</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Compile-time only</td>
+              <td>Predictable, low overhead, easier debugging</td>
+              <td>Cannot adapt to estimation errors, data skew</td>
+              <td>PostgreSQL, MySQL</td>
+            </tr>
+            <tr>
+              <td>Runtime adaptive</td>
+              <td>Handles stale stats, skew, dynamic workloads</td>
+              <td>More complex, re-optimization overhead, harder to debug</td>
+              <td>Spark AQE, BigQuery, Snowflake</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>2. Push vs. Pull Execution</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>Pros</th>
+              <th>Cons</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Pull (Volcano)</td>
+              <td>Simple implementation, natural backpressure, easy to add operators</td>
+              <td>Virtual call overhead, poor cache utilization, no SIMD</td>
+            </tr>
+            <tr>
+              <td>Push (compiled)</td>
+              <td>Tight loops, cache-friendly, SIMD potential, no virtual dispatch</td>
+              <td>Complex implementation, compilation latency, harder to cancel mid-stream</td>
+            </tr>
+            <tr>
+              <td>Vectorized</td>
+              <td>Balance of both: batch amortizes overhead, SIMD-friendly, still interpretable</td>
+              <td>Batch size tuning, memory overhead for buffers</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>3. Shuffle vs. Broadcast</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Pros</th>
+              <th>Cons</th>
+              <th>Use When</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Shuffle (repartition)</td>
+              <td>Works for any size; enables parallel join</td>
+              <td>Network I/O proportional to data; disk spill; latency</td>
+              <td>Both sides large; no table fits in memory</td>
+            </tr>
+            <tr>
+              <td>Broadcast</td>
+              <td>No shuffle of large side; very fast for large-small joins</td>
+              <td>Memory pressure if "small" side is actually large; OOM risk</td>
+              <td>One side &lt; broadcast threshold (10MB Spark, varies by engine)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>4. Statistics Freshness vs. Overhead</h3>
+        <ul>
+          <li><strong>Manual ANALYZE:</strong> No overhead until run; risk of stale stats (PostgreSQL default)</li>
+          <li><strong>Auto-vacuum ANALYZE:</strong> Triggers after N% row changes; moderate overhead (PostgreSQL with autovacuum)</li>
+          <li><strong>Continuous/automatic:</strong> Always fresh; storage metadata overhead (BigQuery, Snowflake)</li>
+          <li><strong>Runtime sampling:</strong> Sample at execution time; adds latency but always accurate (some experimental systems)</li>
+        </ul>
+
+        <h3>5. Memory vs. Disk Trade-off</h3>
+        <pre class="diagram">
+Memory Budget Decision Tree:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Hash table fits in memory?
+├── YES → In-memory hash join/aggregate (fastest)
+│         └─ Risk: OOM if estimate wrong
+└── NO  → Spill strategy:
+          ├── Grace Hash Join (partition + spill)
+          │   └─ 2-3x slower, but bounded memory
+          ├── External Sort-Merge
+          │   └─ Disk I/O bound, but handles any size
+          └── Hybrid (Spark): try in-memory, fall back to spill
+              └─ Best average case, but unpredictable latency
+
+PostgreSQL: work_mem controls per-operation memory (default 4MB)
+Spark: spark.executor.memory + spark.memory.fraction (unified pool)
+Snowflake: automatic, warehouse-sized (no user tuning)
+BigQuery: automatic, slot-based allocation
+        </pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Interview insight:</strong> When discussing trade-offs, demonstrate that you understand there is no universally "best" choice. The optimal strategy depends on data size, distribution, available resources, latency requirements, and workload patterns. Staff engineers choose based on workload characteristics, not dogma.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 17: FOLLOW-UP QUESTIONS
+         ============================================================ -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions the Interviewer May Ask</h2>
+      <details>
+        <summary>Prepare for these depth probes</summary>
+        <ol>
+          <li>
+            <strong>"How would you handle a skewed join where one key has 90% of the data?"</strong>
+            <p>Answer framework: Identify the hot key, salt the join (append random suffix to hot key, replicate the other side), or use AQE skew handling. In BigQuery, this is handled automatically by dynamic work rebalancing. In Spark, enable <code>spark.sql.adaptive.skewJoin.enabled</code>.</p>
+          </li>
+          <li>
+            <strong>"Why might a query be fast in PostgreSQL but slow in Spark for small data?"</strong>
+            <p>Answer: Spark has high startup overhead (JVM launch, DAG scheduling, shuffle setup). For &lt;100MB datasets, the overhead dominates. PostgreSQL processes immediately with no distributed coordination. Spark shines at TB+ scale.</p>
+          </li>
+          <li>
+            <strong>"How does the optimizer decide between a hash join and sort-merge join?"</strong>
+            <p>Answer: CBO compares estimated costs. Hash join: O(build) + O(probe), needs memory for build side. Sort-merge: O(N log N + M log M) for sorting + O(N+M) for merge, but can exploit existing sort order. If inputs are pre-sorted (index or previous sort), merge join avoids sort cost. If memory is limited, merge join streams without materializing a hash table.</p>
+          </li>
+          <li>
+            <strong>"What happens when a hash table spills to disk?"</strong>
+            <p>Answer: Grace Hash Join — partition both inputs by hash into B buckets. Process one bucket pair at a time. Each bucket is small enough for memory. Recursive partitioning if a single bucket still too large. 2-3x slower than in-memory due to extra I/O passes.</p>
+          </li>
+          <li>
+            <strong>"How does BigQuery achieve sub-second queries on petabyte tables?"</strong>
+            <p>Answer: (1) Capacitor columnar format enables reading only needed columns. (2) Dremel tree with thousands of leaf servers provides massive parallelism. (3) Aggressive caching and materialized views. (4) Partition pruning eliminates irrelevant data. (5) Slots are shared across the org — not waiting for cluster provisioning.</p>
+          </li>
+          <li>
+            <strong>"Explain whole-stage code generation in Spark."</strong>
+            <p>Answer: Instead of interpreting a tree of operators (virtual dispatch per row), Spark generates Java bytecode that fuses multiple operators into a single function. The generated code is a tight loop with no virtual calls, keeping data in CPU registers. This eliminates interpretation overhead and enables JIT optimizations. Boundaries: shuffles, sorts, and broadcast builds break codegen stages.</p>
+          </li>
+          <li>
+            <strong>"How do you decide the number of shuffle partitions?"</strong>
+            <p>Answer: Target ~128MB-256MB per partition for optimal parallelism vs. overhead balance. Formula: total_shuffle_data / target_partition_size. For 100GB shuffle: 100GB / 200MB = 500 partitions. Too few → memory pressure and skew sensitivity. Too many → scheduling overhead and small file problem. AQE coalesces automatically in Spark 3.0+.</p>
+          </li>
+          <li>
+            <strong>"What is the difference between logical and physical optimization?"</strong>
+            <p>Answer: Logical optimization transforms the plan using algebraic equivalences (same result, fewer operations) — predicate pushdown, join reorder. Physical optimization selects concrete algorithms (hash vs. merge join) and execution strategies (broadcast vs. shuffle) based on cost estimates. Logical is "what to compute," physical is "how to compute it."</p>
+          </li>
+        </ol>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 18: SUMMARY
+         ============================================================ -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Key points to remember</summary>
+        <div class="callout callout-tip">
+          <ol>
+            <li><strong>Five phases:</strong> Parse → Logical Plan → Optimize → Physical Plan → Distributed Execution. Know what happens at each boundary.</li>
+            <li><strong>Parsing</strong> converts SQL text to an AST via tokenization and grammar rules. Semantic analysis resolves names and types against the catalog.</li>
+            <li><strong>Logical plan</strong> is a tree of relational algebra operators (Scan, Filter, Project, Join, Aggregate) independent of physical implementation.</li>
+            <li><strong>Rule-based rewriting</strong> applies always-beneficial transformations: predicate pushdown, projection pruning, constant folding, subquery decorrelation.</li>
+            <li><strong>Cost-based optimization</strong> uses table statistics and cardinality estimation to enumerate and compare plan alternatives. The independence assumption is its Achilles' heel.</li>
+            <li><strong>Physical planning</strong> maps logical operators to algorithms: hash join vs. sort-merge vs. nested loop, hash aggregate vs. sort aggregate.</li>
+            <li><strong>Three execution models:</strong> Volcano (row-at-a-time, simple), Vectorized (batch, SIMD-friendly), Compiled (fused code, fastest for CPU-bound).</li>
+            <li><strong>Distributed execution</strong> splits the plan into stages at shuffle/exchange boundaries. Data redistribution (shuffle) is the most expensive operation in distributed queries.</li>
+            <li><strong>Runtime optimizations</strong> (AQE, DPP, runtime bloom filters) adapt the plan during execution based on actual data, fixing estimation errors.</li>
+            <li><strong>Stale statistics</strong> are the #1 cause of query performance regressions. Always ANALYZE after bulk loads, or use engines with automatic stats maintenance.</li>
+            <li><strong>Cross-engine literacy:</strong> PostgreSQL is single-node Volcano; BigQuery is serverless vectorized Dremel tree; Snowflake is vectorized push with automatic scaling; Spark is whole-stage codegen with AQE.</li>
+            <li><strong>Debugging:</strong> EXPLAIN ANALYZE (PostgreSQL), Spark UI SQL tab, BigQuery Execution Details, Snowflake Query Profile. Always compare estimated vs. actual row counts.</li>
+          </ol>
+        </div>
+      </details>
+    </section>
+
+    <nav class="chapter-nav">
+      <a href="../index.html" class="chapter-nav-prev">&larr; Back to Index</a>
+      <a href="ch02-full-table-scan-vs-index.html" class="chapter-nav-next">Chapter 2: Full Table Scan vs Index &rarr;</a>
+    </nav>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>

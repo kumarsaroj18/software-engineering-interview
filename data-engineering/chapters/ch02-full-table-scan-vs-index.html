@@ -1,0 +1,1983 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ch 2 — Full Table Scan vs Index | Data Engineering Interview Handbook</title>
+  <link rel="stylesheet" href="../../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 2</span>
+      <span class="chapter-title">Full Scan vs Index</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#statistics">Database Statistics</a></li>
+        <li><a href="#histograms">Histograms &amp; Cardinality</a></li>
+        <li><a href="#cost-model">The Cost Model</a></li>
+        <li><a href="#index-selectivity">Index Selectivity</a></li>
+        <li><a href="#scan-types">Scan Types Compared</a></li>
+        <li><a href="#data-skew">Data Skew &amp; Stale Stats</a></li>
+        <li><a href="#explain-plans">Reading EXPLAIN</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo; <a href="../index.html#part-i">Part I — SQL &amp; Query Processing Internals</a> &rsaquo; <span>Chapter 2</span>
+    </nav>
+
+    <div class="chapter-header">
+      <h1>Why Did the Optimizer Choose a Full Table Scan Instead of Using an Index?</h1>
+      <span class="badge badge-hard">Hard</span>
+      <div class="chapter-topics">
+        <span class="topic-tag">Statistics</span>
+        <span class="topic-tag">Cost Model</span>
+      </div>
+    </div>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+
+    <!-- ============================================================
+         SECTION 1: INTERVIEWER INTENT
+         ============================================================ -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>Why interviewers ask this question</summary>
+        <p>This question is a litmus test for senior Data Engineers because it reveals:</p>
+        <ul>
+          <li><strong>Deep understanding of query optimizer internals</strong> — not just "indexes make things faster" but <em>when</em> and <em>why</em> they don't.</li>
+          <li><strong>Statistics awareness</strong> — whether you understand that the optimizer is a cost-based decision engine, not a rule-based one.</li>
+          <li><strong>Production debugging skills</strong> — can you diagnose a regression where a query suddenly switches from index scan to sequential scan?</li>
+          <li><strong>Cross-engine knowledge</strong> — do you understand that BigQuery has no traditional indexes, Snowflake uses micro-partition pruning, and Spark uses predicate pushdown?</li>
+          <li><strong>Trade-off reasoning</strong> — recognizing that an index scan is NOT always better than a sequential scan.</li>
+        </ul>
+        <p>At FAANG-level, the interviewer expects you to articulate the <em>cost formula</em>, explain selectivity thresholds, reference <code>pg_stats</code>, and describe scenarios where the optimizer is correct to reject an index.</p>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 2: QUICK ANSWER
+         ============================================================ -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <details>
+        <summary>30-second senior-level response</summary>
+        <blockquote class="callout-tip">
+          <p><strong>The optimizer chose a full table scan because, given the table statistics, the estimated cost of random I/O from index lookups exceeded the cost of a sequential scan.</strong></p>
+          <p>Key reasons this happens:</p>
+          <ol>
+            <li><strong>Low selectivity</strong> — The query returns more than ~5-15% of rows. Random I/O per row (index path) becomes more expensive than sequential read of the entire table.</li>
+            <li><strong>Stale statistics</strong> — <code>pg_stats</code> histograms are outdated after bulk loads, causing cardinality misestimation.</li>
+            <li><strong>Low correlation</strong> — Physical row order doesn't match index order, making each index lookup hit a different page (high random I/O).</li>
+            <li><strong>Small table</strong> — Table fits in a few pages; sequential scan is cheaper regardless of selectivity.</li>
+            <li><strong>No covering index</strong> — Index doesn't include all required columns, forcing heap lookups that add random I/O.</li>
+          </ol>
+          <p>The optimizer's decision is: <code>cost(seq_scan) &lt; cost(index_scan)</code> based on the formula:<br>
+          <code>total_cost = (pages_read × io_cost_per_page) + (rows_processed × cpu_cost_per_row)</code></p>
+        </blockquote>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 3: DATABASE STATISTICS
+         ============================================================ -->
+    <section id="statistics">
+      <h2>Database Statistics</h2>
+      <details>
+        <summary>pg_stats, histogram bounds, MCVs, n_distinct, correlation</summary>
+
+        <h3>Why Statistics Matter</h3>
+        <p>PostgreSQL's query optimizer is <strong>cost-based</strong>. It doesn't follow rules like "always use an index if one exists." Instead, it estimates the cost of each possible plan and picks the cheapest. These estimates depend entirely on <strong>table statistics</strong> collected by <code>ANALYZE</code>.</p>
+
+        <h3>The pg_stats View</h3>
+        <p>The <code>pg_stats</code> view exposes per-column statistics that the planner uses:</p>
+        <pre><code class="language-sql">-- Inspect statistics for a specific column
+SELECT
+  schemaname,
+  tablename,
+  attname,
+  null_frac,          -- fraction of NULLs (0.0 to 1.0)
+  avg_width,          -- average column width in bytes
+  n_distinct,         -- estimated distinct values (-1 = unique)
+  most_common_vals,   -- array of most common values (MCVs)
+  most_common_freqs,  -- frequency of each MCV
+  histogram_bounds,   -- boundaries of equi-depth histogram buckets
+  correlation         -- physical-to-logical ordering (-1 to +1)
+FROM pg_stats
+WHERE tablename = 'orders'
+  AND attname = 'status';</code></pre>
+
+        <h3>Key Statistics Fields</h3>
+
+        <h4>null_frac</h4>
+        <p>Fraction of rows where the column is NULL. Used to exclude NULLs from selectivity estimates. If <code>null_frac = 0.3</code>, the optimizer knows 30% of rows won't match an equality predicate on a non-NULL value.</p>
+
+        <h4>n_distinct</h4>
+        <p>Estimated number of distinct values. Positive value = absolute count. Negative value = ratio to total rows (e.g., <code>-1</code> means every row is unique, <code>-0.5</code> means half the rows are distinct).</p>
+        <pre><code class="language-sql">-- n_distinct examples:
+-- n_distinct = 5      → exactly 5 distinct values (e.g., status column)
+-- n_distinct = -1     → column is unique (e.g., primary key)
+-- n_distinct = -0.01  → 1% of rows are distinct</code></pre>
+
+        <h4>most_common_vals (MCVs) and most_common_freqs</h4>
+        <p>The optimizer stores the N most frequent values and their frequencies. Default <code>default_statistics_target = 100</code>, so up to 100 MCVs are stored.</p>
+        <pre><code class="language-sql">-- Example MCV output for orders.status:
+-- most_common_vals:  {completed, pending, shipped, cancelled, refunded}
+-- most_common_freqs: {0.45, 0.25, 0.15, 0.10, 0.05}
+--
+-- The optimizer KNOWS that WHERE status = 'completed'
+-- will match ~45% of rows → too many for an index scan!</code></pre>
+
+        <h4>histogram_bounds</h4>
+        <p>For values NOT in the MCV list, the optimizer uses an equi-depth histogram. Each bucket contains approximately the same number of rows.</p>
+        <pre><code class="language-sql">-- Example histogram_bounds for orders.created_at:
+-- {2020-01-01, 2020-04-01, 2020-07-01, 2020-10-01,
+--  2021-01-01, 2021-04-01, 2021-07-01, 2021-10-01,
+--  2022-01-01, 2022-04-01, ...}
+--
+-- With 100 buckets over 1M rows, each bucket ≈ 10,000 rows
+-- Range query: WHERE created_at BETWEEN '2021-01-01' AND '2021-04-01'
+-- → spans ~1 bucket → ~10,000 rows → ~1% selectivity → index is good!</code></pre>
+
+        <h4>correlation</h4>
+        <p>Measures how well the physical row order matches the logical (index) order. Ranges from -1 to +1.</p>
+        <pre><code class="language-bash"># correlation interpretation:
+# +1.0  → perfectly ordered (heap matches index) → index scan is cheap
+# +0.0  → random order → each index lookup hits a different page
+# -1.0  → perfectly reverse-ordered
+
+# Example: auto-increment ID column typically has correlation ≈ +1.0
+# Example: UUID primary key typically has correlation ≈ +0.0</code></pre>
+        <p><strong>Impact:</strong> When correlation is low, the optimizer penalizes index scans because each tuple lookup likely requires a separate page read (random I/O). This is a primary reason the optimizer prefers sequential scans on poorly-correlated columns.</p>
+
+        <h3>Increasing Statistics Accuracy</h3>
+        <pre><code class="language-sql">-- Increase stats target for a specific column (default: 100, max: 10000)
+ALTER TABLE orders ALTER COLUMN created_at SET STATISTICS 1000;
+
+-- Re-analyze to collect more granular histogram
+ANALYZE orders;
+
+-- Verify the change
+SELECT attname, array_length(histogram_bounds, 1) as num_buckets
+FROM pg_stats
+WHERE tablename = 'orders' AND attname = 'created_at';</code></pre>
+
+        <h3>BigQuery &amp; Snowflake Comparison</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th>PostgreSQL</th>
+              <th>BigQuery</th>
+              <th>Snowflake</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Statistics storage</td>
+              <td><code>pg_stats</code> view</td>
+              <td>Internal (not user-visible)</td>
+              <td><code>SYSTEM$CLUSTERING_INFORMATION()</code></td>
+            </tr>
+            <tr>
+              <td>Manual refresh</td>
+              <td><code>ANALYZE table</code></td>
+              <td>Automatic</td>
+              <td>Automatic</td>
+            </tr>
+            <tr>
+              <td>Histogram type</td>
+              <td>Equi-depth</td>
+              <td>Proprietary</td>
+              <td>Min/max per micro-partition</td>
+            </tr>
+            <tr>
+              <td>Correlation equivalent</td>
+              <td><code>correlation</code> in pg_stats</td>
+              <td>N/A (columnar storage)</td>
+              <td>Clustering depth</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 4: HISTOGRAMS & CARDINALITY ESTIMATION
+         ============================================================ -->
+    <section id="histograms">
+      <h2>Histograms &amp; Cardinality Estimation</h2>
+      <details>
+        <summary>Equi-depth, equi-width, and how the optimizer estimates selectivity</summary>
+
+        <h3>Histogram Types</h3>
+
+        <h4>Equi-Width Histograms</h4>
+        <p>Divide the value range into buckets of equal width. Problem: skewed data causes some buckets to have millions of rows, others near-zero.</p>
+        <pre><code class="language-bash"># Equi-Width Histogram (BAD for skewed data)
+#
+# Values:  0──────────50─────────100─────────150─────────200
+# Bucket:  |   B1     |    B2    |    B3     |    B4     |
+# Rows:    |  950,000 |  40,000  |   8,000   |   2,000   |
+#
+# Problem: B1 has wildly different density than B4
+# Selectivity estimate for WHERE val BETWEEN 0 AND 25
+# would be 50% of B1 ≈ 475,000 rows — VERY imprecise</code></pre>
+
+        <h4>Equi-Depth Histograms (PostgreSQL's approach)</h4>
+        <p>Each bucket contains approximately the same number of rows. Bucket boundaries are placed at whatever values achieve equal row counts.</p>
+        <pre><code class="language-bash"># Equi-Depth Histogram (PostgreSQL default)
+#
+# 1,000,000 rows, 100 buckets → ~10,000 rows per bucket
+#
+# Values:  0──5──8──12──15──20──30──50──80──100──150──200
+# Bucket:  |B1|B2|B3| B4| B5| B6| B7| B8| B9|B10 |B11|
+# Rows:    10K 10K 10K 10K 10K 10K 10K 10K 10K 10K  10K
+#
+# Notice: dense regions (0-20) have NARROW buckets
+#         sparse regions (100-200) have WIDE buckets
+#
+# Selectivity for WHERE val BETWEEN 0 AND 8:
+# → spans buckets B1 + B2 → ~20,000 rows → 2% selectivity
+# Much more accurate!</code></pre>
+
+        <h3>How the Optimizer Estimates Selectivity</h3>
+
+        <h4>Step 1: Check MCVs</h4>
+        <pre><code class="language-sql">-- For equality predicates: WHERE status = 'pending'
+-- Optimizer checks most_common_vals/most_common_freqs
+-- If 'pending' is in MCVs with freq 0.25 → selectivity = 0.25
+-- Estimated rows = 0.25 × total_rows</code></pre>
+
+        <h4>Step 2: Check Histogram (for non-MCV values)</h4>
+        <pre><code class="language-sql">-- For range predicates: WHERE amount > 500
+-- 1. Find which histogram bucket contains 500
+-- 2. Interpolate within that bucket
+-- 3. Add all buckets beyond that point
+--
+-- Example with 10 buckets, bounds = {0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000}
+-- WHERE amount > 500: value falls at bucket boundary 5/10
+-- Selectivity = (10 - 5) / 10 = 0.5 (50%)
+-- But wait — subtract MCV fraction first!
+-- If MCVs account for 20% of rows:
+-- Histogram fraction = 1 - 0.20 - null_frac
+-- Final selectivity = 0.5 × histogram_fraction + mcv_selectivity</code></pre>
+
+        <h4>Step 3: The Selectivity Formula</h4>
+        <pre><code class="language-python"># PostgreSQL's selectivity estimation (simplified)
+def estimate_selectivity(predicate, stats):
+    """
+    For: WHERE column = value
+    """
+    # Check if value is in Most Common Values
+    if value in stats.most_common_vals:
+        idx = stats.most_common_vals.index(value)
+        return stats.most_common_freqs[idx]
+
+    # Value not in MCVs — use histogram
+    # Fraction of rows NOT accounted for by MCVs or NULLs
+    other_frac = 1.0 - sum(stats.most_common_freqs) - stats.null_frac
+
+    # For equality on non-MCV value, assume uniform distribution
+    # among remaining distinct values
+    num_other_distinct = stats.n_distinct - len(stats.most_common_vals)
+    selectivity = other_frac / num_other_distinct
+
+    return selectivity</code></pre>
+
+        <h3>Cardinality Estimation Errors</h3>
+        <p>The #1 cause of bad query plans is <strong>cardinality misestimation</strong>. When the optimizer thinks a predicate returns 100 rows but it actually returns 100,000, it picks an index scan that becomes catastrophically slow.</p>
+
+        <pre><code class="language-sql">-- Detecting cardinality errors in EXPLAIN ANALYZE:
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 42;
+
+-- Look for:
+-- Index Scan using idx_orders_customer on orders
+--   (cost=0.43..8.45 rows=1 width=120)        ← estimated: 1 row
+--   (actual time=0.05..450.23 rows=50000 loops=1)  ← actual: 50,000 rows!
+--
+-- 50,000x misestimation! The optimizer thought 1 row (use index)
+-- but reality was 50,000 rows (should have used seq scan)</code></pre>
+
+        <h3>Correlated Predicates Problem</h3>
+        <p>Optimizers assume predicates are independent. This causes severe underestimation for correlated columns:</p>
+        <pre><code class="language-sql">-- Table: events (city, country)
+-- Predicate: WHERE city = 'Paris' AND country = 'France'
+--
+-- Optimizer estimates:
+--   P(city='Paris') × P(country='France') = 0.01 × 0.05 = 0.0005
+--   → 50 rows estimated
+--
+-- Reality: city and country are correlated!
+--   P(city='Paris' AND country='France') ≈ P(city='Paris') = 0.01
+--   → 10,000 rows actual
+--
+-- PostgreSQL 10+ has extended statistics to handle this:
+CREATE STATISTICS city_country_stats (dependencies)
+ON city, country FROM events;
+ANALYZE events;</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 5: THE COST MODEL
+         ============================================================ -->
+    <section id="cost-model">
+      <h2>The Cost Model</h2>
+      <details>
+        <summary>Sequential I/O cost, random I/O cost, CPU cost, PostgreSQL's cost parameters</summary>
+
+        <h3>PostgreSQL Cost Parameters</h3>
+        <p>The optimizer assigns abstract "cost units" to operations. The default values:</p>
+        <pre><code class="language-sql">-- View current cost parameters
+SHOW seq_page_cost;          -- 1.0  (baseline: sequential page read)
+SHOW random_page_cost;       -- 4.0  (random I/O is 4× more expensive)
+SHOW cpu_tuple_cost;         -- 0.01 (processing one row)
+SHOW cpu_index_tuple_cost;   -- 0.005 (processing one index entry)
+SHOW cpu_operator_cost;      -- 0.0025 (evaluating an operator/function)
+SHOW effective_cache_size;   -- 4GB (how much of the table is in cache)</code></pre>
+
+        <h3>The Cost Formulas</h3>
+
+        <h4>Sequential Scan Cost</h4>
+        <pre><code class="language-python"># Sequential Scan Cost Formula
+def seq_scan_cost(relpages, reltuples, qual_cost_per_row=0.0025):
+    """
+    relpages:  number of disk pages in the table
+    reltuples: number of rows in the table
+    """
+    # I/O cost: read every page sequentially
+    io_cost = relpages * seq_page_cost  # relpages × 1.0
+
+    # CPU cost: process every row + evaluate WHERE clause
+    cpu_cost = reltuples * (cpu_tuple_cost + qual_cost_per_row)
+    #        = reltuples × (0.01 + 0.0025)
+
+    total_cost = io_cost + cpu_cost
+    return total_cost
+
+# Example: orders table with 100,000 pages, 10,000,000 rows
+# io_cost  = 100,000 × 1.0 = 100,000
+# cpu_cost = 10,000,000 × 0.0125 = 125,000
+# total    = 225,000 cost units</code></pre>
+
+        <h4>Index Scan Cost</h4>
+        <pre><code class="language-python"># Index Scan Cost Formula
+def index_scan_cost(
+    index_pages,      # pages in the index
+    index_selectivity,# fraction of index to traverse
+    heap_pages,       # pages in the table
+    rows_fetched,     # estimated matching rows
+    correlation       # physical ordering correlation
+):
+    """
+    The key insight: index scan cost depends heavily on correlation.
+    Low correlation → many random page reads → expensive!
+    """
+    # Index I/O cost: traverse B-tree
+    index_io = index_pages * index_selectivity * random_page_cost
+    # = index_pages × selectivity × 4.0
+
+    # Heap I/O cost: fetch actual rows from heap
+    # This is where correlation matters!
+    if correlation close to 1.0:
+        # Pages are sequential — cheap I/O
+        heap_io = rows_fetched * seq_page_cost / rows_per_page
+    else:
+        # Pages are random — expensive I/O!
+        heap_io = rows_fetched * random_page_cost
+        # WORST CASE: every row hit = separate random page read
+
+    # Mackert-Lohman formula (actual PostgreSQL formula):
+    # Estimates effective pages fetched considering caching
+    # T = total heap pages, b = pages with matching rows
+    # effective_pages = min(T, b + (T - b) × (1 - exp(-b/T)))
+
+    # CPU cost
+    cpu_cost = (rows_fetched * cpu_index_tuple_cost +
+                rows_fetched * cpu_tuple_cost)
+
+    total = index_io + heap_io + cpu_cost
+    return total
+
+# Example: fetch 500,000 rows from 10M row table, correlation=0.01
+# index_io = 30,000 pages × 0.05 × 4.0 = 6,000
+# heap_io  = 500,000 × 4.0 = 2,000,000  ← ENORMOUS!
+# cpu_cost = 500,000 × 0.015 = 7,500
+# total    = 2,013,500 cost units
+#
+# vs seq_scan_cost = 225,000 cost units
+# Sequential scan wins by 9×!</code></pre>
+
+        <h3>The Tipping Point</h3>
+        <pre><code class="language-bash"># When does index scan become more expensive than seq scan?
+#
+# Simplified crossover (ignoring caching effects):
+#
+# seq_scan_cost = relpages × 1.0 + reltuples × 0.0125
+# idx_scan_cost ≈ rows_fetched × random_page_cost
+#               = selectivity × reltuples × 4.0
+#
+# Set equal and solve for selectivity:
+# relpages + reltuples × 0.0125 = selectivity × reltuples × 4.0
+#
+# For a typical table (100 rows per page, reltuples = 100 × relpages):
+# relpages + 100×relpages × 0.0125 = selectivity × 100×relpages × 4.0
+# relpages × 2.25 = selectivity × relpages × 400
+# selectivity = 2.25 / 400 = 0.0056 ≈ 0.6%
+#
+# With caching effects and correlation, the practical threshold is:
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Selectivity Threshold: ~5-15% for index to beat seq scan  │
+# │  (varies by correlation, table size, effective_cache_size)  │
+# └─────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>Tuning Cost Parameters for SSDs</h3>
+        <pre><code class="language-sql">-- SSDs reduce the random/sequential I/O gap
+-- Default: random_page_cost = 4.0 (HDD assumption)
+-- SSD recommended: 1.1 to 2.0
+SET random_page_cost = 1.1;
+
+-- This makes the optimizer MORE LIKELY to choose index scans
+-- because the penalty for random I/O is lower on SSDs
+
+-- For cloud-managed databases:
+-- AWS RDS default: random_page_cost = 1.1 (already SSD-tuned)
+-- On-premise HDD: keep at 4.0</code></pre>
+
+        <h3>Effective Cache Size</h3>
+        <pre><code class="language-sql">-- effective_cache_size tells the optimizer how much data
+-- it can expect to find already in OS page cache
+SET effective_cache_size = '24GB';  -- typically 50-75% of RAM
+
+-- Higher value → optimizer assumes more pages are cached
+-- → reduces estimated random I/O cost
+-- → makes index scans more attractive</code></pre>
+
+        <h3>BigQuery &amp; Snowflake Cost Models</h3>
+        <p><strong>BigQuery:</strong> No user-visible cost model. Internally uses slot-based execution. "Full scan" is the norm — BigQuery is designed for it. Columnar storage + partitioning + clustering replace traditional indexes.</p>
+        <p><strong>Snowflake:</strong> Uses micro-partition pruning metadata (min/max values per partition). The "cost" equivalent is the number of micro-partitions scanned. Clustering keys help prune partitions, analogous to how indexes help PostgreSQL.</p>
+        <pre><code class="language-sql">-- Snowflake: check pruning effectiveness
+SELECT * FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY())
+WHERE query_text LIKE '%orders%'
+ORDER BY start_time DESC LIMIT 1;
+-- Look at: partitions_scanned vs partitions_total
+
+-- BigQuery: check bytes processed (cost proxy)
+-- In query results metadata:
+-- totalBytesProcessed: 1,234,567,890
+-- totalBytesBilled:    2,000,000,000 (rounded up to nearest 10MB)</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 6: INDEX SELECTIVITY
+         ============================================================ -->
+    <section id="index-selectivity">
+      <h2>Index Selectivity</h2>
+      <details>
+        <summary>When indexes help vs hurt, selectivity threshold ~5-15%</summary>
+
+        <h3>Defining Selectivity</h3>
+        <pre><code class="language-sql">-- Selectivity = fraction of rows matching a predicate
+-- Range: 0.0 (matches nothing) to 1.0 (matches everything)
+--
+-- High selectivity (confusing term!):
+--   In database literature: "highly selective" = few rows match = SMALL fraction
+--   selectivity = 0.001 → index is great
+--
+-- Low selectivity:
+--   "not very selective" = many rows match = LARGE fraction
+--   selectivity = 0.50 → index is terrible
+
+-- Calculate selectivity for a predicate:
+SELECT
+  (COUNT(*) FILTER (WHERE status = 'refunded'))::float / COUNT(*) as selectivity
+FROM orders;
+-- Result: 0.02 → only 2% of rows → index scan is beneficial</code></pre>
+
+        <h3>The 5-15% Rule of Thumb</h3>
+        <pre><code class="language-bash"># When does an index HELP?
+#
+# ┌──────────────────────────────────────────────────────────────────┐
+# │  Selectivity    │ Optimizer Decision   │ Reason                  │
+# ├──────────────────────────────────────────────────────────────────┤
+# │  < 1%           │ Index Scan           │ Few random reads needed │
+# │  1% - 5%        │ Index / Bitmap Scan  │ Still worth it          │
+# │  5% - 15%       │ DEPENDS on:          │ Correlation, cache,     │
+# │                 │  correlation          │ table size, SSD vs HDD │
+# │                 │  effective_cache_size │                         │
+# │  > 15%          │ Sequential Scan      │ Too many random reads   │
+# │  > 50%          │ Sequential Scan      │ Definitely seq scan     │
+# └──────────────────────────────────────────────────────────────────┘
+#
+# Exception: Index-Only Scan can be viable up to 30-40%
+# if the index covers all needed columns (no heap access)</code></pre>
+
+        <h3>Factors That Shift the Threshold</h3>
+
+        <h4>1. Correlation</h4>
+        <pre><code class="language-sql">-- High correlation (≈1.0): threshold is HIGHER (index viable up to ~20%)
+-- because sequential-like access pattern even through index
+SELECT correlation FROM pg_stats
+WHERE tablename = 'orders' AND attname = 'created_at';
+-- Result: 0.98 → almost perfectly ordered → index works well
+
+-- Low correlation (≈0.0): threshold is LOWER (index only viable < 2-5%)
+SELECT correlation FROM pg_stats
+WHERE tablename = 'orders' AND attname = 'customer_id';
+-- Result: 0.05 → random order → index causes scattered I/O</code></pre>
+
+        <h4>2. Table Size</h4>
+        <pre><code class="language-sql">-- Small tables (< 100 pages): ALWAYS seq scan
+-- The entire table fits in a few I/O operations
+-- Index overhead (tree traversal) exceeds just reading everything
+
+SELECT relpages, reltuples FROM pg_class WHERE relname = 'lookup_codes';
+-- relpages: 3, reltuples: 200
+-- Optimizer: "Why bother with an index? I can read 3 pages in one I/O"</code></pre>
+
+        <h4>3. Random Page Cost Setting</h4>
+        <pre><code class="language-sql">-- HDD (random_page_cost = 4.0):
+-- Index threshold is LOW (~5%) because random I/O is very expensive
+
+-- SSD (random_page_cost = 1.1):
+-- Index threshold is HIGHER (~15-20%) because random ≈ sequential
+
+-- This is why the same query can pick different plans on different hardware!</code></pre>
+
+        <h4>4. Covering Index (Index-Only Scan)</h4>
+        <pre><code class="language-sql">-- If the index includes ALL columns needed by the query,
+-- no heap access is required → random I/O penalty disappears
+
+-- Regular index: must do heap lookup for non-indexed columns
+CREATE INDEX idx_orders_status ON orders(status);
+-- SELECT * FROM orders WHERE status = 'refunded';
+-- → Index Scan: read index + random heap lookups
+
+-- Covering index: all data in index
+CREATE INDEX idx_orders_covering ON orders(status) INCLUDE (amount, created_at);
+-- SELECT amount, created_at FROM orders WHERE status = 'refunded';
+-- → Index Only Scan: no heap access needed
+-- → Viable even at 20-30% selectivity!</code></pre>
+
+        <h3>Selectivity and Multi-Column Predicates</h3>
+        <pre><code class="language-sql">-- Combined selectivity (assuming independence):
+-- WHERE status = 'pending' AND region = 'us-east-1'
+-- sel(status='pending') = 0.25
+-- sel(region='us-east-1') = 0.10
+-- combined = 0.25 × 0.10 = 0.025 (2.5%) → index is great!
+
+-- But with a composite index:
+CREATE INDEX idx_orders_status_region ON orders(status, region);
+-- The index can serve both predicates efficiently
+-- If only single-column indexes exist, bitmap scan may combine them</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 7: SCAN TYPES COMPARED
+         ============================================================ -->
+    <section id="scan-types">
+      <h2>Scan Types Compared</h2>
+      <details>
+        <summary>Sequential Scan, Index Scan, Index Only Scan, Bitmap Index Scan</summary>
+
+        <h3>ASCII Diagram: Sequential Scan vs B-Tree Index Scan</h3>
+        <pre><code class="language-bash"># ═══════════════════════════════════════════════════════════════════
+# SEQUENTIAL SCAN — Read every page from first to last
+# ═══════════════════════════════════════════════════════════════════
+#
+#  Disk Pages:  [P1]→[P2]→[P3]→[P4]→[P5]→[P6]→[P7]→[P8]→...→[Pn]
+#                ↓    ↓    ↓    ↓    ↓    ↓    ↓    ↓         ↓
+#  Read:         ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓    ...  ✓
+#  Filter:      row matches WHERE? → emit or discard
+#
+#  Cost: relpages × seq_page_cost (1.0)
+#  I/O pattern: SEQUENTIAL (OS can prefetch efficiently)
+#  Good when: selectivity > 15%, small tables, full aggregations
+#
+# ═══════════════════════════════════════════════════════════════════
+# B-TREE INDEX SCAN — Traverse tree, then fetch heap tuples
+# ═══════════════════════════════════════════════════════════════════
+#
+#          ┌──────────────────────────┐
+#          │      Root Node           │
+#          │  [10 | 50 | 100 | 500]  │
+#          └──┬─────┬──────┬─────┬───┘
+#             │     │      │     │
+#     ┌───────┘  ┌──┘   ┌──┘  ┌─┘
+#     ▼          ▼      ▼     ▼
+#  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+#  │Branch│ │Branch│ │Branch│ │Branch│
+#  │ 1-9  │ │11-49│ │51-99│ │101+  │
+#  └──┬───┘ └──┬──┘ └──┬──┘ └──┬───┘
+#     ▼        ▼       ▼       ▼
+#  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+#  │Leaf  │ │Leaf  │ │Leaf  │ │Leaf  │
+#  │1,2,3 │→│4,5,6 │→│7,8,9 │ │...   │   ← Leaf nodes linked
+#  │ctid↓ │ │ctid↓ │ │ctid↓ │ │      │
+#  └──────┘ └──────┘ └──────┘ └──────┘
+#     │        │        │
+#     ▼        ▼        ▼
+#  ┌──────┐ ┌──────┐ ┌──────┐
+#  │Heap  │ │Heap  │ │Heap  │   ← Random page reads!
+#  │Page 7│ │Page 2│ │Page 9│   ← Different pages each time
+#  └──────┘ └──────┘ └──────┘
+#
+#  Cost: tree_traversal + random_page_cost × rows_fetched
+#  I/O pattern: RANDOM (each heap fetch may hit different page)
+#  Good when: selectivity < 5%, high correlation, covering index</code></pre>
+
+        <h3>1. Sequential Scan (Seq Scan)</h3>
+        <pre><code class="language-sql">-- When the optimizer chooses Sequential Scan:
+EXPLAIN SELECT * FROM orders WHERE status = 'completed';
+-- Seq Scan on orders  (cost=0.00..225000.00 rows=4500000 width=120)
+--   Filter: (status = 'completed'::text)
+
+-- Reasons for seq scan:
+-- 1. status = 'completed' matches 45% of rows (too many)
+-- 2. Would need 4.5M random page reads via index
+-- 3. Sequential read of 100K pages is MUCH cheaper</code></pre>
+
+        <h3>2. Index Scan</h3>
+        <pre><code class="language-sql">-- Classic B-tree traversal + heap tuple fetch
+EXPLAIN SELECT * FROM orders WHERE order_id = 12345;
+-- Index Scan using orders_pkey on orders
+--   (cost=0.43..8.45 rows=1 width=120)
+--   Index Cond: (order_id = 12345)
+
+-- How it works:
+-- 1. Traverse B-tree: root → branch → leaf (2-4 page reads)
+-- 2. Get ctid (physical tuple location) from leaf
+-- 3. Fetch tuple from heap page (1 random read)
+-- Total: ~3-5 random page reads for 1 row — very efficient!</code></pre>
+
+        <h3>3. Index Only Scan</h3>
+        <pre><code class="language-sql">-- No heap access needed! All data is in the index.
+-- Requires: covering index + visibility map shows page is all-visible
+
+CREATE INDEX idx_orders_covering ON orders(status) INCLUDE (amount);
+
+EXPLAIN SELECT amount FROM orders WHERE status = 'refunded';
+-- Index Only Scan using idx_orders_covering on orders
+--   (cost=0.43..5500.00 rows=200000 width=8)
+--   Index Cond: (status = 'refunded'::text)
+--   Heap Fetches: 0   ← No heap access!</code></pre>
+
+        <pre><code class="language-bash"># Visibility Map and Index-Only Scans
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │ Visibility Map (VM) — 1 bit per heap page                   │
+# │                                                              │
+# │ Page:  [P1] [P2] [P3] [P4] [P5] [P6] [P7] [P8]           │
+# │ VM:     1    1    0    1    1    0    1    1               │
+# │                   ↑              ↑                          │
+# │            Page has recent    Page has recent               │
+# │            updates (not       updates (not                  │
+# │            all-visible)       all-visible)                  │
+# │                                                              │
+# │ Index-Only Scan for rows on P3 and P6:                      │
+# │   → Must check heap to verify tuple visibility (MVCC)      │
+# │   → "Heap Fetches" in EXPLAIN output                       │
+# │                                                              │
+# │ After VACUUM: all pages become all-visible                  │
+# │   → Heap Fetches drops to 0                                │
+# └─────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>4. Bitmap Index Scan</h3>
+        <pre><code class="language-sql">-- Two-phase approach: build bitmap, then fetch pages in order
+EXPLAIN SELECT * FROM orders
+WHERE status = 'pending' AND region = 'eu-west-1';
+
+-- Bitmap Heap Scan on orders  (cost=1200.00..45000.00 rows=25000 width=120)
+--   Recheck Cond: (status = 'pending' AND region = 'eu-west-1')
+--   →  BitmapAnd
+--       →  Bitmap Index Scan on idx_orders_status
+--            (cost=0.00..600.00 rows=250000 width=0)
+--            Index Cond: (status = 'pending')
+--       →  Bitmap Index Scan on idx_orders_region
+--            (cost=0.00..400.00 rows=100000 width=0)
+--            Index Cond: (region = 'eu-west-1')</code></pre>
+
+        <pre><code class="language-bash"># How Bitmap Index Scan works:
+#
+# Phase 1: Build bitmap from index(es)
+#
+# Index on status='pending':     [0,1,1,0,0,1,0,1,1,0,1,0...]  (page-level bits)
+# Index on region='eu-west-1':   [1,1,0,0,1,1,0,0,1,0,0,1...]
+#                                  ────────────────────────────
+# BitmapAnd result:              [0,1,0,0,0,1,0,0,1,0,0,0...]
+#
+# Phase 2: Fetch pages IN SEQUENTIAL ORDER
+#
+# Instead of random I/O per row, read pages 2, 6, 9 sequentially
+# This converts random I/O → sequential I/O!
+#
+# "Recheck Condition":
+# When bitmap becomes "lossy" (too many bits → stores page-level not row-level),
+# must recheck the condition for each row on the page.
+#
+# ┌────────────────────────────────────────────────────────────┐
+# │  Bitmap scan is the "middle ground" between:               │
+# │    - Index scan (good for < 5% selectivity)               │
+# │    - Seq scan (good for > 15% selectivity)                │
+# │  Bitmap scan: optimal for 5-15% selectivity range         │
+# └────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>Scan Type Decision Matrix</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Scan Type</th>
+              <th>Selectivity</th>
+              <th>I/O Pattern</th>
+              <th>Best For</th>
+              <th>Limitation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Seq Scan</td>
+              <td>&gt; 15%</td>
+              <td>Sequential</td>
+              <td>Large result sets, full aggs</td>
+              <td>Reads entire table</td>
+            </tr>
+            <tr>
+              <td>Index Scan</td>
+              <td>&lt; 5%</td>
+              <td>Random</td>
+              <td>Point lookups, small ranges</td>
+              <td>Expensive heap fetches</td>
+            </tr>
+            <tr>
+              <td>Index Only Scan</td>
+              <td>&lt; 30%</td>
+              <td>Sequential (index)</td>
+              <td>Covering queries</td>
+              <td>Needs visibility map</td>
+            </tr>
+            <tr>
+              <td>Bitmap Index Scan</td>
+              <td>5-15%</td>
+              <td>Batched sequential</td>
+              <td>Multiple conditions, OR clauses</td>
+              <td>Memory for bitmap</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 8: DATA SKEW & STALE STATISTICS
+         ============================================================ -->
+    <section id="data-skew">
+      <h2>Data Skew &amp; Stale Statistics</h2>
+      <details>
+        <summary>Why ANALYZE matters, when stats go stale, correlation drift</summary>
+
+        <h3>What Makes Statistics Stale?</h3>
+        <pre><code class="language-bash"># Statistics become stale when data distribution changes:
+#
+# 1. Bulk loads    → new data may have different distribution
+# 2. Deletes      → surviving rows have different profile
+# 3. Updates      → values shift, correlation changes
+# 4. Time-based   → recent data dominates queries but stats reflect all data
+#
+# PostgreSQL auto-analyze threshold:
+# Trigger: inserts + updates + deletes > autovacuum_analyze_threshold
+#          + autovacuum_analyze_scale_factor × reltuples
+#
+# Default: 50 + 0.10 × reltuples
+# For a 10M row table: 50 + 1,000,000 = 1,000,050 changes before auto-analyze
+# That's 10% of the table! Stats can be VERY stale for large tables.</code></pre>
+
+        <h3>Detecting Stale Statistics</h3>
+        <pre><code class="language-sql">-- Check when ANALYZE last ran
+SELECT
+  schemaname,
+  relname,
+  last_analyze,
+  last_autoanalyze,
+  n_live_tup,
+  n_dead_tup,
+  n_mod_since_analyze  -- changes since last analyze!
+FROM pg_stat_user_tables
+WHERE relname = 'orders'
+ORDER BY n_mod_since_analyze DESC;
+
+-- If n_mod_since_analyze is large relative to n_live_tup,
+-- statistics are likely stale!</code></pre>
+
+        <h3>Data Skew and Optimizer Mistakes</h3>
+        <pre><code class="language-sql">-- Classic skew scenario: orders table
+-- 99% of orders belong to 10 enterprise customers
+-- 1% of orders belong to 990 small customers
+--
+-- Statistics say: n_distinct(customer_id) = 1000
+-- Uniform assumption: each customer has 10M/1000 = 10,000 orders
+--
+-- Reality:
+-- Enterprise customer #1: 2,000,000 orders
+-- Small customer #500:         50 orders
+--
+-- Query: SELECT * FROM orders WHERE customer_id = 1
+-- Optimizer estimates: 10,000 rows → chooses Index Scan
+-- Actual: 2,000,000 rows → Index Scan is CATASTROPHIC!
+--
+-- MCVs to the rescue (if stats are fresh):
+-- most_common_vals: {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+-- most_common_freqs: {0.20, 0.18, 0.15, 0.12, 0.10, ...}
+-- Now optimizer knows customer_id=1 matches 20% → seq scan!</code></pre>
+
+        <h3>Correlation Drift</h3>
+        <pre><code class="language-sql">-- Initial state: orders inserted chronologically
+-- correlation(created_at) = 0.99
+-- Index scan on date range is very efficient
+
+-- After 6 months of updates and backfills:
+-- Many rows updated → moved to end of heap (HOT notwithstanding)
+-- Bulk historical data loaded out of order
+-- correlation(created_at) drops to 0.35
+
+-- Now the SAME query that used an index for months
+-- correctly switches to seq scan because correlation dropped!
+
+-- Check correlation:
+SELECT attname, correlation
+FROM pg_stats
+WHERE tablename = 'orders'
+ORDER BY abs(correlation) DESC;</code></pre>
+
+        <h3>Fixing Stale Statistics</h3>
+        <pre><code class="language-sql">-- Manual analyze (immediate)
+ANALYZE orders;
+
+-- Analyze specific columns (faster)
+ANALYZE orders(customer_id, status, created_at);
+
+-- More aggressive auto-analyze settings for hot tables
+ALTER TABLE orders SET (
+  autovacuum_analyze_threshold = 1000,
+  autovacuum_analyze_scale_factor = 0.02  -- trigger at 2% changes
+);
+
+-- For partitioned tables, analyze each partition
+DO $$
+DECLARE
+  part RECORD;
+BEGIN
+  FOR part IN
+    SELECT inhrelid::regclass AS partition_name
+    FROM pg_inherits
+    WHERE inhparent = 'orders'::regclass
+  LOOP
+    EXECUTE format('ANALYZE %s', part.partition_name);
+  END LOOP;
+END $$;</code></pre>
+
+        <h3>Spark Comparison: Data Skew</h3>
+        <pre><code class="language-python"># In Spark, data skew manifests differently:
+# - No traditional index scans
+# - Skew causes partition imbalance in shuffles
+# - "Stale statistics" equivalent: outdated table stats in Hive metastore
+
+# Spark's ANALYZE TABLE equivalent:
+# spark.sql("ANALYZE TABLE orders COMPUTE STATISTICS FOR ALL COLUMNS")
+
+# Adaptive Query Execution (AQE) in Spark 3.0+:
+# - Detects skew at runtime (not relying on static stats)
+# - Splits skewed partitions dynamically
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+
+# AQE is Spark's answer to "stale statistics" —
+# it re-optimizes the plan during execution based on actual data sizes</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 9: READING EXPLAIN / EXPLAIN ANALYZE
+         ============================================================ -->
+    <section id="explain-plans">
+      <h2>Reading EXPLAIN / EXPLAIN ANALYZE</h2>
+      <details>
+        <summary>Actual vs estimated rows, buffers, timing, nested loops</summary>
+
+        <h3>EXPLAIN vs EXPLAIN ANALYZE</h3>
+        <pre><code class="language-sql">-- EXPLAIN: shows the plan WITHOUT executing the query
+-- Use for: expensive queries you don't want to actually run
+EXPLAIN SELECT * FROM orders WHERE status = 'pending';
+
+-- EXPLAIN ANALYZE: executes the query and shows actual metrics
+-- Use for: comparing estimated vs actual rows (find misestimates)
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM orders WHERE status = 'pending';
+
+-- EXPLAIN options:
+-- ANALYZE   → actually run the query
+-- BUFFERS   → show shared/local buffer hits and reads
+-- COSTS     → show cost estimates (default: on)
+-- TIMING    → show per-node timing (default: on with ANALYZE)
+-- FORMAT    → TEXT (default), JSON, YAML, XML</code></pre>
+
+        <h3>Anatomy of an EXPLAIN ANALYZE Output</h3>
+        <pre><code class="language-sql">EXPLAIN (ANALYZE, BUFFERS) SELECT o.*, c.name
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+WHERE o.created_at >= '2024-01-01'
+  AND o.status = 'pending';
+
+-- Output:
+/*
+ Hash Join  (cost=850.00..52340.00 rows=12500 width=180)
+            (actual time=12.5..890.3 rows=48000 loops=1)
+   Hash Cond: (o.customer_id = c.id)
+   Buffers: shared hit=42000 read=8500
+   →  Seq Scan on orders o  (cost=0.00..48000.00 rows=12500 width=120)
+                             (actual time=0.02..780.5 rows=48000 loops=1)
+         Filter: (created_at >= '2024-01-01' AND status = 'pending')
+         Rows Removed by Filter: 9952000
+         Buffers: shared hit=40000 read=8000
+   →  Hash  (cost=500.00..500.00 rows=10000 width=60)
+             (actual time=8.2..8.2 rows=10000 loops=1)
+         Buffers: shared hit=2000 read=500
+         →  Seq Scan on customers c  (cost=0.00..500.00 rows=10000 width=60)
+                                      (actual time=0.01..5.0 rows=10000 loops=1)
+                Buffers: shared hit=2000 read=500
+ Planning Time: 0.5 ms
+ Execution Time: 920.8 ms
+*/</code></pre>
+
+        <h3>How to Read Each Line</h3>
+        <pre><code class="language-bash"># Breaking down a single node:
+#
+# Seq Scan on orders o  (cost=0.00..48000.00 rows=12500 width=120)
+# ─────────────────────  ──────────────────── ────────── ─────────
+#     Node type            Startup..Total      Est. rows   Row width
+#                          cost    cost
+#
+#                          (actual time=0.02..780.5 rows=48000 loops=1)
+#                           ──────────────────── ────────── ─────────
+#                           Startup..Total time  Act. rows  Iterations
+#                           (milliseconds)
+#
+# KEY INSIGHT: estimated rows=12500, actual rows=48000
+# → 3.8× underestimate! The optimizer thought fewer rows matched.
+# → This could cause upstream nodes to pick wrong join strategy.
+#
+# Buffers: shared hit=40000 read=8000
+# ─────── ──────────────── ──────────
+#          Pages found      Pages read
+#          in cache         from disk
+#
+# hit/(hit+read) = 40000/48000 = 83% cache hit ratio</code></pre>
+
+        <h3>Red Flags in EXPLAIN Output</h3>
+        <pre><code class="language-bash"># 🚨 Red Flag 1: Estimated vs Actual row count mismatch
+# rows=100 vs actual rows=500000
+# → Statistics are stale or predicates are correlated
+
+# 🚨 Red Flag 2: "Rows Removed by Filter" is very high
+# Rows Removed by Filter: 9,952,000 (from 10M table to get 48K rows)
+# → Missing index? Or selectivity too low for index?
+
+# 🚨 Red Flag 3: High buffer reads vs hits
+# Buffers: shared hit=100 read=50000
+# → Cold cache or working set exceeds shared_buffers
+
+# 🚨 Red Flag 4: loops > 1 with high actual rows
+# Nested Loop  (actual time=0.1..4500.0 rows=1000000 loops=1)
+#   →  Index Scan  (actual time=0.05..0.08 rows=1 loops=1000000)
+# → 1M index lookups! Should probably be a Hash Join
+
+# 🚨 Red Flag 5: Sort node with "Sort Method: external merge"
+# → Sort spilled to disk because work_mem too small</code></pre>
+
+        <h3>JSON Format for Programmatic Analysis</h3>
+        <pre><code class="language-sql">-- JSON format is machine-readable for monitoring tools
+EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+SELECT * FROM orders WHERE status = 'pending';
+
+-- Useful for:
+-- 1. Storing plans in monitoring databases
+-- 2. Comparing plans over time (plan regression detection)
+-- 3. Automated alerting on cardinality misestimates
+-- 4. Tools like pgMustard, explain.dalibo.com, auto_explain</code></pre>
+
+        <h3>auto_explain for Production</h3>
+        <pre><code class="language-sql">-- Log slow query plans automatically in production
+-- postgresql.conf:
+-- shared_preload_libraries = 'auto_explain'
+-- auto_explain.log_min_duration = '1s'    -- log plans over 1 second
+-- auto_explain.log_analyze = on           -- include actual times
+-- auto_explain.log_buffers = on           -- include buffer usage
+-- auto_explain.log_nested_statements = on
+
+-- This captures the EXACT plan that was used during the slow execution
+-- Critical for debugging intermittent plan regressions</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 10: PRODUCTION INCIDENT
+         ============================================================ -->
+    <section id="production-incident">
+      <h2>Production Incident: Index → Seq Scan Regression</h2>
+      <details>
+        <summary>Real incident: query switches from index to seq scan after data growth</summary>
+
+        <h3>The Scenario</h3>
+        <pre><code class="language-bash"># Company: E-commerce platform (FAANG-scale)
+# Table: orders (PostgreSQL 14)
+# Size: grew from 5M to 50M rows over 12 months
+# Query: dashboard showing "pending" orders for ops team
+#
+# Timeline:
+# ─────────────────────────────────────────────────────────────────
+# Month 1-8:  Query uses Index Scan on idx_orders_status
+#             Response time: 15ms
+#             Pending orders: ~50,000 (1% of 5M)
+#
+# Month 9:   Data hits 30M rows
+#             Pending orders: ~900,000 (3% of 30M)
+#             Query still uses index scan
+#             Response time: 180ms (slower but still OK)
+#
+# Month 10:  Data hits 40M rows, bulk import of historical orders
+#             Auto-analyze runs after import
+#             Pending orders: ~5,200,000 (13% of 40M!)
+#             ⚠️  PLAN FLIP: optimizer switches to Seq Scan
+#             Response time: 4,200ms
+#             Ops dashboard times out → incident!
+# ─────────────────────────────────────────────────────────────────</code></pre>
+
+        <h3>Why It Happened</h3>
+        <pre><code class="language-sql">-- Before the flip (Month 8):
+-- pg_stats for orders.status:
+-- most_common_vals:  {completed, shipped, pending, cancelled}
+-- most_common_freqs: {0.65, 0.20, 0.01, 0.14}
+--                                  ↑
+--                         1% selectivity → index scan!
+
+-- After the flip (Month 10):
+-- Bulk import added millions of unprocessed historical orders
+-- Auto-analyze updated stats:
+-- most_common_vals:  {completed, pending, shipped, cancelled}
+-- most_common_freqs: {0.52, 0.13, 0.20, 0.15}
+--                           ↑
+--                  13% selectivity → crossed the threshold!
+--
+-- Optimizer's calculation:
+-- Index scan cost: 5,200,000 × random_page_cost(4.0) = 20,800,000
+-- Seq scan cost:   500,000 pages × seq_page_cost(1.0) = 500,000
+-- Seq scan is 41× cheaper! Optimizer is CORRECT.</code></pre>
+
+        <h3>The EXPLAIN ANALYZE Evidence</h3>
+        <pre><code class="language-sql">-- During incident:
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT order_id, customer_id, amount, created_at
+FROM orders
+WHERE status = 'pending'
+ORDER BY created_at DESC
+LIMIT 100;
+
+-- Output (the problem):
+/*
+ Limit  (cost=890000.00..890000.25 rows=100 width=52)
+        (actual time=4100.5..4100.8 rows=100 loops=1)
+   →  Sort  (cost=890000.00..903000.00 rows=5200000 width=52)
+             (actual time=4100.4..4100.5 rows=100 loops=1)
+         Sort Key: created_at DESC
+         Sort Method: top-N heapsort  Memory: 35kB
+         →  Seq Scan on orders  (cost=0.00..750000.00 rows=5200000 width=52)
+                                 (actual time=0.03..3200.0 rows=5200000 loops=1)
+               Filter: (status = 'pending'::text)
+               Rows Removed by Filter: 34800000
+               Buffers: shared hit=200000 read=300000
+ Planning Time: 0.8 ms
+ Execution Time: 4200.3 ms
+*/
+
+-- The optimizer read ALL 40M rows, filtered to 5.2M, sorted them,
+-- then returned just 100. This is correct but slow.</code></pre>
+
+        <h3>The Fix</h3>
+        <pre><code class="language-sql">-- Solution 1: Composite index matching the query pattern
+CREATE INDEX CONCURRENTLY idx_orders_pending_recent
+ON orders(status, created_at DESC)
+WHERE status = 'pending';  -- partial index!
+
+-- This partial index only contains 'pending' rows
+-- Size: ~5.2M entries vs 40M in full index
+-- Supports the ORDER BY + LIMIT pattern efficiently
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT order_id, customer_id, amount, created_at
+FROM orders
+WHERE status = 'pending'
+ORDER BY created_at DESC
+LIMIT 100;
+
+-- After fix:
+/*
+ Limit  (cost=0.56..12.80 rows=100 width=52)
+        (actual time=0.05..0.35 rows=100 loops=1)
+   →  Index Scan using idx_orders_pending_recent on orders
+        (cost=0.56..650000.00 rows=5200000 width=52)
+        (actual time=0.04..0.30 rows=100 loops=1)
+         Index Cond: (status = 'pending'::text)
+         Buffers: shared hit=5
+ Planning Time: 0.3 ms
+ Execution Time: 0.5 ms
+*/
+-- 4200ms → 0.5ms (8400× improvement!)
+-- Key insight: partial index + LIMIT means we only read 100 rows from index</code></pre>
+
+        <h3>Lessons Learned</h3>
+        <pre><code class="language-bash"># 1. Data growth changes selectivity
+#    What was 1% selectivity becomes 13% — plan flip is EXPECTED
+#
+# 2. The optimizer was RIGHT to switch
+#    At 13% selectivity with low correlation, seq scan IS cheaper
+#    The real fix is a better index, not forcing an old plan
+#
+# 3. Monitor plan stability
+#    Use pg_stat_statements + auto_explain to detect plan changes
+#
+# 4. Partial indexes are powerful
+#    Index only the subset of data your queries actually filter on
+#
+# 5. LIMIT changes the game
+#    With ORDER BY + LIMIT, an index on the sort column
+#    can return results without scanning all matching rows
+#
+# Prevention checklist:
+# □ Set up alerting on query latency (p99)
+# □ Monitor pg_stat_statements for plan changes
+# □ Review selectivity of key predicates quarterly
+# □ Use partial indexes for status-based queries
+# □ Tune autovacuum_analyze_scale_factor for large tables</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 11: DEBUGGING WORKFLOW
+         ============================================================ -->
+    <section id="debugging-workflow">
+      <h2>Debugging Workflow</h2>
+      <details>
+        <summary>Step-by-step: pg_stats → EXPLAIN ANALYZE → compare → fix</summary>
+
+        <h3>The 7-Step Investigation</h3>
+        <pre><code class="language-bash"># Step-by-step debugging when a query unexpectedly uses seq scan:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ Step 1: Confirm the plan                                        │
+# │ Step 2: Check selectivity in pg_stats                          │
+# │ Step 3: Compare estimated vs actual rows                       │
+# │ Step 4: Check correlation                                      │
+# │ Step 5: Check statistics freshness                             │
+# │ Step 6: Test with forced index scan                            │
+# │ Step 7: Implement fix (new index, ANALYZE, or accept seq scan) │
+# └─────────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>Step 1: Confirm the Plan</h3>
+        <pre><code class="language-sql">-- Run EXPLAIN ANALYZE with BUFFERS to see the full picture
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+SELECT * FROM orders WHERE customer_id = 42 AND status = 'pending';
+
+-- Note: VERBOSE shows output columns and table aliases</code></pre>
+
+        <h3>Step 2: Check Selectivity</h3>
+        <pre><code class="language-sql">-- What does the optimizer think about the predicate columns?
+SELECT
+  attname,
+  n_distinct,
+  most_common_vals::text::text[] as mcvs,
+  most_common_freqs::text::float[] as freqs,
+  correlation
+FROM pg_stats
+WHERE tablename = 'orders'
+  AND attname IN ('customer_id', 'status');
+
+-- Calculate actual selectivity:
+SELECT
+  COUNT(*) FILTER (WHERE customer_id = 42 AND status = 'pending') as matching,
+  COUNT(*) as total,
+  COUNT(*) FILTER (WHERE customer_id = 42 AND status = 'pending')::float
+    / COUNT(*) as actual_selectivity
+FROM orders;</code></pre>
+
+        <h3>Step 3: Compare Estimated vs Actual Rows</h3>
+        <pre><code class="language-sql">-- From the EXPLAIN ANALYZE output, find:
+-- (cost=... rows=ESTIMATED ...) vs (actual ... rows=ACTUAL ...)
+--
+-- If ACTUAL >> ESTIMATED:
+--   → Statistics undercount matching rows
+--   → May need ANALYZE or extended statistics
+--
+-- If ACTUAL << ESTIMATED:
+--   → Statistics overcount (e.g., stale after DELETE)
+--   → Optimizer chose seq scan when index would be better
+--   → Run ANALYZE and re-check
+
+-- Quick check: ratio of misestimation
+-- Ratio > 10× is concerning
+-- Ratio > 100× almost certainly causes wrong plan choice</code></pre>
+
+        <h3>Step 4: Check Correlation</h3>
+        <pre><code class="language-sql">-- Low correlation = index scan has high random I/O penalty
+SELECT attname, correlation
+FROM pg_stats
+WHERE tablename = 'orders'
+  AND attname IN ('customer_id', 'created_at', 'status');
+
+-- If correlation < 0.5 for the indexed column:
+-- The optimizer correctly penalizes index scans
+-- Consider: CLUSTER table on that index (one-time reorder)
+-- Warning: CLUSTER locks the table exclusively!
+
+-- Alternative: pg_repack (online table reordering)
+-- pg_repack --table orders --order-by created_at</code></pre>
+
+        <h3>Step 5: Check Statistics Freshness</h3>
+        <pre><code class="language-sql">-- When were stats last updated?
+SELECT
+  relname,
+  last_analyze,
+  last_autoanalyze,
+  n_mod_since_analyze,
+  n_live_tup,
+  ROUND(n_mod_since_analyze::numeric / GREATEST(n_live_tup, 1) * 100, 1)
+    AS pct_modified_since_analyze
+FROM pg_stat_user_tables
+WHERE relname = 'orders';
+
+-- If pct_modified_since_analyze > 5%, stats are likely stale
+-- Run ANALYZE immediately:
+ANALYZE orders;</code></pre>
+
+        <h3>Step 6: Test with Forced Index Scan</h3>
+        <pre><code class="language-sql">-- Temporarily disable seq scan to see index plan and its ACTUAL cost
+SET enable_seqscan = off;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE customer_id = 42 AND status = 'pending';
+
+-- Compare execution time:
+-- If forced index scan is SLOWER → optimizer was right, seq scan is better
+-- If forced index scan is FASTER → statistics are misleading the optimizer
+
+-- RESET IMMEDIATELY:
+RESET enable_seqscan;
+
+-- ⚠️ NEVER set enable_seqscan=off in production!
+-- Use only for debugging in a session/transaction</code></pre>
+
+        <h3>Step 7: Implement the Fix</h3>
+        <pre><code class="language-sql">-- Decision tree for the fix:
+--
+-- Was the optimizer RIGHT? (seq scan actually faster)
+--   YES → The query needs a BETTER index, not the existing one
+--         Consider: partial index, covering index, composite index
+--   NO  → Statistics are wrong
+--         Fix: ANALYZE, increase statistics_target, extended stats
+--
+-- Fix Option A: Better index
+CREATE INDEX CONCURRENTLY idx_orders_cust_pending
+ON orders(customer_id, status)
+WHERE status = 'pending';  -- partial: only pending rows
+
+-- Fix Option B: Fresh statistics
+ANALYZE orders;
+
+-- Fix Option C: Extended statistics (correlated columns)
+CREATE STATISTICS orders_cust_status (dependencies)
+ON customer_id, status FROM orders;
+ANALYZE orders;
+
+-- Fix Option D: Reorder table (last resort, high impact)
+-- Improves correlation but requires maintenance window
+CLUSTER orders USING idx_orders_created_at;</code></pre>
+
+        <h3>Quick Reference: Debugging Cheat Sheet</h3>
+        <pre><code class="language-bash"># ┌──────────────────────────────────────────────────────────────┐
+# │ Symptom                  │ Likely Cause        │ Fix         │
+# ├──────────────────────────────────────────────────────────────┤
+# │ est=100, actual=100K     │ Stale stats         │ ANALYZE     │
+# │ est=100K, actual=100K    │ Correct: low sel.   │ Better idx  │
+# │ Seq scan, small result   │ Low correlation     │ CLUSTER     │
+# │ Index scan, slow         │ Many heap fetches   │ Cover. idx  │
+# │ Bitmap→lossy recheck     │ work_mem too low    │ ↑ work_mem  │
+# │ Plan flips daily         │ Stats boundary      │ pin plan    │
+# └──────────────────────────────────────────────────────────────┘</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 12: CODE EXAMPLES
+         ============================================================ -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>EXPLAIN output, CREATE INDEX strategies, partial indexes, expression indexes</summary>
+
+        <h3>EXPLAIN Output: Full Table Scan Chosen Over Index</h3>
+        <pre><code class="language-sql">-- Setup: 10M row orders table
+CREATE TABLE orders (
+  order_id     BIGSERIAL PRIMARY KEY,
+  customer_id  BIGINT NOT NULL,
+  status       VARCHAR(20) NOT NULL DEFAULT 'pending',
+  amount       NUMERIC(10,2),
+  region       VARCHAR(30),
+  created_at   TIMESTAMPTZ DEFAULT now(),
+  updated_at   TIMESTAMPTZ DEFAULT now()
+);
+
+-- Existing index:
+CREATE INDEX idx_orders_status ON orders(status);
+
+-- Query that gets seq scan despite index existing:
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE status = 'completed';
+
+/*
+ Seq Scan on orders  (cost=0.00..285714.00 rows=4500000 width=85)
+                     (actual time=0.015..1850.432 rows=4523891 loops=1)
+   Filter: ((status)::text = 'completed'::text)
+   Rows Removed by Filter: 5476109
+   Buffers: shared hit=85000 read=50714
+ Planning Time: 0.12 ms
+ Execution Time: 2150.881 ms
+*/
+-- 45% selectivity → seq scan is correct!</code></pre>
+
+        <h3>Composite Index Strategy</h3>
+        <pre><code class="language-sql">-- Rule: put equality columns first, range columns last
+-- Query pattern:
+-- WHERE status = ? AND region = ? AND created_at >= ?
+
+-- Good: equality, equality, range
+CREATE INDEX idx_orders_composite
+ON orders(status, region, created_at);
+
+-- The index can fully satisfy:
+-- 1. WHERE status = 'pending'                      (uses 1st column)
+-- 2. WHERE status = 'pending' AND region = 'us'    (uses 1st + 2nd)
+-- 3. WHERE status = 'pending' AND region = 'us'
+--    AND created_at >= '2024-01-01'                (uses all 3)
+
+-- CANNOT efficiently satisfy:
+-- WHERE region = 'us'            (skips 1st column - needs skip scan)
+-- WHERE created_at >= '2024-01-01' (skips 1st + 2nd columns)
+
+EXPLAIN (ANALYZE)
+SELECT * FROM orders
+WHERE status = 'pending' AND region = 'us-east-1'
+  AND created_at >= '2024-06-01';
+
+/*
+ Index Scan using idx_orders_composite on orders
+   (cost=0.56..4520.00 rows=1200 width=85)
+   (actual time=0.03..2.8 rows=1150 loops=1)
+   Index Cond: (status = 'pending' AND region = 'us-east-1'
+                AND created_at >= '2024-06-01')
+*/</code></pre>
+
+        <h3>Partial Index</h3>
+        <pre><code class="language-sql">-- Index only the rows you actually query!
+-- If 95% of queries filter on status IN ('pending', 'processing'):
+
+CREATE INDEX idx_orders_active
+ON orders(customer_id, created_at)
+WHERE status IN ('pending', 'processing');
+
+-- Benefits:
+-- 1. MUCH smaller index (5% of rows vs 100%)
+-- 2. Faster to scan, build, and maintain
+-- 3. Less WAL traffic on writes
+-- 4. More of the index fits in cache
+
+-- Size comparison:
+SELECT
+  pg_size_pretty(pg_relation_size('idx_orders_status')) as full_idx_size,
+  pg_size_pretty(pg_relation_size('idx_orders_active')) as partial_idx_size;
+-- full_idx_size:    240 MB
+-- partial_idx_size:  12 MB (20× smaller!)
+
+-- Partial index on NULL values (common pattern):
+CREATE INDEX idx_orders_unprocessed
+ON orders(created_at)
+WHERE processed_at IS NULL;
+-- Useful for worker queues: "find next unprocessed order"</code></pre>
+
+        <h3>Expression Index</h3>
+        <pre><code class="language-sql">-- Index on a computed expression
+-- Query: WHERE LOWER(email) = 'user@example.com'
+CREATE INDEX idx_customers_email_lower
+ON customers(LOWER(email));
+
+-- Query: WHERE DATE(created_at) = '2024-06-15'
+CREATE INDEX idx_orders_date
+ON orders(DATE(created_at));
+
+-- Query: WHERE jsonb_data->>'type' = 'premium'
+CREATE INDEX idx_orders_jsonb_type
+ON orders((jsonb_data->>'type'));
+
+-- EXPLAIN proof:
+EXPLAIN SELECT * FROM customers WHERE LOWER(email) = 'user@example.com';
+/*
+ Index Scan using idx_customers_email_lower on customers
+   (cost=0.42..8.44 rows=1 width=120)
+   Index Cond: (lower((email)::text) = 'user@example.com'::text)
+*/</code></pre>
+
+        <h3>Covering Index (INCLUDE)</h3>
+        <pre><code class="language-sql">-- PostgreSQL 11+: INCLUDE non-key columns in index
+-- Enables Index-Only Scan without adding columns to B-tree keys
+
+-- Query: SELECT amount, created_at FROM orders WHERE status = 'refunded'
+CREATE INDEX idx_orders_refunded_covering
+ON orders(status) INCLUDE (amount, created_at)
+WHERE status = 'refunded';
+
+EXPLAIN SELECT amount, created_at FROM orders WHERE status = 'refunded';
+/*
+ Index Only Scan using idx_orders_refunded_covering on orders
+   (cost=0.42..5800.00 rows=200000 width=16)
+   Index Cond: (status = 'refunded')
+   Heap Fetches: 0
+*/
+-- No heap access! All data served from index.</code></pre>
+
+        <h3>Snowflake: Clustering Instead of Indexes</h3>
+        <pre><code class="language-sql">-- Snowflake doesn't have B-tree indexes
+-- Instead: clustering keys control micro-partition pruning
+
+-- Define clustering key (analogous to choosing an index)
+ALTER TABLE orders CLUSTER BY (status, created_at);
+
+-- Check clustering quality
+SELECT SYSTEM$CLUSTERING_INFORMATION('orders', '(status, created_at)');
+-- Returns: average_depth, total_constant_partition_count, etc.
+
+-- Query with pruning:
+SELECT * FROM orders
+WHERE status = 'pending' AND created_at >= '2024-01-01';
+-- Snowflake reads partition metadata (min/max per column)
+-- Skips partitions where status != 'pending' or created_at < '2024-01-01'
+-- Analogous to index scan but at partition level
+
+-- Monitoring pruning in query profile:
+-- "Partitions scanned": 42
+-- "Partitions total":   1,500
+-- Pruning efficiency: 97.2% of partitions skipped!</code></pre>
+
+        <h3>BigQuery: Partitioning and Clustering</h3>
+        <pre><code class="language-sql">-- BigQuery has NO indexes — relies on:
+-- 1. Partitioning (coarse-grained, like range partitions)
+-- 2. Clustering (fine-grained, like sorted micro-partitions)
+
+CREATE TABLE `project.dataset.orders`
+(
+  order_id     INT64,
+  customer_id  INT64,
+  status       STRING,
+  amount       NUMERIC,
+  created_at   TIMESTAMP
+)
+PARTITION BY DATE(created_at)      -- partition pruning
+CLUSTER BY status, customer_id;    -- block pruning within partitions
+
+-- Query that benefits from both:
+SELECT * FROM `project.dataset.orders`
+WHERE DATE(created_at) = '2024-06-15'  -- prunes partitions
+  AND status = 'pending';               -- prunes blocks
+
+-- Check bytes scanned (equivalent to "did it use the index?"):
+-- totalBytesProcessed: 45,000,000 (45MB of multi-TB table)
+-- Without partitioning/clustering: 2,500,000,000,000 (2.5TB!)</code></pre>
+
+        <h3>Spark: Predicate Pushdown and Data Skipping</h3>
+        <pre><code class="language-python"># Spark doesn't have traditional indexes either
+# Optimization strategies:
+
+# 1. Partition pruning (Hive-style partitions)
+df = spark.read.parquet("s3://bucket/orders/")
+# If partitioned by status:
+# s3://bucket/orders/status=pending/
+# s3://bucket/orders/status=completed/
+filtered = df.filter(df.status == "pending")
+# → Only reads the 'pending' partition directory
+
+# 2. Predicate pushdown to Parquet
+# Parquet stores min/max per row group (analogous to Snowflake micro-partitions)
+filtered = df.filter(df.created_at >= "2024-01-01")
+# → Skips row groups where max(created_at) < '2024-01-01'
+
+# 3. Delta Lake Z-ORDER (multi-dimensional clustering)
+# spark.sql("""
+#   OPTIMIZE orders
+#   ZORDER BY (customer_id, created_at)
+# """)
+# Colocates related data → better data skipping
+
+# 4. Data Skipping with Delta Lake statistics
+# Delta stores file-level min/max/null_count per column
+# Filter queries skip files where predicate can't match
+
+# Check physical plan for pushdown:
+filtered.explain(True)
+# Look for: PushedFilters: [IsNotNull(status), EqualTo(status,pending)]</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 13: COMMON MISTAKES
+         ============================================================ -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Pitfalls senior engineers still fall into</summary>
+
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Mistake</th>
+              <th>Why It's Wrong</th>
+              <th>Correct Approach</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>Forcing index scan with <code>enable_seqscan=off</code> in production</td>
+              <td>Overrides optimizer for ALL queries in the session; may make other queries worse; doesn't fix root cause</td>
+              <td>Create a better index (partial, covering) that makes index path genuinely cheaper</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>Creating indexes on low-cardinality columns (e.g., boolean, status with 3 values)</td>
+              <td>Index scan returns too many rows; bitmap scan at best; wastes storage and slows writes</td>
+              <td>Use partial index on the rare value: <code>WHERE status = 'error'</code></td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>Ignoring correlation when choosing indexes</td>
+              <td>Index on UUID column has correlation ≈ 0.0; every lookup hits a different page</td>
+              <td>Check <code>pg_stats.correlation</code>; consider CLUSTER or covering index to avoid heap</td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Not running ANALYZE after bulk loads</td>
+              <td>Auto-analyze may take hours to trigger on large tables; optimizer uses stale stats in the meantime</td>
+              <td>Always <code>ANALYZE table</code> immediately after bulk INSERT/COPY</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>Multi-column index with wrong column order</td>
+              <td><code>INDEX(created_at, status)</code> can't efficiently serve <code>WHERE status = 'x'</code></td>
+              <td>Put equality predicates first, range predicates last</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>Assuming index is always faster</td>
+              <td>For aggregations over entire table (<code>COUNT(*)</code>, <code>SUM(amount)</code>), seq scan with parallel workers is faster</td>
+              <td>Trust the optimizer; verify with EXPLAIN ANALYZE before overriding</td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td>Neglecting index maintenance cost</td>
+              <td>Each index adds overhead to every INSERT, UPDATE, DELETE; 10 indexes = 10× write amplification</td>
+              <td>Audit unused indexes: <code>pg_stat_user_indexes</code> where <code>idx_scan = 0</code></td>
+            </tr>
+            <tr>
+              <td>8</td>
+              <td>Using functions on indexed columns in WHERE clause</td>
+              <td><code>WHERE YEAR(created_at) = 2024</code> can't use index on <code>created_at</code></td>
+              <td>Use sargable predicates: <code>WHERE created_at >= '2024-01-01' AND created_at < '2025-01-01'</code></td>
+            </tr>
+            <tr>
+              <td>9</td>
+              <td>Not considering Index-Only Scan potential</td>
+              <td><code>SELECT *</code> forces heap lookups even with index; adding INCLUDE columns enables index-only path</td>
+              <td>Select only needed columns; use INCLUDE for frequently accessed non-key columns</td>
+            </tr>
+            <tr>
+              <td>10</td>
+              <td>Blaming the optimizer instead of investigating</td>
+              <td>99% of the time the optimizer is correct given its statistics; the problem is the data it was given</td>
+              <td>Follow the debugging workflow: check stats → EXPLAIN → compare est. vs actual → fix stats or index</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Anti-Pattern: The "Index Everything" Approach</h3>
+        <pre><code class="language-sql">-- Real example from production audit:
+-- Table: user_events (50M rows, 200GB)
+-- Indexes found: 23 indexes consuming 180GB!
+-- Problem: writes were 4× slower than necessary
+
+-- Find unused indexes:
+SELECT
+  schemaname || '.' || relname AS table,
+  indexrelname AS index,
+  pg_size_pretty(pg_relation_size(i.indexrelid)) AS size,
+  idx_scan AS times_used
+FROM pg_stat_user_indexes i
+JOIN pg_index USING (indexrelid)
+WHERE idx_scan = 0        -- never used!
+  AND indisunique = false  -- don't drop unique constraints
+ORDER BY pg_relation_size(i.indexrelid) DESC;
+
+-- Result: 12 indexes (90GB) never used in 6 months
+-- Dropping them: write throughput increased 2.5×</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 14: TRADE-OFFS
+         ============================================================ -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Index maintenance cost vs query speed, covering indexes vs storage</summary>
+
+        <h3>The Fundamental Trade-off</h3>
+        <pre><code class="language-bash"># ┌──────────────────────────────────────────────────────────────────┐
+# │           READ PERFORMANCE vs WRITE PERFORMANCE                 │
+# ├──────────────────────────────────────────────────────────────────┤
+# │                                                                  │
+# │  More indexes → Faster reads (more access paths)                │
+# │              → Slower writes (must update each index)            │
+# │              → More storage (index data on disk)                │
+# │              → More WAL (index changes logged)                  │
+# │              → Longer VACUUM (more index pages to clean)        │
+# │                                                                  │
+# │  Fewer indexes → Slower reads (seq scans more common)           │
+# │               → Faster writes (less maintenance)                │
+# │               → Less storage                                    │
+# │               → Shorter VACUUM                                  │
+# │                                                                  │
+# │  Sweet spot: minimal set of indexes that cover your query       │
+# │  patterns at acceptable selectivity                             │
+# └──────────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>Write Amplification</h3>
+        <pre><code class="language-sql">-- Each INSERT into a table with N indexes requires:
+-- 1 heap page write + N index page writes + WAL for all
+--
+-- Example: INSERT into orders with 8 indexes
+-- Heap:    1 page write
+-- Indexes: 8 page writes (one per index, possibly more if page split)
+-- WAL:     9 WAL records minimum
+--
+-- Measure write amplification:
+SELECT
+  relname,
+  n_tup_ins,
+  n_tup_upd,
+  n_tup_del,
+  pg_size_pretty(pg_total_relation_size(relid)) as total_size,
+  (SELECT COUNT(*) FROM pg_index WHERE indrelid = relid) as num_indexes
+FROM pg_stat_user_tables
+WHERE relname = 'orders';
+
+-- HOT (Heap-Only Tuple) optimization:
+-- If updated columns are NOT in any index, PostgreSQL can do a
+-- "heap-only tuple" update — no index maintenance needed!
+-- This is why you should NOT index columns that are frequently updated.</code></pre>
+
+        <h3>Covering Index: Space vs Speed</h3>
+        <pre><code class="language-sql">-- Trade-off: larger index that enables Index-Only Scan
+
+-- Option A: Lean index (small, serves Index Scan)
+CREATE INDEX idx_lean ON orders(status);
+-- Size: 100MB, requires heap lookup for every row
+
+-- Option B: Covering index (larger, serves Index-Only Scan)
+CREATE INDEX idx_covering ON orders(status) INCLUDE (amount, created_at, customer_id);
+-- Size: 350MB, but zero heap lookups!
+
+-- When is covering index worth it?
+-- ✓ Query is called thousands of times per second
+-- ✓ Heap lookups are the bottleneck (visible in BUFFERS output)
+-- ✓ The extra columns are narrow (few bytes each)
+-- ✗ Extra columns are wide (text, jsonb) → index becomes huge
+-- ✗ Query is rare → not worth the write overhead</code></pre>
+
+        <h3>Partial Index: Precision Scalpel</h3>
+        <pre><code class="language-sql">-- Trade-off: restricted applicability vs minimal overhead
+
+-- Full index: covers ALL queries on status, but large
+CREATE INDEX idx_full ON orders(created_at);
+-- Size: 800MB (covers all 50M rows)
+
+-- Partial index: covers ONLY queries for recent pending orders
+CREATE INDEX idx_partial ON orders(created_at)
+WHERE status = 'pending' AND created_at >= '2024-01-01';
+-- Size: 5MB (covers only ~100K rows!)
+
+-- Maintenance cost: partial index only updated when a row
+-- enters or leaves the partial index condition
+-- INSERT with status='completed' → does NOT touch idx_partial</code></pre>
+
+        <h3>Cross-Engine Trade-off Comparison</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Consideration</th>
+              <th>PostgreSQL</th>
+              <th>BigQuery</th>
+              <th>Snowflake</th>
+              <th>Spark/Delta</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Index maintenance cost</td>
+              <td>Per write</td>
+              <td>N/A (no indexes)</td>
+              <td>Automatic reclustering</td>
+              <td>OPTIMIZE command</td>
+            </tr>
+            <tr>
+              <td>Storage overhead</td>
+              <td>Index size on disk</td>
+              <td>None</td>
+              <td>Metadata only</td>
+              <td>Z-ORDER rewrite</td>
+            </tr>
+            <tr>
+              <td>Read optimization</td>
+              <td>B-tree, Hash, GiST</td>
+              <td>Partition/cluster pruning</td>
+              <td>Micro-partition pruning</td>
+              <td>Data skipping + pushdown</td>
+            </tr>
+            <tr>
+              <td>Write penalty</td>
+              <td>High (per index)</td>
+              <td>None</td>
+              <td>Low (async recluster)</td>
+              <td>Batch (OPTIMIZE)</td>
+            </tr>
+            <tr>
+              <td>Tuning complexity</td>
+              <td>High (manual)</td>
+              <td>Low (auto-managed)</td>
+              <td>Medium (clustering keys)</td>
+              <td>Medium (Z-ORDER cols)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Decision Framework</h3>
+        <pre><code class="language-bash"># When to accept a sequential scan (don't add an index):
+#
+# 1. Table is small (< 10,000 rows / < 100 pages)
+#    → Seq scan reads ~100 pages in <1ms. Index adds overhead.
+#
+# 2. Query returns > 15% of rows
+#    → Seq scan is genuinely cheaper. Focus on the query pattern.
+#
+# 3. Table is write-heavy, query is rare
+#    → Index maintenance cost exceeds read benefit.
+#
+# 4. Column has very low cardinality (< 10 distinct values)
+#    → Use partial index on the rare value instead.
+#
+# 5. Full aggregation query (COUNT, SUM, AVG over all rows)
+#    → Parallel seq scan with multiple workers is optimal.
+#
+# When to definitely add an index:
+#
+# 1. Point lookups (WHERE pk = ?) — always index
+# 2. Foreign key columns (JOIN performance + lock avoidance)
+# 3. Selective predicates (< 5% of rows) on frequently-run queries
+# 4. ORDER BY + LIMIT pattern (top-N queries)
+# 5. Unique constraints (implicitly create index)</code></pre>
+      </details>
+    </section>
+
+
+    <!-- ============================================================
+         SECTION 15: FOLLOW-UP QUESTIONS
+         ============================================================ -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Deeper questions the interviewer may ask next</summary>
+
+        <h3>Level 1: Fundamentals</h3>
+        <ul>
+          <li><strong>"What is selectivity and how does it affect plan choice?"</strong>
+            <p>Selectivity is the fraction of rows matching a predicate (0.0 to 1.0). Below ~5%, index scan wins. Above ~15%, seq scan wins. The zone between depends on correlation, cache, and hardware.</p>
+          </li>
+          <li><strong>"What's the difference between Index Scan and Index Only Scan?"</strong>
+            <p>Index Scan: traverses B-tree + fetches heap tuple (random I/O per row). Index Only Scan: reads data directly from the index (no heap access) — requires covering index + all-visible pages (visibility map).</p>
+          </li>
+          <li><strong>"When would you use a Bitmap Index Scan?"</strong>
+            <p>When selectivity is in the 5-15% "gray zone" or when combining multiple indexes with BitmapAnd/BitmapOr. It builds a bitmap of matching pages, then reads them in physical order (converting random I/O to sequential).</p>
+          </li>
+        </ul>
+
+        <h3>Level 2: Production Scenarios</h3>
+        <ul>
+          <li><strong>"A query used an index yesterday but does a seq scan today. What happened?"</strong>
+            <p>Most likely: auto-analyze ran after data changes, updating statistics that crossed the selectivity threshold. Other causes: table bloat changed relpages estimate, correlation dropped, or effective_cache_size changed.</p>
+          </li>
+          <li><strong>"How would you prevent plan instability for a critical query?"</strong>
+            <p>Options: (1) Partial index that keeps selectivity low regardless of data growth, (2) pg_hint_plan extension to pin plans, (3) Prepared statements with custom plan (plan_cache_mode=force_custom_plan), (4) Connection pooler query routing to a replica with different settings.</p>
+          </li>
+          <li><strong>"Your table has 500M rows and a query returns 1M rows. Index or seq scan?"</strong>
+            <p>1M/500M = 0.2% selectivity → likely index scan. But check correlation! If correlation ≈ 0.0, those 1M rows hit 1M different pages → 1M × random_page_cost could exceed seq scan of the entire table. Bitmap scan would be the sweet spot here.</p>
+          </li>
+        </ul>
+
+        <h3>Level 3: Architecture &amp; Cross-Engine</h3>
+        <ul>
+          <li><strong>"How does BigQuery handle this without indexes?"</strong>
+            <p>BigQuery uses columnar storage + partition pruning + clustering. Since it reads only needed columns and can skip entire partitions/blocks based on metadata (min/max), it achieves "selective" reads without B-trees. The equivalent of "index vs seq scan" is "pruned scan vs full scan."</p>
+          </li>
+          <li><strong>"How does Snowflake's micro-partition pruning compare to PostgreSQL indexes?"</strong>
+            <p>Snowflake stores min/max metadata per micro-partition (16MB compressed). Query predicates are evaluated against metadata to skip irrelevant partitions. This is coarser than a B-tree (partition-level vs row-level) but requires zero maintenance and works across all queries automatically.</p>
+          </li>
+          <li><strong>"How would you design a table for both OLTP point lookups and analytical scans?"</strong>
+            <p>Hybrid approach: (1) PostgreSQL with partitioning for recent data (indexed for OLTP) + cold partitions for analytics, or (2) HTAP architecture with PostgreSQL for writes + Snowflake/BigQuery replica for analytics, or (3) Citus/TimescaleDB for distributed PostgreSQL with both access patterns.</p>
+          </li>
+          <li><strong>"What's the relationship between VACUUM and index-only scans?"</strong>
+            <p>VACUUM marks heap pages as "all-visible" in the visibility map. Index-only scans can only skip heap access for all-visible pages. Without regular VACUUM, heap fetches increase and index-only scan degrades to index scan performance.</p>
+          </li>
+        </ul>
+
+        <h3>Level 4: Deep Internals</h3>
+        <ul>
+          <li><strong>"Explain the Mackert-Lohman formula for estimating effective cache hits."</strong>
+            <p>PostgreSQL uses this to estimate how many heap page fetches will actually hit the buffer cache vs require disk reads. Formula: <code>effective_pages = min(T, b + (T - b) × (1 - exp(-b/T)))</code> where T = total pages, b = pages containing matching rows. As b→T, most pages are already fetched → amortized cost decreases.</p>
+          </li>
+          <li><strong>"How does PostgreSQL handle index scans on TOAST'd columns?"</strong>
+            <p>TOAST'd values are stored out-of-line. An index scan that needs TOAST'd columns requires additional I/O beyond the heap page fetch. This makes covering indexes with INCLUDE even more valuable for wide tables — avoid TOAST lookups entirely.</p>
+          </li>
+          <li><strong>"What's the impact of fillfactor on index scan performance?"</strong>
+            <p>Lower fillfactor (e.g., 70%) leaves free space in heap pages for HOT updates, reducing index maintenance. However, it increases total pages → makes seq scan more expensive. Trade-off between write performance and scan cost.</p>
+          </li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SECTION 16: SUMMARY
+         ============================================================ -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Key takeaways for the interview</summary>
+
+        <h3>The One-Paragraph Answer</h3>
+        <p>The query optimizer chose a full table scan because its cost-based analysis determined that sequential I/O (reading all pages in order) is cheaper than the random I/O pattern of index lookups when the query's selectivity exceeds ~5-15%. This decision is driven by table statistics (<code>pg_stats</code>), particularly the column's selectivity (from MCVs and histograms), correlation (physical vs logical ordering), and the cost parameters (<code>random_page_cost</code> vs <code>seq_page_cost</code>). The optimizer is almost always correct given accurate statistics.</p>
+
+        <h3>Key Formulas</h3>
+        <pre><code class="language-bash"># Sequential Scan Cost:
+#   cost = relpages × seq_page_cost + reltuples × cpu_tuple_cost
+#   cost = relpages × 1.0 + reltuples × 0.01
+#
+# Index Scan Cost:
+#   cost = index_traversal + (rows × random_page_cost × (1 - correlation²))
+#                          + rows × cpu_index_tuple_cost
+#
+# Tipping Point (simplified):
+#   index_cost > seq_cost when:
+#   selectivity > seq_page_cost / (random_page_cost × pages_per_row)
+#   ≈ 5-15% depending on correlation and caching</code></pre>
+
+        <h3>Interview Checklist</h3>
+        <pre><code class="language-bash"># ✓ Mention cost-based optimizer (not rule-based)
+# ✓ Explain selectivity and the ~5-15% threshold
+# ✓ Reference pg_stats: MCVs, histograms, correlation, n_distinct
+# ✓ Explain random vs sequential I/O cost difference (4:1 on HDD)
+# ✓ Describe when optimizer is CORRECT to choose seq scan
+# ✓ Mention production debugging: EXPLAIN ANALYZE, check est vs actual
+# ✓ Discuss fixes: partial indexes, ANALYZE, covering indexes
+# ✓ Cross-engine awareness: BigQuery (no indexes), Snowflake (pruning)
+# ✓ Trade-offs: index maintenance cost, write amplification
+# ✓ Real scenario: plan flip due to data growth crossing threshold</code></pre>
+
+        <h3>Mental Model</h3>
+        <pre><code class="language-bash"># ┌─────────────────────────────────────────────────────────────────┐
+# │                                                                  │
+# │  "The optimizer is an economist, not a rule follower.           │
+# │   It calculates the cheapest path given the information          │
+# │   it has (statistics). When it chooses seq scan, it's usually   │
+# │   RIGHT — the real question is whether its information          │
+# │   is accurate and whether a better access path EXISTS."         │
+# │                                                                  │
+# │  Fix the statistics (ANALYZE) or create a better path           │
+# │  (partial/covering index) — don't fight the optimizer.          │
+# │                                                                  │
+# └─────────────────────────────────────────────────────────────────┘</code></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         CHAPTER NAVIGATION
+         ============================================================ -->
+    <nav class="chapter-nav" aria-label="Chapter navigation">
+      <a href="ch01-sql-query-execution.html" class="prev">&larr; Ch 1: SQL Query Execution</a>
+      <a href="ch03-join-order-optimization.html" class="next">Ch 3: Join Order Optimization &rarr;</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="../../assets/js/main.js"></script>
+</body>
+</html>
