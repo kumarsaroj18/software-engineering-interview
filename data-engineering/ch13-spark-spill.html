@@ -192,17 +192,18 @@ per_task_execution = execution_initial / 4  # ~592 MB per task initially</code><
       <h3>Off-Heap Memory</h3>
       <p>Off-heap memory bypasses JVM garbage collection entirely, providing predictable allocation without GC pauses:</p>
       <ul>
-        <li>Managed via <code>sun.misc.Unsafe</code> or Platform-specific allocators</li>
+        <li>Managed using Spark's low-level memory management abstractions (historically built on <code>sun.misc.Unsafe</code>)</li>
         <li>Used by Project Tungsten for binary row format storage</li>
         <li>Not subject to GC pressure — critical for large aggregations</li>
         <li>Requires explicit memory management (risk of leaks if misconfigured)</li>
-        <li>Configured separately: <code>spark.memory.offHeap.size</code> adds to the unified pool</li>
+        <li>Configured separately: when enabled, Spark maintains a separate off-heap unified memory pool (with its own execution/storage split) alongside the on-heap pool</li>
       </ul>
       <pre><code class="language-python"># Enabling off-heap memory
 spark.conf.set("spark.memory.offHeap.enabled", "true")
 spark.conf.set("spark.memory.offHeap.size", "4g")
-# Total unified memory = on-heap unified + off-heap
-# = (heap - 300MB) * 0.6 + 4GB</code></pre>
+# Spark manages a separate off-heap unified memory pool (4 GB)
+# alongside the on-heap unified pool: (heap - 300MB) * 0.6
+# Both pools independently track execution and storage usage</code></pre>
     </section>
 
     <!-- ═══════════════════════════════════════════════════════════════
@@ -231,7 +232,8 @@ spark.conf.set("spark.memory.offHeap.size", "4g")
 │     ↓                                                            │
 │  2. After each insert, check: shouldSpill()?                    │
 │     - currentMemory > myMemoryThreshold?                        │
-│     - More than 32 elements since last spill check?             │
+│     - Element count crossed a power-of-2 boundary?              │
+│       (checks at 32, 64, 128, 256... elements — not every insert)│
 │     ↓                                                            │
 │  3. Request more memory from TaskMemoryManager                  │
 │     - TaskMemoryManager tries to acquire from execution pool    │
@@ -303,12 +305,12 @@ spark.conf.set("spark.memory.offHeap.size", "4g")
           </tr>
         </tbody>
       </table>
-      <p><strong>Rule of thumb:</strong> A task that spills runs 3–10x slower than one that fits in memory. Multiple spills compound: if a task spills 5 times, it re-reads data 5 times during the final merge.</p>
+      <p><strong>Rule of thumb:</strong> Depending on storage hardware, serializer, and workload, a task that spills typically runs 3–10x slower than one that fits in memory. Multiple spills compound: Spark must merge data from all spill files during the final phase, increasing I/O and CPU cost proportionally.</p>
 
       <h3>Spill (Memory) vs Spill (Disk) in Spark UI</h3>
       <ul>
         <li><strong>Spill (Memory)</strong> — The total size of deserialized data that was spilled across all spill events. This is the in-memory size before serialization.</li>
-        <li><strong>Spill (Disk)</strong> — The total bytes actually written to disk. Always smaller than Spill (Memory) due to serialization + compression.</li>
+        <li><strong>Spill (Disk)</strong> — The total bytes actually written to disk. Usually smaller than Spill (Memory) because serialized data is more compact and may also be compressed.</li>
         <li><strong>Ratio</strong> — A typical ratio is 3:1 to 5:1 (Memory:Disk), depending on data compressibility and serializer efficiency.</li>
       </ul>
     </section>
@@ -384,13 +386,13 @@ spark.conf.set("spark.memory.offHeap.size", "4g")
         <tbody>
           <tr>
             <td>executor.memory too large (&gt;32 GB)</td>
-            <td>Long GC pauses, reduced throughput</td>
-            <td>Cap at 20–28 GB; use more executors instead</td>
+            <td>Potentially longer GC pauses; lost compressed OOPs optimization</td>
+            <td>Benchmark GC behavior carefully; consider capping at 28 GB or using off-heap for excess</td>
           </tr>
           <tr>
-            <td>Too many cores per executor (>5)</td>
+            <td>Too many cores per executor</td>
             <td>Per-task memory too low, frequent spill</td>
-            <td>Use 4–5 cores per executor for optimal balance</td>
+            <td>4–6 cores per executor is a practical starting point; benchmark for your workload</td>
           </tr>
           <tr>
             <td>Ignoring memoryOverhead</td>
@@ -426,8 +428,8 @@ cores_per_executor = 5
 memory_per_executor = available_memory // executors_per_node  # ~42 GB
 overhead = max(0.384, memory_per_executor * 0.10)  # ~4.2 GB
 heap_per_executor = memory_per_executor - overhead  # ~38 GB
-# BUT: >32 GB heap has severe GC implications
-# Better: use 20 GB heap + higher overhead for off-heap
+# BUT: >32 GB heap may increase GC pause times and loses compressed OOPs
+# Better: benchmark or use 20 GB heap + off-heap for heavy workloads
 
 # Recommended:
 # spark.executor.memory = 20g
@@ -636,7 +638,7 @@ rdd = rdd.partitionBy(500, SkewAwarePartitioner(500, hot_keys))</code></pre>
         <li><strong>Binary row format (UnsafeRow)</strong> — Stores data in a flat, binary format without Java object wrappers. A row with 10 fields occupies a contiguous byte array, not 10+ separate heap objects.</li>
         <li><strong>Cache-aware computation</strong> — Algorithms designed for CPU cache-line efficiency (sequential memory access patterns)</li>
         <li><strong>Code generation (Whole-Stage CodeGen)</strong> — Fuses multiple operators into a single optimized function, eliminating virtual method calls and object allocation per row</li>
-        <li><strong>Off-heap memory management</strong> — Allocates memory outside JVM heap using <code>sun.misc.Unsafe</code>, avoiding GC entirely for managed data</li>
+        <li><strong>Off-heap memory management</strong> — Allocates memory outside JVM heap using Spark's internal memory abstractions (historically <code>sun.misc.Unsafe</code>), avoiding GC entirely for managed data</li>
         <li><strong>Explicit memory management</strong> — Pages of binary data with manual lifecycle control (allocate/free) rather than relying on GC</li>
       </ul>
       <pre><code class="language-text">Traditional Java Objects:
@@ -676,11 +678,6 @@ Tungsten UnsafeRow:
             <td>Heaps > 4 GB; provides predictable pause times</td>
           </tr>
           <tr>
-            <td>Increase Young Gen ratio</td>
-            <td><code>-XX:NewRatio=2</code></td>
-            <td>Short-lived objects dominate (most Spark workloads)</td>
-          </tr>
-          <tr>
             <td>G1 region size</td>
             <td><code>-XX:G1HeapRegionSize=16m</code></td>
             <td>Large heaps (>16 GB); aligns with Spark's allocation patterns</td>
@@ -693,7 +690,7 @@ Tungsten UnsafeRow:
           <tr>
             <td>GC logging</td>
             <td><code>-Xlog:gc*:file=gc.log:time</code></td>
-            <td>Always enable in production for diagnostics</td>
+            <td>Always enable in production for diagnostics (Java 11+; use -XX:+PrintGCDetails for Java 8)</td>
           </tr>
           <tr>
             <td>Off-heap (avoid GC entirely)</td>
@@ -709,10 +706,11 @@ spark.conf.set("spark.executor.extraJavaOptions",
     "-XX:+UseG1GC "
     "-XX:G1HeapRegionSize=16m "
     "-XX:InitiatingHeapOccupancyPercent=35 "
-    "-Xlog:gc*:file=/tmp/spark-gc-%p.log:time,uptime,level,tags "
-    "-XX:+PrintGCDetails "
-    "-XX:+PrintGCTimeStamps"
+    "-Xlog:gc*:file=/tmp/spark-gc-%p.log:time,uptime,level,tags"
 )
+# Note: -XX:+PrintGCDetails and -XX:+PrintGCTimeStamps were removed in Java 11+.
+# Use -Xlog:gc* (unified logging) for Java 11/17 deployments.
+# For Java 8 only: add -XX:+PrintGCDetails -XX:+PrintGCTimeStamps instead.
 
 # In Spark UI: check "GC Time" column in Task metrics
 # Rule of thumb:
@@ -741,7 +739,8 @@ Broadcast Hash Join (No Shuffle):
 │  100 GB  │  (sent to all      │  500 MB  │
 │  (stays) │   executors)       │  (small) │
 └──────────┘                     └──────────┘
-No shuffle write/read → No spill from this join</code></pre>
+No shuffle write/read → No shuffle spill from this join
+(Note: downstream operators like aggregations may still spill)</code></pre>
 
       <h3>spark.sql.autoBroadcastJoinThreshold</h3>
       <p>Spark automatically broadcasts a table if its estimated size (from catalog statistics or file size) is below this threshold:</p>
@@ -781,6 +780,7 @@ No shuffle write/read → No spill from this join</code></pre>
       </ul>
 
       <h3>Broadcast Threshold Tuning Guidelines</h3>
+      <p>The following are starting points for tuning. Actual broadcast viability depends on executor memory, number of concurrent broadcasts, cluster size, and query shape:</p>
       <table>
         <thead>
           <tr>
@@ -863,6 +863,7 @@ AQE Query Planning:
 spark.conf.set("spark.sql.adaptive.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.initialPartitionNum", "2000")
+# Note: initialPartitionNum is deprecated in Spark 3.2+; use spark.sql.shuffle.partitions instead
 spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "128m")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.minPartitionSize", "1m")
 
@@ -898,6 +899,7 @@ spark.conf.set("spark.sql.adaptive.enabled", "true")
 # Coalescing: merge small partitions
 spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.initialPartitionNum", "2000")
+# Note: initialPartitionNum is deprecated in Spark 3.2+; use spark.sql.shuffle.partitions instead
 spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "128m")
 
 # Skew join: split large partitions
@@ -906,16 +908,13 @@ spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
 spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256m")
 
 # Dynamic join strategy switching
-spark.conf.set("spark.sql.adaptive.localShuffleReader.enabled", "true")
-
-# For Spark 3.2+: custom cost evaluator
-spark.conf.set("spark.sql.adaptive.optimizer.excludedRules", "")</code></pre>
+spark.conf.set("spark.sql.adaptive.localShuffleReader.enabled", "true")</code></pre>
 
       <h3>AQE Limitations</h3>
       <ul>
         <li><strong>Only works at shuffle boundaries</strong> — Cannot help with spill within a single stage (e.g., large aggregation before shuffle)</li>
         <li><strong>Requires shuffle</strong> — AQE collects statistics from shuffle map output; operations without shuffle don't benefit</li>
-        <li><strong>Skew join only for SortMergeJoin</strong> — Does not apply to ShuffledHashJoin or BroadcastHashJoin</li>
+        <li><strong>Skew join primarily targets SortMergeJoin</strong> — AQE skew optimization is primarily designed for SortMergeJoin workloads; support for other join types has expanded across Spark releases</li>
         <li><strong>Does not address root cause</strong> — AQE mitigates symptoms; the underlying data distribution issue remains</li>
         <li><strong>Overhead of re-planning</strong> — Small queries may see slight overhead from runtime re-optimization (negligible for large jobs)</li>
       </ul>
@@ -975,8 +974,8 @@ spark.conf.set("spark.sql.adaptive.optimizer.excludedRules", "")</code></pre>
 # Useful before multiple operations on the same key
 df = df.repartition(400, "customer_id")
 
-# Now all records for each customer_id are in the same partition
-# Subsequent groupBy("customer_id") or join on customer_id won't need shuffle
+# Repartitioning on the join/grouping key can reduce unnecessary reshuffling
+# when the optimizer can preserve the partitioning through subsequent operations
 
 # Repartition by multiple columns
 df = df.repartition(400, "customer_id", "order_date")
@@ -1025,8 +1024,13 @@ spark.conf.set("spark.sql.shuffle.partitions", "4000")</code></pre>
         </tbody>
       </table>
       <pre><code class="language-python"># Dynamic partition count based on input size
-input_size_bytes = spark.read.parquet("s3://bucket/table") \
-    .inputFiles().__len__()  # Approximation
+# Use Hadoop FileSystem API or cloud storage metadata for accurate sizing:
+# input_size_bytes = sum of file sizes from storage listing (e.g., S3 ListObjects)
+# Alternatively, read a small sample to estimate:
+sample_df = spark.read.parquet("s3://bucket/table").limit(10000)
+avg_row_bytes = sample_df.toPandas().memory_usage(deep=True).sum() / len(sample_df.toPandas())
+estimated_total_rows = spark.read.parquet("s3://bucket/table").count()
+estimated_size_mb = (estimated_total_rows * avg_row_bytes) / (1024 * 1024)
 
 # Better approach: use AQE with high initial count
 spark.conf.set("spark.sql.shuffle.partitions", "2000")
@@ -1189,6 +1193,7 @@ spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
 spark.conf.set("spark.sql.shuffle.partitions", "2000")</code></pre>
 
       <h3>Post-Incident Improvements</h3>
+      <p><strong>Why not just increase executor memory?</strong> Increasing executor memory would only have allowed the single 89 GB partition to fit slightly further before spilling. It would not eliminate the underlying skew, would have increased cluster cost proportionally, and the next partner onboarding would trigger the same failure at a higher threshold. The correct fix was to redistribute the workload across multiple partitions.</p>
       <ul>
         <li><strong>Data quality gate:</strong> Pre-join profiling step that alerts if any key exceeds 5% of total rows</li>
         <li><strong>Monitoring:</strong> CloudWatch alarm on <code>max(spill_disk_bytes)</code> metric from Spark event logs</li>
@@ -1238,6 +1243,15 @@ spark.conf.set("spark.sql.shuffle.partitions", "2000")</code></pre>
 └─────────────────────────────────────────────────────────────────┘</code></pre>
 
       <h3>Key Metrics in Spark UI</h3>
+      <p><strong>Recommended inspection order</strong> (how experienced Spark engineers diagnose spill):</p>
+      <ol>
+        <li><strong>Duration</strong> — Identify straggler tasks (max vs median)</li>
+        <li><strong>Shuffle Read</strong> — Confirm data volume driving the slow task</li>
+        <li><strong>Spill (Memory)</strong> — Quantify memory pressure</li>
+        <li><strong>Spill (Disk)</strong> — Quantify actual I/O cost</li>
+        <li><strong>GC Time</strong> — Check if GC is compounding the problem</li>
+        <li><strong>Peak Execution Memory</strong> — Determine how close tasks are to limits</li>
+      </ol>
       <table>
         <thead>
           <tr>
@@ -1732,9 +1746,9 @@ def detect_skew(df, key_column, skew_factor=10):
           </tr>
           <tr>
             <td>8</td>
-            <td>Too many cores per executor (>5)</td>
+            <td>Too many cores per executor</td>
             <td>Execution memory shared among more tasks; per-task memory drops below useful threshold</td>
-            <td>Use 4-5 cores per executor; trade off executor count vs. per-task memory</td>
+            <td>4–6 cores per executor is a common guideline; trade off executor count vs. per-task memory</td>
           </tr>
           <tr>
             <td>9</td>

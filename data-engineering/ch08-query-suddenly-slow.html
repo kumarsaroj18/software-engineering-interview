@@ -199,9 +199,12 @@ WHERE tablename = 'orders' AND attname = 'customer_id';
 -- Example scenario:
 -- Month 1: 500K distinct customers, n_distinct estimated as 500000
 -- Month 6: 5M distinct customers, but n_distinct still says 500000
--- Impact: planner thinks a customer_id filter returns 1/500K of rows
---         but actually returns 1/5M → overestimates selectivity by 10x
---         → chooses Seq Scan when Index Scan would be better
+-- Impact: planner thinks a customer_id = $1 filter matches
+--         1/500K of rows = 200 rows (in a 100M-row table)
+--         but actual selectivity is 1/5M = 20 rows
+--         → planner OVERestimates matching rows (200 vs actual 20)
+--         → this makes index access appear less attractive
+--         → depending on cost estimates, may lead to a less efficient plan
 
 -- n_distinct = -1 means "as many distinct values as rows"
 -- n_distinct = -0.5 means "half as many distinct values as rows"
@@ -372,16 +375,15 @@ spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "2
 spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
 
 # Fix 2: Salt the key for manual skew handling
-import random
 salt_range = 100  # split hot key across 100 partitions
 
 orders_salted = orders_df.withColumn(
     "salt", F.when(
         F.col("customer_id") == "BOT_ACCOUNT",
-        F.lit(random.randint(0, salt_range - 1))
+        (F.rand() * salt_range).cast("int")  # per-row random salt
     ).otherwise(F.lit(0))
 ).withColumn(
-    "join_key", F.concat("customer_id", F.lit("_"), "salt")
+    "join_key", F.concat("customer_id", F.lit("_"), F.col("salt").cast("string"))
 )
 </code></pre>
       </details>
@@ -467,9 +469,11 @@ LIMIT 20;
 <pre><code class="language-sql">
 -- PostgreSQL plan caching behavior:
 -- Executions 1-5: custom plan (uses actual parameter values)
--- Execution 6+: generic plan (uses placeholder $1, $2, etc.)
---   IF generic cost <= 1.1 × average custom cost → use generic
---   ELSE → continue with custom plans
+-- Execution 6+: PostgreSQL compares custom and generic plans.
+--   If the generic plan is considered sufficiently competitive
+--   (the exact heuristic is implementation-specific and not a
+--   documented guarantee), it begins reusing the generic plan.
+--   Otherwise, it continues generating custom plans.
 
 -- Example: prepared statement
 PREPARE get_orders(text) AS
@@ -489,13 +493,18 @@ EXECUTE get_orders('NORMAL_CUSTOMER');  -- 500 rows, Index Scan
 -- BUT if n_distinct is wrong (stale stats say 10K distinct customers)
 -- → avg 5000 rows/customer → Seq Scan chosen for generic plan!
 
--- Diagnose: check if generic plan is in use
-EXPLAIN (ANALYZE) EXECUTE get_orders('RARE_CUSTOMER');
--- Look for "$1" in the plan output — indicates generic plan
-
--- Force custom plans (PostgreSQL 12+):
+-- Diagnose: compare custom vs generic plan behavior (PostgreSQL 12+)
+-- Run the query under both modes and compare:
 SET plan_cache_mode = 'force_custom_plan';
--- Or per-statement:
+EXPLAIN (ANALYZE) EXECUTE get_orders('RARE_CUSTOMER');
+-- vs:
+SET plan_cache_mode = 'force_generic_plan';
+EXPLAIN (ANALYZE) EXECUTE get_orders('RARE_CUSTOMER');
+-- If the generic plan is significantly worse, that's the regression source.
+
+-- Fix: force custom plans permanently for this session:
+SET plan_cache_mode = 'force_custom_plan';
+-- Or reset the prepared statement to restart the evaluation:
 DEALLOCATE get_orders;
 -- And re-prepare to reset the counter
 </code></pre>
@@ -567,8 +576,7 @@ EXEC sp_query_store_force_plan @query_id = 42, @plan_id = 7;
 #   - DDL changes (ALTER TABLE, CREATE INDEX, DROP INDEX)
 #   - DEALLOCATE statement
 #   - Server restart
-#   - shared_buffers pressure (plan eviction)
-#   - pg_stat_statements reset
+#   - Session termination (prepared statements are per-session)
 #
 # SQL Server:
 #   - UPDATE STATISTICS
@@ -758,8 +766,8 @@ EXPLAIN ANALYZE SELECT ... -- Nested Loop, 45 seconds!
         <p>
           B-tree indexes in PostgreSQL can become <strong>bloated</strong> over time due to
           page splits, deleted entries that aren't reclaimed, and non-HOT updates. A bloated
-          index forces more I/O per lookup, eventually making the planner prefer a Seq Scan
-          over using the bloated index.
+          index forces more I/O per lookup, making index scans progressively slower and,
+          in extreme cases, potentially influencing the planner's plan choices.
         </p>
 <pre><code class="language-sql">
 -- Check index bloat in PostgreSQL:
@@ -794,7 +802,9 @@ SELECT * FROM pgstatindex('idx_orders_customer_id');
 -- Impact on query performance:
 -- Healthy index (90% density): 3 page reads for 1 lookup
 -- Bloated index (45% density): 6 page reads for 1 lookup (2x I/O)
--- If bloat is extreme, planner may switch to Seq Scan entirely
+-- Severe bloat increases the cost of index access. In extreme cases it
+-- can influence planner decisions, although more commonly it simply
+-- makes index scans slower without changing the plan choice.
 </code></pre>
       </details>
       <details>
@@ -1113,7 +1123,9 @@ WHERE o.created_at > '2024-01-01';
 -- Result: Batches goes from 1 to 4 → 3x-10x slower overnight
 
 -- Check current work_mem:
-SHOW work_mem;  -- default is often 4 MB (WAY too low for analytics)
+SHOW work_mem;  -- default is 4 MB; analytical workloads frequently need more,
+               -- but increases should be balanced against concurrent query count
+               -- since work_mem is allocated per operation, not per connection
 
 -- Set appropriate work_mem for the session:
 SET work_mem = '256MB';  -- per-operation, not per-connection total
@@ -1185,6 +1197,8 @@ df.groupBy("user_id").agg(  # 100M distinct users
 # Fix: enable AQE or salt the skewed key
 
 # 3. Large broadcast threshold mismatch:
+# Default autoBroadcastJoinThreshold is 10MB. Setting it higher
+# risks OOM if the "small" table is larger than expected.
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "500MB")
 # If the "small" table is actually 2GB after filtering, broadcast fails
 # and falls back to sort-merge join with potential spill
@@ -1297,9 +1311,11 @@ LIMIT 15;
 
 -- Mitigation strategies:
 -- 1. Separate OLTP and OLAP workloads (read replicas for analytics)
--- 2. Use BufFileRead ring buffer (large seq scans in PG use limited buffer)
--- 3. Pin critical tables in cache with pg_prewarm:
-SELECT pg_prewarm('orders');  -- load table into shared_buffers
+-- 2. PostgreSQL uses a Buffer Access Strategy (ring buffer) for large
+--    sequential scans to limit cache pollution automatically
+-- 3. Preload frequently accessed tables into shared_buffers with pg_prewarm:
+SELECT pg_prewarm('orders');  -- loads table into shared_buffers
+-- Note: pages are NOT pinned; they remain subject to normal eviction
 -- 4. Increase shared_buffers (but diminishing returns past 25% of RAM)
 </code></pre>
       </details>
@@ -1345,6 +1361,14 @@ SELECT * FROM orders WHERE order_id = 12345;
 -- When connection pools are exhausted, new queries queue behind
 -- existing connections. The query itself doesn't change, but the
 -- perceived latency includes queue wait time.
+--
+-- Important distinction:
+-- - Application-level pool (e.g., HikariCP, c3p0): requests queue
+--   in the app before even reaching PostgreSQL. Users experience
+--   slowness even when the database itself is healthy.
+-- - Database connections (max_connections): once all PostgreSQL
+--   slots are used, new connections are refused entirely.
+-- Both produce "query suddenly slow" symptoms from the user's perspective.
 
 -- Check active connections:
 SELECT
@@ -1413,7 +1437,8 @@ WHERE state = 'idle in transaction'
 # │    - Statistics NOT refreshed!                                  │
 # │                                                                 │
 # │  Month 12, Day 2: Query plan changes                           │
-# │    - Generic plan evaluation triggered (PG connection recycled) │
+# │    - A newly prepared statement began using a generic plan      │
+# │      after sufficient executions, exposing the stale stats      │
 # │    - Planner uses stale stats: 'pending' = 2% of 100M = 2M rows│
 # │    - Actual 'pending' rows per customer: 50-500 (was 1-5)       │
 # │    - BUT planner also thinks customer_id selectivity = 1/500K   │
@@ -1573,7 +1598,7 @@ ANALYZE orders;
           <li><strong>Monitor statistics age</strong> — alert on <code>n_mod_since_analyze / n_live_tup</code> ratio exceeding 5% for critical tables.</li>
           <li><strong>The "uniform distribution" assumption kills</strong> — when one status value goes from 2% to 35%, the planner's independence assumption produces wildly wrong estimates.</li>
           <li><strong>Composite indexes provide plan stability</strong> — an index on (customer_id, status, created_at) gives the same plan regardless of statistics accuracy.</li>
-          <li><strong>Generic plans in PG need monitoring</strong> — when connections recycle, new generic plans may be chosen based on stale statistics.</li>
+          <li><strong>Generic plans in PG need monitoring</strong> — after sufficient executions, prepared statements may switch to generic plans based on stale statistics, causing sudden regressions.</li>
           <li><strong>Test with production data volumes</strong> — this bug would never appear in dev (10K rows) or staging (1M rows).</li>
         </ul>
       </details>

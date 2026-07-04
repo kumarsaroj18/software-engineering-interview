@@ -123,13 +123,15 @@
         BigQuery is a serverless, columnar, massively parallel analytics engine
         built on Google's Dremel technology. Unlike PostgreSQL — a single-node,
         row-oriented OLTP database — BigQuery separates storage (Capacitor files
-        on Colossus/GCS) from compute (dynamically allocated slots), executes
+        stored in Google's Colossus distributed storage system) from compute (dynamically allocated slots), executes
         queries via a multi-level serving tree (root → mixers → leaf nodes), and
         prices queries by bytes scanned rather than compute time. It has no
-        indexes, no VACUUM, no connection limits, and no traditional query
-        optimizer with cost-based index selection. Instead, it relies on columnar
-        pruning, partitioning, clustering, and massive parallelism to achieve
-        sub-minute latency on petabyte-scale datasets.
+        indexes, no VACUUM, and no connection limits. BigQuery uses a distributed
+        cost-based optimizer focused on partition pruning, clustering, join
+        strategy selection, and distributed execution rather than user-managed
+        indexes. It relies on columnar pruning, partitioning, clustering, and
+        massive parallelism to achieve sub-minute latency on petabyte-scale
+        datasets.
       </p>
       <div class="key-insight">
         <strong>One-liner:</strong> PostgreSQL optimizes single-node execution
@@ -163,8 +165,9 @@
         <li>
           <strong>Storage layer:</strong> Data is stored in Capacitor columnar
           format on Google's distributed file system (Colossus). Storage is
-          managed, replicated, and encrypted automatically. You pay for storage
-          separately (~$0.02/GB/month for active, ~$0.01/GB/month for long-term).
+          managed, replicated, and encrypted automatically. Storage is billed
+          separately from compute, with lower rates for long-term (inactive)
+          data. See current BigQuery pricing documentation for exact rates.
         </li>
         <li>
           <strong>Compute layer:</strong> Query execution uses dynamically
@@ -174,19 +177,20 @@
         </li>
         <li>
           <strong>Network layer:</strong> Jupiter network fabric provides
-          petabit-scale bisection bandwidth between storage and compute, making
-          remote storage access nearly as fast as local disk for sequential reads.
+          petabit-scale bisection bandwidth between storage and compute,
+          enabling BigQuery to efficiently separate storage from compute
+          without significant I/O bottlenecks for large sequential reads.
         </li>
       </ul>
 
       <h3>Slot-Based Execution</h3>
       <p>
-        A "slot" in BigQuery is an abstraction over a unit of computational work.
-        Each slot represents approximately 0.5 CPU core with associated memory.
-        Key properties:
+        A "slot" in BigQuery is an abstract unit of computational capacity.
+        Each slot represents a share of compute resources (CPU, memory, and
+        network) used during query execution. Key properties:
       </p>
       <ul>
-        <li>On-demand projects get up to 2,000 slots by default (burstable)</li>
+        <li>On-demand projects receive dynamically allocated slots, subject to project quotas and available capacity</li>
         <li>Flat-rate reservations guarantee dedicated slots (100+ slot increments)</li>
         <li>Slots are allocated dynamically across query stages</li>
         <li>A single query can use thousands of slots in parallel</li>
@@ -235,7 +239,8 @@
         <li>
           <strong>Fair scheduling:</strong> On-demand queries share a slot pool.
           During peak usage, individual queries may receive fewer slots, causing
-          slower execution but never failure.
+          slower execution. In some situations, resource limits or quotas can
+          still cause query failures.
         </li>
         <li>
           <strong>Isolation via reservations:</strong> Flat-rate customers get
@@ -271,7 +276,9 @@
         BigQuery's execution engine is derived from Google's Dremel paper (2010).
         Unlike PostgreSQL's single-process volcano-style iterator model, Dremel
         uses a multi-level serving tree that distributes work across thousands of
-        nodes simultaneously.
+        nodes simultaneously. While the underlying implementation has evolved
+        significantly since the original paper, the conceptual model of
+        hierarchical distributed execution remains a useful mental framework.
       </p>
 
       <h3>Tree Structure</h3>
@@ -341,8 +348,9 @@
         </li>
         <li>
           <strong>Predicate pushdown:</strong> Filters are applied during the scan
-          phase, eliminating rows before they enter memory. Capacitor metadata
-          (min/max values, bloom filters) enables skipping entire file segments.
+          phase, eliminating rows before they enter memory. Capacitor maintains
+          column statistics (such as min/max values per block) that enable
+          skipping entire file segments.
         </li>
         <li>
           <strong>Local computation:</strong> Projections, expressions, and
@@ -428,8 +436,8 @@ PostgreSQL Heap Page:                  Capacitor File:
         </li>
         <li>
           <strong>Better compression:</strong> Values in a single column share the
-          same data type and often similar values, enabling 5-10x better
-          compression than row-oriented storage.
+          same data type and often similar values, enabling substantially better
+          compression than row-oriented storage for most analytical workloads.
         </li>
         <li>
           <strong>Vectorized processing:</strong> Columnar data can be processed
@@ -517,10 +525,6 @@ Encoding of links.forward column:
           <strong>Row counts:</strong> Used for optimizing COUNT(*) queries without
           reading data.
         </li>
-        <li>
-          <strong>Bloom filters:</strong> Probabilistic membership tests that
-          enable skipping blocks for equality predicates.
-        </li>
       </ul>
       <p>
         <strong>PostgreSQL contrast:</strong> PostgreSQL stores data in 8KB heap
@@ -538,7 +542,8 @@ Encoding of links.forward column:
       <p>
         The shuffle is one of BigQuery's most critical differentiators from both
         PostgreSQL and other MPP databases. It enables large-scale data
-        redistribution between query stages without writing to disk.
+        redistribution between query stages primarily through an in-memory
+        service, managed separately from query execution.
       </p>
 
       <h3>Jupiter Network Fabric</h3>
@@ -548,15 +553,15 @@ Encoding of links.forward column:
       </p>
       <ul>
         <li>
-          Any compute node can communicate with any other at near-local speeds.
+          Any compute node can communicate with any other at extremely high speeds.
         </li>
         <li>
           Data movement between query stages does not require disk serialization
-          as an intermediate step.
+          as the default intermediate step.
         </li>
         <li>
-          The network is non-blocking — thousands of simultaneous shuffles from
-          different queries can proceed without congestion.
+          Jupiter provides extremely high bisection bandwidth, greatly reducing
+          network bottlenecks during distributed query execution.
         </li>
       </ul>
 
@@ -598,25 +603,25 @@ Query Stage 1 (Scan + Hash)          Query Stage 2 (Aggregate)
                   └─────────────────┘
       </code></pre>
 
-      <h3>No Disk Spill in Standard Path</h3>
+      <h3>Primarily Memory-Backed Shuffle</h3>
       <p>
-        Unlike Spark or Hadoop MapReduce, BigQuery's standard execution path does
-        not spill shuffle data to disk:
+        Unlike Spark or Hadoop MapReduce, BigQuery's shuffle service is primarily
+        memory-backed and managed separately from query execution:
       </p>
       <ul>
         <li>
-          The shuffle service has enough aggregate RAM to hold intermediate data
-          for concurrent queries across the cluster.
+          The shuffle service maintains enough aggregate RAM to hold intermediate
+          data for concurrent queries across the cluster.
         </li>
         <li>
-          If a query's shuffle volume is exceptionally large, BigQuery may use
-          persistent shuffle (writing to Colossus), but this is rare and handled
-          transparently.
+          Under certain conditions (exceptionally large shuffle volumes),
+          BigQuery transparently uses persistent shuffle storage (writing to
+          Colossus), but this is handled automatically without user intervention.
         </li>
         <li>
-          This no-spill design means shuffle-heavy operations (large JOINs,
-          high-cardinality GROUP BYs) complete much faster than equivalent
-          disk-based shuffles.
+          This memory-first design means shuffle-heavy operations (large JOINs,
+          high-cardinality GROUP BYs) typically complete much faster than
+          equivalent disk-based shuffles in other systems.
         </li>
       </ul>
 
@@ -625,7 +630,7 @@ Query Stage 1 (Scan + Hash)          Query Stage 2 (Aggregate)
         <li>
           <strong>JOIN performance:</strong> Large hash joins that would be
           catastrophically slow in disk-based MPP systems are routine in BigQuery
-          because shuffle data stays in RAM.
+          because the shuffle service is primarily memory-backed.
         </li>
         <li>
           <strong>Skew handling:</strong> BigQuery automatically detects shuffle
@@ -727,8 +732,8 @@ Stage 4 (Write):                 1 slot  → Write final 10 rows to result buffe
         <tbody>
           <tr>
             <td>Pricing</td>
-            <td>$6.25 per TB scanned</td>
-            <td>~$2,000/month per 100 slots</td>
+            <td>Per TB scanned (see current pricing docs)</td>
+            <td>Per-slot commitment (see BigQuery Editions pricing)</td>
           </tr>
           <tr>
             <td>Slot availability</td>
@@ -845,9 +850,10 @@ Stage 4 (Write):                 1 slot  → Write final 10 rows to result buffe
           window functions, and DISTINCT processing.
         </li>
         <li>
-          <strong>Join execution:</strong> Hash joins (broadcast or shuffle-based),
-          with the smaller table typically broadcast to all slots processing the
-          larger table.
+          <strong>Join execution:</strong> Hash joins (broadcast or shuffle-based).
+          The optimizer may choose a broadcast hash join when replicating one
+          side of the join is expected to be more efficient than repartitioning
+          both inputs.
         </li>
         <li>
           <strong>Sort operations:</strong> ORDER BY processing, typically in the
@@ -917,7 +923,7 @@ Stage 4 (Write):   ░░░░░░░░░░░░░░░░░░░░�
         <li><strong>Stage ID:</strong> Sequential identifier for each stage</li>
         <li><strong>Input/Output rows:</strong> How many rows entered and left each stage</li>
         <li><strong>Slot time:</strong> Total compute time consumed (slot-milliseconds)</li>
-        <li><strong>Wait time:</strong> Time slots spent waiting (indicates contention)</li>
+        <li><strong>Wait time:</strong> Time slots spent waiting (may indicate slot contention, upstream stage dependencies, or scheduling delays)</li>
         <li><strong>Shuffle bytes:</strong> Data volume sent between stages</li>
         <li><strong>Parallelism:</strong> Number of workers active in each stage</li>
       </ul>
@@ -1086,8 +1092,9 @@ FROM analytics.orders;</code></pre>
       </p>
       <ul>
         <li>
-          JSONB is stored as a single binary blob per row — there is no columnar
-          sub-field access. Accessing one key reads the entire JSONB value.
+          JSONB is stored as a single binary value per row — accessing a nested
+          field does not benefit from independent column pruning as it does in
+          BigQuery's Capacitor format.
         </li>
         <li>
           PostgreSQL arrays exist but lack BigQuery's deep integration with the
@@ -1122,7 +1129,7 @@ FROM analytics.orders;</code></pre>
         (bytes read from storage):
       </p>
       <ul>
-        <li><strong>Rate:</strong> $6.25 per TB scanned (as of 2024)</li>
+        <li><strong>Rate:</strong> Charged per TB scanned (refer to current BigQuery pricing documentation for exact rates)</li>
         <li><strong>Minimum charge:</strong> 10 MB per query (even if less is read)</li>
         <li><strong>Free tier:</strong> First 1 TB of processing per month is free</li>
         <li><strong>Cached results:</strong> Queries that hit the 24-hour cache cost $0</li>
@@ -1243,7 +1250,7 @@ LIMIT 10;</code></pre>
 SELECT
   job_id,
   total_bytes_billed,
-  total_bytes_billed / POW(1024, 4) * 6.25 AS estimated_cost_usd
+  total_bytes_billed / POW(1024, 4) * 6.25 AS estimated_cost_usd  -- Update rate per current pricing
 FROM `region-us`.INFORMATION_SCHEMA.JOBS
 WHERE creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
 ORDER BY total_bytes_billed DESC
@@ -1281,7 +1288,7 @@ LIMIT 20;</code></pre>
       <ul>
         <li><strong>Partition pruning:</strong> Coarse-grained data skipping based on partition column values</li>
         <li><strong>Cluster block pruning:</strong> Fine-grained skipping based on sorted block metadata</li>
-        <li><strong>Capacitor metadata:</strong> Per-column min/max, bloom filters, null counts</li>
+        <li><strong>Capacitor metadata:</strong> Per-column statistics (min/max values, null counts) enabling block-level pruning</li>
         <li><strong>Brute-force parallelism:</strong> Scanning 1TB across 2,000 slots takes seconds</li>
       </ul>
       <p>
@@ -1339,7 +1346,7 @@ LIMIT 20;</code></pre>
           <tr>
             <td>Query planner</td>
             <td>Cost-based optimizer with statistics</td>
-            <td>Rule-based + dynamic re-optimization during execution</td>
+            <td>Distributed cost-based optimizer with adaptive execution</td>
           </tr>
           <tr>
             <td>Plan caching</td>
@@ -1369,7 +1376,7 @@ LIMIT 20;</code></pre>
           <tr>
             <td>Adaptive execution</td>
             <td>No (plan fixed at execution start)</td>
-            <td>Yes (can re-partition mid-query on skew detection)</td>
+            <td>Yes (can dynamically adjust execution strategies, including handling data skew)</td>
           </tr>
           <tr>
             <td>Point lookups</td>
@@ -1388,9 +1395,10 @@ LIMIT 20;</code></pre>
         </li>
         <li>
           <strong>BigQuery:</strong> Single-statement transactions for DML. MERGE
-          is atomic. Multi-statement transactions exist but are limited (max 100
-          DML statements, 20-minute timeout). No row-level locking — uses
-          table-level snapshot isolation.
+          is atomic. Multi-statement transactions exist but with limitations
+          (e.g., duration timeouts and statement count constraints). BigQuery
+          provides snapshot-based concurrency control and abstracts locking from
+          users rather than exposing PostgreSQL-style row-level locks.
         </li>
       </ul>
 
@@ -1496,7 +1504,8 @@ WHERE
 GROUP BY 1;</code></pre>
       <p>
         The query failed because <code>device.type</code> doesn't exist in the
-        schema. The analyst then tried:
+        schema — the analyst assumed it resembled a GA4 export and referenced a
+        non-existent field. The analyst then tried:
       </p>
       <pre><code class="language-sql">-- WORSE QUERY: Scans 2TB because of SELECT user.*
 SELECT
@@ -1708,7 +1717,7 @@ SELECT
   query,
   total_bytes_billed,
   ROUND(total_bytes_billed / POW(1024, 4), 4) AS tb_billed,
-  ROUND(total_bytes_billed / POW(1024, 4) * 6.25, 2) AS cost_usd,
+  ROUND(total_bytes_billed / POW(1024, 4) * 6.25, 2) AS cost_usd,  -- Update rate per current pricing
   total_slot_ms,
   TIMESTAMP_DIFF(end_time, start_time, SECOND) AS duration_sec
 FROM `region-us`.INFORMATION_SCHEMA.JOBS
@@ -1854,7 +1863,7 @@ SELECT
   SUM(total_slot_ms) / 1000 / 3600 AS total_slot_hours,
   COUNT(*) AS query_count,
   ROUND(SUM(total_bytes_billed) / POW(1024, 4), 2) AS tb_scanned,
-  ROUND(SUM(total_bytes_billed) / POW(1024, 4) * 6.25, 2) AS on_demand_cost_usd
+  ROUND(SUM(total_bytes_billed) / POW(1024, 4) * 6.25, 2) AS on_demand_cost_usd  -- Update rate per current pricing
 FROM `region-us`.INFORMATION_SCHEMA.JOBS
 WHERE
   creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
@@ -2008,7 +2017,7 @@ FROM my_table;</code></pre>
         </thead>
         <tbody>
           <tr>
-            <td>Excellent compression (5-10x)</td>
+            <td>Excellent compression ratios</td>
             <td>Point lookups require reading and reconstructing from columns</td>
           </tr>
           <tr>

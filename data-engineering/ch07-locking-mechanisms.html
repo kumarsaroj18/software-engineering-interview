@@ -135,8 +135,8 @@
         <p>
           <strong>Deadlocks</strong> occur when two or more transactions hold locks and each waits
           for a lock held by another, forming a cycle in the wait-for graph. Databases detect
-          deadlocks by periodically checking this graph (or via timeouts) and abort the cheapest
-          transaction to break the cycle.
+          deadlocks by checking this graph (or via timeouts) and abort one of the participating
+          transactions to break the cycle. The victim selection strategy is database-specific.
         </p>
         <p>
           Modern MVCC systems (PostgreSQL, Oracle, Snowflake) eliminate read-write conflicts by
@@ -226,8 +226,8 @@ INSERT INTO events (id, data) VALUES (1, 'test');
         <p>
           An intent exclusive lock on a higher-level resource signals that the transaction
           intends to acquire exclusive locks on lower-level resources. IX is compatible with
-          other IX locks (multiple transactions can write to different rows in the same table)
-          but incompatible with S or X locks at the same level.
+          IS and other IX locks (multiple transactions can read or write different rows in the
+          same table) but incompatible with S, SIX, and X locks at the same level.
         </p>
 <pre><code class="language-bash">
 # Transaction T1: UPDATE orders SET status='shipped' WHERE id = 5;
@@ -273,7 +273,7 @@ SELECT * FROM accounts WITH (UPDLOCK) WHERE id = 42;
 
 -- PostgreSQL equivalent: SELECT ... FOR UPDATE
 SELECT * FROM accounts WHERE id = 42 FOR UPDATE;
--- Acquires RowExclusiveLock (effectively X on the row)
+-- Acquires a RowShareLock on the table + row-level exclusive lock on the row
 </code></pre>
       </details>
       <details>
@@ -373,9 +373,11 @@ UPDATE orders SET priority = 0 WHERE id BETWEEN 1 AND 100000;
       <details>
         <summary>Table-level locking</summary>
         <p>
-          Locks the entire table. Maximum simplicity and minimum memory (one lock structure)
-          but severely limits concurrency. Used for DDL operations, bulk loads, and explicit
-          LOCK TABLE statements.
+          Table-level locks protect table-wide operations. Depending on the lock mode, they
+          may still allow concurrent reads or writes — PostgreSQL defines eight table-level
+          lock modes ranging from AccessShareLock (compatible with nearly everything) to
+          AccessExclusiveLock (blocks all access). Explicit LOCK TABLE, DDL operations, and
+          bulk loads use table-level locks.
         </p>
 <pre><code class="language-sql">
 -- PostgreSQL table-level lock modes (from least to most restrictive):
@@ -407,8 +409,10 @@ COMMIT;
       <details>
         <summary>Database-level locking</summary>
         <p>
-          The coarsest granularity. Locks the entire database, preventing any concurrent access.
-          Used during database restore, schema migration scripts, or single-user maintenance modes.
+          The coarsest granularity. Some database systems support maintenance modes that
+          effectively prevent normal concurrent access to an entire database, although true
+          database-wide locks are uncommon in most enterprise databases. Used during database
+          restore, schema migration scripts, or single-user maintenance modes.
         </p>
 <pre><code class="language-sql">
 -- SQL Server: set database to single-user mode
@@ -626,9 +630,10 @@ UPDATE accounts SET balance = balance + 100 WHERE id = 'B';  -- WAIT (T2 holds X
 #
 # Detection algorithms:
 #
-# 1. Periodic DFS/BFS on WFG (PostgreSQL)
-#    - Runs every deadlock_timeout (default: 1 second in PostgreSQL)
-#    - Triggered when a transaction has waited longer than deadlock_timeout
+# 1. Per-backend trigger (PostgreSQL)
+#    - When a backend has waited longer than deadlock_timeout (default 1s),
+#      PostgreSQL performs a deadlock check by examining the wait-for graph
+#    - NOT a periodic background thread — triggered per-backend on demand
 #    - O(V + E) where V = waiting transactions, E = wait edges
 #
 # 2. Continuous edge tracking (SQL Server)
@@ -643,7 +648,7 @@ UPDATE accounts SET balance = balance + 100 WHERE id = 'B';  -- WAIT (T2 holds X
 #
 # PostgreSQL deadlock detection timeline:
 #   T=0:     Transaction starts waiting for lock
-#   T=1s:    deadlock_timeout fires → trigger deadlock check
+#   T=1s:    Backend's deadlock_timeout fires → triggers deadlock check
 #   T=1.001s: WFG traversal finds cycle (or doesn't)
 #   T=1.002s: Victim selected → ERROR: deadlock detected
 </code></pre>
@@ -658,9 +663,10 @@ UPDATE accounts SET balance = balance + 100 WHERE id = 'B';  -- WAIT (T2 holds X
 # Victim selection strategies:
 #
 # PostgreSQL:
-#   - Aborts the transaction that triggered the deadlock check
-#   - Simple: the one that most recently started waiting
-#   - No cost-based selection
+#   - Aborts one of the transactions participating in the detected deadlock
+#   - The exact choice is implementation-specific rather than cost-based
+#   - In practice, typically the transaction whose backend triggered the check
+#   - No user-controllable priority setting
 #
 # SQL Server:
 #   - DEADLOCK_PRIORITY setting (LOW, NORMAL, HIGH, or -10 to 10)
@@ -900,9 +906,10 @@ ADD TARGET package0.ring_buffer;
       <details>
         <summary>PostgreSQL: no lock escalation</summary>
         <p>
-          PostgreSQL does <strong>not</strong> perform lock escalation. Row-level locks are
-          stored in the tuple header (xmax field) rather than in a separate lock table, so
-          they consume no additional memory regardless of how many rows are locked.
+          PostgreSQL does <strong>not</strong> perform lock escalation. Row-level lock
+          information is recorded in tuple headers using the xmax field together with
+          infomask bits, rather than in a separate lock table. This avoids per-row memory
+          allocation regardless of how many rows are locked.
         </p>
 <pre><code class="language-bash">
 # PostgreSQL lock architecture — why no escalation is needed:
@@ -911,8 +918,9 @@ ADD TARGET package0.ring_buffer;
 # │  Row-level "locks" in PostgreSQL:                              │
 # │                                                                │
 # │  • NOT stored in a lock table / lock manager                   │
-# │  • Stored in the tuple header (xmax field + infomask bits)     │
-# │  • xmax = transaction ID that locked/deleted the row           │
+# │  • Recorded in tuple headers (xmax field + infomask bits)      │
+# │  • xmax = transaction ID or MultiXactId that locked/deleted row│
+# │  • Infomask bits encode lock mode (FOR UPDATE vs FOR SHARE)    │
 # │  • No per-row memory allocation for locks!                     │
 # │                                                                │
 # │  UPDATE orders SET status='x' WHERE date = '2024-01-15';      │
@@ -948,10 +956,11 @@ SELECT * FROM performance_schema.memory_summary_global_by_event_name
 WHERE event_name LIKE '%lock%';
 
 -- InnoDB lock wait monitoring:
+-- MySQL 5.7 only (these views were REMOVED in MySQL 8.0):
 SELECT * FROM information_schema.INNODB_LOCK_WAITS;
 SELECT * FROM information_schema.INNODB_LOCKS;
 
--- In MySQL 8.0+:
+-- MySQL 8.0+ replacements (use these instead):
 SELECT * FROM performance_schema.data_locks;
 SELECT * FROM performance_schema.data_lock_waits;
 
@@ -1071,7 +1080,8 @@ def distributed_lock(lock_name: str, conn_string: str, timeout_ms: int = 5000):
     Context manager for distributed locking via PostgreSQL advisory locks.
     
     Advantages over Redis SETNX:
-    - Automatic release on connection drop (no stale locks)
+    - Session-level advisory locks auto-release on connection drop (no stale locks)
+    - Transaction-level advisory locks release at COMMIT/ROLLBACK
     - ACID guarantees on lock state
     - No separate infrastructure to maintain
     
@@ -1079,6 +1089,9 @@ def distributed_lock(lock_name: str, conn_string: str, timeout_ms: int = 5000):
     - Tied to PostgreSQL availability
     - Higher latency than Redis (~1ms vs ~0.1ms)
     - Connection per lock holder
+    
+    Note: lock_timeout does NOT apply to advisory lock waits.
+    We use pg_try_advisory_lock with a polling loop instead.
     """
     lock_key = hash(lock_name) & 0x7FFFFFFFFFFFFFFF  # positive bigint
     
@@ -1086,20 +1099,28 @@ def distributed_lock(lock_name: str, conn_string: str, timeout_ms: int = 5000):
     conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
     cur = conn.cursor()
     
-    # Set lock timeout
-    cur.execute(f"SET lock_timeout = '{timeout_ms}ms'")
+    # Advisory locks ignore lock_timeout, so poll with pg_try_advisory_lock
+    import time as _time
+    deadline = _time.time() + (timeout_ms / 1000.0)
+    acquired = False
+    while _time.time() < deadline:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+        acquired = cur.fetchone()[0]
+        if acquired:
+            break
+        _time.sleep(0.05)  # 50ms poll interval
+    
+    if not acquired:
+        conn.close()
+        raise TimeoutError(f"Could not acquire lock '{lock_name}' within {timeout_ms}ms")
     
     try:
-        # Blocking acquire with timeout
-        cur.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
         yield  # Critical section
-    except psycopg2.errors.LockNotAvailable:
-        raise TimeoutError(f"Could not acquire lock '{lock_name}' within {timeout_ms}ms")
     finally:
         try:
             cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
         except Exception:
-            pass  # Connection drop auto-releases
+            pass  # Connection drop auto-releases session-level locks
         conn.close()
 
 # Usage:
@@ -1316,8 +1337,9 @@ VACUUM orders;
 # │  Analytics + OLTP      │  Painful              │  Natural fit            │
 # ├────────────────────────┼───────────────────────┼─────────────────────────┤
 # │  Used by               │  SQL Server (default) │  PostgreSQL, Oracle,    │
-# │                        │  MySQL MyISAM         │  MySQL InnoDB, CockroachDB│
-# │                        │  SQLite (exclusive)   │  Snowflake, BigQuery    │
+# │                        │  MySQL MyISAM (table- │  MySQL InnoDB, CockroachDB│
+# │                        │   level locking)      │  Snowflake, BigQuery    │
+# │                        │  SQLite (exclusive)   │                         │
 # └────────────────────────┴───────────────────────┴─────────────────────────┘
 #
 # Note: SQL Server supports MVCC via READ_COMMITTED_SNAPSHOT_ISOLATION (RCSI)
@@ -1348,11 +1370,12 @@ VACUUM orders;
 # │         Multiple queries can read the same table simultaneously  │
 # │         Each sees a consistent snapshot at query start time      │
 # │                                                                  │
-# │  WRITES (DML): Table-level mutation lock                         │
-# │  • Only one DML statement can modify a table at a time           │
-# │  • Concurrent DMLs queue behind each other                       │
-# │  • Quota: 20 DML statements per table per day (legacy)           │
-# │  • Now: rate-limited, not hard-capped                            │
+# │  WRITES (DML): Serialized conflict detection                    │
+# │  • BigQuery serializes conflicting mutations internally          │
+# │  • Concurrent DML is supported, but operations modifying         │
+# │    overlapping data may be delayed or fail with serialization    │
+# │    errors                                                        │
+# │  • Rate-limited: subject to DML quotas per table (not a flat cap)│
 # │                                                                  │
 # │  STREAMING INSERTS: No table lock (append-only buffer)           │
 # │  • Rows buffered in streaming buffer, eventually materialized    │
@@ -1402,9 +1425,10 @@ ORDER BY queue_seconds DESC;
 # │                                                                  │
 # │  WRITE vs WRITE (same table):                                    │
 # │  • INSERT: concurrent (append to different micro-partitions)     │
-# │  • UPDATE/DELETE/MERGE: table-level lock                         │
-# │    - Only one UPDATE/DELETE/MERGE at a time per table            │
-# │    - Subsequent writes queue (up to lock timeout)                │
+# │  • UPDATE/DELETE/MERGE: coordinated via transaction manager      │
+# │    - Conflicting modifications may wait or fail                  │
+# │    - Independent operations can proceed concurrently             │
+# │    - Subsequent conflicting writes queue (up to lock timeout)    │
 # │                                                                  │
 # │  DDL:                                                            │
 # │  • ALTER TABLE, DROP TABLE: exclusive table lock                 │
@@ -1455,7 +1479,8 @@ ALTER SESSION SET LOCK_TIMEOUT = 300;  -- 300 seconds (default: 43200 = 12h!)
 # │  Conflict rules:                                                 │
 # │  • Two APPEND operations → NEVER conflict (different files)      │
 # │  • APPEND vs UPDATE/DELETE → conflict only if touching same files│
-# │  • Two UPDATEs on same partition → ALWAYS conflict               │
+# │  • Two UPDATEs on same partition → may conflict if they modify   │
+# │    overlapping files or rows within the same snapshot            │
 # │  • UPDATE + OPTIMIZE → may conflict                              │
 # │                                                                  │
 # │  Conflict detection mechanism:                                   │
@@ -1652,11 +1677,13 @@ COMMIT;
 -- FIX 2: Reduce lock hold time (medium-term)
 -- Before: single transaction updating 100K rows (holds locks for minutes)
 -- After: micro-batches of 1000 rows with explicit commits
+-- NOTE: DO $$ blocks cannot use COMMIT; use application-level loop instead.
 
-DO $$
+-- Option A: Use a PROCEDURE (PostgreSQL 11+) for in-database batching:
+CREATE OR REPLACE PROCEDURE batch_update_orders(p_batch_size INT DEFAULT 1000)
+LANGUAGE plpgsql AS $$
 DECLARE
   batch_start BIGINT := 1;
-  batch_size BIGINT := 1000;
   max_id BIGINT;
 BEGIN
   SELECT max(id) INTO max_id FROM staging_orders;
@@ -1666,12 +1693,20 @@ BEGIN
     FROM staging_orders s
     WHERE o.id = s.id
       AND o.id >= batch_start
-      AND o.id < batch_start + batch_size;
-    COMMIT;  -- Release locks between batches
-    batch_start := batch_start + batch_size;
+      AND o.id < batch_start + p_batch_size;
+    COMMIT;  -- Allowed in procedures (not in DO blocks)
+    batch_start := batch_start + p_batch_size;
     PERFORM pg_sleep(0.1);  -- 100ms breathing room for OLTP
   END LOOP;
 END $$;
+
+CALL batch_update_orders(1000);
+
+-- Option B: Application-level loop (Python):
+-- for batch_start in range(1, max_id, batch_size):
+--     conn.execute(update_sql, (batch_start, batch_start + batch_size))
+--     conn.commit()  -- releases locks between batches
+--     time.sleep(0.1)
 
 -- FIX 3: Set lock_timeout on ETL connections
 ALTER ROLE etl_user SET lock_timeout = '5s';
@@ -1783,7 +1818,7 @@ WHERE NOT blocked_locks.granted
   AND blocking_locks.granted
 ORDER BY blocked_activity.xact_start;
 
--- Simpler version (PostgreSQL 14+):
+-- Simpler version (PostgreSQL 9.6+):
 SELECT * FROM pg_blocking_pids(blocked_pid);
 
 -- Or use pg_stat_activity.wait_event_type:
@@ -2575,7 +2610,7 @@ FOR UPDATE SKIP LOCKED;  -- skips row 1 (locked), grabs row 2
       <details>
         <summary>Advisory locks vs external lock services</summary>
         <ul>
-          <li><strong>PostgreSQL advisory locks:</strong> Zero additional infrastructure, auto-release on disconnect, transactional semantics available. But tied to PostgreSQL availability, connection per lock holder, ~1ms latency.</li>
+          <li><strong>PostgreSQL advisory locks:</strong> Zero additional infrastructure, session-level locks auto-release on disconnect, transactional semantics available. But tied to PostgreSQL availability, connection per lock holder, ~1ms latency.</li>
           <li><strong>Redis (SETNX + TTL):</strong> Sub-millisecond latency, language-agnostic, works across any services. But no auto-release on crash (relies on TTL expiry), potential split-brain with Redlock, requires Redis infrastructure.</li>
           <li><strong>ZooKeeper/etcd:</strong> Consensus-based correctness, ephemeral nodes auto-cleanup, well-suited for leader election. But operational complexity, higher latency (~5-10ms), additional infrastructure.</li>
           <li><strong>Decision:</strong> If you already have PostgreSQL and need coordination among services that connect to it — advisory locks. If cross-service with high throughput — Redis. If correctness-critical distributed coordination — ZooKeeper/etcd.</li>
@@ -2608,10 +2643,11 @@ FOR UPDATE SKIP LOCKED;  -- skips row 1 (locked), grabs row 2
       <details>
         <summary>Q1: How does PostgreSQL handle deadlocks differently from SQL Server?</summary>
         <p>
-          <strong>PostgreSQL:</strong> Deadlock detection is lazy — triggered only when a
-          transaction has waited longer than <code>deadlock_timeout</code> (default 1s).
-          Detection runs a DFS on the wait-for graph. Victim is always the transaction that
-          triggered the check (the most recent waiter). No cost-based victim selection.
+          <strong>PostgreSQL:</strong> Deadlock detection is triggered per-backend — when a
+          backend has waited longer than <code>deadlock_timeout</code> (default 1s), it
+          performs a deadlock check by examining the wait-for graph via DFS.
+          Victim is one of the transactions participating in the cycle; the exact choice is
+          implementation-specific rather than cost-based. No user-controllable priority setting.
         </p>
         <p>
           <strong>SQL Server:</strong> Deadlock detection is proactive — the lock manager

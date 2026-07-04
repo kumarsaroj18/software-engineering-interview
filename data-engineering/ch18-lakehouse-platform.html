@@ -265,8 +265,8 @@
       <h3>Why Lakehouse Emerged Now</h3>
       <p>Three technological developments converged around 2018-2020:</p>
       <ol>
-        <li><strong>Open table formats matured:</strong> Delta Lake (2019), Apache Iceberg (2018 from Netflix), Apache Hudi (2016 from Uber) — all reached production readiness, proving ACID transactions on object storage were possible.</li>
-        <li><strong>Object storage became fast enough:</strong> S3 request rates went from 100 rps per prefix to 5,500+ (2018 improvement). High-throughput columnar reads became viable.</li>
+        <li><strong>Open table formats matured:</strong> Delta Lake (2019), Apache Iceberg (2017 at Netflix, donated to Apache 2018), Apache Hudi (2016 from Uber) — all reached production readiness, proving ACID transactions on object storage were possible.</li>
+        <li><strong>Object storage became fast enough:</strong> S3 request rates went from ~300-800 rps per prefix to 3,500+ PUT / 5,500+ GET per prefix (July 2018 improvement). High-throughput columnar reads became viable.</li>
         <li><strong>Compute engines decoupled:</strong> Spark, Trino, Flink, and Dremio all adopted catalog-based access patterns, making engine interoperability practical through shared metadata.</li>
       </ol>
 
@@ -293,7 +293,7 @@
 # │   ├── 00000000000000000001.json    ← add files
 # │   ├── 00000000000000000002.json    ← update operation
 # │   ├── ...
-# │   ├── 00000000000000000010.checkpoint.parquet  ← checkpoint every 10 commits
+# │   ├── 00000000000000000010.checkpoint.parquet  ← checkpoint (every 10 commits by default, configurable)
 # │   └── _last_checkpoint                         ← pointer to latest checkpoint
 # ├── part-00000-abc123.snappy.parquet
 # ├── part-00001-def456.snappy.parquet
@@ -312,10 +312,10 @@
       <h4>Key Delta Lake Features</h4>
       <ul>
         <li><strong>ACID transactions:</strong> Optimistic concurrency control using the transaction log. Conflicting writes are detected at commit time (not at read time) using file-level conflict resolution.</li>
-        <li><strong>Time travel:</strong> Query any historical version by snapshot ID or timestamp. Retention controlled by <code>delta.logRetentionDuration</code> (default 30 days).</li>
-        <li><strong>Z-ORDER clustering:</strong> Co-locates related data in the same files using space-filling curves (Z-order or Hilbert curves), dramatically improving multi-dimensional filter performance.</li>
+        <li><strong>Time travel:</strong> Query any historical version by snapshot ID or timestamp. Retention controlled by <code>delta.logRetentionDuration</code> (default 30 days). Note: time travel also depends on <code>delta.deletedFileRetentionDuration</code> (default 7 days) — if VACUUM has removed the underlying data files, time travel to those versions will fail even if log entries exist.</li>
+        <li><strong>Z-ORDER clustering:</strong> Co-locates related data in the same files using a Z-order space-filling curve, dramatically improving multi-dimensional filter performance.</li>
         <li><strong>Change Data Feed (CDF):</strong> Tracks row-level changes (insert/update/delete) between versions, enabling efficient incremental reads without scanning all files.</li>
-        <li><strong>Liquid Clustering (v3.0+):</strong> Replaces static partitioning and Z-ORDER with adaptive, incremental clustering that rebalances data as write patterns change.</li>
+        <li><strong>Liquid Clustering (v3.1+):</strong> Replaces static partitioning and Z-ORDER with adaptive, incremental clustering that rebalances data as write patterns change.</li>
       </ul>
 
       <pre><code class="language-sql">-- Delta Lake time travel examples
@@ -340,7 +340,7 @@ ZORDER BY (customer_id, order_date);
 -- Queries filtering on these columns skip 80-95% of files.</code></pre>
 
       <h3>Apache Iceberg</h3>
-      <p>Created at Netflix (2018), donated to Apache. Iceberg uses a tree-structured metadata hierarchy that provides O(1) snapshot access and hidden partitioning.</p>
+      <p>Created at Netflix (2017), donated to Apache (2018). Iceberg uses a tree-structured metadata hierarchy that provides O(1) snapshot access and hidden partitioning.</p>
 
       <h4>Metadata Layer Architecture</h4>
       <pre><code class="language-bash"># Iceberg metadata hierarchy:
@@ -526,7 +526,7 @@ df_incremental = spark.read.format("hudi") \
           <tr>
             <td>Origin</td>
             <td>Databricks (2019)</td>
-            <td>Netflix (2018)</td>
+            <td>Netflix (2017)</td>
             <td>Uber (2016)</td>
           </tr>
           <tr>
@@ -593,7 +593,7 @@ df_incremental = spark.read.format("hudi") \
             <td>Vendor alignment</td>
             <td>Databricks ecosystem</td>
             <td>Vendor-neutral (broadest adoption)</td>
-            <td>AWS ecosystem (EMR, Athena)</td>
+            <td>AWS ecosystem (EMR, Athena, Glue) primarily, but vendor-neutral Apache project</td>
           </tr>
           <tr>
             <td>Community momentum</td>
@@ -605,7 +605,7 @@ df_incremental = spark.read.format("hudi") \
       </table>
 
       <div class="callout callout-info">
-        <p><strong>Industry trend (2024+):</strong> Iceberg is emerging as the de facto standard for multi-engine lakehouses. Snowflake (Iceberg tables), AWS (native Iceberg in Athena/EMR/Glue), Databricks (UniForm for Iceberg compatibility), and Google (BigLake) have all converged on Iceberg interoperability. If starting a new lakehouse from scratch, Iceberg offers the broadest engine support and least vendor lock-in.</p>
+        <p><strong>Industry trend (2024+):</strong> Iceberg is increasingly becoming the preferred open table format for multi-engine lakehouses. Snowflake (Iceberg tables), AWS (native Iceberg in Athena/EMR/Glue), Databricks (UniForm for Iceberg compatibility), and Google (BigLake) have all converged on Iceberg interoperability. If starting a new lakehouse from scratch, Iceberg offers the broadest engine support and least vendor lock-in.</p>
       </div>
     </section>
 
@@ -613,7 +613,7 @@ df_incremental = spark.read.format("hudi") \
     <!-- Section 5: Medallion Architecture Deep Dive -->
     <section id="medallion-architecture" class="section">
       <h2>Medallion Architecture Deep Dive</h2>
-      <p>The medallion (multi-hop) architecture organizes data in progressive layers of refinement, from raw ingestion to business-ready aggregates. Each layer has distinct responsibilities, quality guarantees, and access patterns.</p>
+      <p>The medallion (multi-hop) architecture organizes data in progressive layers of refinement, from raw ingestion to business-ready aggregates. Each layer has distinct responsibilities, quality guarantees, and access patterns. Note: this is the most widely adopted layering pattern, but not the only one — some organizations use additional layers (Raw, Curated, Serving, Sandbox) or organize primarily by domain rather than refinement stage.</p>
 
       <h3>Architecture Overview</h3>
       <pre><code class="language-bash"># Medallion Architecture:
@@ -632,7 +632,7 @@ df_incremental = spark.read.format("hudi") \
 # │  • Add metadata: _ingested_at, _source_system, _batch_id           │
 # │  • Format: Parquet (from structured) or JSON (from semi-structured)│
 # │  • Retention: Long (1-7 years) — this is your reprocessing safety  │
-# │  • Quality: None enforced (raw dump)                               │
+# │  • Quality: No business validation; minimal ingestion checks only     │
 # │                                                                     │
 # │  s3://lakehouse/bronze/orders/                                     │
 # │  s3://lakehouse/bronze/clickstream/                                │
@@ -816,7 +816,7 @@ def ingest_cdc_to_bronze(spark, kafka_df, target_path: str):
 
       <h3>Silver Layer Patterns</h3>
       <pre><code class="language-python"># Silver layer: deduplication, cleansing, and conforming
-def bronze_to_silver_orders(spark, bronze_path: str, silver_path: str):
+def bronze_to_silver_orders(spark, bronze_path: str, silver_table_name: str):
     """
     Transform Bronze orders to Silver:
     1. Deduplicate by order_id (keep latest by _ingested_at)
@@ -851,7 +851,7 @@ def bronze_to_silver_orders(spark, bronze_path: str, silver_path: str):
         .filter("total_amount > 0")
 
     # MERGE into Silver (upsert: insert new, update existing)
-    silver_table = spark.table(silver_path)
+    silver_table = spark.table(silver_table_name)
     silver_table.alias("target").merge(
         cleansed_df.alias("source"),
         "target.order_id = source.order_id"
@@ -890,6 +890,8 @@ WITH order_facts AS (
     WHERE o.status IN ('confirmed', 'shipped', 'delivered')
     {% if is_incremental() %}
         AND o._processed_at > (SELECT MAX(_processed_at) FROM {{ this }})
+        -- NOTE: In production, consider a lookback window to handle late-arriving data:
+        -- AND o._processed_at > (SELECT MAX(_processed_at) - INTERVAL 2 HOURS FROM {{ this }})
     {% endif %}
 ),
 
@@ -986,6 +988,7 @@ GRANT SELECT ON TABLE finance.reporting.daily_revenue TO `data-analysts`;
 CREATE FUNCTION mask_email(email STRING)
 RETURNS STRING
 RETURN CASE
+    WHEN email IS NULL THEN NULL
     WHEN is_member('pii-readers') THEN email
     ELSE CONCAT(LEFT(email, 2), '***@', SPLIT(email, '@')[1])
 END;
@@ -1058,7 +1061,10 @@ lineage = UpstreamLineageClass(
     ]
 )
 
-emitter.emit_mce(dataset_urn, lineage)</code></pre>
+emitter.emit_mce(dataset_urn, lineage)
+# Note: newer DataHub SDK versions (0.10+) prefer the Metadata Change Proposal (MCP)
+# API via DatahubRestEmitter.emit() with MetadataChangeProposalWrapper objects.
+# The MCE pattern shown here illustrates the concept; check your SDK version for current API.</code></pre>
 
       <h3>Lineage Tracking with OpenLineage</h3>
       <pre><code class="language-python"># OpenLineage: standard lineage emission from Spark/Airflow
@@ -1497,8 +1503,8 @@ stream_df = spark.readStream \
     .option("cloudFiles.inferColumnTypes", "true") \
     .option("cloudFiles.schemaEvolutionMode", "addNewColumns") \
     .option("cloudFiles.maxFilesPerTrigger", 1000) \
-    .option("cloudFiles.useNotifications", "true") \  # Use S3 events (faster)
-    .load("s3://landing-zone/vendor-feeds/daily/")
+    .option("cloudFiles.useNotifications", "true") \
+    .load("s3://landing-zone/vendor-feeds/daily/")  # useNotifications: leverage S3 events for faster discovery
 
 # Transform and write to Bronze
 bronze_stream = stream_df \
@@ -2414,6 +2420,8 @@ WITH order_facts AS (
     WHERE o.status NOT IN ('cancelled', 'deleted')
     {% if is_incremental() %}
         AND o._processed_at > (SELECT MAX(_computed_at) FROM {{ this }})
+        -- Production tip: subtract a lookback window for late-arriving data
+        -- e.g., MAX(_computed_at) - INTERVAL 2 HOURS
     {% endif %}
 ),
 

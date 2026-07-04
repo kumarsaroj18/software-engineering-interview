@@ -130,7 +130,7 @@
         <li>Enable SCD Type 2 tracking — multiple rows per natural key, each with a unique surrogate.</li>
         <li>Insulate the warehouse from source system key changes (mergers, migrations).</li>
         <li>Provide consistent integer keys that compress better and join faster than composite natural keys.</li>
-        <li>At FAANG scale, surrogate keys are often generated as deterministic hashes (MD5/SHA-256 of the natural key + effective timestamp) to enable distributed generation without coordination.</li>
+        <li>At FAANG scale, surrogate keys may be generated using identity columns, distributed ID generators (e.g., Snowflake sequences), or deterministic techniques (hash of natural key + timestamp) when coordination-free generation across distributed systems is required. Hashes are also commonly used for change detection and business-key mapping.</li>
       </ul>
 
       <h3>Grain Declaration</h3>
@@ -180,8 +180,8 @@
           </tr>
           <tr>
             <td>Dimension size</td>
-            <td>Fine for dimensions &lt; 100M rows</td>
-            <td>Better when dimensions exceed 100M rows</td>
+            <td>Fine for most dimension sizes</td>
+            <td>Better when dimensions have large hierarchies or high redundancy</td>
           </tr>
           <tr>
             <td>ETL complexity</td>
@@ -279,7 +279,7 @@ WHERE customer_natural_key = 'CUST-12345';</code></pre>
         <li>Maintain a "current" dimension table and a separate "history" dimension table.</li>
         <li>Current table stays small and fast; history table captures all versions.</li>
         <li>Use for: very high-frequency changes where Type 2 would bloat the primary dimension.</li>
-        <li>Common at FAANG for user profile dimensions that change multiple times per day.</li>
+        <li>Useful when current-state lookups are significantly more common than historical analysis, and when high-frequency changes would make the primary dimension excessively large with Type 2.</li>
       </ul>
       <pre><code class="language-sql">-- Type 4: Current table (fast lookups)
 CREATE TABLE dim_customer_current (
@@ -352,7 +352,7 @@ WHERE customer_natural_key = 'CUST-12345';</code></pre>
         <li><strong>Hash-based change detection</strong> — Compute MD5/SHA of all tracked columns to detect actual changes vs. no-op updates.</li>
         <li><strong>Batch windows</strong> — Process SCD updates in daily or hourly batches to amortize the cost of full-table scans on large dimensions.</li>
         <li><strong>Late-arriving dimensions</strong> — Insert placeholder "unknown" rows with surrogate key -1; backfill when the actual dimension data arrives.</li>
-        <li><strong>Partition-level updates</strong> — In BigQuery/Snowflake, use partition overwrite to efficiently update Type 2 dimensions without scanning the entire table.</li>
+        <li><strong>Partition-level updates</strong> — Where dimensions are partitioned appropriately, partition-level rewrites can significantly reduce update costs. Otherwise, MERGE operations are the standard implementation strategy for SCD Type 2.</li>
       </ul>
     </section>
 
@@ -487,7 +487,7 @@ WHERE fo.order_line_sk IS NULL;</code></pre>
       <p>The most common and effective partitioning strategy for fact tables:</p>
       <ul>
         <li><strong>Daily partitions</strong> — Standard for most transactional facts. One partition per day, typically on the event timestamp or date key.</li>
-        <li><strong>Hourly partitions</strong> — For very high-volume streaming facts (clickstream, IoT telemetry) where daily partitions exceed optimal size (1-10 GB per partition).</li>
+        <li><strong>Hourly partitions</strong> — For very high-volume streaming facts (clickstream, IoT telemetry) where daily partitions would be excessively large. Choose granularity based on data volume and query patterns rather than a fixed partition size target.</li>
         <li><strong>Monthly partitions</strong> — For slowly-growing dimensions or periodic snapshots where daily would create too many small files.</li>
       </ul>
       <pre><code class="language-sql">-- BigQuery: Time-partitioned table
@@ -577,7 +577,7 @@ GROUP BY user_id;</code></pre>
       <h3>BigQuery Clustering Deep Dive</h3>
       <ul>
         <li>BigQuery automatically re-clusters data in the background — no manual maintenance required.</li>
-        <li>Clustering reduces bytes scanned (and therefore cost) by up to 10-100x for selective queries.</li>
+        <li>For highly selective queries, clustering can substantially reduce bytes scanned (and therefore cost). The improvement depends on filter selectivity and data distribution.</li>
         <li>Cluster columns must be top-level, non-repeated fields (STRING, INT64, NUMERIC, DATE, TIMESTAMP, BOOL).</li>
         <li>Use <code>INFORMATION_SCHEMA.TABLE_STORAGE</code> to monitor clustering effectiveness.</li>
       </ul>
@@ -591,7 +591,7 @@ FROM `project.dataset.INFORMATION_SCHEMA.TABLE_STORAGE`
 WHERE table_name = 'fact_page_views';</code></pre>
 
       <h3>Snowflake Micro-Partitions</h3>
-      <p>Snowflake takes a unique approach — all tables are automatically divided into immutable micro-partitions (50-500 MB compressed):</p>
+      <p>Snowflake takes a unique approach — all tables are automatically divided into immutable micro-partitions (approximately 50-500 MB of uncompressed data each):</p>
       <ul>
         <li><strong>Automatic</strong> — No explicit partition DDL needed. Snowflake manages partitioning internally.</li>
         <li><strong>Clustering</strong> — Defined via <code>CLUSTER BY</code> to control the physical ordering within micro-partitions.</li>
@@ -669,7 +669,7 @@ FROM TABLE(INFORMATION_SCHEMA.AUTOMATIC_CLUSTERING_HISTORY(
 CREATE MATERIALIZED VIEW `project.dataset.mv_daily_revenue`
 OPTIONS (
   enable_refresh = TRUE,
-  refresh_interval_minutes = 30
+  max_staleness = INTERVAL "0:30:0" HOUR TO SECOND
 )
 AS
 SELECT
@@ -679,9 +679,12 @@ SELECT
   COUNT(*) AS order_count,
   SUM(revenue) AS total_revenue,
   AVG(revenue) AS avg_order_value,
-  COUNT(DISTINCT customer_id) AS unique_customers
+  APPROX_COUNT_DISTINCT(customer_id) AS approx_unique_customers
 FROM `project.dataset.fact_orders`
 GROUP BY 1, 2, 3;
+-- Note: BigQuery materialized views have restrictions on supported
+-- aggregates. COUNT(DISTINCT) may require APPROX_COUNT_DISTINCT instead.
+-- Always verify engine-specific MV restrictions.
 
 -- Snowflake: Materialized view
 CREATE MATERIALIZED VIEW mv_daily_revenue AS
@@ -820,7 +823,7 @@ GROUP BY 1, 2;</code></pre>
       <ul>
         <li><strong>Purpose:</strong> Land raw data exactly as received from sources — no transformations, no deduplication.</li>
         <li><strong>Format:</strong> Often stored as JSON, Avro, or raw Parquet reflecting the source schema.</li>
-        <li><strong>Properties:</strong> Append-only, immutable, full-fidelity copy of source data.</li>
+        <li><strong>Properties:</strong> Append-only, immutable, full-fidelity copy of source data. Business transformations are avoided; only ingestion-related processing (metadata enrichment, format conversion, decompression) is typically applied.</li>
         <li><strong>Retention:</strong> Long retention (1-7 years) for replay capability and auditing.</li>
         <li><strong>Schema:</strong> Schema-on-read; may include a metadata envelope (source_system, ingestion_timestamp, batch_id).</li>
       </ul>
@@ -907,7 +910,7 @@ CLUSTER BY (customer_key, product_key);</code></pre>
         <li><strong>Over-engineering:</strong> Teams create bronze/silver/gold for every table regardless of complexity, adding latency and cost without value.</li>
         <li><strong>Naming confusion:</strong> "Silver" means different things to different teams — is it cleaned? conformed? enriched? All three?</li>
         <li><strong>Duplication waste:</strong> Storing 3 copies of every dataset triples storage costs. Apply selectively.</li>
-        <li><strong>Latency accumulation:</strong> Each layer adds processing time. A 3-layer pipeline with hourly refreshes means 3-hour end-to-end latency minimum.</li>
+        <li><strong>Latency accumulation:</strong> Poorly designed sequential refresh schedules can accumulate latency across layers. Modern orchestration platforms often trigger downstream layers immediately after upstream completion, but pipeline design requires attention to end-to-end timing.</li>
         <li><strong>Organizational boundaries:</strong> Layer ownership disputes — who owns Silver? Platform team or domain teams?</li>
         <li><strong>Not a substitute for data contracts:</strong> Layers don't prevent schema breaking changes from upstream. You still need explicit contracts.</li>
       </ul>
@@ -941,7 +944,7 @@ LIMIT 20;</code></pre>
       <h3>Compression</h3>
       <ul>
         <li><strong>Columnar formats</strong> — Parquet and ORC achieve 3-10x compression over row-based formats through dictionary encoding, run-length encoding, and delta encoding.</li>
-        <li><strong>Column data types</strong> — Use the smallest type that fits: INT32 vs INT64, DATE vs TIMESTAMP, STRING vs fixed-width CHAR.</li>
+        <li><strong>Column data types</strong> — Choose the most appropriate data type for business semantics. Appropriate numeric types (INT32 vs INT64) and low-cardinality categorical columns typically provide the greatest compression benefits.</li>
         <li><strong>Sort order</strong> — Sorting data before writing improves compression by increasing value locality (run-length encoding becomes effective).</li>
         <li><strong>Dictionary encoding</strong> — Low-cardinality columns (status, country_code, category) compress 50-100x with dictionary encoding.</li>
       </ul>
@@ -958,7 +961,7 @@ df.repartition(200) \
       <ul>
         <li><strong>Partition expiration:</strong> Automatically delete old partitions after retention period (BigQuery: <code>partition_expiration_days</code>).</li>
         <li><strong>Table cloning:</strong> Use zero-copy clones for development/testing instead of full copies.</li>
-        <li><strong>Time travel reduction:</strong> Reduce time travel retention from default (e.g., Snowflake 90 days → 14 days for non-critical tables).</li>
+        <li><strong>Time travel reduction:</strong> Reduce time travel retention for non-critical tables (e.g., Snowflake supports up to 90 days on Enterprise+ edition; Standard edition defaults to 1 day).</li>
         <li><strong>Archive and drop:</strong> Export cold data to object storage (GCS/S3) before dropping from the warehouse.</li>
       </ul>
       <pre><code class="language-sql">-- Snowflake: Reduce time travel for large staging tables
@@ -989,19 +992,19 @@ DELETE FROM fact_events WHERE event_date < '2023-01-01';</code></pre>
         <tbody>
           <tr>
             <td>On-demand (BigQuery)</td>
-            <td>$6.25/TB scanned</td>
+            <td>Per-TB scanned (check current pricing)</td>
             <td>Unpredictable workloads, exploration</td>
             <td>Runaway queries can spike costs</td>
           </tr>
           <tr>
-            <td>Flat-rate slots (BigQuery)</td>
-            <td>$2,400/month per 100 slots</td>
-            <td>Predictable workloads, &gt;$10K/month spend</td>
+            <td>Flat-rate slots (BigQuery, legacy)</td>
+            <td>Fixed monthly per 100 slots (legacy model)</td>
+            <td>Now replaced by Editions pricing</td>
             <td>Under-utilization wastes money</td>
           </tr>
           <tr>
             <td>Editions (BigQuery)</td>
-            <td>Autoscaling slots with commitment</td>
+            <td>Autoscaling slots with commitment tiers</td>
             <td>Variable but growing workloads</td>
             <td>Commitment lock-in</td>
           </tr>
@@ -1053,6 +1056,7 @@ CREATE RESOURCE MONITOR monthly_budget
       </ol>
 
       <h3>Root Cause Analysis</h3>
+      <p>The cost explosion resulted from a combination of factors that compounded each other:</p>
       <ul>
         <li><strong>No partition filter requirement:</strong> The table was created without <code>require_partition_filter = TRUE</code>, so every query scanned all 50 TB.</li>
         <li><strong>No partitioning at all:</strong> The table lacked any <code>PARTITION BY</code> clause — even time-based queries scanned everything.</li>

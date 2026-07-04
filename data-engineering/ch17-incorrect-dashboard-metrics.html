@@ -353,12 +353,16 @@
             for each row. Compare hash sets between source and target to find mismatched rows
           </li>
           <li>
-            <strong>Partition-level hashing:</strong> Compute an aggregate hash (e.g., MD5 of ordered
-            concatenation) per partition. If partition hashes match, all rows are identical
+            <strong>Partition-level hashing:</strong> Compute a deterministic hash for each partition
+            (e.g., hash over a deterministic serialization of partition contents). If partition hashes
+            match, all rows are identical. For large datasets, this avoids transferring or
+            concatenating the full partition contents
           </li>
           <li>
-            <strong>Column-level checksums:</strong> Compute SUM(CRC32(column)) for numeric columns
-            and compare between systems. Fast and catches bit-level corruption
+            <strong>Column-level checksums:</strong> Compute deterministic checksums or hashes per
+            column and compare between systems. For example, hashing sorted column values or using
+            order-independent aggregate functions (like XOR of hashes). This is fast and catches
+            most data-level corruption without row-by-row comparison
           </li>
           <li>
             <strong>Incremental reconciliation:</strong> Only hash rows modified since the last
@@ -412,9 +416,10 @@
         </p>
         <ul>
           <li>
-            <strong>Integer to float:</strong> Changing an INT column to FLOAT can introduce floating-point
-            precision errors in SUM aggregations. A revenue column that was cents-as-integer (1599)
-            becomes 15.99 as float, but SUM(15.99) over millions of rows accumulates rounding errors
+            <strong>Integer to float:</strong> Changing a DECIMAL(10,2) column to FLOAT introduces
+            binary floating-point representation. While individual values appear correct, SUM()
+            aggregations over millions of rows accumulate rounding errors that cause totals to drift
+            from the precise decimal result — potentially by several dollars on large revenue datasets
           </li>
           <li>
             <strong>String to timestamp:</strong> If the format specification doesn't match all source
@@ -449,8 +454,11 @@
           </li>
           <li>
             <strong>Case sensitivity:</strong> A rename from <code>userId</code> to <code>userid</code>
-            may or may not break depending on the warehouse's case sensitivity settings. BigQuery is
-            case-sensitive; Snowflake defaults to case-insensitive but preserves case in quoted identifiers
+            may or may not break depending on the warehouse's case sensitivity settings. Identifier
+            case sensitivity varies across engines (e.g., Snowflake defaults to case-insensitive for
+            unquoted identifiers but preserves case in quoted ones; BigQuery treats column names as
+            case-insensitive). Schema changes involving only letter case should be tested carefully
+            against each engine's specific behavior
           </li>
           <li>
             <strong>Cascading breakage:</strong> A single field rename can break dozens of downstream
@@ -686,8 +694,9 @@
             (processing only new arrivals) is more efficient than full-table dedup on every run
           </li>
           <li>
-            <strong>Engine support:</strong> QUALIFY is natively supported in Snowflake, BigQuery, and
-            Databricks. In engines without QUALIFY (Redshift, Postgres), use a CTE with ROW_NUMBER
+            <strong>Engine support:</strong> QUALIFY is natively supported in Snowflake, BigQuery,
+            Redshift (since late 2023), and recent Databricks Runtime versions. In engines without QUALIFY
+            (PostgreSQL), use a CTE with ROW_NUMBER
             and filter in the outer query: <code>WITH ranked AS (...) SELECT * FROM ranked WHERE rn = 1</code>
           </li>
         </ul>
@@ -740,7 +749,9 @@
           <li>
             <strong>is_incremental() lookback:</strong> In dbt, use a lookback window larger than your
             expected late-arrival window: <code>WHERE event_time &gt;= (SELECT MAX(event_time) - INTERVAL '3 days'
-            FROM {{ this }})</code>. This reprocesses recent partitions to capture late data
+            FROM {{ this }})</code>. This reprocesses recent partitions to capture late data.
+            <em>Trade-off:</em> a larger lookback improves completeness but increases processing cost
+            because recent partitions are repeatedly recomputed on every run
           </li>
           <li>
             <strong>Merge strategy:</strong> Use <code>incremental_strategy='merge'</code> with a unique
@@ -871,8 +882,10 @@
           </li>
           <li>
             <strong>Sequence numbers:</strong> Debezium provides <code>source.lsn</code> (Postgres)
-            or <code>source.pos</code> (MySQL) that represent the monotonically increasing position
-            in the transaction log. Use these for ordering rather than wall-clock timestamps
+            or <code>source.file</code> + <code>source.pos</code> (MySQL) that represent the
+            monotonically increasing position in the transaction log. For MySQL, both fields are
+            needed because the position resets with each new binlog file. Use these for ordering
+            rather than wall-clock timestamps
           </li>
         </ul>
 
@@ -1111,11 +1124,12 @@ INNER JOIN staging.customers c
           <li>
             <strong>Row count test:</strong> Added <code>dbt_utils.equal_rowcount</code> test comparing
             <code>int_orders_enriched</code> against <code>staging.orders</code> to catch any future
-            row drops
+            row drops. (This is valid because the enrichment is a 1:1 transformation that should
+            preserve every source row; for aggregation or filtering models, use bounded-count tests instead)
           </li>
           <li>
             <strong>Revenue bounds test:</strong> Added a singular test that asserts daily revenue is
-            within 20% of the 7-day rolling average. Deviations trigger pipeline failure and alert
+            within 30% of the 7-day rolling average. Deviations trigger pipeline failure and alert
           </li>
           <li>
             <strong>CI with production data sample:</strong> Modified CI to test against a representative
@@ -1137,7 +1151,15 @@ INNER JOIN staging.customers c
         <ul>
           <li>
             <strong>Assumptions are dangerous:</strong> Never change JOIN semantics based on assumptions
-            about data completeness. Verify with production queries first
+            about data completeness. Verify with production queries first. The developer should have
+            run this query before changing the JOIN:
+            <pre><code>-- Verification query: how many orders have no matching customer?
+SELECT COUNT(*) AS unmatched_orders
+FROM staging.orders o
+LEFT JOIN staging.customers c
+  ON o.customer_id = c.customer_id
+WHERE c.customer_id IS NULL;</code></pre>
+            This would have shown ~30% of orders had no match, immediately invalidating the assumption
           </li>
           <li>
             <strong>Silent failures are worst:</strong> The query didn't error—it produced fewer rows
@@ -1339,6 +1361,16 @@ context = gx.get_context()
 # Define expectations for the orders dataset
 suite = context.add_expectation_suite("orders_quality_suite")
 
+# Create a validator (connects suite to actual data)
+# Note: exact API varies across GX versions; this illustrates the pattern
+batch_request = context.get_datasource("warehouse_datasource") \
+    .get_asset("int_orders_enriched") \
+    .build_batch_request()
+validator = context.get_validator(
+    batch_request=batch_request,
+    expectation_suite=suite
+)
+
 # Table-level expectations
 validator.expect_table_row_count_to_be_between(
     min_value=10000,
@@ -1393,12 +1425,12 @@ validator.expect_column_proportion_of_unique_values_to_be_between(
     max_value=0.01
 )
 
-# Cross-table validation (custom expectation)
-validator.expect_column_pair_values_to_be_equal(
-    column_A="total_row_count",
-    column_B="source_row_count",
-    meta={"notes": "Row count reconciliation with source"}
-)</code></pre>
+# Cross-table validation (custom — not a built-in GE expectation)
+# Row-count reconciliation is typically done outside GE, e.g.:
+#   source_count = source_df.count()
+#   target_count = target_df.count()
+#   assert abs(source_count - target_count) / source_count < 0.01
+# Or use a custom expectation class for integration with GE checkpoints</code></pre>
 
         <h4>Great Expectations Checkpoint Configuration</h4>
         <pre><code># great_expectations/checkpoints/orders_checkpoint.yml

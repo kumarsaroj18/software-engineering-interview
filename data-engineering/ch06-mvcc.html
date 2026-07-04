@@ -98,7 +98,7 @@
       <h2>Why MVCC Exists</h2>
 
       <h3>The Fundamental Problem: Readers vs. Writers</h3>
-      <p>In a lock-based concurrency model (e.g., SQL Server's default READ COMMITTED with shared locks), a reader acquiring a shared lock on a row blocks any writer attempting an exclusive lock on the same row, and vice versa. Under high concurrency, this creates contention that degrades throughput exponentially.</p>
+      <p>In a lock-based concurrency model (e.g., SQL Server's default READ COMMITTED with shared locks), a reader acquiring a shared lock on a row blocks any writer attempting an exclusive lock on the same row, and vice versa. Under high concurrency, this creates contention that can significantly reduce throughput as lock waits accumulate.</p>
 
       <pre><code class="language-sql">-- Lock-based world: Session A blocks Session B
 -- Session A (reader)
@@ -127,7 +127,7 @@ COMMIT;</code></pre>
       <p>MVCC's version history enables:</p>
       <ul>
         <li><strong>Consistent long-running analytics</strong> — A 30-minute reporting query sees a stable snapshot even as OLTP writes continue.</li>
-        <li><strong>Point-in-time recovery</strong> — Combined with WAL, MVCC versions provide the foundation for PITR.</li>
+        <li><strong>Point-in-time recovery</strong> — Combined with WAL replay, MVCC ensures recovered databases expose transactionally consistent snapshots.</li>
         <li><strong>Time-travel semantics</strong> — Snowflake's <code>AT(TIMESTAMP =&gt; ...)</code> and BigQuery's <code>FOR SYSTEM_TIME AS OF</code> are direct applications of retained versions.</li>
       </ul>
 
@@ -142,7 +142,7 @@ COMMIT;</code></pre>
       <h2>Version Chains &amp; Tuple Structure</h2>
 
       <h3>PostgreSQL Heap Tuple Layout</h3>
-      <p>Every row in a PostgreSQL heap page is a "heap tuple" with a fixed-size header (23 bytes minimum) followed by user data. The MVCC-critical fields in the header are:</p>
+      <p>Every row in a PostgreSQL heap page is a "heap tuple" with a tuple header of 23 bytes before alignment (typically 24 bytes in practice due to MAXALIGN padding) followed by user data. The MVCC-critical fields in the header are:</p>
 
       <pre><code class="language-sql">-- Inspecting tuple header fields directly
 SELECT ctid, xmin, xmax, cmin, cmax,
@@ -190,12 +190,12 @@ HEAP_XMIN_FROZEN     = 0x0300  # xmin is frozen (always visible)
 HEAP_UPDATED         = 0x2000  # tuple was result of an update
 HEAP_HOT_UPDATED     = 0x4000  # tuple has been HOT-updated</code></pre>
 
-      <p>These "hint bits" are critical for performance. Without them, every visibility check would require a CLOG (pg_xact) lookup. Once set, subsequent reads skip the CLOG entirely — but setting hint bits dirties the page, generating additional WAL in full_page_writes mode.</p>
+      <p>These "hint bits" are critical for performance. Without them, every visibility check would require a CLOG (pg_xact) lookup. Once set, subsequent reads skip the CLOG entirely — but setting hint bits dirties the page. After a checkpoint with <code>full_page_writes</code> enabled, the next modification to a page triggers a full-page image write, which can indirectly increase WAL volume for read-heavy workloads hitting cold pages.</p>
 
       <h3>Version Chain Traversal</h3>
-      <p>When an index scan finds a TID (e.g., <code>(0,1)</code>), the executor follows the <code>t_ctid</code> chain until it finds a version visible to the current snapshot. In non-HOT chains, each version has its own index entry. In HOT chains (covered later), only the root tuple is indexed.</p>
+      <p>When an index scan finds a TID (e.g., <code>(0,1)</code>), it fetches the tuple and checks visibility. In non-HOT chains, each version has its own index entry, so the index directly points to the relevant tuple. In HOT chains (covered later), only the root tuple is indexed — the executor must follow the <code>t_ctid</code> chain to find the version visible to the current snapshot:</p>
 
-      <pre><code class="language-python"># Pseudocode: version chain traversal
+      <pre><code class="language-python"># Pseudocode: HOT chain traversal (only root tuple is indexed)
 def find_visible_version(tid, snapshot):
     tuple = heap_fetch(tid)
     while True:
@@ -270,7 +270,7 @@ def is_visible(tuple, snapshot):
         return True  # not deleted, or deleter aborted
 
     if tuple.xmax == my_xid:
-        return tuple.cmax >= snapshot.curcid  # I deleted it — visible if before my delete cmd
+        return tuple.cmax >= snapshot.curcid  # I deleted it — still visible if delete cmd hasn't executed yet
 
     if tuple.xmax in snapshot.xip:
         return True  # deleter was in-progress — deletion not yet visible
@@ -287,7 +287,7 @@ def is_visible(tuple, snapshot):
         return True</code></pre>
 
       <h3>CLOG (pg_xact) — The Transaction Status Oracle</h3>
-      <p>The commit log stores 2 bits per transaction ID: <code>IN_PROGRESS</code>, <code>COMMITTED</code>, <code>ABORTED</code>, or <code>SUB_COMMITTED</code>. It lives in <code>pg_xact/</code> (formerly <code>pg_clog/</code>) as 256KB segment files, each covering 2^23 transactions.</p>
+      <p>The commit log stores 2 bits per transaction ID: <code>IN_PROGRESS</code>, <code>COMMITTED</code>, <code>ABORTED</code>, or <code>SUB_COMMITTED</code>. It lives in <code>pg_xact/</code> (formerly <code>pg_clog/</code>) as 256KB segment files, each covering approximately 1 million transactions (2^20).</p>
 
       <pre><code class="language-bash"># CLOG segment files
 ls -la $PGDATA/pg_xact/
@@ -359,7 +359,7 @@ UPDATE orders SET status = 'shipped' WHERE id = 500;
 -- ERROR: could not serialize access due to concurrent update
 COMMIT;</code></pre>
 
-      <p>Unlike READ COMMITTED, REPEATABLE READ does <strong>not</strong> do EvalPlanQual re-evaluation. If the target row was modified after the snapshot, the transaction aborts with a serialization error.</p>
+      <p>Unlike READ COMMITTED, REPEATABLE READ does <strong>not</strong> transparently continue with the newer committed version. If the target row was modified by a concurrent committed transaction, PostgreSQL raises a serialization error rather than re-evaluating the predicate.</p>
 
       <h3>Serializable (SSI — Serializable Snapshot Isolation)</h3>
       <p>PostgreSQL's SERIALIZABLE level uses Serializable Snapshot Isolation (SSI), based on the academic work by Cahill, Röhm, and Fekete (2008). It detects "dangerous structures" — cycles in the serialization graph — using predicate locks (SIRead locks).</p>
@@ -454,7 +454,8 @@ LIMIT 10;
 
 -- Emergency: approaching wraparound
 -- If age > 2 billion - autovacuum_freeze_max_age, PostgreSQL
--- will refuse new writes and shut down to prevent wraparound!</code></pre>
+-- eventually enters a protective mode that prevents normal write
+-- activity until the situation is resolved.</code></pre>
 
       <h3>Autovacuum Tuning</h3>
       <p>Autovacuum is a background launcher that spawns worker processes based on activity thresholds:</p>
@@ -528,7 +529,7 @@ WHERE NOT all_visible;</code></pre>
         </tbody>
       </table>
 
-      <p><strong>Production tip:</strong> Never use VACUUM FULL on production tables. Use <code>pg_repack</code> instead — it rebuilds the table online with minimal locking.</p>
+      <p><strong>Production tip:</strong> Avoid VACUUM FULL on busy production tables because it requires an AccessExclusiveLock for the entire duration. During planned maintenance windows it can still be appropriate for small-to-medium tables. For large tables, use <code>pg_repack</code> instead — it rebuilds the table online with minimal locking.</p>
 
       <pre><code class="language-bash"># pg_repack: online table rebuild (no AccessExclusiveLock for duration)
 pg_repack -d mydb -t accounts --no-kill-backend
@@ -547,7 +548,7 @@ pg_repack -d mydb -t accounts --no-kill-backend
       <h3>How HOT Works</h3>
       <p>Heap-Only Tuple (HOT) updates avoid index entry creation when:</p>
       <ol>
-        <li>The update does <strong>not modify any indexed column</strong></li>
+        <li>The update does <strong>not change any value referenced by any index</strong> on the table (including expression indexes and INCLUDE columns)</li>
         <li>The new tuple version fits on the <strong>same heap page</strong> as the old version</li>
       </ol>
       <p>When both conditions are met:</p>
@@ -747,12 +748,12 @@ SHOW ENGINE INNODB STATUS\G
           <tr><th>Aspect</th><th>PostgreSQL (append-only)</th><th>InnoDB (undo log)</th></tr>
         </thead>
         <tbody>
-          <tr><td>Write amplification</td><td>Higher (full tuple copy)</td><td>Lower (in-place + undo delta)</td></tr>
+          <tr><td>Write amplification</td><td>Higher (full tuple copy)</td><td>Generally lower (in-place update with previous versions preserved in undo log)</td></tr>
           <tr><td>Read old versions</td><td>Direct heap access</td><td>Reconstruct from undo chain (slower for long chains)</td></tr>
           <tr><td>Bloat location</td><td>Heap pages + indexes</td><td>Undo tablespace (separate from data)</td></tr>
           <tr><td>Cleanup mechanism</td><td>VACUUM (per-table, can be slow)</td><td>Purge thread (continuous, usually faster)</td></tr>
           <tr><td>Index maintenance</td><td>New index entries per update (unless HOT)</td><td>No change to secondary indexes for non-key updates</td></tr>
-          <tr><td>Wraparound risk</td><td>Yes (XID wraparound)</td><td>No (64-bit transaction IDs)</td></tr>
+          <tr><td>Wraparound risk</td><td>Yes (XID wraparound)</td><td>No (48-bit transaction IDs — no practical wraparound risk)</td></tr>
         </tbody>
       </table>
 
@@ -768,7 +769,7 @@ SHOW ENGINE INNODB STATUS\G
       <h3>Snowflake — Time Travel &amp; Fail-Safe</h3>
       <p>Snowflake implements MVCC at the micro-partition level rather than the row level:</p>
       <ul>
-        <li>Micro-partitions are immutable columnar files (50-500MB compressed)</li>
+        <li>Micro-partitions are immutable columnar files (approximately 50-500MB of uncompressed data)</li>
         <li>An UPDATE creates new micro-partitions; old ones are retained for the Time Travel period</li>
         <li><code>DATA_RETENTION_TIME_IN_DAYS</code> (0-90 days) controls how long old versions are kept</li>
         <li>After Time Travel expires, data enters 7-day Fail-Safe (Snowflake-managed, no user access)</li>
@@ -792,7 +793,7 @@ AT(OFFSET => -3600);  -- 1 hour ago</code></pre>
         <li>Tables store history for 7 days (<code>FOR SYSTEM_TIME AS OF</code> decorator)</li>
         <li>Internally uses immutable columnar storage with metadata-level versioning</li>
         <li>No user-facing MVCC configuration — fully managed</li>
-        <li>DML operations (INSERT, UPDATE, DELETE) are metadata operations on columnar files</li>
+        <li>DML operations (INSERT, UPDATE, DELETE) create new storage versions behind the scenes while metadata tracks the active version visible to queries</li>
       </ul>
 
       <pre><code class="language-sql">-- BigQuery time travel
@@ -811,7 +812,7 @@ FOR SYSTEM_TIME AS OF '2024-01-15 10:00:00 UTC';</code></pre>
         </thead>
         <tbody>
           <tr><td>PostgreSQL</td><td>Heap (append)</td><td>VACUUM</td><td>32-bit (wraparound risk)</td><td>Limited (no native)</td></tr>
-          <tr><td>InnoDB</td><td>Undo log</td><td>Purge thread</td><td>64-bit</td><td>No</td></tr>
+          <tr><td>InnoDB</td><td>Undo log</td><td>Purge thread</td><td>48-bit</td><td>No</td></tr>
           <tr><td>Oracle</td><td>Undo tablespace</td><td>UNDO_RETENTION</td><td>SCN (48-bit)</td><td>Flashback Query</td></tr>
           <tr><td>Snowflake</td><td>Micro-partition</td><td>Retention policy</td><td>N/A (cloud)</td><td>0-90 days</td></tr>
           <tr><td>BigQuery</td><td>Columnar files</td><td>Automatic (7 days)</td><td>N/A (cloud)</td><td>7 days</td></tr>
@@ -887,7 +888,7 @@ SELECT pg_terminate_backend(12345);
 -- Step 2: Immediately run aggressive vacuum
 VACUUM (VERBOSE, PARALLEL 4) orders;
 -- Took 45 minutes to process 180M dead tuples
--- Freed 400GB of heap space (marked reusable, not returned to OS)
+-- Marked approximately 400GB of heap space reusable for future inserts (not returned to OS)
 
 -- Step 3: Rebuild bloated indexes
 REINDEX INDEX CONCURRENTLY idx_orders_status;
@@ -925,7 +926,7 @@ ALTER TABLE orders SET (
         <li>A single idle transaction can cripple an entire database within hours on high-write tables.</li>
         <li><code>backend_xmin</code> monitoring is non-negotiable for production PostgreSQL.</li>
         <li>Regular VACUUM only marks space reusable — the OS file doesn't shrink. Use pg_repack for actual file size reduction.</li>
-        <li>Analytics workloads must be isolated to read replicas with <code>hot_standby_feedback = off</code> (accept occasional query cancellations on replica vs. blocking vacuum on primary).</li>
+        <li>Analytics workloads must be isolated to read replicas. For analytical replicas, consider disabling <code>hot_standby_feedback</code> if preventing primary-table bloat is more important than allowing very long-running replica queries (which may be cancelled when conflicting with WAL replay).</li>
       </ul>
     </section>
 
@@ -1476,7 +1477,7 @@ if __name__ == '__main__':
 
       <details>
         <summary>Q: How does PostgreSQL handle XID wraparound, and what happens if it fails?</summary>
-        <p>PostgreSQL uses 32-bit XIDs with modular arithmetic — XID A is "in the past" relative to B if <code>(B - A) &lt; 2^31</code>. To prevent a live XID from wrapping into the "future" zone, aggressive VACUUM freezes old tuples (replacing their xmin with <code>FrozenTransactionId = 2</code>). If a table's <code>age(relfrozenxid)</code> reaches <code>autovacuum_freeze_max_age</code> (default 200M), emergency autovacuum fires. If it reaches ~2 billion, PostgreSQL shuts down to prevent data corruption — the DBA must run vacuum in single-user mode. PostgreSQL 14+ is working toward 64-bit XIDs to eliminate this risk entirely.</p>
+        <p>PostgreSQL uses 32-bit XIDs with modular arithmetic — XID A is "in the past" relative to B if <code>(B - A) &lt; 2^31</code>. To prevent a live XID from wrapping into the "future" zone, aggressive VACUUM freezes old tuples (replacing their xmin with <code>FrozenTransactionId = 2</code>). If a table's <code>age(relfrozenxid)</code> reaches <code>autovacuum_freeze_max_age</code> (default 200M), emergency autovacuum fires. If it reaches ~2 billion, PostgreSQL enters protective mode to prevent data corruption — the DBA must run vacuum in single-user mode. The PostgreSQL community has been working toward 64-bit XIDs to eliminate this risk, though internal tuple headers still use 32-bit XIDs as of PostgreSQL 17.</p>
       </details>
 
       <details>

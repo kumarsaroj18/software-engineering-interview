@@ -94,7 +94,7 @@
           <p><strong>The optimizer chose a full table scan because, given the table statistics, the estimated cost of random I/O from index lookups exceeded the cost of a sequential scan.</strong></p>
           <p>Key reasons this happens:</p>
           <ol>
-            <li><strong>Low selectivity</strong> — The query returns more than ~5-15% of rows. Random I/O per row (index path) becomes more expensive than sequential read of the entire table.</li>
+            <li><strong>Low selectivity</strong> — The query returns a large fraction of rows (a commonly cited rule of thumb is ~5-15%, but the actual crossover depends on correlation, table size, row width, cache residency, storage type, and optimizer cost parameters). Random I/O per row (index path) becomes more expensive than sequential read of the entire table.</li>
             <li><strong>Stale statistics</strong> — <code>pg_stats</code> histograms are outdated after bulk loads, causing cardinality misestimation.</li>
             <li><strong>Low correlation</strong> — Physical row order doesn't match index order, making each index lookup hit a different page (high random I/O).</li>
             <li><strong>Small table</strong> — Table fits in a few pages; sequential scan is cheaper regardless of selectivity.</li>
@@ -418,6 +418,9 @@ def index_scan_cost(
         # Pages are random — expensive I/O!
         heap_io = rows_fetched * random_page_cost
         # WORST CASE: every row hit = separate random page read
+        # NOTE: This worst-case formula is for intuition only.
+        # PostgreSQL actually estimates heap page fetches using
+        # the Mackert-Lohman model (shown below).
 
     # Mackert-Lohman formula (actual PostgreSQL formula):
     # Estimates effective pages fetched considering caching
@@ -458,10 +461,11 @@ def index_scan_cost(
 # selectivity = 2.25 / 400 = 0.0056 ≈ 0.6%
 #
 # With caching effects and correlation, the practical threshold is:
-# ┌─────────────────────────────────────────────────────────────┐
-# │  Selectivity Threshold: ~5-15% for index to beat seq scan  │
-# │  (varies by correlation, table size, effective_cache_size)  │
-# └─────────────────────────────────────────────────────────────┘</code></pre>
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  Rule of thumb: ~5-15% selectivity for index to beat seq scan       │
+# │  (varies significantly by correlation, row width, table size,       │
+# │   cache residency, SSD vs HDD, work_mem, effective_cache_size)     │
+# └─────────────────────────────────────────────────────────────────────┘</code></pre>
 
         <h3>Tuning Cost Parameters for SSDs</h3>
         <pre><code class="language-sql">-- SSDs reduce the random/sequential I/O gap
@@ -486,8 +490,8 @@ SET effective_cache_size = '24GB';  -- typically 50-75% of RAM
 -- → makes index scans more attractive</code></pre>
 
         <h3>BigQuery &amp; Snowflake Cost Models</h3>
-        <p><strong>BigQuery:</strong> No user-visible cost model. Internally uses slot-based execution. "Full scan" is the norm — BigQuery is designed for it. Columnar storage + partitioning + clustering replace traditional indexes.</p>
-        <p><strong>Snowflake:</strong> Uses micro-partition pruning metadata (min/max values per partition). The "cost" equivalent is the number of micro-partitions scanned. Clustering keys help prune partitions, analogous to how indexes help PostgreSQL.</p>
+        <p><strong>BigQuery:</strong> No user-visible cost model. Internally uses slot-based execution. BigQuery has no traditional B-tree indexes — it relies on partition pruning, clustering, columnar storage, and distributed scans to minimize data read. Specialized search indexes and vector indexes exist for specific workloads (full-text search, nearest-neighbor).</p>
+        <p><strong>Snowflake:</strong> Uses micro-partition pruning metadata (min/max values per partition). The "cost" equivalent is the number of micro-partitions scanned. Clustering keys improve micro-partition pruning but are not indexes — they control the physical organization of data within micro-partitions, allowing the query engine to skip irrelevant partitions based on min/max zone maps.</p>
         <pre><code class="language-sql">-- Snowflake: check pruning effectiveness
 SELECT * FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY())
 WHERE query_text LIKE '%orders%'
@@ -497,7 +501,7 @@ ORDER BY start_time DESC LIMIT 1;
 -- BigQuery: check bytes processed (cost proxy)
 -- In query results metadata:
 -- totalBytesProcessed: 1,234,567,890
--- totalBytesBilled:    2,000,000,000 (rounded up to nearest 10MB)</code></pre>
+-- totalBytesBilled:    1,234,567,890 (minimum 10 MB per query; actual bytes above that floor)</code></pre>
       </details>
     </section>
 
@@ -530,21 +534,24 @@ FROM orders;
 
         <h3>The 5-15% Rule of Thumb</h3>
         <pre><code class="language-bash"># When does an index HELP?
+# (These are rough guidelines for PostgreSQL — actual crossover depends on
+# correlation, cache residency, row width, storage type, and cost parameters)
 #
 # ┌──────────────────────────────────────────────────────────────────┐
-# │  Selectivity    │ Optimizer Decision   │ Reason                  │
+# │  Selectivity    │ Typical Decision     │ Reason                  │
 # ├──────────────────────────────────────────────────────────────────┤
 # │  < 1%           │ Index Scan           │ Few random reads needed │
 # │  1% - 5%        │ Index / Bitmap Scan  │ Still worth it          │
 # │  5% - 15%       │ DEPENDS on:          │ Correlation, cache,     │
 # │                 │  correlation          │ table size, SSD vs HDD │
 # │                 │  effective_cache_size │                         │
-# │  > 15%          │ Sequential Scan      │ Too many random reads   │
+# │  > 15%          │ Usually Seq Scan     │ Too many random reads   │
 # │  > 50%          │ Sequential Scan      │ Definitely seq scan     │
 # └──────────────────────────────────────────────────────────────────┘
 #
-# Exception: Index-Only Scan can be viable up to 30-40%
-# if the index covers all needed columns (no heap access)</code></pre>
+# Exception: Index-Only Scan can remain efficient for substantially
+# larger result sets because heap access is largely avoided
+# (depends on visibility map coverage and cache).</code></pre>
 
         <h3>Factors That Shift the Threshold</h3>
 
@@ -561,13 +568,14 @@ WHERE tablename = 'orders' AND attname = 'customer_id';
 -- Result: 0.05 → random order → index causes scattered I/O</code></pre>
 
         <h4>2. Table Size</h4>
-        <pre><code class="language-sql">-- Small tables (< 100 pages): ALWAYS seq scan
+        <pre><code class="language-sql">-- Small tables (< 100 pages): frequently use seq scan
 -- The entire table fits in a few I/O operations
--- Index overhead (tree traversal) exceeds just reading everything
+-- Index overhead (tree traversal) rarely pays off,
+-- although unique lookups may still use an index
 
 SELECT relpages, reltuples FROM pg_class WHERE relname = 'lookup_codes';
 -- relpages: 3, reltuples: 200
--- Optimizer: "Why bother with an index? I can read 3 pages in one I/O"</code></pre>
+-- Optimizer: "Reading 3 pages sequentially is cheaper than index traversal"</code></pre>
 
         <h4>3. Random Page Cost Setting</h4>
         <pre><code class="language-sql">-- HDD (random_page_cost = 4.0):
@@ -591,7 +599,7 @@ CREATE INDEX idx_orders_status ON orders(status);
 CREATE INDEX idx_orders_covering ON orders(status) INCLUDE (amount, created_at);
 -- SELECT amount, created_at FROM orders WHERE status = 'refunded';
 -- → Index Only Scan: no heap access needed
--- → Viable even at 20-30% selectivity!</code></pre>
+-- → Can remain efficient for much larger result sets than regular index scan!</code></pre>
 
         <h3>Selectivity and Multi-Column Predicates</h3>
         <pre><code class="language-sql">-- Combined selectivity (assuming independence):
@@ -737,7 +745,7 @@ WHERE status = 'pending' AND region = 'eu-west-1';
 #
 # Phase 1: Build bitmap from index(es)
 #
-# Index on status='pending':     [0,1,1,0,0,1,0,1,1,0,1,0...]  (page-level bits)
+# Index on status='pending':     [0,1,1,0,0,1,0,1,1,0,1,0...]  (tuple locations)
 # Index on region='eu-west-1':   [1,1,0,0,1,1,0,0,1,0,0,1...]
 #                                  ────────────────────────────
 # BitmapAnd result:              [0,1,0,0,0,1,0,0,1,0,0,0...]
@@ -748,14 +756,17 @@ WHERE status = 'pending' AND region = 'eu-west-1';
 # This converts random I/O → sequential I/O!
 #
 # "Recheck Condition":
-# When bitmap becomes "lossy" (too many bits → stores page-level not row-level),
-# must recheck the condition for each row on the page.
+# The bitmap initially tracks exact tuple locations (TIDs).
+# When bitmap exceeds work_mem, it becomes "lossy" — storing only
+# page-level bits. In lossy mode, the executor must recheck the
+# condition for each row on the fetched page.
 #
 # ┌────────────────────────────────────────────────────────────┐
 # │  Bitmap scan is the "middle ground" between:               │
-# │    - Index scan (good for < 5% selectivity)               │
-# │    - Seq scan (good for > 15% selectivity)                │
-# │  Bitmap scan: optimal for 5-15% selectivity range         │
+# │    - Index scan (good for very low selectivity)           │
+# │    - Seq scan (good for high selectivity)                 │
+# │  Bitmap scan: typically chosen for moderate selectivity    │
+# │  (varies with correlation, work_mem, and cache)           │
 # └────────────────────────────────────────────────────────────┘</code></pre>
 
         <h3>Scan Type Decision Matrix</h3>
@@ -772,7 +783,7 @@ WHERE status = 'pending' AND region = 'eu-west-1';
           <tbody>
             <tr>
               <td>Seq Scan</td>
-              <td>&gt; 15%</td>
+              <td>&gt; ~15% (varies)</td>
               <td>Sequential</td>
               <td>Large result sets, full aggs</td>
               <td>Reads entire table</td>
@@ -786,14 +797,14 @@ WHERE status = 'pending' AND region = 'eu-west-1';
             </tr>
             <tr>
               <td>Index Only Scan</td>
-              <td>&lt; 30%</td>
+              <td>Broad (no heap I/O)</td>
               <td>Sequential (index)</td>
               <td>Covering queries</td>
               <td>Needs visibility map</td>
             </tr>
             <tr>
               <td>Bitmap Index Scan</td>
-              <td>5-15%</td>
+              <td>~1-15% (varies)</td>
               <td>Batched sequential</td>
               <td>Multiple conditions, OR clauses</td>
               <td>Memory for bitmap</td>
@@ -871,9 +882,10 @@ ORDER BY n_mod_since_analyze DESC;
 -- correlation(created_at) = 0.99
 -- Index scan on date range is very efficient
 
--- After 6 months of updates and backfills:
--- Many rows updated → moved to end of heap (HOT notwithstanding)
+-- After 6 months of operations:
+-- Non-HOT updates place new tuple versions on different pages
 -- Bulk historical data loaded out of order
+-- Out-of-order inserts from concurrent sessions
 -- correlation(created_at) drops to 0.35
 
 -- Now the SAME query that used an index for months
@@ -1109,7 +1121,10 @@ SELECT * FROM orders WHERE status = 'pending';
 -- Optimizer's calculation:
 -- Index scan cost: 5,200,000 × random_page_cost(4.0) = 20,800,000
 -- Seq scan cost:   500,000 pages × seq_page_cost(1.0) = 500,000
--- Seq scan is 41× cheaper! Optimizer is CORRECT.</code></pre>
+-- Seq scan is 41× cheaper!
+-- Given the available indexes, the optimizer correctly preferred a
+-- sequential scan. The real issue: no index matched the actual
+-- access pattern (status + created_at DESC + LIMIT).</code></pre>
 
         <h3>The EXPLAIN ANALYZE Evidence</h3>
         <pre><code class="language-sql">-- During incident:
@@ -1176,7 +1191,7 @@ LIMIT 100;
         <pre><code class="language-bash"># 1. Data growth changes selectivity
 #    What was 1% selectivity becomes 13% — plan flip is EXPECTED
 #
-# 2. The optimizer was RIGHT to switch
+# 2. Given available indexes, the optimizer was right to switch
 #    At 13% selectivity with low correlation, seq scan IS cheaper
 #    The real fix is a better index, not forcing an old plan
 #
@@ -1349,7 +1364,8 @@ CLUSTER orders USING idx_orders_created_at;</code></pre>
 # │ Seq scan, small result   │ Low correlation     │ CLUSTER     │
 # │ Index scan, slow         │ Many heap fetches   │ Cover. idx  │
 # │ Bitmap→lossy recheck     │ work_mem too low    │ ↑ work_mem  │
-# │ Plan flips daily         │ Stats boundary      │ pin plan    │
+# │ Plan flips daily         │ Stats boundary      │ ANALYZE +   │
+# │                          │                     │ partial idx │
 # └──────────────────────────────────────────────────────────────┘</code></pre>
       </details>
     </section>
@@ -1516,9 +1532,11 @@ WHERE status = 'pending' AND created_at >= '2024-01-01';
 -- Pruning efficiency: 97.2% of partitions skipped!</code></pre>
 
         <h3>BigQuery: Partitioning and Clustering</h3>
-        <pre><code class="language-sql">-- BigQuery has NO indexes — relies on:
+        <pre><code class="language-sql">-- BigQuery has no traditional B-tree indexes for query optimization.
+-- It relies primarily on:
 -- 1. Partitioning (coarse-grained, like range partitions)
 -- 2. Clustering (fine-grained, like sorted micro-partitions)
+-- (Specialized search indexes and vector indexes exist for specific workloads)
 
 CREATE TABLE `project.dataset.orders`
 (
@@ -1926,14 +1944,16 @@ WHERE status = 'pending' AND created_at >= '2024-01-01';
 #   cost = relpages × seq_page_cost + reltuples × cpu_tuple_cost
 #   cost = relpages × 1.0 + reltuples × 0.01
 #
-# Index Scan Cost:
-#   cost = index_traversal + (rows × random_page_cost × (1 - correlation²))
-#                          + rows × cpu_index_tuple_cost
+# Index Scan Cost (conceptual approximation):
+#   cost ≈ index_traversal + (rows × random_page_cost × (1 - correlation²))
+#                           + rows × cpu_index_tuple_cost
+#   Note: (1 - correlation²) is a conceptual model for intuition.
+#   PostgreSQL uses the Mackert-Lohman page-fetch estimator, not this formula.
 #
 # Tipping Point (simplified):
 #   index_cost > seq_cost when:
 #   selectivity > seq_page_cost / (random_page_cost × pages_per_row)
-#   ≈ 5-15% depending on correlation and caching</code></pre>
+#   ≈ 5-15% depending on correlation, caching, and hardware</code></pre>
 
         <h3>Interview Checklist</h3>
         <pre><code class="language-bash"># ✓ Mention cost-based optimizer (not rule-based)
@@ -1943,7 +1963,7 @@ WHERE status = 'pending' AND created_at >= '2024-01-01';
 # ✓ Describe when optimizer is CORRECT to choose seq scan
 # ✓ Mention production debugging: EXPLAIN ANALYZE, check est vs actual
 # ✓ Discuss fixes: partial indexes, ANALYZE, covering indexes
-# ✓ Cross-engine awareness: BigQuery (no indexes), Snowflake (pruning)
+# ✓ Cross-engine awareness: BigQuery (no B-tree indexes, uses pruning), Snowflake (micro-partition pruning)
 # ✓ Trade-offs: index maintenance cost, write amplification
 # ✓ Real scenario: plan flip due to data growth crossing threshold</code></pre>
 

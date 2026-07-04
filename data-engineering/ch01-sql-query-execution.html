@@ -62,7 +62,7 @@
       </div>
       <h1>How Does a SQL Query Actually Execute Inside a Distributed Query Engine?</h1>
       <p class="chapter-takeaway">
-        <strong>Key Takeaway:</strong> A SQL query traverses five major phases—parsing, logical planning, optimization, physical planning, and distributed execution—each offering distinct opportunities for performance tuning. Understanding this pipeline is critical for diagnosing why a query that "should be fast" runs slowly in production.
+        <strong>Key Takeaway:</strong> A SQL query traverses parsing, logical planning, optimization, physical planning, and execution. In distributed engines, the execution phase additionally involves plan fragmentation, exchanges, and distributed scheduling across worker nodes. Each phase offers distinct opportunities for performance tuning, and understanding this pipeline is critical for diagnosing why a query that "should be fast" runs slowly in production.
       </p>
     </header>
 
@@ -101,10 +101,10 @@
         <summary>Concise answer you can deliver under pressure</summary>
         <div class="callout callout-tip">
           <blockquote>
-            <p>"A SQL query goes through five phases. First, the <strong>parser</strong> tokenizes the SQL text and builds an Abstract Syntax Tree, validating syntax. Second, a <strong>logical plan</strong> is generated—a tree of relational algebra operators like Scan, Filter, Project, Join, and Aggregate. Third, the <strong>optimizer</strong> rewrites this plan using heuristic rules (predicate pushdown, constant folding) and then a cost-based optimizer enumerates candidate plans, using table statistics and cardinality estimates to pick the cheapest. Fourth, the <strong>physical plan</strong> maps logical operators to concrete algorithms—hash join vs. sort-merge join, hash aggregate vs. sort aggregate. Finally, in a distributed engine, the <strong>execution layer</strong> partitions the plan into stages separated by shuffle/exchange boundaries, distributes fragments across worker nodes, and executes them using either a Volcano iterator model, vectorized batch processing, or compiled push-based execution. Runtime optimizations like Adaptive Query Execution in Spark can re-optimize mid-flight based on actual data statistics observed during shuffles."</p>
+            <p>"A SQL query goes through several phases. First, the <strong>parser</strong> tokenizes the SQL text and builds an Abstract Syntax Tree, validating syntax. Second, a <strong>logical plan</strong> is generated—a tree of relational algebra operators like Scan, Filter, Project, Join, and Aggregate. Third, the <strong>optimizer</strong> rewrites this plan using heuristic rules (predicate pushdown, constant folding) and then a cost-based optimizer enumerates candidate plans, using table statistics and cardinality estimates to pick the cheapest. Fourth, the <strong>physical plan</strong> maps logical operators to concrete algorithms—hash join vs. sort-merge join, hash aggregate vs. sort aggregate. Finally, in a distributed engine, the <strong>execution layer</strong> partitions the plan into stages separated by shuffle/exchange boundaries, distributes fragments across worker nodes, and executes them using techniques such as iterator-based processing, vectorized batch execution, or compiled push-based execution—often combining more than one. Runtime optimizations like Adaptive Query Execution in Spark can re-optimize mid-flight based on actual data statistics observed at shuffle boundaries."</p>
           </blockquote>
         </div>
-        <p>This answer hits all five phases in under 60 seconds. Now let's go deep on each.</p>
+        <p>This answer hits all major phases in under 60 seconds. Now let's go deep on each.</p>
       </details>
     </section>
 
@@ -547,6 +547,9 @@ Batch 5: "Decimal Optimization"
 
         <h3>Cardinality Estimation</h3>
         <p>The most critical (and error-prone) component. Estimates how many rows each operator will produce.</p>
+        <div class="callout callout-warning">
+          <p><strong>Note:</strong> The formulas below are simplified heuristics for building intuition. Production optimizers use histograms, most-common-value (MCV) lists, correlation statistics, sampling, extended statistics, and engine-specific estimation techniques that are significantly more sophisticated.</p>
+        </div>
         <pre class="diagram">
 Selectivity Estimation Formulas:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -556,7 +559,7 @@ Range predicate:       sel(col > value) = (max - value) / (max - min)
 AND combination:       sel(A AND B) = sel(A) × sel(B)  [independence assumption]
 OR combination:        sel(A OR B) = sel(A) + sel(B) - sel(A) × sel(B)
 JOIN selectivity:      sel(R.a = S.b) = 1 / max(NDV(R.a), NDV(S.b))
-LIKE prefix:           sel(col LIKE 'abc%') ≈ 1 / NDV(col)  [heuristic]
+LIKE prefix:           sel(col LIKE 'abc%') ≈ range fraction from histogram  [engine-specific]
 
 Cardinality after filter:
   |σ_p(R)| = |R| × sel(p)
@@ -603,10 +606,10 @@ Sort-Merge Join Cost:
         </pre>
 
         <h3>Plan Enumeration</h3>
-        <p>For N tables, there are (2N-2)! / (N-1)! possible join orderings. With N=10 tables, that's ~17 billion plans. Optimizers use:</p>
+        <p>The number of possible join orders grows super-exponentially with the number of tables (considering left-deep trees alone: N! orderings; bushy trees expand the space further). For N=10, the search space is in the billions for bushy trees, making exhaustive enumeration infeasible for large queries. Optimizers use:</p>
         <ul>
-          <li><strong>Dynamic Programming (PostgreSQL, Spark):</strong> Bottom-up, optimal for ≤12 tables. Considers all pair-wise joins, memoizes sub-plans.</li>
-          <li><strong>Greedy/Heuristic (large queries):</strong> PostgreSQL switches to GEQO (Genetic Query Optimizer) for &gt;12 tables.</li>
+          <li><strong>Dynamic Programming (PostgreSQL, Spark):</strong> Bottom-up, optimal for small join counts (PostgreSQL uses this for &lt;12 tables). Considers all pair-wise joins, memoizes sub-plans.</li>
+          <li><strong>Greedy/Heuristic (large queries):</strong> PostgreSQL switches to GEQO (Genetic Query Optimizer) for ≥12 tables.</li>
           <li><strong>Cascades Framework (SQL Server, newer engines):</strong> Top-down, rule-based exploration with memoization. More extensible.</li>
         </ul>
 
@@ -618,7 +621,9 @@ SET enable_mergejoin = off; -- force nested loop
 SELECT * FROM pg_stats
 WHERE tablename = 'orders' AND attname = 'created_at';
 
--- Spark SQL: enable CBO (off by default in older versions)
+-- Spark SQL: CBO requires table and column statistics.
+-- Many deployments rely primarily on Catalyst rule-based optimization
+-- unless statistics are explicitly collected.
 SET spark.sql.cbo.enabled = true;
 SET spark.sql.cbo.joinReorder.enabled = true;
 
@@ -626,7 +631,7 @@ SET spark.sql.cbo.joinReorder.enabled = true;
 ANALYZE TABLE orders COMPUTE STATISTICS FOR ALL COLUMNS;</code></pre>
 
         <div class="callout callout-tip">
-          <p><strong>Staff-level insight:</strong> In Snowflake, you never manually collect statistics—the system maintains them automatically via micro-partition metadata (min/max, NDV, null count per micro-partition). This is why Snowflake doesn't expose ANALYZE TABLE or histogram commands.</p>
+          <p><strong>Staff-level insight:</strong> In Snowflake, you never manually collect statistics—the system automatically maintains optimizer metadata including micro-partition zone maps, clustering metadata, and runtime statistics. This is why Snowflake doesn't expose ANALYZE TABLE or histogram commands.</p>
         </div>
       </details>
     </section>
@@ -792,7 +797,7 @@ Node 1 (Partition A):              Node 2 (Partition B):
       <h2>Execution Models</h2>
       <details>
         <summary>Volcano/Iterator, Vectorized, and Compiled/Push-based models</summary>
-        <p>How operators actually process data at runtime. This is the execution engine's inner loop—where CPU cycles are spent.</p>
+        <p>How operators actually process data at runtime. This is the execution engine's inner loop—where CPU cycles are spent. These are execution <em>techniques</em> rather than mutually exclusive categories—modern engines often combine them (e.g., Spark uses an iterator-style operator tree with whole-stage code generation; DuckDB is vectorized but also applies selective code generation).</p>
 
         <h3>Model Comparison</h3>
         <pre class="diagram">
@@ -816,10 +821,14 @@ Node 1 (Partition A):              Node 2 (Partition B):
 │                    │                      │                         │
 ├────────────────────┼──────────────────────┼─────────────────────────┤
 │ Used by:           │ Used by:             │ Used by:                │
-│ PostgreSQL,        │ DuckDB, Snowflake,   │ Spark (WholeStage       │
-│ MySQL, older       │ ClickHouse,          │ CodeGen), HyPer,        │
-│ systems            │ Velox (Meta),        │ Apache DataFusion       │
-│                    │ BigQuery             │                         │
+│ PostgreSQL (with   │ DuckDB, Snowflake,   │ Spark (WholeStage       │
+│ JIT compilation    │ ClickHouse,          │ CodeGen over iterator   │
+│ for expressions),  │ Velox (Meta),        │ tree), HyPer,           │
+│ MySQL, older       │ BigQuery             │ Apache DataFusion       │
+│ systems            │                      │                         │
+│                    │ Note: DuckDB also    │ Note: Spark combines    │
+│                    │ uses selective        │ this with Volcano-style │
+│                    │ code generation       │ operator structure      │
 ├────────────────────┼──────────────────────┼─────────────────────────┤
 │ Overhead:          │ Overhead:            │ Overhead:               │
 │ Virtual fn call    │ Amortized over       │ Minimal - tight         │
@@ -955,7 +964,7 @@ public void processPartition(Iterator&lt;InternalRow&gt; input) {
 }</code></pre>
 
         <div class="callout callout-tip">
-          <p><strong>Spark CodeGen in practice:</strong> Check your Spark UI's "Details" for any stage. If you see <code>WholeStageCodegen</code> wrapping your operators, code generation is active. Operators that break codegen: <code>SortMergeJoin</code> (needs materialization), <code>External Sort</code>, any operator that spills to disk.</p>
+          <p><strong>Spark CodeGen in practice:</strong> Check your Spark UI's "Details" for any stage. If you see <code>WholeStageCodegen</code> wrapping your operators, code generation is active. Operators that break codegen pipelines: <code>Exchange</code> (shuffle boundary), <code>External Sort</code> (spill to disk), and Python UDFs. Each codegen boundary starts a new <code>WholeStageCodegen</code> stage.</p>
         </div>
 
         <h3>Performance Comparison</h3>
@@ -1001,9 +1010,9 @@ public void processPartition(Iterator&lt;InternalRow&gt; input) {
             </tr>
             <tr>
               <td>Throughput (TPC-H)</td>
-              <td>1x baseline</td>
-              <td>5-10x</td>
-              <td>10-50x</td>
+              <td>Baseline</td>
+              <td>Higher (batch amortization + SIMD)</td>
+              <td>Highest for CPU-bound analytical workloads</td>
             </tr>
           </tbody>
         </table>
@@ -1173,7 +1182,7 @@ BigQuery Dremel Execution Tree:
         </pre>
 
         <div class="callout callout-info">
-          <p><strong>Snowflake's approach:</strong> Snowflake uses "virtual warehouses" — clusters of EC2/GCE nodes with local SSD cache. Data is read from cloud storage (S3/GCS), cached locally, and processed. Unlike Spark, Snowflake automatically scales the number of workers per query based on data volume (multi-cluster warehouses).</p>
+          <p><strong>Snowflake's approach:</strong> Snowflake uses "virtual warehouses" — clusters of compute nodes with local SSD cache. Data is read from cloud storage (S3/GCS/Azure Blob), cached locally, and processed. Snowflake executes queries using the compute resources allocated to the user-selected warehouse size. Multi-cluster warehouses primarily improve concurrent workload handling rather than automatically scaling a single query's parallelism.</p>
         </div>
       </details>
     </section>
@@ -1188,7 +1197,7 @@ BigQuery Dremel Execution Tree:
         <p>Traditional optimizers make all decisions at compile time based on statistics. Runtime optimizations adjust the plan <em>during execution</em> based on actual observed data.</p>
 
         <h3>Spark Adaptive Query Execution (AQE)</h3>
-        <p>Introduced in Spark 3.0, AQE re-optimizes the plan at shuffle boundaries (materialization points) when actual row counts differ from estimates.</p>
+        <p>Introduced in Spark 3.0, AQE re-optimizes the plan at shuffle boundaries (materialization points) when actual row counts differ from estimates. Because shuffle stages fully materialize intermediate data, these are the only points where Spark can observe actual statistics and revise the plan—AQE cannot re-optimize within a running stage.</p>
         <pre class="diagram">
 AQE Optimization Points:
 ━━━━━━━━━━━━━━━━━━━━━━━
@@ -1263,7 +1272,7 @@ Result: 33x less I/O with DPP
         </pre>
 
         <h3>Runtime Bloom Filters</h3>
-        <p>BigQuery and Spark use bloom filters built during the join's build phase to filter the probe side at scan time:</p>
+        <p>Several modern query engines, including Spark in supported execution paths, can use bloom filters built during the join's build phase to filter the probe side at scan time:</p>
         <ul>
           <li>Build a bloom filter from the smaller join side's keys</li>
           <li>Push the bloom filter down to the scan of the larger side</li>
@@ -1272,7 +1281,7 @@ Result: 33x less I/O with DPP
         </ul>
 
         <div class="callout callout-tip">
-          <p><strong>Snowflake's runtime pruning:</strong> Snowflake uses "pruning" extensively — each micro-partition (50-500MB compressed) has min/max metadata for every column. At runtime, the engine checks join keys against micro-partition ranges to skip irrelevant data without bloom filters.</p>
+          <p><strong>Snowflake's runtime pruning:</strong> Snowflake uses "pruning" extensively — each micro-partition (50-500MB uncompressed) has min/max metadata for every column. At runtime, the engine checks join keys against micro-partition ranges to skip irrelevant data without bloom filters.</p>
         </div>
       </details>
     </section>
@@ -1297,7 +1306,7 @@ Result: 33x less I/O with DPP
           <tbody>
             <tr>
               <td><strong>Architecture</strong></td>
-              <td>Single-node, shared-nothing processes</td>
+              <td>Single-node, shared-memory multi-process</td>
               <td>Serverless, multi-tenant Dremel tree</td>
               <td>Multi-cluster shared-data (cloud storage)</td>
               <td>Driver + Executors on cluster (YARN/K8s)</td>
@@ -1305,7 +1314,7 @@ Result: 33x less I/O with DPP
             <tr>
               <td><strong>Execution Model</strong></td>
               <td>Volcano (pull, row-at-a-time)</td>
-              <td>Vectorized columnar (batches)</td>
+              <td>Distributed columnar execution (Dremel tree with vectorized processing)</td>
               <td>Vectorized push-based</td>
               <td>Whole-Stage CodeGen + Volcano fallback</td>
             </tr>
@@ -1355,7 +1364,7 @@ Result: 33x less I/O with DPP
               <td><strong>Runtime Adaptation</strong></td>
               <td>None (plan fixed at compile time)</td>
               <td>Dynamic work rebalancing</td>
-              <td>Automatic scaling, adaptive pruning</td>
+              <td>Adaptive pruning, runtime filtering</td>
               <td>AQE (Spark 3.0+)</td>
             </tr>
             <tr>
@@ -1395,8 +1404,12 @@ Limit (100 rows)
       → Index Scan using idx_orders_created_at
          (if selectivity < ~5% of table)
 
-Single process, single thread. work_mem bounds hash table size.
+Coordinated by a single backend process. work_mem bounds hash table size.
 If hash table exceeds work_mem → spill to disk (batch mode).
+
+Note: Modern PostgreSQL (9.6+) supports parallel query for eligible
+operations (parallel seq scan, hash join, aggregate, bitmap heap scan).
+The query is coordinated by one backend process with parallel workers.
         </pre>
 
         <h4>BigQuery Execution</h4>
@@ -1453,7 +1466,7 @@ With AQE: if partitions are skewed or too small, coalesce/split dynamically.
         </pre>
 
         <div class="callout callout-info">
-          <p><strong>Key difference:</strong> PostgreSQL uses a single-threaded execution with no parallelism for most queries. BigQuery and Snowflake automatically parallelize across hundreds of nodes. Spark requires explicit cluster provisioning but gives you control over parallelism (number of executors, cores, memory).</p>
+          <p><strong>Key difference:</strong> PostgreSQL queries are coordinated by a single backend process but can use parallel workers for sequential scans, hash joins, and aggregates (since 9.6). BigQuery and Snowflake automatically parallelize across hundreds of nodes with no configuration. Spark requires explicit cluster provisioning but gives you control over parallelism (number of executors, cores, memory).</p>
         </div>
       </details>
     </section>
@@ -1501,7 +1514,7 @@ With AQE: if partitions are skewed or too small, coalesce/split dynamically.
             </tr>
             <tr>
               <td>Jul 15, 2024</td>
-              <td><strong>INCIDENT:</strong> Histogram bucket for "electronics" overflows. Optimizer estimates 5% selectivity (old histogram) but actual is 35%.</td>
+              <td><strong>INCIDENT:</strong> Stale statistics with insufficient resolution failed to capture the new distribution. Optimizer estimates 5% selectivity (based on outdated histogram) but actual selectivity is 35%.</td>
               <td><strong>8 minutes</strong></td>
             </tr>
             <tr>
@@ -1519,7 +1532,7 @@ With AQE: if partitions are skewed or too small, coalesce/split dynamically.
 
         <h3>Root Cause Analysis</h3>
         <pre class="diagram">
-What the optimizer "saw" (stale histogram):
+What the optimizer "saw" (low-resolution statistics):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Category Distribution (histogram from June):
@@ -2215,17 +2228,17 @@ BigQuery: automatic, slot-based allocation
         <summary>Key points to remember</summary>
         <div class="callout callout-tip">
           <ol>
-            <li><strong>Five phases:</strong> Parse → Logical Plan → Optimize → Physical Plan → Distributed Execution. Know what happens at each boundary.</li>
+            <li><strong>Core phases:</strong> Parse → Logical Plan → Optimize → Physical Plan → Execution. In distributed engines, execution additionally involves plan fragmentation, exchanges, and distributed scheduling.</li>
             <li><strong>Parsing</strong> converts SQL text to an AST via tokenization and grammar rules. Semantic analysis resolves names and types against the catalog.</li>
             <li><strong>Logical plan</strong> is a tree of relational algebra operators (Scan, Filter, Project, Join, Aggregate) independent of physical implementation.</li>
             <li><strong>Rule-based rewriting</strong> applies always-beneficial transformations: predicate pushdown, projection pruning, constant folding, subquery decorrelation.</li>
             <li><strong>Cost-based optimization</strong> uses table statistics and cardinality estimation to enumerate and compare plan alternatives. The independence assumption is its Achilles' heel.</li>
             <li><strong>Physical planning</strong> maps logical operators to algorithms: hash join vs. sort-merge vs. nested loop, hash aggregate vs. sort aggregate.</li>
-            <li><strong>Three execution models:</strong> Volcano (row-at-a-time, simple), Vectorized (batch, SIMD-friendly), Compiled (fused code, fastest for CPU-bound).</li>
+            <li><strong>Three execution techniques</strong> (often combined): Volcano (row-at-a-time, simple), Vectorized (batch, SIMD-friendly), Compiled (fused code, highest throughput for CPU-bound). Modern engines like Spark and DuckDB combine multiple techniques.</li>
             <li><strong>Distributed execution</strong> splits the plan into stages at shuffle/exchange boundaries. Data redistribution (shuffle) is the most expensive operation in distributed queries.</li>
             <li><strong>Runtime optimizations</strong> (AQE, DPP, runtime bloom filters) adapt the plan during execution based on actual data, fixing estimation errors.</li>
             <li><strong>Stale statistics</strong> are the #1 cause of query performance regressions. Always ANALYZE after bulk loads, or use engines with automatic stats maintenance.</li>
-            <li><strong>Cross-engine literacy:</strong> PostgreSQL is single-node Volcano; BigQuery is serverless vectorized Dremel tree; Snowflake is vectorized push with automatic scaling; Spark is whole-stage codegen with AQE.</li>
+            <li><strong>Cross-engine literacy:</strong> PostgreSQL is single-node shared-memory multi-process (Volcano with parallel query support); BigQuery is serverless distributed Dremel tree with vectorized processing; Snowflake is vectorized push with user-selected warehouse sizing; Spark is whole-stage codegen over an iterator tree with AQE.</li>
             <li><strong>Debugging:</strong> EXPLAIN ANALYZE (PostgreSQL), Spark UI SQL tab, BigQuery Execution Details, Snowflake Query Profile. Always compare estimated vs. actual row counts.</li>
           </ol>
         </div>

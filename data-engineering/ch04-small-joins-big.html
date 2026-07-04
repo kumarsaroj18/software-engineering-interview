@@ -169,9 +169,11 @@
 # └─────────────────────────────────────────────────────────────────┘
         </code></pre>
         <p>
-          The build phase is <code>O(|small|)</code> in both time and memory. Each row from
-          the small table is hashed on the join key and inserted into an in-memory hash map.
-          Modern engines (PostgreSQL 11+, Spark) use open-addressing or chained bucket designs.
+          The build phase requires linear time and memory proportional to the size of the
+          build-side hash table (row payloads, bucket array, hash metadata, and allocator
+          overhead). Each row from the small table is hashed on the join key and inserted
+          into an in-memory hash map. Modern engines use optimized in-memory hash table
+          implementations, although the underlying data structures vary by engine.
         </p>
       </details>
       <details>
@@ -196,7 +198,7 @@
         <p>
           The hash table must fit in the executor's memory budget. Building on the large side
           would require materializing billions of rows — exceeding available RAM and triggering
-          expensive spill-to-disk (grace hash join / hybrid hash join).
+          expensive spill-to-disk (hybrid hash join).
         </p>
         <table>
           <thead>
@@ -292,7 +294,7 @@ JOIN dim_store d ON s.store_id = d.store_id;
         <p>
           Key observations: <code>Batches: 1</code> means the entire hash table fit in memory
           without partitioning. <code>Memory Usage: 3842kB</code> confirms it's a small build side.
-          If batches > 1, the engine is spilling to disk (grace hash join).
+          If batches > 1, the engine is spilling to disk (hybrid hash join).
         </p>
       </details>
     </section>
@@ -308,8 +310,8 @@ JOIN dim_store d ON s.store_id = d.store_id;
 # │          BROADCAST JOIN vs. SHUFFLE JOIN                               │
 # ├───────────────────────────────────────────────────────────────────────┤
 # │                                                                        │
-# │  BROADCAST JOIN                       SHUFFLE (SORT-MERGE) JOIN        │
-# │  ──────────────                       ─────────────────────────        │
+# │  BROADCAST JOIN                       SHUFFLE JOIN                   │
+# │  ──────────────                       ────────────                   │
 # │                                                                        │
 # │  Small table (10 MB)                  Both tables shuffled by key      │
 # │       │                                                                │
@@ -440,8 +442,8 @@ result = fact_sales.join(
             <tr>
               <td>Trino/Presto</td>
               <td>100 MB</td>
-              <td><code>join-distribution-type</code></td>
-              <td>Session property</td>
+              <td><code>join-max-broadcast-table-size</code></td>
+              <td><code>join-distribution-type</code> session property</td>
             </tr>
             <tr>
               <td>Databricks</td>
@@ -508,9 +510,10 @@ result = fact_sales.join(
 # │  └───────┘              │  rows    │  K can be thousands            │
 # │                          └──────────┘                                │
 # │                                                                      │
-# │  Memory for intermediates: UNBOUNDED                                 │
+# │  Memory for intermediates: can grow orders of magnitude larger       │
+# │    than the inputs, often forcing repeated disk spills              │
 # │  Network shuffle: BOTH sides must be repartitioned                   │
-# │  Disk spill: GUARANTEED for large clusters                           │
+# │  Disk spill: likely for large clusters                               │
 # │                                                                      │
 # └─────────────────────────────────────────────────────────────────────┘
         </code></pre>
@@ -557,6 +560,11 @@ print(f"Large × Large output: {large_large:,.0f}")
           cardinality is bounded by the large side. This is why fact-dimension joins are
           inherently safer than fact-fact joins.
         </p>
+        <p>
+          <strong>Note:</strong> Real optimizers additionally use histograms, most-common-values (MCVs),
+          extended statistics, and runtime feedback — this simple independence-assumption formula
+          often over- or underestimates actual data distributions.
+        </p>
       </details>
       <details>
         <summary>Impact on downstream operators</summary>
@@ -597,12 +605,12 @@ print(f"Large × Large output: {large_large:,.0f}")
               <td>PostgreSQL</td>
               <td><code>work_mem</code> (per-operation)</td>
               <td>Typically 256 MB–1 GB per sort/hash</td>
-              <td>Grace hash join (partition to temp files)</td>
+              <td>Hybrid hash join (partition to temp files)</td>
             </tr>
             <tr>
               <td>Spark</td>
               <td>Unified Memory (execution + storage)</td>
-              <td>60% of <code>(heap - 300MB)</code></td>
+              <td><code>(heap - 300MB) × spark.memory.fraction</code> (default 0.6), shared across all concurrent operators</td>
               <td>External sort-based shuffle + spill</td>
             </tr>
             <tr>
@@ -621,10 +629,10 @@ print(f"Large × Large output: {large_large:,.0f}")
         </table>
       </details>
       <details>
-        <summary>Grace hash join — spilling gracefully</summary>
+        <summary>Hybrid hash join — spilling gracefully</summary>
         <p>
-          When the build side exceeds memory, engines use a <strong>Grace hash join</strong>
-          (or hybrid hash join) strategy:
+          When the build side exceeds memory, engines use a <strong>hybrid hash join</strong>
+          (sometimes called Grace hash join) strategy:
         </p>
         <ol>
           <li>Partition both build and probe sides into N buckets using a secondary hash function</li>
@@ -753,8 +761,8 @@ spark.conf.set("spark.memory.storageFraction", "0.5")   # storage vs execution s
         </ol>
         <p>
           For a 500 GB table across 200 partitions, each reduce task fetches ~2.5 GB from
-          200 different sources — creating 200 × 200 = 40,000 network connections. This is
-          the "shuffle storm" that kills cluster performance.
+          200 different sources — requiring potentially tens of thousands of block transfers
+          across the cluster. This is the "shuffle storm" that kills cluster performance.
         </p>
       </details>
       <details>
@@ -852,6 +860,8 @@ spark.conf.set("spark.sql.adaptive.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
 spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
 spark.conf.set("spark.sql.adaptive.localShuffleReader.enabled", "true")
+# Note: In Spark 3.2+, local shuffle reader behavior is automatic when AQE
+# is enabled. This explicit config is only needed for Spark 3.0/3.1.
 
 # AQE broadcast threshold (can differ from static threshold)
 spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "30m")
@@ -967,8 +977,10 @@ spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "2
           <li><strong>work_mem:</strong> Controls maximum memory for the hash table. Default 4 MB
               is often too low for analytical workloads. Production DWH settings: 256 MB–2 GB.</li>
           <li><strong>Batch splitting:</strong> When the build side exceeds work_mem, PostgreSQL
-              splits into batches (powers of 2). Each batch requires a full re-scan of the
-              probe side — O(batches × |probe|).</li>
+              splits into batches (powers of 2). Both build and probe sides are partitioned
+              together — probe-side rows for spilled batches are written to temporary files
+              during the initial pass, and each batch pair is processed separately. This
+              increases I/O but does not require re-scanning the probe relation.</li>
           <li><strong>Parallel hash join (PG 11+):</strong> Multiple workers build a shared hash
               table using atomic operations. Build phase parallelizes well; probe phase is
               embarrassingly parallel.</li>
@@ -1030,8 +1042,9 @@ WHERE o.order_date >= '2024-01-01';
       "steps": [
         {"kind": "READ", "substeps": ["$3:sale_id, $4:store_id, $5:amount FROM fact_sales"]},
         {"kind": "HASH_JOIN", "substeps": [
-          "INNER JOIN EACH WITH ALL ON $4 = $1",
-          "Build side: S00 (broadcast)"
+          "INNER HASH JOIN (broadcast build side: S00)",
+          "Build hash table on dim_store.store_id",
+          "Probe with fact_sales.store_id"
         ]},
         {"kind": "WRITE", "substeps": ["$3, $5, $2 TO __output"]}
       ],
@@ -1045,15 +1058,17 @@ WHERE o.order_date >= '2024-01-01';
 }
         </code></pre>
         <p>
-          Note: <code>"JOIN EACH WITH ALL"</code> indicates broadcast — "EACH" is the large
-          (partitioned) side, "ALL" is the small (broadcast) side.
+          Note: <code>"broadcast build side"</code> in BigQuery's internal plan representation
+          indicates the small table was replicated to all slots. Standard SQL mode does not
+          expose this as user-facing syntax, but the execution plan reveals broadcast vs.
+          hash-distributed join semantics.
         </p>
       </details>
       <details>
         <summary>Snowflake micro-partition join optimization</summary>
         <p>
-          Snowflake's unique architecture uses micro-partitions (50–500 MB compressed) and
-          the optimization is driven by:
+          Snowflake's unique architecture uses micro-partitions (approximately 50–500 MB of
+          uncompressed data) and the optimization is driven by:
         </p>
         <ul>
           <li><strong>Pruning:</strong> Join key ranges from the small table are used to prune
@@ -1162,7 +1177,9 @@ print(f"Estimated size: {dim_store_df.queryExecution.optimizedPlan.stats.sizeInB
       <details>
         <summary>Root cause analysis</summary>
         <pre><code class="language-bash">
-# Root cause chain:
+# Root cause: a combination of stale catalog statistics, a hardcoded
+# broadcast hint, and missing table-size monitoring created a silent
+# failure mode:
 #
 # 1. ANALYZE TABLE was not in the pipeline DAG
 #    → Catalog statistics permanently showed Month 0 sizes
@@ -1177,7 +1194,8 @@ print(f"Estimated size: {dim_store_df.queryExecution.optimizedPlan.stats.sizeInB
 #    → Even if stats were correct, the hint overrode the optimizer
 #
 # 5. No memory guardrails on broadcast size
-#    → Spark < 3.4 doesn't validate actual size vs threshold before broadcast
+#    → Depending on Spark version and statistics accuracy, an unexpectedly
+#      large broadcast can still lead to memory failures
         </code></pre>
       </details>
       <details>
@@ -1624,7 +1642,7 @@ JOIN dim_store d ON f.store_id = d.store_id;
             <tr>
               <td>CPU</td>
               <td>O(|build| + |probe|) — hash + probe</td>
-              <td>O(|A| log|A| + |B| log|B|) — sort dominates</td>
+              <td>O(|A| log|A| + |B| log|B|) including sort; O(|A|+|B|) if pre-sorted</td>
             </tr>
             <tr>
               <td>Pre-sorted input</td>
@@ -1638,7 +1656,7 @@ JOIN dim_store d ON f.store_id = d.store_id;
             </tr>
             <tr>
               <td>Spill behavior</td>
-              <td>Grace hash join (recursive partitioning)</td>
+              <td>Hybrid hash join (recursive partitioning)</td>
               <td>External merge sort (well-understood)</td>
             </tr>
             <tr>

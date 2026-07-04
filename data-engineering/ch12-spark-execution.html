@@ -265,7 +265,7 @@ print(f"Default parallelism: {sc.defaultParallelism}")</code></pre>
         <li><strong>Optimization opportunity</strong> — Catalyst sees the entire computation graph before executing, enabling predicate pushdown, projection pruning, and join reordering that would be impossible with eager evaluation.</li>
         <li><strong>Pipelining</strong> — Multiple narrow transformations can be fused into a single pass over the data (no intermediate materialization).</li>
         <li><strong>Reduced I/O</strong> — Filters pushed before expensive operations eliminate unnecessary data reads.</li>
-        <li><strong>Fault tolerance</strong> — The lineage DAG serves as the recovery plan; Spark never needs write-ahead logs for intermediate results.</li>
+        <li><strong>Fault tolerance</strong> — The lineage DAG serves as the recovery plan; for batch execution, Spark primarily relies on lineage rather than write-ahead logging for intermediate results.</li>
       </ul>
 
       <h3>The Lineage Graph (DAG)</h3>
@@ -469,7 +469,7 @@ df = orders.join(customers, "customer_id") \
       <h3>Phase 3: Physical Planning</h3>
       <p>The physical planner converts the optimized logical plan into one or more physical plans, then selects the best using a cost model:</p>
       <ul>
-        <li><strong>Join strategy selection</strong> — Chooses between BroadcastHashJoin, SortMergeJoin, ShuffledHashJoin based on table sizes and <code>spark.sql.autoBroadcastJoinThreshold</code> (default 10 MB).</li>
+        <li><strong>Join strategy selection</strong> — Chooses between BroadcastHashJoin, SortMergeJoin, ShuffledHashJoin based on table sizes and <code>spark.sql.autoBroadcastJoinThreshold</code> (default 10 MB, commonly raised in production environments).</li>
         <li><strong>Aggregation strategy</strong> — Partial aggregation (map-side combine) vs full shuffle aggregation.</li>
         <li><strong>Sort implementation</strong> — In-memory sort vs external sort based on data size vs available memory.</li>
         <li><strong>Scan planning</strong> — Chooses between file scan, bucket scan, or cached data scan.</li>
@@ -533,7 +533,7 @@ print(df.queryExecution.executedPlan)  # With codegen wrappers</code></pre>
       <p>Tungsten addresses all four problems with a custom memory management and execution backend.</p>
 
       <h3>Off-Heap Memory Management</h3>
-      <p>Tungsten allocates memory outside the JVM heap using <code>sun.misc.Unsafe</code> (or <code>java.nio.DirectByteBuffer</code>):</p>
+      <p>Tungsten introduces binary processing (UnsafeRow), efficient memory management, and whole-stage code generation — all of which improve performance regardless of whether off-heap is enabled. Optionally, Tungsten can allocate memory outside the JVM heap using <code>sun.misc.Unsafe</code> (or <code>java.nio.DirectByteBuffer</code>) for further GC avoidance:</p>
       <ul>
         <li>Explicit allocation and deallocation — no GC involvement.</li>
         <li>Memory pages managed by Spark's <code>TaskMemoryManager</code> per task.</li>
@@ -547,15 +547,18 @@ print(df.queryExecution.executedPlan)  # With codegen wrappers</code></pre>
 
 ┌───────────────┬────────────────────────────────┬───────────────────┐
 │ Null Bitmap   │ Fixed-width values region       │ Variable-length   │
-│ (1 bit/field) │ (8 bytes per field)             │ data region       │
+│ (1 bit/field) │ (8 bytes per slot)              │ data region       │
 ├───────────────┼────────────────────────────────┼───────────────────┤
 │ 0b000         │ [42][offset+len][3.14159...]    │ ["hello"]         │
 │ (3 bits)      │ INT   STRING ref   DOUBLE       │                   │
 └───────────────┴────────────────────────────────┴───────────────────┘
 
-Benefits:
-- Fixed offsets for O(1) field access (no deserialization needed)
+Key details:
+- Fixed-width region stores primitive values directly (INT, LONG, DOUBLE)
+- Variable-length fields store an offset and length pointing into the
+  variable-length data region (not the value itself)
 - Contiguous memory layout for CPU cache-friendly access
+- Fixed offsets enable O(1) field access (no deserialization needed)
 - Direct binary comparison for sort operations
 - No object creation — operates directly on byte arrays</code></pre>
 
@@ -568,7 +571,7 @@ Benefits:
       </ul>
 
       <h3>Whole-Stage Code Generation</h3>
-      <p>WholeStageCodegen eliminates the iterator model overhead by generating a single Java method for an entire pipeline stage:</p>
+      <p>WholeStageCodegen eliminates the iterator model overhead by generating specialized Java code that fuses multiple operators into a single execution pipeline:</p>
       <pre><code class="language-text">Traditional Volcano Model (per-row virtual dispatch):
 
   Aggregate.next()
@@ -639,12 +642,12 @@ spark.conf.set("spark.sql.codegen.wholeStage", "false")</code></pre>
         └── Stage 2 ...</code></pre>
 
       <h3>Jobs</h3>
-      <p>Every <strong>action</strong> triggers exactly one job. A single application can have many jobs (e.g., a notebook with multiple <code>.show()</code> or <code>.write()</code> calls):</p>
-      <pre><code class="language-python"># This creates 3 jobs:
+      <p>Most <strong>actions</strong> trigger a Spark job, although some actions or SQL commands may internally launch multiple jobs. A single application can have many jobs (e.g., a notebook with multiple <code>.show()</code> or <code>.write()</code> calls):</p>
+      <pre><code class="language-python"># This creates 2 jobs:
 df = spark.read.parquet("s3://data/events/")
-df.cache()          # Job 0: materialize cache
-df.count()          # Job 1: count action
-df.write.parquet("s3://output/")  # Job 2: write action</code></pre>
+df.cache()          # Marks for caching — no job triggered (lazy)
+df.count()          # Job 0: triggers computation AND caches the result
+df.write.parquet("s3://output/")  # Job 1: reads from cache, writes output</code></pre>
 
       <h3>Stages</h3>
       <p>The DAG scheduler splits each job into stages at <strong>shuffle boundaries</strong> (wide dependencies). Within a stage, all transformations have narrow dependencies and can be pipelined:</p>
@@ -744,14 +747,15 @@ result.write.parquet("...")                # Action triggers all stages
           </tr>
         </tbody>
       </table>
-      <p>Configure locality wait via <code>spark.locality.wait</code> (default 3s). For clusters with fast networks (cloud), reducing this to 0–1s can improve overall throughput by avoiding idle executors waiting for locality.</p>
+      <p>Configure locality wait via <code>spark.locality.wait</code> (default 3s). On fast cloud networks, reducing this may improve throughput by avoiding idle executors waiting for locality, but this should be validated through workload-specific benchmarking.</p>
 
       <h3>Parallel Execution</h3>
       <pre><code class="language-python"># Cluster: 10 executors × 4 cores = 40 task slots
 # Stage with 200 partitions → 200 tasks
 # Tasks run in 5 waves: 40 + 40 + 40 + 40 + 40 = 200
 
-# Ideal: partitions ≈ 2-3× total cores for even distribution
+# Heuristic: partitions ≈ 2-3× total cores for even distribution
+# (adjust based on actual data size and partition skew)
 # Too few partitions → underutilized cores, possible OOM
 # Too many partitions → scheduling overhead, small-file problem
 
@@ -791,7 +795,7 @@ STAGE 1 (Map Side / Shuffle Write)          STAGE 2 (Reduce Side / Shuffle Read)
       <ol>
         <li><strong>Partitioning</strong> — Computes the target partition for each record using the partitioner (hash or range).</li>
         <li><strong>Sorting</strong> — Sorts records by (partition_id, optional_key) within an in-memory buffer.</li>
-        <li><strong>Spilling</strong> — When the buffer exceeds <code>spark.shuffle.spill.initialMemoryThreshold</code>, spills sorted runs to disk.</li>
+        <li><strong>Spilling</strong> — When in-memory shuffle buffers become full, Spark spills sorted runs to disk automatically.</li>
         <li><strong>Merging</strong> — Merges all spill files + remaining in-memory data into final shuffle files.</li>
         <li><strong>Writing</strong> — Produces one data file + one index file per map task (consolidated format since Spark 1.4).</li>
       </ol>
@@ -812,7 +816,7 @@ without reading the entire file.</code></pre>
         <li><strong>Merges</strong> sorted blocks if sort-based aggregation is required.</li>
         <li><strong>Processes</strong> the merged stream through downstream operators.</li>
       </ol>
-      <p>Remote fetches happen in parallel (5 concurrent requests per reduce task by default, controlled by <code>spark.reducer.maxReqsInFlight</code>).</p>
+      <p>Remote fetches happen in parallel, with total in-flight data controlled by <code>spark.reducer.maxSizeInFlight</code> (default 48 MB) and maximum concurrent requests by <code>spark.reducer.maxReqsInFlight</code> (default unlimited; practically bounded by the in-flight data size limit).</p>
 
       <h3>Sort-Based Shuffle (Default)</h3>
       <p>Since Spark 2.0, the only shuffle implementation is <strong>sort-based shuffle</strong> (<code>SortShuffleManager</code>):</p>
@@ -824,11 +828,11 @@ without reading the entire file.</code></pre>
       </ul>
 
       <h3>Tungsten Sort Optimization</h3>
-      <p>When conditions are met, Spark uses Tungsten's unsafe sort:</p>
+      <p>Spark uses Tungsten's unsafe sort for shuffle operations when possible:</p>
       <ul>
-        <li><strong>Requirements</strong>: No aggregation, no ordering required within partitions, serialized record size fits in a page.</li>
-        <li><strong>Mechanism</strong>: Stores serialized records in off-heap pages. Sort operates on 8-byte pointers (partition_id + page_offset) — never deserializes records.</li>
-        <li><strong>Benefit</strong>: 3–5× faster sort for large shuffles due to cache-efficient memory access and zero deserialization.</li>
+        <li><strong>Mechanism</strong>: Stores serialized records in memory pages. Sort operates on 8-byte pointers (partition_id + page_offset) — never deserializes records during sorting.</li>
+        <li><strong>Benefit</strong>: Significantly faster sort for large shuffles due to cache-efficient memory access and zero deserialization during comparison.</li>
+        <li><strong>Fallback</strong>: External merge sort with efficient spill-to-disk when memory is exhausted.</li>
       </ul>
 
       <h3>Shuffle Configuration Tuning</h3>
@@ -956,9 +960,9 @@ spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "50m")  # 50 MB</code></p
 
       <pre><code class="language-text">BroadcastHashJoin Execution:
 
-1. Driver collects small DataFrame to driver memory
-2. Driver broadcasts serialized hash table to all executors
-3. Each executor stores broadcast in BlockManager (memory)
+1. Spark materializes the broadcast side and serializes it as a broadcast variable
+2. The broadcast variable (hash table) is distributed to all executors
+3. Each executor stores the broadcast in BlockManager (memory)
 4. Large side tasks probe the hash table — NO SHUFFLE of large side
 
    Executor 1: [Large partition 0] ──probe──▶ [Broadcast HashTable]
@@ -982,7 +986,7 @@ Phase 3: Merge-join (single pass, both sorted)
   O(N + M) per partition — highly efficient for large datasets</code></pre>
 
       <h3>ShuffledHashJoin (SHJ)</h3>
-      <p>An alternative when one side is moderately small (fits in memory per partition) but too large to broadcast:</p>
+      <p>An alternative when one side is moderately small but too large to broadcast. Spark may choose ShuffledHashJoin when one side is sufficiently small per partition and the optimizer estimates it to be more efficient than SortMergeJoin:</p>
       <pre><code class="language-python"># ShuffledHashJoin: both sides shuffled, smaller builds hash table
 # Faster than SMJ when skipping sort is possible
 # Requires: spark.sql.join.preferSortMergeJoin = false
@@ -1064,10 +1068,11 @@ customers.write \
     .sortBy("customer_id") \
     .saveAsTable("customers_bucketed")
 
-# Join on bucketed tables — NO SHUFFLE, NO SORT at query time
+# Join on bucketed tables — can eliminate shuffle and sort when both
+# tables are bucketed compatibly and Spark can exploit that metadata
 orders_b = spark.table("orders_bucketed")
 customers_b = spark.table("customers_bucketed")
-joined = orders_b.join(customers_b, "customer_id")  # Direct SortMergeJoin, 0 shuffle</code></pre>
+joined = orders_b.join(customers_b, "customer_id")  # SortMergeJoin, reduced/no shuffle</code></pre>
     </section>
 
     <!-- ═══════════════════════════════════════════════════════════════
@@ -1083,7 +1088,7 @@ joined = orders_b.join(customers_b, "customer_id")  # Direct SortMergeJoin, 0 sh
         <li><strong>Cardinality estimation errors</strong> — Complex predicates, UDFs, and correlated columns make accurate estimation nearly impossible.</li>
         <li><strong>Runtime data characteristics</strong> — Actual shuffle partition sizes and skew patterns are unknowable at plan time.</li>
       </ul>
-      <p>AQE (enabled by default in Spark 3.2+) addresses these by re-optimizing the query plan <em>between stages</em>, using actual runtime statistics from completed shuffle map stages.</p>
+      <p>AQE (production-ready since Spark 3.0, enabled by default in Spark 3.2+) addresses these by re-optimizing the query plan <em>between stages</em>, using actual runtime statistics from completed shuffle map stages.</p>
 
       <pre><code class="language-python"># Enable AQE (default true since Spark 3.2)
 spark.conf.set("spark.sql.adaptive.enabled", "true")
@@ -1883,7 +1888,7 @@ spark.conf.set("spark.metrics.conf.*.sink.prometheusServlet.path", "/metrics/pro
           </tr>
           <tr>
             <td>Using <code>.distinct()</code> when <code>.dropDuplicates(subset)</code> suffices</td>
-            <td><code>.distinct()</code> shuffles ALL columns; <code>.dropDuplicates(["key"])</code> shuffles only the key columns</td>
+            <td><code>.distinct()</code> uses all columns as the grouping key for deduplication; <code>.dropDuplicates(["key"])</code> only uses specified columns as the grouping key, which is more efficient when full-row uniqueness isn't needed</td>
             <td>Use <code>.dropDuplicates()</code> with explicit columns when full-row uniqueness isn't needed</td>
           </tr>
         </tbody>
@@ -2017,7 +2022,7 @@ spark.conf.set("spark.metrics.conf.*.sink.prometheusServlet.path", "/metrics/pro
       <ul>
         <li><strong>"What is Photon?"</strong> — Databricks' native C++ execution engine that replaces Spark's JVM-based execution. Uses vectorized processing (operates on column batches, not individual rows), SIMD instructions, and pre-compiled operators instead of code generation. Can be 2–8× faster than standard Spark for scan/filter/join heavy workloads.</li>
         <li><strong>"How does Spark handle out-of-core processing (data larger than memory)?"</strong> — External sort spills sorted runs to disk and merge-sorts them. External hash aggregation spills hash table entries when memory is full. SortMergeJoin is inherently streaming (bounded memory). The key metric: if you see shuffle spill in the UI, the operation went out-of-core — not a failure, but slower than in-memory.</li>
-        <li><strong>"What changes in Spark 4.0?"</strong> — Spark Connect (client-server architecture), ANSI SQL compliance by default, Variant data type for semi-structured data, improved Python API (type hints, pandas-native operations), removal of deprecated Mesos support, and new streaming state management backend.</li>
+        <li><strong>"What changes in Spark 4.0?"</strong> — Spark Connect (client-server architecture), ANSI SQL compliance by default, enhanced Variant data type for semi-structured data (introduced in 3.5, expanded in 4.0), improved Python API (type hints, pandas-native operations), removal of deprecated Mesos support, and new streaming state management backend.</li>
       </ul>
     </section>
 

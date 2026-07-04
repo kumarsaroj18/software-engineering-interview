@@ -90,7 +90,7 @@
         <p>A production real-time event processing pipeline consists of:</p>
         <ol>
           <li><strong>Ingestion layer:</strong> Kafka (or Kinesis/Pulsar) as a durable, partitioned event log with configurable retention.</li>
-          <li><strong>Processing engine:</strong> Apache Flink for true record-at-a-time processing with event-time semantics, keyed state, and exactly-once via distributed snapshots (Chandy-Lamport).</li>
+          <li><strong>Processing engine:</strong> Apache Flink for logical record-at-a-time streaming with pipelined execution, event-time semantics, keyed state, and exactly-once state consistency via distributed snapshots (inspired by Chandy-Lamport). End-to-end exactly-once requires cooperation from both source (replayable) and sink (idempotent or transactional).</li>
           <li><strong>Windowing &amp; watermarks:</strong> Assign events to windows based on event time; use watermarks to track progress and trigger window computations; configure allowed lateness for stragglers.</li>
           <li><strong>State management:</strong> RocksDB state backend for large state with incremental checkpointing; heap for low-latency small state.</li>
           <li><strong>Sink layer:</strong> Write results to downstream systems (OLAP stores, caches, alerting) with idempotent writes for end-to-end exactly-once.</li>
@@ -331,7 +331,7 @@ events
 
       <h3>What is a Watermark?</h3>
       <p>A watermark is a <strong>monotonically advancing assertion</strong> that says: "I believe no more events with event time ≤ W(t) will arrive." It's the mechanism by which a streaming engine tracks event-time progress and decides when to fire windows.</p>
-      <p>Crucially, watermarks are <em>heuristic</em> — they can be wrong. An event may arrive after its watermark has passed (a "late" event). The system must handle this gracefully.</p>
+      <p>Crucially, watermarks are <em>heuristic</em> — they can be wrong. A watermark represents confidence rather than certainty; the engine accepts that some events may still arrive after the watermark has passed. An event may arrive after its watermark has passed (a "late" event). The system must handle this gracefully.</p>
 
       <h3>Watermark Generation Strategies</h3>
       <table class="comparison-table">
@@ -495,11 +495,11 @@ env.setStateBackend(new HashMapStateBackend());
         </thead>
         <tbody>
           <tr><td>Max state size</td><td>Disk-bound (TBs)</td><td>JVM heap (10s of GBs)</td></tr>
-          <tr><td>Access latency</td><td>~10–100μs (disk/SSD)</td><td>~100ns (memory)</td></tr>
+          <tr><td>Access latency</td><td>Typically microseconds from block cache; SSD access on cache misses</td><td>~100ns (memory)</td></tr>
           <tr><td>Serialization</td><td>Every access (ser/deser overhead)</td><td>None (Java objects on heap)</td></tr>
           <tr><td>Incremental checkpoints</td><td>Yes (only changed SST files)</td><td>No (full snapshot each time)</td></tr>
           <tr><td>GC pressure</td><td>Minimal (off-heap)</td><td>High (large heap = long GC pauses)</td></tr>
-          <tr><td>Best for</td><td>Large state, production workloads</td><td>Small state, development/testing</td></tr>
+          <tr><td>Best for</td><td>Large state, production workloads</td><td>Workloads with modest state that fits in memory</td></tr>
         </tbody>
       </table>
 
@@ -570,7 +570,7 @@ ValueState&lt;UserSession&gt; sessionState =
 #                  └── Partition 2: [msg2, msg5, msg8, msg11, ...]
 #
 # Key insight: ordering guaranteed WITHIN a partition, not across partitions.
-# Partition assignment: hash(key) % num_partitions</code></pre>
+# Partition assignment: Kafka's default partitioner uses murmur2(key) % num_partitions</code></pre>
 
       <h3>Topics and Partitions</h3>
       <table class="comparison-table">
@@ -682,8 +682,8 @@ KafkaSource&lt;Event&gt; source = KafkaSource.&lt;Event&gt;builder()
         <tbody>
           <tr>
             <td><strong>Processing Model</strong></td>
-            <td>True record-at-a-time streaming</td>
-            <td>Micro-batch (continuous mode experimental)</td>
+            <td>Logical record-at-a-time streaming with pipelined execution</td>
+            <td>Micro-batch (continuous mode exists but is limited and rarely used in production)</td>
             <td>Record-at-a-time (library, not framework)</td>
           </tr>
           <tr>
@@ -706,13 +706,13 @@ KafkaSource&lt;Event&gt; source = KafkaSource.&lt;Event&gt;builder()
           </tr>
           <tr>
             <td><strong>Exactly-Once</strong></td>
-            <td>Distributed snapshots (Chandy-Lamport)</td>
+            <td>Distributed snapshots (inspired by Chandy-Lamport)</td>
             <td>Micro-batch transactional writes</td>
             <td>Kafka transactions (EOS)</td>
           </tr>
           <tr>
             <td><strong>Deployment</strong></td>
-            <td>Standalone, YARN, K8s, managed (AWS KDA)</td>
+            <td>Standalone, YARN, K8s, managed (Amazon Managed Service for Apache Flink)</td>
             <td>Standalone, YARN, K8s, Databricks</td>
             <td>Any JVM process — no cluster needed</td>
           </tr>
@@ -725,7 +725,7 @@ KafkaSource&lt;Event&gt; source = KafkaSource.&lt;Event&gt;builder()
           <tr>
             <td><strong>Session Windows</strong></td>
             <td>Native with merging</td>
-            <td>Not natively supported (workarounds exist)</td>
+            <td>Supported since Spark 3.2+ via session_window()</td>
             <td>Supported with SessionWindows</td>
           </tr>
           <tr>
@@ -791,11 +791,12 @@ spark.readStream \
     .start()
 
 # Even with trigger=10s, actual end-to-end latency includes:
-# - Trigger scheduling overhead: ~50ms
-# - Batch planning: ~100ms
+# - Trigger scheduling overhead
+# - Batch planning
 # - Actual processing: variable
-# - Write commit: ~50ms
-# Total: 300ms–2s even for small batches</code></pre>
+# - Write commit
+# Total: typically several hundred milliseconds to a few seconds
+#        depending on trigger interval and workload</code></pre>
     </section>
 
 
@@ -807,7 +808,7 @@ spark.readStream \
       <p>In distributed systems, out-of-order arrival is the <em>default</em>, not the exception. Causes include:</p>
       <ul>
         <li><strong>Multi-path routing:</strong> Events from the same user may traverse different network paths with different latencies.</li>
-        <li><strong>Partition rebalancing:</strong> Kafka consumer group rebalances can cause temporary ordering disruptions across partitions.</li>
+        <li><strong>Partition rebalancing:</strong> Kafka consumer group rebalances pause consumption temporarily; ordering within each partition is preserved, but events from different partitions may appear to arrive in a different relative order to the new consumer assignment.</li>
         <li><strong>Producer retries:</strong> A producer retrying a failed send may deliver event N+1 before event N's retry succeeds.</li>
         <li><strong>Geographic distribution:</strong> Events from a user in Tokyo and another in NYC arrive at different times despite occurring simultaneously.</li>
         <li><strong>Offline/batch upload:</strong> Mobile devices or IoT sensors that buffer events and upload in bursts.</li>
@@ -855,7 +856,7 @@ SingleOutputStreamOperator&lt;Result&gt; mainStream = events
 DataStream&lt;Event&gt; lateStream = mainStream.getSideOutput(lateEvents);
 
 lateStream
-    .addSink(new KafkaSink&lt;&gt;("late-events-topic"))  // dead letter queue
+    .addSink(new KafkaSink&lt;&gt;("late-events-topic"))  // reprocessing topic for late events
     .name("late-events-sink");</code></pre>
 
       <h3>Reprocessing Strategy for Late Data</h3>
@@ -962,7 +963,7 @@ kafka-consumer-groups.sh \
 # user-events  2          14521567        14521567        0
 #
 # Total lag: 659 messages
-# At 1KB/msg: ~659 KB behind
+# Assuming average message size of ~1KB: ~659 KB behind
 # At 100K msg/sec: ~6ms behind (healthy)</code></pre>
 
       <pre><code class="language-python"># Consumer lag alerting thresholds
@@ -1143,14 +1144,17 @@ public class AsyncDatabaseLookup
       <h3>Resolution Steps</h3>
       <ol>
         <li><strong>Immediate (30 min):</strong> Increased allowed lateness to 5 minutes via Flink REST API + savepoint restart.</li>
-        <li><strong>Short-term (2 hours):</strong> Scaled up Flink parallelism from 32 to 64 TaskManagers to chew through backlog.</li>
+        <li><strong>Short-term (2 hours):</strong> Scaled up Flink parallelism from 32 to 64 TaskManagers to chew through backlog. Note: scaling resolved the throughput backlog but did not recover events that had already been dropped due to the watermark configuration.</li>
         <li><strong>Catchup (4 hours):</strong> Pipeline caught up to real-time after processing backlog at 2x speed.</li>
-        <li><strong>Reconciliation (next day):</strong> Batch job reprocessed the affected 6-hour window from Kafka (7-day retention) to produce corrected billing numbers.</li>
+        <li><strong>Reconciliation (next day):</strong> Batch job reprocessed the affected 6-hour window from Kafka (7-day retention) to produce corrected billing numbers. This was the only way to restore correctness for the dropped events.</li>
       </ol>
 
       <h3>Prevention Measures Implemented</h3>
       <pre><code class="language-java">// 1. Adaptive watermark based on observed lateness distribution
-// Instead of fixed 10s, dynamically adjust based on p99 lateness
+// Instead of fixed 10s, dynamically adjust based on p99 lateness.
+// Note: this heuristic uses wall-clock time minus event time, which mixes
+// processing time with event time. Alternative approaches track purely
+// event-time disorder between consecutive events.
 public class AdaptiveWatermark implements WatermarkGenerator&lt;Event&gt; {
   private final DescriptiveStatistics latencyStats =
       new DescriptiveStatistics(10_000);  // sliding window of 10K samples
@@ -1185,7 +1189,7 @@ public class AdaptiveWatermark implements WatermarkGenerator&lt;Event&gt; {
       <h3>Lessons Learned</h3>
       <ul>
         <li><strong>Watermarks must account for worst-case, not average-case lateness.</strong> 10s works in steady state but fails during traffic spikes when network congestion causes buffering.</li>
-        <li><strong>Allowed lateness is your second line of defense — size it generously.</strong> The state cost of keeping windows open 5 minutes longer is trivial compared to data loss.</li>
+        <li><strong>Allowed lateness is your second line of defense — size it generously.</strong> For many production workloads, modestly increasing allowed lateness is often cheaper than losing business-critical events, though it does increase retained state proportionally.</li>
         <li><strong>Monitor the late-event ratio as a leading indicator.</strong> By the time consumer lag is hours, the damage is already done.</li>
         <li><strong>Design for reprocessing from day one.</strong> The batch reconciliation job saved us because Kafka retention was sufficient and the sink was idempotent.</li>
         <li><strong>Alerting must be actionable.</strong> 47 simultaneous alerts is noise. One alert that says "late-event ratio &gt; 5% — consider increasing watermark tolerance" is signal.</li>
@@ -1252,7 +1256,7 @@ public class RealtimeRevenueJob {
     revenue.addSink(new ClickHouseSink&lt;&gt;("revenue_5min"))
         .name("clickhouse-sink");
 
-    // Late data → DLQ for reprocessing
+    // Late data → reprocessing topic
     revenue.getSideOutput(lateOrders)
         .addSink(new KafkaSink&lt;&gt;("late-orders-dlq"))
         .name("late-orders-dlq");
@@ -1319,15 +1323,16 @@ public class ClickStreamTopology {
             .withTimestampExtractor(new ClickEventTimestampExtractor())
     );
 
-    // Branch: separate page views from button clicks
-    KStream&lt;String, ClickEvent&gt;[] branches = clicks.branch(
-        (key, event) -&gt; event.getType() == ClickType.PAGE_VIEW,
-        (key, event) -&gt; event.getType() == ClickType.BUTTON_CLICK,
-        (key, event) -&gt; true  // catch-all
-    );
+    // Branch: separate page views from button clicks (using split() API, KS 3.0+)
+    Map&lt;String, KStream&lt;String, ClickEvent&gt;&gt; branches = clicks.split(Named.as("click-"))
+        .branch((key, event) -&gt; event.getType() == ClickType.PAGE_VIEW,
+            Branched.as("page-views"))
+        .branch((key, event) -&gt; event.getType() == ClickType.BUTTON_CLICK,
+            Branched.as("button-clicks"))
+        .defaultBranch(Branched.as("other"));
 
-    KStream&lt;String, ClickEvent&gt; pageViews = branches[0];
-    KStream&lt;String, ClickEvent&gt; buttonClicks = branches[1];
+    KStream&lt;String, ClickEvent&gt; pageViews = branches.get("click-page-views");
+    KStream&lt;String, ClickEvent&gt; buttonClicks = branches.get("click-button-clicks");
 
     // Windowed aggregation: page views per URL per minute
     KTable&lt;Windowed&lt;String&gt;, Long&gt; pageViewCounts = pageViews
@@ -1376,11 +1381,12 @@ from pyspark.sql.types import (
 spark = SparkSession.builder \
     .appName("RealTimeEventProcessing") \
     .config("spark.sql.shuffle.partitions", "64") \
-    .config("spark.streaming.backpressure.enabled", "true") \
     .config("spark.sql.streaming.stateStore.providerClass",
             "org.apache.spark.sql.execution.streaming.state."
             "RocksDBStateStoreProvider") \
     .getOrCreate()
+# Note: RocksDBStateStoreProvider is available in Spark 3.2+ (Databricks)
+# and open-source Spark 3.5+. Earlier versions use the default HDFS-backed store.
 
 # Define schema for Kafka events
 event_schema = StructType([
@@ -1631,19 +1637,19 @@ query.awaitTermination()</code></pre>
           </tr>
           <tr>
             <td><strong>At-least-once</strong></td>
-            <td>Moderate overhead (~5-10%)</td>
+            <td>Moderate overhead (varies by workload)</td>
             <td>Retry on failure; possible duplicates</td>
             <td>Most use cases where sink is idempotent</td>
           </tr>
           <tr>
             <td><strong>Exactly-once (internal)</strong></td>
-            <td>~10-20% overhead</td>
+            <td>Noticeable overhead (varies by workload; barrier alignment cost)</td>
             <td>Distributed snapshots + barrier alignment</td>
             <td>Stateful computations where duplicates corrupt results</td>
           </tr>
           <tr>
             <td><strong>Exactly-once (end-to-end)</strong></td>
-            <td>~20-40% overhead</td>
+            <td>Significant overhead (varies by workload; 2PC adds latency)</td>
             <td>Checkpoints + transactional sinks (2PC)</td>
             <td>Financial systems, billing, compliance-critical pipelines</td>
           </tr>

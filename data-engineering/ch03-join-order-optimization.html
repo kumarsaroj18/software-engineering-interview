@@ -91,7 +91,7 @@
         <summary>30-second elevator pitch</summary>
         <blockquote class="callout-tip">
           <p><strong>Query optimizers determine join order through cost-based enumeration.</strong> They estimate the cardinality (row count) of each intermediate join result using table statistics (histograms, NDV, null fractions), then enumerate possible join orderings — using dynamic programming for small table counts (&lt;12) or heuristic/genetic algorithms for larger counts. Each candidate plan is scored by a cost model that accounts for I/O, CPU, memory, and (in distributed systems) shuffle/network cost. The optimizer picks the plan with the lowest estimated total cost.</p>
-          <p>The critical insight: for N tables, there are <code>(2N-2)! / (N-1)!</code> possible join trees. A 10-table join has ~17 billion possible orderings. The optimizer must prune this search space efficiently while avoiding plans that produce massive intermediate results.</p>
+          <p>The critical insight: the search space of possible join orderings grows super-exponentially with table count. A 10-table join has tens of billions of possible bushy join plans, making exhaustive enumeration impractical. The optimizer must prune this search space efficiently while avoiding plans that produce massive intermediate results.</p>
           <p>In practice, join order optimization fails when: (1) statistics are stale or missing, (2) the independence assumption between columns is violated, or (3) correlated predicates cause cardinality underestimation that cascades through the plan.</p>
         </blockquote>
       </details>
@@ -214,7 +214,7 @@ JOIN dim_product p ON p.product_id = f.product_id;
 --        (Batches > 1 = spilled to disk!)</code></pre>
 
         <h4>Build Side Selection is Critical</h4>
-        <p>The optimizer <strong>always</strong> puts the smaller table on the build side. If it gets this wrong (due to bad cardinality estimates), the hash table won't fit in memory, causing spill and potentially 10-100x slowdown.</p>
+        <p>The optimizer <strong>generally prefers</strong> the smaller estimated input as the build side, because it minimizes memory usage. If it gets this wrong (due to bad cardinality estimates), the hash table won't fit in memory, causing spill that can dramatically increase execution time.</p>
       </details>
 
       <details>
@@ -252,7 +252,7 @@ def sort_merge_join(left_table, right_table, join_key):
         <h4>When Optimizers Choose Sort-Merge</h4>
         <ul>
           <li><strong>Pre-sorted data</strong> — Both inputs come from index scans or prior sorts (eliminates sort phase cost)</li>
-          <li><strong>Range joins</strong> — For <code>BETWEEN</code>, <code>&lt;</code>, <code>&gt;</code> conditions where hash cannot be used</li>
+          <li><strong>Range joins</strong> — For <code>BETWEEN</code>, <code>&lt;</code>, <code>&gt;</code> conditions in engines with mergejoinable inequality operators (engine-specific; not all engines support this)</li>
           <li><strong>Very large tables</strong> — When neither fits in memory but both can be sorted externally</li>
           <li><strong>Merge-join-able operators</strong> — Equality on sortable data types</li>
         </ul>
@@ -308,7 +308,7 @@ ORDER BY t.event_id;
               <td>O(sort buffers)</td>
               <td>Pre-sorted inputs, range joins</td>
               <td>Random order, high cardinality keys</td>
-              <td>✅ Yes (sortable ops)</td>
+              <td>✅ Yes (mergejoinable ops, engine-specific)</td>
             </tr>
           </tbody>
         </table>
@@ -321,7 +321,8 @@ ORDER BY t.event_id;
 │  Is it an equi-join (=)?                                     │
 │  ├── NO  → Is one side small (&lt;1000 rows)?                  │
 │  │         ├── YES → Nested Loop (with index if available)   │
-│  │         └── NO  → Sort-Merge Join                         │
+│  │         └── NO  → Nested Loop or Sort-Merge (if engine   │
+│  │                    supports mergejoinable inequality ops)  │
 │  └── YES → Is one side small enough for memory?              │
 │            ├── YES → Hash Join (small=build, large=probe)    │
 │            └── NO  → Are both sides pre-sorted?              │
@@ -356,8 +357,7 @@ ORDER BY t.event_id;
             <tr><td>15</td><td>1.3 × 10¹²</td><td>astronomical</td><td>intractable</td></tr>
           </tbody>
         </table>
-        <p>The formula for bushy trees with N relations is: <code>C(N) = (2N-2)! / (N-1)!</code></p>
-        <p>This is why exhaustive enumeration is only feasible for small N (typically ≤ 10-12 tables).</p>
+        <p>The formula for bushy trees with N relations is: <code>N! × Catalan(N-1)</code> — i.e., all permutations times the number of distinct tree shapes. This is why exhaustive enumeration is only feasible for small N (typically ≤ 10-12 tables).</p>
       </details>
 
       <details>
@@ -516,11 +516,12 @@ SET geqo_seed = 0.0;              -- Random seed for reproducibility</code></pre
 │  3. T2 ⋈ D → result         3. T1 ⋈ T2 → result            │
 │                                                              │
 │  Properties:                 Properties:                     │
-│  • N! orderings              • (2N-2)!/(N-1)! orderings     │
+│  • N! orderings              • N! × Catalan(N-1) orderings  │
 │  • Easy to pipeline          • Better for parallel engines   │
 │  • Can stream probe side     • Can reduce intermediates      │
-│  • PostgreSQL prefers this   • Spark/BigQuery allow this     │
-│  • work_mem: one hash table  • work_mem: multiple hash tbls  │
+│  • PostgreSQL commonly       • Spark/BigQuery explore these  │
+│    produces left-deep plans  • work_mem: multiple hash tbls  │
+│  • work_mem: one hash table                                  │
 └─────────────────────────────────────────────────────────────┘</code></pre>
 
         <h4>Why Left-Deep Trees Dominate in Row-Store OLTP</h4>
@@ -638,7 +639,7 @@ WHERE country = 'Japan' AND city = 'Tokyo';
           <li><strong>Foreign key implied correlation</strong>: After joining, predicates on the FK table are correlated with the PK table's columns</li>
         </ul>
 
-        <h4>PostgreSQL Extended Statistics (v12+)</h4>
+        <h4>PostgreSQL Extended Statistics (v10+, enhanced with MCV in v12)</h4>
         <pre><code class="language-sql">-- Create extended statistics for correlated columns
 CREATE STATISTICS stat_country_city (dependencies, ndistinct, mcv)
 ON country, city FROM customers;
@@ -735,7 +736,7 @@ WHERE o.created_at >= '2024-01-01'
       <details>
         <summary>BigQuery</summary>
         <h4>Automatic Optimization with Slot-Based Cost Model</h4>
-        <p>BigQuery's optimizer is fully automatic — no user hints for join order. Key characteristics:</p>
+        <p>BigQuery's optimizer largely determines join order automatically, with only limited optimizer hints available (e.g., <code>JOIN_METHOD</code>). Key characteristics:</p>
         <ul>
           <li><strong>Distributed cost model</strong>: Accounts for slot-hours (CPU), shuffle bytes, and memory per slot</li>
           <li><strong>Automatic repartitioning</strong>: Decides whether to broadcast or hash-partition each join side</li>
@@ -765,7 +766,7 @@ ORDER BY stage_id;
         <h4>BigQuery Cost Model Priorities</h4>
         <ol>
           <li><strong>Minimize shuffle bytes</strong> — Moving data between slots is expensive</li>
-          <li><strong>Broadcast small tables</strong> — If table &lt; ~100MB, broadcast to avoid shuffle</li>
+          <li><strong>Broadcast small tables</strong> — Sufficiently small tables are typically broadcast to avoid shuffle (threshold determined by the optimizer)</li>
           <li><strong>Filter pushdown</strong> — Apply WHERE clauses before joins to reduce data</li>
           <li><strong>Partition pruning</strong> — Eliminate partitions before considering join order</li>
         </ol>
@@ -776,7 +777,7 @@ ORDER BY stage_id;
         <h4>Micro-Partition Pruning Informs Join Order</h4>
         <p>Snowflake's optimizer is unique because its micro-partition metadata heavily influences join ordering:</p>
         <ul>
-          <li><strong>Micro-partition statistics</strong>: Min/max values, NDV, null count per micro-partition (16MB chunks)</li>
+          <li><strong>Micro-partition statistics</strong>: Min/max values, NDV, null count per micro-partition (50-500MB uncompressed each)</li>
           <li><strong>Pruning-aware costing</strong>: A join that allows pruning 90% of a fact table's partitions is dramatically cheaper</li>
           <li><strong>Automatic clustering</strong>: Tables clustered on join keys have better locality → cheaper merge joins</li>
           <li><strong>Result caching</strong>: Prior query results cached, effectively making some "joins" free</li>
@@ -802,7 +803,7 @@ $$);
         <h4>Snowflake's Unique Optimizations</h4>
         <ul>
           <li><strong>Predicate pushdown through joins</strong>: <code>WHERE dim.year = 2024</code> → derives date range → prunes fact table partitions</li>
-          <li><strong>Dynamic partition pruning</strong>: At runtime, after scanning the dim filter, constructs a bloom filter to prune fact partitions</li>
+          <li><strong>Dynamic partition pruning</strong>: At runtime, after scanning the dimension filter, applies runtime filtering to prune additional fact table micro-partitions</li>
           <li><strong>Join order influenced by pruning potential</strong>: Optimizer prefers to join dimension tables with the most selective filters first, maximizing fact table pruning</li>
         </ul>
       </details>
@@ -812,7 +813,7 @@ $$);
         <h4>Cost-Based Optimization with ANALYZE TABLE</h4>
         <p>Spark's Catalyst optimizer has evolved from purely rule-based to hybrid CBO:</p>
 
-        <pre><code class="language-sql">-- Enable Spark CBO (disabled by default in some versions)
+        <pre><code class="language-sql">-- Enable Spark CBO (may require enabling depending on distribution/version)
 SET spark.sql.cbo.enabled = true;
 SET spark.sql.cbo.joinReorder.enabled = true;
 SET spark.sql.cbo.joinReorder.dp.threshold = 12;
@@ -917,7 +918,7 @@ df.explain(mode="formatted")</code></pre>
 │  dim_customer (1M rows, 50MB)  → PROBE                       │
 │                                                              │
 │  Memory needed: 5GB (exceeds work_mem → SPILL TO DISK!)      │
-│  Spill: Multiple batches, random I/O, 10-100x slower         │
+│  Spill: Multiple batches, random I/O, dramatically slower    │
 │  Time: Same O(101M) ops BUT with disk spill overhead         │
 │                                                              │
 │  RESULT: Same logical answer, 10-50x performance difference  │
@@ -929,7 +930,7 @@ df.explain(mode="formatted")</code></pre>
         <p>When the build side exceeds available memory:</p>
         <ol>
           <li><strong>PostgreSQL</strong>: Hash join switches to multi-batch mode. Tuples are partitioned by hash into batches. Only one batch at a time fits in <code>work_mem</code>. Each additional batch requires re-reading probe-side tuples from disk.</li>
-          <li><strong>Spark</strong>: <code>ShuffledHashJoinExec</code> spills build-side partitions to disk via <code>UnsafeExternalSorter</code>. Configurable via <code>spark.sql.autoBroadcastJoinThreshold</code> (default 10MB).</li>
+          <li><strong>Spark</strong>: <code>ShuffledHashJoinExec</code> spills build-side partitions to disk when memory is insufficient. If the build side is too large, Spark may fall back to <code>SortMergeJoin</code>. The broadcast threshold is controlled by <code>spark.sql.autoBroadcastJoinThreshold</code> (default 10MB) — tables below this threshold skip shuffling entirely via broadcast.</li>
           <li><strong>Snowflake</strong>: Automatically spills to remote storage (S3/Azure Blob). "Bytes spilled to local/remote storage" in query profile.</li>
         </ol>
 
@@ -1180,9 +1181,9 @@ GROUP BY d.date_key, s.store_name, p.category, c.segment,
 │     → Expected 25K rows after join (actual: 75M)             │
 │     → NLJ on 75M rows × index lookup = CATASTROPHE           │
 │                                                              │
-│  5. GEQO kicked in (12 tables > geqo_threshold)             │
-│     → Genetic algorithm found a "good" plan based on BAD     │
-│       cardinality estimates → amplified the error            │
+│  5. GEQO kicked in (12 tables ≥ geqo_threshold)             │
+│     → Genetic algorithm converged on a plan based on         │
+│       incorrect cardinality estimates                         │
 └─────────────────────────────────────────────────────────────┘</code></pre>
 
         <h4>The Bad Plan (EXPLAIN excerpt)</h4>
@@ -1252,8 +1253,9 @@ END $$;</code></pre>
         <summary>Lessons Learned</summary>
         <ul>
           <li><strong>Statistics are the optimizer's eyes.</strong> Stale stats = blind optimizer. Always ANALYZE after bulk operations.</li>
+          <li><strong>Stale statistics don't directly cause regressions — algorithm selection does.</strong> The 3x cardinality error itself wasn't catastrophic; it became catastrophic because it caused the optimizer to select nested loop joins instead of hash joins on millions of rows.</li>
           <li><strong>Partition-level stats are separate.</strong> Analyzing the parent doesn't always update partition stats (depends on version).</li>
-          <li><strong>GEQO amplifies bad estimates.</strong> Genetic algorithms optimize relative to the cost model — if the cost model's inputs are wrong, GEQO finds the "best" bad plan.</li>
+          <li><strong>GEQO can only optimize according to the cost estimates it receives.</strong> Incorrect cardinality estimates lead it to converge on a poor plan — it finds the "best" plan relative to wrong inputs.</li>
           <li><strong>Monitor estimation accuracy, not just query time.</strong> A 3x estimation error today becomes a 30x error tomorrow as data grows.</li>
           <li><strong>Have an emergency playbook:</strong> Know how to force join order (<code>join_collapse_limit=1</code>) and disable GEQO as immediate mitigations.</li>
         </ul>
@@ -1650,7 +1652,7 @@ result = session.execute(query, {"year": 2024, "quarter": 2, "country": "US"})</
             <tr>
               <td>Ignoring hash join spill warnings</td>
               <td>"Query returns correct results so it's fine"</td>
-              <td>10-100x performance degradation from disk I/O</td>
+              <td>Significant performance degradation from disk I/O</td>
               <td>Monitor Batches>1 (PG) or spill metrics (Spark); increase work_mem or fix build side selection</td>
             </tr>
             <tr>
@@ -1757,7 +1759,7 @@ result = session.execute(query, {"year": 2024, "quarter": 2, "country": "US"})</
             <tr>
               <td>Search space size</td>
               <td>N! (manageable)</td>
-              <td>(2N-2)!/(N-1)! (exponentially larger)</td>
+              <td>N! × Catalan(N-1) (exponentially larger)</td>
             </tr>
             <tr>
               <td>Planning time</td>
@@ -1886,7 +1888,7 @@ result = session.execute(query, {"year": 2024, "quarter": 2, "country": "US"})</
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
 │  WHAT: Choosing the sequence in which tables are joined      │
-│  WHY:  N tables = (2N-2)!/(N-1)! possible plans            │
+│  WHY:  The search space grows super-exponentially with N     │
 │        Wrong order → 100-1000x performance difference        │
 │                                                              │
 │  HOW OPTIMIZERS DECIDE:                                      │
@@ -1915,7 +1917,7 @@ result = session.execute(query, {"year": 2024, "quarter": 2, "country": "US"})</
 │                                                              │
 │  ENGINE-SPECIFIC:                                            │
 │  • PostgreSQL: DP + GEQO, join_collapse_limit, pg_hint_plan │
-│  • BigQuery:   Automatic, slot-based, no user hints          │
+│  • BigQuery:   Largely automatic, slot-based, limited hints  │
 │  • Snowflake:  Micro-partition pruning, dynamic pruning      │
 │  • Spark:      Catalyst CBO, broadcast hints, AQE           │
 │                                                              │

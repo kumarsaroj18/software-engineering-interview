@@ -59,7 +59,7 @@
       </div>
       <h1>How Do You Guarantee Exactly-Once Processing?</h1>
       <p class="chapter-takeaway">
-        <strong>Key Takeaway:</strong> True exactly-once is impossible in distributed systems. We achieve "effectively exactly-once" through the combination of idempotent producers, transactional processing with checkpoints, and idempotent sinks — making duplicates invisible to the end result.
+        <strong>Key Takeaway:</strong> True end-to-end exactly-once delivery across distributed systems is impossible. Modern streaming systems achieve "effectively exactly-once" through the combination of idempotent producers, transactional processing with checkpoints, and idempotent sinks — making duplicates invisible to the end result.
       </p>
     </header>
 
@@ -247,9 +247,10 @@ Producer ──▶ Broker ──▶ Consumer
           </li>
           <li>
             <strong>FLP Impossibility:</strong> In an asynchronous system with even one faulty
-            process, no deterministic algorithm can guarantee consensus. Since exactly-once
-            requires consensus on whether a message was processed, it cannot be guaranteed
-            in all cases.
+            process, no deterministic algorithm can guarantee consensus. Because distributed
+            systems cannot always distinguish between message loss, acknowledgment loss, and
+            process failure, perfect delivery semantics cannot be guaranteed under all failure
+            scenarios.
           </li>
           <li>
             <strong>Network Partitions:</strong> During a partition, the sender cannot distinguish
@@ -486,16 +487,16 @@ consumerProps.put("auto.offset.reset", "earliest");
 
         <h3>Idempotent Producer (enable.idempotence=true)</h3>
         <p>
-          Kafka's idempotent producer eliminates duplicates caused by producer retries. Each
+          Kafka's idempotent producer prevents duplicate writes caused by producer retries
+          within a producer session for each partition. Each
           message batch is assigned a sequence number; the broker deduplicates based on
-          (PID, partition, sequence number). This is a prerequisite for transactions and
-          provides per-partition exactly-once for individual produce calls:
+          (PID, partition, sequence number). This is a prerequisite for transactions:
         </p>
         <ul>
           <li>Handles network retries transparently—duplicate sends are detected and discarded</li>
           <li>Ensures in-order delivery per partition even with <code>max.in.flight.requests.per.connection=5</code></li>
           <li>Requires <code>acks=all</code> to prevent data loss on leader failover</li>
-          <li>The broker maintains a sliding window of 5 sequence numbers per PID/partition</li>
+          <li>The broker tracks the last 5 in-flight request batches per producer ID/partition pair for deduplication</li>
         </ul>
 
         <h3>Transaction Performance Considerations</h3>
@@ -512,7 +513,7 @@ consumerProps.put("auto.offset.reset", "earliest");
               <tr>
                 <td><code>transaction.timeout.ms</code></td>
                 <td>Max time before coordinator aborts transaction</td>
-                <td>Set to 2-3x your expected processing time; default 60000ms</td>
+                <td>Set comfortably above the worst-case checkpoint completion time; default 60000ms</td>
               </tr>
               <tr>
                 <td><code>max.block.ms</code></td>
@@ -802,17 +803,19 @@ ON DUPLICATE KEY UPDATE
           appending to a log), use a deduplication table to track processed event IDs:
         </p>
         <pre><code class="language-sql">
--- Deduplication with transactional check-and-insert
+-- Atomic deduplication with INSERT ON CONFLICT (race-condition-safe)
 BEGIN;
 
--- Check if we've already processed this event
-SELECT 1 FROM processed_events WHERE event_id = $1;
-
--- If not found, process it
+-- Attempt to insert into dedup table; if already exists, do nothing
 INSERT INTO processed_events (event_id, processed_at)
-VALUES ($1, NOW());
+VALUES ($1, NOW())
+ON CONFLICT (event_id) DO NOTHING;
 
--- Apply the non-idempotent operation
+-- Check if the insert succeeded (row was new)
+-- If 0 rows affected, this is a duplicate — skip the business logic
+-- If 1 row affected, apply the non-idempotent operation
+-- (In application code: check affected row count before proceeding)
+
 UPDATE account_balances
 SET balance = balance + $2
 WHERE account_id = $3;
@@ -892,7 +895,7 @@ DROP TABLE processed_events_20231225;
         <p>
           Google BigQuery's streaming insert API provides built-in deduplication through
           <code>insertId</code>. Records with the same insertId are deduplicated within a
-          time window (best effort, approximately 1 minute):
+          limited best-effort deduplication window:
         </p>
         <pre><code class="language-python">
 # BigQuery streaming insert with deduplication
@@ -996,7 +999,7 @@ def idempotent_write(event):
 
         <h3>Overview</h3>
         <p>
-          Two-phase commit (2PC) is a distributed consensus protocol that coordinates commits
+          Two-phase commit (2PC) is a distributed atomic commit protocol that coordinates commits
           across multiple participants to ensure atomicity. In streaming, 2PC enables exactly-once
           delivery to external systems that support transactions (databases, Kafka, etc.) by
           tying the external commit to the checkpoint completion.
@@ -1041,7 +1044,15 @@ On Failure (before checkpoint complete):
         <h3>Flink TwoPhaseCommitSinkFunction</h3>
         <p>
           Flink provides the abstract class <code>TwoPhaseCommitSinkFunction</code> that
-          implements the 2PC protocol integrated with Flink's checkpointing mechanism:
+          implements the 2PC protocol integrated with Flink's checkpointing mechanism.
+          <strong>Note:</strong> This API is considered legacy in Flink 1.14+; the newer Sink API
+          with <code>TwoPhaseCommittingSink</code> provides similar functionality with improved
+          integration. The underlying 2PC concepts remain the same.
+        </p>
+        <p>
+          <strong>PostgreSQL note:</strong> The PREPARE TRANSACTION command used below requires
+          <code>max_prepared_transactions &gt; 0</code> in postgresql.conf (disabled by default).
+          This must be configured before using 2PC sinks with PostgreSQL.
         </p>
         <pre><code class="language-java">
 // Flink Two-Phase Commit Sink for PostgreSQL
@@ -1277,7 +1288,7 @@ public class DeduplicationFunction
         <p>
           When tracking millions of event IDs, exact set membership becomes expensive. Bloom
           filters provide space-efficient probabilistic deduplication with a configurable
-          false positive rate (duplicate events incorrectly identified as new):
+          false positive rate (new events incorrectly identified as duplicates):
         </p>
         <pre><code class="language-java">
 // Bloom Filter Deduplication (space-efficient, probabilistic)
@@ -1332,8 +1343,10 @@ public class BloomFilterDedup
           <p>
             Bloom filters have false positives (marking a new event as duplicate) but never
             false negatives (never letting a true duplicate through). For exactly-once, this
-            means occasional data loss (false positive = dropped event). Use a two-tier
-            approach: Bloom filter as fast check, then exact lookup for positives.
+            means occasional data loss (false positive = dropped event). <strong>Bloom filters
+            should never be the final authority for exactly-once decisions.</strong> Use them
+            only as a fast pre-filter before an exact lookup (two-tier approach: Bloom filter
+            as fast check, then exact lookup for positives).
           </p>
         </div>
 
@@ -1442,6 +1455,8 @@ class RedisDeduplicator:
 
         <pre><code class="language-lua">
 -- Redis Lua script for atomic dedup + processing metadata
+-- Lua scripts execute atomically in Redis (no race conditions between
+-- EXISTS and SET — the entire script runs as a single uninterruptible operation)
 -- KEYS[1] = dedup key
 -- ARGV[1] = TTL in seconds
 -- ARGV[2] = event metadata (JSON)
@@ -1644,7 +1659,7 @@ writer.write("s3://bucket/savepoints/migrated-savepoint/");
               <tr>
                 <td>Resume from checkpoint</td>
                 <td>None</td>
-                <td>None (with EOS)</td>
+                <td>None (with EOS and idempotent/transactional sink)</td>
                 <td>Fast (seconds)</td>
                 <td>Automatic failure recovery</td>
               </tr>
@@ -1712,6 +1727,8 @@ End-to-End Exactly-Once = Source Guarantee + Processing Guarantee + Sink Guarant
 │ Files (S3) ✓     │                      │ BigQuery (insertId) ~     │
 │ Database CDC ✓   │                      │ S3 (rename on commit) ✓   │
 └──────────────────┴──────────────────────┴───────────────────────────┘
+
+~ indicates best-effort deduplication rather than strict exactly-once semantics.
         </code></pre>
 
         <h3>Source Requirements</h3>
@@ -1774,6 +1791,9 @@ End-to-End Exactly-Once = Source Guarantee + Processing Guarantee + Sink Guarant
             makes external API calls with side effects, replay may produce different results.
             Use event-time (from the message) instead of wall-clock time, seed random generators
             from message content, and guard external calls with the dedup pattern.
+            <strong>Common production mistake:</strong> calling an external payment API during
+            replay will execute the payment twice unless protected by idempotency keys. Always
+            pass a deterministic idempotency key (derived from the event) to external APIs.
           </p>
         </div>
 

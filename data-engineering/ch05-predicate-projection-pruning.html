@@ -170,8 +170,8 @@
           <strong>Predicate pushdown</strong> (also called <em>filter pushdown</em>) is a query
           optimization where filter predicates (WHERE conditions) are evaluated at the storage/scan
           layer rather than after data reaches the compute engine. The optimizer "pushes" the
-          predicate down through the logical plan — below joins, aggregations, and projections —
-          until it sits directly above the table scan operator.
+          predicate down through the logical plan — below joins, aggregations, and projections
+          (whenever doing so preserves query semantics) — until it sits directly above the table scan operator.
         </p>
 <pre><code class="language-sql">
 -- Logical plan BEFORE predicate pushdown:
@@ -193,8 +193,8 @@
         </p>
         <ul>
           <li><strong>Parquet/ORC:</strong> min/max statistics in column chunk headers allow entire row groups to be skipped</li>
-          <li><strong>BigQuery:</strong> storage API evaluates predicates server-side, returning only matching rows</li>
-          <li><strong>PostgreSQL:</strong> index scans replace sequential scans when predicates match indexed columns</li>
+          <li><strong>BigQuery:</strong> evaluates eligible predicates within its distributed storage layer (Capacitor), returning only matching rows to the execution engine</li>
+          <li><strong>PostgreSQL:</strong> pushed predicates enable efficient access paths — index scans, bitmap index scans, index-only scans, or partition pruning as applicable</li>
           <li><strong>Spark:</strong> Data source V2 API passes Filter objects to the connector</li>
         </ul>
       </details>
@@ -318,7 +318,7 @@ WHERE region = 'us-east-1'
           <li><strong>Predicates on derived columns:</strong> <code>WHERE YEAR(date_col) = 2024</code> vs <code>WHERE date_col BETWEEN '2024-01-01' AND '2024-12-31'</code></li>
           <li><strong>After OUTER JOINs:</strong> Predicates on the nullable side can't always be pushed below the join</li>
           <li><strong>LIKE with leading wildcard:</strong> <code>WHERE col LIKE '%suffix'</code> — can't use sorted statistics</li>
-          <li><strong>OR conditions across columns:</strong> <code>WHERE col_a = 1 OR col_b = 2</code> — limits row group skipping</li>
+          <li><strong>OR conditions across columns:</strong> <code>WHERE col_a = 1 OR col_b = 2</code> — generally harder to optimize and may reduce row group skipping, though some engines can partially decompose OR predicates</li>
         </ul>
 <pre><code class="language-sql">
 -- WRONG: prevents pushdown
@@ -459,8 +459,10 @@ df_all.select("event_id", "user_id").show()  # Too late — already cached every
       <details>
         <summary>SELECT * is the enemy of projection pushdown</summary>
         <p>
-          The single most common anti-pattern in data engineering is <code>SELECT *</code> in
-          production pipelines. It defeats projection pushdown entirely and causes:
+          <code>SELECT *</code> often defeats projection pushdown, particularly across
+          materialized boundaries, cached datasets, wide schemas, and complex query plans.
+          While some modern optimizers can eliminate unused columns across simple views or CTEs,
+          relying on this behavior is fragile and non-portable. In production pipelines it causes:
         </p>
         <ul>
           <li>10–100x more bytes scanned (especially with nested columns)</li>
@@ -471,13 +473,16 @@ df_all.select("event_id", "user_id").show()  # Too late — already cached every
         </ul>
 <pre><code class="language-sql">
 -- Anti-pattern: CTEs with SELECT *
+-- (Some optimizers like BigQuery can see through simple CTEs,
+--  but this pattern risks defeating projection pushdown in many
+--  engines, complex plans, or across materialization boundaries.)
 WITH base AS (
-  SELECT * FROM events  -- reads ALL 200 columns
+  SELECT * FROM events  -- may read ALL 200 columns depending on engine
 )
 SELECT user_id, COUNT(*) 
 FROM base 
 GROUP BY user_id;
--- Even though only user_id is needed, all 200 columns are scanned
+-- Best practice: always use explicit columns regardless of engine
 
 -- Fixed: explicit column list
 WITH base AS (
@@ -558,8 +563,9 @@ GROUP BY user_id;
         <summary>BigQuery nested column storage (Dremel encoding)</summary>
         <p>
           BigQuery uses <em>Dremel encoding</em> (repetition + definition levels) to store
-          nested and repeated fields. Each leaf field in a nested structure is stored as an
-          independent column stripe with its own repetition/definition level vectors.
+          nested and repeated fields. Conceptually, each leaf field in a nested structure is
+          represented independently in the columnar storage layout, enabling pruning of
+          unreferenced nested fields.
         </p>
 <pre><code class="language-sql">
 -- BigQuery table with nested STRUCT
@@ -703,8 +709,10 @@ result_bad = df.select(
         <summary>Spark nested pruning configuration</summary>
 <pre><code class="language-python">
 # Spark 3.x nested pruning settings
-spark.conf.set("spark.sql.optimizer.nestedSchemaPruning.enabled", "true")  # default: true
-spark.conf.set("spark.sql.optimizer.nestedPredicatePushdown.enabled", "true")  # Spark 3.3+
+spark.conf.set("spark.sql.optimizer.nestedSchemaPruning.enabled", "true")  # default: true in Spark 3.1+
+# Newer Spark releases (3.3+) also support nested predicate pushdown
+# for compatible data sources:
+# spark.conf.set("spark.sql.optimizer.nestedPredicatePushdown.enabled", "true")
 
 # Verify nested pruning is working:
 df = spark.read.parquet("s3://data-lake/events/")
@@ -792,8 +800,8 @@ pruned.explain(True)
         <p><strong>Key Parquet features for pushdown:</strong></p>
         <ul>
           <li><strong>Dictionary encoding:</strong> Low-cardinality columns (region, status) get dictionary-encoded, enabling fast predicate evaluation on dictionary indices</li>
-          <li><strong>Page-level column index (Parquet 2.0):</strong> Fine-grained min/max per page allows skipping within a column chunk</li>
-          <li><strong>Bloom filters (Parquet 1.12+):</strong> Probabilistic filter for high-cardinality equality predicates</li>
+          <li><strong>Page-level column index (parquet-format 2.6+):</strong> When page indexes are present, engines can skip individual pages within a column chunk for fine-grained filtering</li>
+          <li><strong>Bloom filters (parquet-mr 1.12+):</strong> Probabilistic filter for high-cardinality equality predicates — allows readers to skip row groups that definitely do not contain the requested value</li>
           <li><strong>Sorted row groups:</strong> If data is sorted by a column, min/max ranges don't overlap → maximum skip rate</li>
         </ul>
       </details>
@@ -804,7 +812,7 @@ pruned.explain(True)
 ┌─────────────────────────────────────────────────────────────────┐
 │  ORC File                                                       │
 ├─────────────────────────────────────────────────────────────────┤
-│  STRIPE 0 (target: 64 MB default, max 250 MB)                  │
+│  STRIPE 0 (target: 64 MB default)                              │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │  INDEX DATA (per column)                                │    │
 │  │    - Row group index (every 10,000 rows)                │    │
@@ -837,7 +845,7 @@ pruned.explain(True)
         <p><strong>ORC advantages for predicate pushdown:</strong></p>
         <ul>
           <li><strong>3-level statistics:</strong> File → Stripe → Row group (every 10K rows) — finer granularity than Parquet's row-group level</li>
-          <li><strong>Built-in bloom filters:</strong> Configurable per column, excellent for high-cardinality equality predicates (user_id, session_id)</li>
+          <li><strong>Built-in bloom filters:</strong> Configurable per column, allows readers to safely skip stripes that definitely do not contain the requested value (excellent for high-cardinality equality predicates like user_id, session_id)</li>
           <li><strong>ACID support:</strong> ORC + Hive ACID enables UPDATE/DELETE while maintaining predicate pushdown through delta files</li>
           <li><strong>Predicate evaluation in reader:</strong> ORC's SearchArgument (SARG) evaluates predicates during stripe/row-group selection</li>
         </ul>
@@ -1081,7 +1089,7 @@ WHERE _PARTITIONDATE = '2024-02-15';
         <summary>Snowflake micro-partition pruning</summary>
         <p>
           Snowflake doesn't use traditional partitioning. Instead, it automatically divides
-          tables into <strong>micro-partitions</strong> (50-500 MB compressed) and maintains
+          tables into <strong>micro-partitions</strong> (50-500 MB uncompressed) and maintains
           metadata about min/max values per column per micro-partition.
         </p>
 <pre><code class="language-sql">
@@ -1218,7 +1226,9 @@ spark.sql("""
           <em>dynamic filtering</em>) are predicates generated <em>during query execution</em>
           based on the results of one side of a join. Unlike static predicate pushdown (known
           at planning time), runtime filters are discovered at execution time and propagated
-          back to the scan operators.
+          back to the scan operators. Runtime filters are most effective when they arrive before
+          the probe-side scan has consumed most of its input — very late filters may provide
+          limited benefit.
         </p>
 <pre><code class="language-bash">
 # Static vs Dynamic Predicate Pushdown
@@ -1392,8 +1402,9 @@ result = orders.join(
       <details>
         <summary>Bytes scanned reduction — the primary metric</summary>
 <pre><code class="language-bash">
-# Cost model for BigQuery on-demand pricing:
+# Cost model for BigQuery on-demand pricing (as of 2024):
 # $5.00 per TB scanned (first 1 TB/month free)
+# Note: pricing is subject to change; verify current rates.
 #
 # Pushdown Impact Calculation:
 # ┌─────────────────────────────────────────────────────────────────┐
@@ -1410,6 +1421,8 @@ result = orders.join(
 # ├──────────────────────┼──────────────────┼───────────────────────┤
 # │  TOTAL SAVINGS       │  99.998%         │  $2,499,960/month     │
 # └──────────────────────┴──────────────────┴───────────────────────┘
+# Note: These numbers are simplified illustrations. Actual savings
+# depend on data layout, workload characteristics, and pricing model.
 </code></pre>
       </details>
       <details>
@@ -2104,12 +2117,14 @@ WHERE event_date = '2024-02-15'
           is <code>SELECT *</code>, all columns are read from storage.
         </p>
 <pre><code class="language-sql">
--- BAD: CTE with SELECT * defeats projection pushdown
+-- BAD: CTE with SELECT * — risks defeating projection pushdown
+-- (some modern optimizers can see through simple CTEs, but this
+--  pattern remains unsafe across engines and complex query plans)
 WITH raw AS (
   SELECT * FROM events WHERE date = '2024-02-15'
 )
 SELECT event_id, user_id FROM raw;
--- BigQuery still reads ALL columns in the CTE scan
+-- Many engines read ALL columns in the CTE scan
 
 -- GOOD: explicit columns from the start
 WITH raw AS (

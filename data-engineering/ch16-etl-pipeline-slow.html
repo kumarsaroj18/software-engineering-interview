@@ -203,7 +203,7 @@ def check_volume_growth(table_path, lookback_days=7):
       <p>Shuffle is the most expensive operation in distributed data processing. When a pipeline suddenly slows down, shuffle spill is often the smoking gun — data that cannot fit in memory spills to disk, turning a memory-speed operation into a disk I/O-bound one.</p>
 
       <h3>How Shuffle Works</h3>
-      <p>During a shuffle (triggered by <code>groupBy</code>, <code>join</code>, <code>repartition</code>, <code>distinct</code>), each mapper writes shuffle files partitioned by the reduce key. Reducers then fetch their partitions over the network. The cost scales as O(M × R) where M = mappers and R = reducers.</p>
+      <p>During a shuffle (triggered by <code>groupBy</code>, <code>join</code>, <code>repartition</code>, <code>distinct</code>), each mapper writes shuffle files partitioned by the reduce key. Reducers then fetch their partitions over the network. With sort-based shuffle (Spark 2.0+), each mapper produces one output file regardless of reducer count, but every reducer must fetch its portion from every mapper — so the number of fetch requests scales as O(M × R) where M = mappers and R = reducers.</p>
 
       <h3>Spark Shuffle Spill</h3>
       <p>When shuffle data exceeds available execution memory, Spark spills to disk:</p>
@@ -261,13 +261,18 @@ curl -s "${SPARK_UI}/api/v1/applications/${APP_ID}/stages/5/0/taskList" | \
       <pre><code class="language-python"># 1. Increase shuffle partitions to reduce per-partition memory pressure
 spark.conf.set("spark.sql.shuffle.partitions", 2000)  # default is 200
 
-# 2. Increase executor memory fraction for shuffle
-spark.conf.set("spark.memory.storageFraction", 0.3)  # reduce storage, more execution
+# 2. Adjust executor memory fraction for shuffle (use with caution)
+# In modern Spark's unified memory model, execution can borrow from storage
+# automatically. Manual tuning of storageFraction is rarely needed and should
+# be based on observed cache pressure rather than applied by default.
+spark.conf.set("spark.memory.storageFraction", 0.3)  # reduce storage reservation
 
 # 3. Use larger instances with more memory per core
 # m5.4xlarge (64GB) → r5.4xlarge (128GB) = 2x shuffle buffer
 
 # 4. Enable push-based shuffle (Spark 3.2+)
+# Note: requires compatible cluster manager and external shuffle service.
+# Verify your deployment supports this before enabling.
 spark.conf.set("spark.shuffle.push.enabled", "true")
 spark.conf.set("spark.shuffle.push.maxBlockSizeToPush", "64m")
 
@@ -512,8 +517,8 @@ def analyze_executor_failures(app_id, yarn_log_dir="/var/log/hadoop-yarn"):
       <p>Running on spot/preemptible instances saves 60–90% on cost but introduces preemption risk. When an executor is preempted mid-task:</p>
       <ul>
         <li>All tasks on that executor must be restarted on a new node</li>
-        <li>Shuffle data written by that executor is lost — downstream stages that depend on it must re-fetch (causing <code>FetchFailedException</code>)</li>
-        <li>If External Shuffle Service is not configured, the entire stage may need to restart</li>
+        <li>Without an external shuffle service (or equivalent shuffle tracking), shuffle data written by the lost executor becomes unavailable — downstream stages that depend on it will encounter <code>FetchFailedException</code></li>
+        <li>If External Shuffle Service is not configured, the entire parent stage may need to restart</li>
       </ul>
       <pre><code class="language-python"># Spark configuration for spot-instance resilience
 # Use external shuffle service to preserve shuffle data across preemptions
@@ -607,14 +612,14 @@ curl -s "http://spark-history:18080/api/v1/applications/${APP_ID}/stages" | \
 
 # Layout A: 100 files × 1GB each
 # - S3 ListObjects: 1 API call
-# - File open overhead: 100 × 50ms = 5s
+# - File open overhead: 100 × ~tens of ms = seconds
 # - Sequential read throughput: full bandwidth utilization
 
 # Layout B: 1,000,000 files × 100KB each
 # - S3 ListObjects: 1000 API calls (1000 keys per page) = 10-30s
-# - File open overhead: 1M × 50ms = 50,000s (if sequential!)
+# - File open latency: tens of milliseconds per object (varies by backend)
 # - Spark parallelizes, but each task processes tiny data
-# - Parquet footer reads dominate: 1M × 20ms = 20,000s of metadata I/O
+# - Parquet footer reads dominate: 1M metadata operations
 
 # Measure file sizes in a partition
 def analyze_file_sizes(path):
@@ -734,7 +739,7 @@ def compact_partition(table_path, partition, target_size_mb=256):
 
       <h3>Prevention</h3>
       <ul>
-        <li>Set <code>spark.sql.files.maxRecordsPerFile</code> to prevent oversized files</li>
+        <li>Set <code>spark.sql.files.maxRecordsPerFile</code> to prevent oversized files (note: this does not prevent small files — appropriate partitioning and compaction are still needed for that)</li>
         <li>Configure streaming sinks with <code>maxFilesPerTrigger</code> and periodic compaction</li>
         <li>Use table formats (Delta, Iceberg) with auto-compaction enabled</li>
         <li>Monitor file count per partition and alert when it exceeds thresholds</li>
@@ -804,7 +809,7 @@ def measure_metastore_latency(database, table):
         <li>10M files = 10,000 API calls just to list them</li>
         <li>At 50ms per call = 8+ minutes of listing time</li>
         <li>S3 rate limits: 5,500 GET requests/sec per prefix</li>
-        <li>Listing is sequential by default — not parallelized</li>
+        <li>Listing may become effectively sequential or metadata-bound unless parallel partition discovery is enabled</li>
       </ul>
       <pre><code class="language-python"># Optimize S3 file listing
 # 1. Use InMemoryFileIndex with partition inference disabled
@@ -936,7 +941,7 @@ critical_settings = {
     "spark.sql.adaptive.coalescePartitions.enabled": "true",
     "spark.sql.adaptive.skewJoin.enabled": "true",
     "spark.sql.adaptive.localShuffleReader.enabled": "true",
-    # This was renamed in Spark 3.2 — old config silently ignored!
+    # This was added in Spark 3.2 — ensure your Spark version supports it
     "spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled": "true",
 }
 
@@ -971,6 +976,8 @@ if table_size > int(threshold):
     print("⚠️  Table exceeds broadcast threshold!")
     print("   Options:")
     print("   1. Increase threshold: spark.sql.autoBroadcastJoinThreshold = 100m")
+    print("      (Caution: larger broadcasts increase executor memory pressure")
+    print("       and may cause OOM if the table continues to grow)")
     print("   2. Force broadcast: F.broadcast(dim_df)")
     print("   3. Filter dimension table before join")
     print("   4. Use bucket join instead")</code></pre>
@@ -1031,6 +1038,7 @@ def compare_plans(plan_a_path, plan_b_path):
       <p>In multi-tenant environments (shared Kubernetes clusters, cloud VMs with shared hypervisors), other workloads can steal resources:</p>
       <ul>
         <li><strong>CPU steal time</strong> — Hypervisor allocating your CPU cycles to other VMs (check <code>%steal</code> in <code>top</code>)</li>
+        <li><strong>Kubernetes CPU throttling</strong> — CPU limits causing CFS (Completely Fair Scheduler) throttling even when the node has spare capacity (check <code>container_cpu_cfs_throttled_seconds_total</code>)</li>
         <li><strong>Memory pressure</strong> — Host-level swapping affects all containers on the node</li>
         <li><strong>Network bandwidth</strong> — Competing workloads saturating the NIC</li>
         <li><strong>Disk I/O contention</strong> — Local SSD shared between containers</li>
@@ -1075,7 +1083,7 @@ aws cloudwatch get-metric-statistics \
           </tr>
           <tr>
             <td>EBS gp3</td>
-            <td>16,000 IOPS, 1,000 MB/s</td>
+            <td>3,000 IOPS baseline (up to 16,000 provisioned), 125 MB/s baseline (up to 1,000 MB/s)</td>
             <td>I/O queue depth spikes</td>
           </tr>
           <tr>
@@ -1226,7 +1234,7 @@ time nslookup s3.us-east-1.amazonaws.com 2>/dev/null | tail -2</code></pre>
           </tr>
           <tr>
             <td>04:15</td>
-            <td>Root cause identified: <code>spark.sql.shuffle.partitions</code> was 200, but the new column created 100K distinct key combinations → 100K output partitions → shuffle explosion.</td>
+            <td>Root cause identified: the new column increased group cardinality dramatically (from ~2.5M to hundreds of millions of potential combinations), causing much larger shuffle state, heavier aggregation work per partition, and extensive shuffle spill.</td>
           </tr>
           <tr>
             <td>04:30</td>
@@ -1263,9 +1271,10 @@ daily_agg = (
         F.sum("revenue").alias("total_revenue"),
     )
 )
-# New key cardinality: 50K × 10 × 200 × 5 = 500M groups!
-# With 200 shuffle partitions → 2.5M groups per partition
-# Each partition now processes 500x more data → shuffle spill → disk I/O → 3x slowdown</code></pre>
+# New key cardinality: 50K × 10 × 200 × 5 = up to 500M potential group combinations
+# (actual groups will be fewer, but the intermediate shuffle data grows dramatically)
+# With 200 shuffle partitions → massively increased aggregation state per partition
+# Each partition processes far more group keys → shuffle spill → disk I/O → 3x slowdown</code></pre>
 
       <h3>Investigation Steps (What We Checked)</h3>
       <ol>
@@ -1295,6 +1304,7 @@ events_df.select(
         </li>
         <li><strong>Git blame</strong> — Found the commit that added <code>sub_event_type</code> to the groupBy (merged 2 days ago, first ran on this date's data)</li>
       </ol>
+      <p><strong>Why 3x and not 200x?</strong> Although the theoretical group cardinality increased by ~200x, only a fraction of those key combinations actually existed in the data. The real impact was that shuffle intermediate data grew substantially (from 1.5GB to 800GB), causing spill-to-disk which cascaded into I/O contention and task retries — producing a 3x slowdown rather than a proportional 200x blowup.</p>
 
       <h3>Resolution</h3>
       <pre><code class="language-python"># Immediate fix: remove sub_event_type from groupBy
@@ -1318,6 +1328,9 @@ sub_event_agg = (
 )
 
 # Step 3: Pivot sub_event_type into columns (bounded width)
+# Note: pivot() is appropriate here because sub_event_type has a
+# relatively small bounded domain (~200 values). For unbounded or
+# very high cardinality columns, pivot would create excessive columns.
 sub_event_pivot = (
     sub_event_agg
     .groupBy("user_id", "event_type", "region")
