@@ -1257,22 +1257,9 @@ tbody tr:hover {
     border-color: var(--border);
   }
 
-  /* Better scroll indicators for code blocks */
+  /* Better scrolling for code blocks */
   pre {
     position: relative;
-  }
-
-  pre::after {
-    content: '';
-    position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: 24px;
-    background: linear-gradient(to right, transparent, var(--bg-code));
-    pointer-events: none;
-    opacity: 0.8;
-    border-radius: 0 var(--radius-md) var(--radius-md) 0;
   }
 
   pre::-webkit-scrollbar {
