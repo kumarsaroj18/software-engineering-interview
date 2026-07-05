@@ -323,7 +323,7 @@
       const codeBlocks = document.querySelectorAll('pre');
       codeBlocks.forEach(pre => {
         // Skip if already has a copy button
-        if (pre.querySelector('.copy-btn')) return;
+        if (pre.querySelector('.copy-btn') || (pre.parentNode && pre.parentNode.classList.contains('code-block-container'))) return;
 
         const btn = document.createElement('button');
         btn.className = 'copy-btn';
@@ -331,13 +331,17 @@
         btn.setAttribute('aria-label', 'Copy code to clipboard');
         btn.addEventListener('click', () => this.copy(pre, btn));
 
-        // If pre is inside a wrapper, add to wrapper; otherwise make relative
-        const wrapper = pre.closest('.code-block-wrapper');
-        if (wrapper) {
-          wrapper.appendChild(btn);
+        // Wrap pre in a container to keep button outside the scrolling area
+        const existingWrapper = pre.closest('.code-block-wrapper');
+        if (existingWrapper) {
+          existingWrapper.style.position = 'relative';
+          existingWrapper.appendChild(btn);
         } else {
-          pre.style.position = 'relative';
-          pre.appendChild(btn);
+          const container = document.createElement('div');
+          container.className = 'code-block-container';
+          pre.parentNode.insertBefore(container, pre);
+          container.appendChild(pre);
+          container.appendChild(btn);
         }
       });
     },

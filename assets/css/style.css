@@ -667,6 +667,8 @@ pre {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
   font-family: var(--font-mono);
   font-size: 0.88rem;
   line-height: 1.6;
@@ -678,6 +680,12 @@ pre code {
   padding: 0;
   border: none;
   font-size: inherit;
+}
+
+/* Override Prism theme backgrounds to prevent color mismatch artifacts */
+pre[class*="language-"],
+code[class*="language-"] {
+  background: none;
 }
 
 code {
@@ -708,6 +716,15 @@ code {
   border-left: 1px solid var(--border);
 }
 
+.code-block-container {
+  position: relative;
+  margin: 1.5em 0;
+}
+
+.code-block-container pre {
+  margin: 0;
+}
+
 .copy-btn {
   position: absolute;
   top: 0.5rem;
@@ -721,8 +738,10 @@ code {
   cursor: pointer;
   opacity: 0;
   transition: opacity var(--transition-fast), background var(--transition-fast);
+  z-index: 2;
 }
 
+.code-block-container:hover .copy-btn,
 pre:hover .copy-btn,
 .code-block-wrapper:hover .copy-btn {
   opacity: 1;
@@ -1278,6 +1297,8 @@ tbody tr:hover {
   /* Copy button always visible on touch devices */
   .copy-btn {
     opacity: 1;
+    font-size: 0.7rem;
+    padding: 0.25rem 0.4rem;
   }
 }
 
