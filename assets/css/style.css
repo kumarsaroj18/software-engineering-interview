@@ -648,6 +648,18 @@ details .details-content {
   animation: slideDown var(--transition-normal) ease;
 }
 
+/* pre/.callout/blockquote carry their own padding; these don't, so they
+   sit flush against the details border without it */
+details > p,
+details > ul,
+details > ol,
+details > dl,
+details > h3,
+details > h4 {
+  margin-left: 1.25rem;
+  margin-right: 1.25rem;
+}
+
 @keyframes slideDown {
   from {
     opacity: 0;
