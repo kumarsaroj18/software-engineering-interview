@@ -285,9 +285,9 @@ public class OrderService {
     }
 }
 
-        // ✅ CORRECT: Retry wraps the transaction — use separate beans (safest)
+// ✅ CORRECT: Retry wraps the transaction — use separate beans (safest)
 // Each retry gets a FRESH transaction, with no aspect ordering ambiguity.
-// See the separate-beans pattern below.
+// See the separate-beans pattern below.</code></pre>
         <div class="callout callout-danger">
           <p><strong>Critical:</strong> The ordering of AOP aspects matters. Both <code>@Retryable</code> and <code>@Transactional</code> default to <code>Ordered.LOWEST_PRECEDENCE</code>, so when placed on the same method the execution order is <strong>undefined</strong>. The safest approach is to separate the concerns: put <code>@Retryable</code> on a method in one bean that calls a <code>@Transactional</code> method on a different bean. If you must use both on the same class, set explicit <code>@Order</code> values and verify with: <code>logging.level.org.springframework.retry=DEBUG</code></p>
         </div>
