@@ -54,13 +54,15 @@
     </nav>
 
     <header class="chapter-header">
-      <span class="badge badge-hard">Hard</span>
-      <h1>Why Are Spark Jobs Spilling to Disk?</h1>
-      <p class="subtitle">Diagnose and resolve memory pressure that forces Spark to serialize intermediate data to local disk.</p>
-      <div class="topics">
-        <span class="topic-tag">Shuffle</span>
-        <span class="topic-tag">Memory</span>
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Shuffle</span>
+        <span class="badge badge-topic">Memory</span>
       </div>
+      <h1>Why Are Spark Jobs Spilling to Disk?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Diagnose and resolve the memory pressure that forces Spark to serialize intermediate data to local disk during shuffles, joins, and aggregations.
+      </p>
     </header>
 
     <div class="search-container">
@@ -863,7 +865,8 @@ AQE Query Planning:
 spark.conf.set("spark.sql.adaptive.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.initialPartitionNum", "2000")
-# Note: initialPartitionNum is deprecated in Spark 3.2+; use spark.sql.shuffle.partitions instead
+# Note: if unset, this defaults to spark.sql.shuffle.partitions — set it explicitly
+# when you want a different (typically higher) starting point for AQE to coalesce down from.
 spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "128m")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.minPartitionSize", "1m")
 
@@ -899,7 +902,8 @@ spark.conf.set("spark.sql.adaptive.enabled", "true")
 # Coalescing: merge small partitions
 spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.initialPartitionNum", "2000")
-# Note: initialPartitionNum is deprecated in Spark 3.2+; use spark.sql.shuffle.partitions instead
+# Note: if unset, this defaults to spark.sql.shuffle.partitions — set it explicitly
+# when you want a different (typically higher) starting point for AQE to coalesce down from.
 spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "128m")
 
 # Skew join: split large partitions

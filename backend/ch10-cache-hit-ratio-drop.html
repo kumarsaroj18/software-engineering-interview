@@ -828,10 +828,12 @@ CONFIG SET slowlog-max-len 256           # Keep more entries</code></pre>
       <details>
         <summary>Keyspace notifications for real-time monitoring</summary>
         <pre><code class="language-bash"># Enable keyspace notifications for eviction and expiry events
-CONFIG SET notify-keyspace-events "Egx"
+CONFIG SET notify-keyspace-events "Egxe"
 # E = keyevent events
 # g = generic commands (DEL, EXPIRE, etc.)
 # x = expired events
+# e = evicted events (separate flag from expired — required for the
+#     eviction listener below; without it, "evicted" messages never fire)
 
 # Subscribe to eviction events
 redis-cli SUBSCRIBE "__keyevent@0__:evicted"

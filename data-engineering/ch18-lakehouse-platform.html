@@ -1856,7 +1856,7 @@ ORDER BY total_monthly_cost DESC
 LIMIT 50;</code></pre>
 
       <div class="callout callout-warning">
-        <p><strong>Hidden cost trap — S3 API calls:</strong> A table with 2 million small files generates massive LIST and GET costs. A single <code>SELECT *</code> might issue 2M GetObject requests ($0.0004 per 1000 = $0.80 per query). At 1000 queries/day, that is $800/month just in API costs — more than the storage itself. This is why compaction is not optional; it is a cost requirement.</p>
+        <p><strong>Hidden cost trap — S3 API calls:</strong> A table with 2 million small files generates massive LIST and GET costs. A single <code>SELECT *</code> might issue 2M GetObject requests ($0.0004 per 1000 = $0.80 per query). At 1000 queries/day, that is $800/day (~$24,000/month) just in API costs — far more than the storage itself. This is why compaction is not optional; it is a cost requirement.</p>
       </div>
     </section>
 
@@ -2736,8 +2736,8 @@ vars:
 
     <!-- Chapter Navigation -->
     <nav class="chapter-nav">
-      <a href="ch17-incorrect-dashboard-metrics.html" class="chapter-nav-prev">← Ch 17: Incorrect Dashboard Metrics</a>
-      <a href="index.html" class="chapter-nav-next">Back to Index →</a>
+      <a href="ch17-incorrect-dashboard-metrics.html" class="prev">← Ch 17: Incorrect Dashboard Metrics</a>
+      <a href="index.html" class="next">Back to Index →</a>
     </nav>
 
   </main>

@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Ch 15 — Intermittent Failures with No Logs | Interview Handbook</title>
   <link rel="stylesheet" href="../assets/css/style.css" />
-  <link rel="stylesheet" href="../assets/css/prism.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
 </head>
 <body>
   <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
@@ -48,20 +48,21 @@
       <a href="../index.html">Home</a> &rsaquo; <a href="../index.html#part-iii">Part III — Production Engineering &amp; Debugging</a> &rsaquo; <span>Chapter 15</span>
     </nav>
 
-    <header>
-      <h1>Chapter 15 — Intermittent Failures with No Logs</h1>
-      <span class="badge badge-hard">Hard</span>
-      <span class="badge badge-topic">Tracing</span>
-      <span class="badge badge-topic">Observability</span>
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Tracing</span>
+        <span class="badge badge-topic">Observability</span>
+      </div>
+      <h1>If Users Report Intermittent Failures but Logs Show No Exceptions, What Would Be Your Debugging Strategy?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> The absence of log entries is itself a diagnostic signal — it means the failure is happening in a layer your current instrumentation doesn't cover (swallowed exceptions, timeouts with silent fallbacks, race conditions, DNS/TCP-level issues, GC pauses, or thread starvation). Debug in order: metrics first, then traces, then infrastructure, and only then a code audit.
+      </p>
     </header>
 
     <div class="search-container">
       <input type="search" class="search-input" placeholder="Search this chapter... (Ctrl+K or /)" aria-label="Search" />
     </div>
-
-    <blockquote class="callout-interview">
-      <strong>Interview Question:</strong> "If users report intermittent failures but logs show no exceptions, what would be your debugging strategy?"
-    </blockquote>
 
 
     <!-- ═══════════════════════════════════════════════════════════════════
@@ -310,14 +311,14 @@ spec:
       image: myapp:latest</code></pre>
         <p><strong>Java-specific DNS caching issues:</strong></p>
         <pre><code class="language-java">// JVM caches DNS results — can cause issues when IPs change
-// Behavior varies by JDK version:
-//   JDK 8-11 without SecurityManager: cache for 30s (default)
-//   JDK 8-11 WITH SecurityManager: cache FOREVER (networkaddress.cache.ttl = -1)
-//   JDK 12+: cache for 30s regardless of SecurityManager
+// Behavior depends on whether a SecurityManager is installed, not the JDK version:
+//   No SecurityManager installed: cache for 30s (JVM-implementation-specific default)
+//   SecurityManager installed: cache FOREVER (networkaddress.cache.ttl defaults to -1)
 //
 // NOTE: SecurityManager is deprecated since JDK 17 (JEP 411) and removed in JDK 24.
-// The "cache forever" behavior is primarily a concern for older JDK base images
-// still common in production (JDK 8, JDK 11 LTS).
+// Until removal, the "cache forever" behavior remains a live risk on ANY JDK version
+// where a SecurityManager or security policy is configured — check your base image
+// and any libraries/agents that may install one, don't assume newer JDKs are exempt.
 
 // Check current settings
 System.out.println(java.security.Security.getProperty("networkaddress.cache.ttl"));
@@ -1553,15 +1554,13 @@ public class DiagnosticsController {
 {
   "hypothesis": "DNS cache staleness causes 3 specific pods to send traffic to old IP",
   "evidence_for": [
-    "Error rate is 0.1% — matches proportion of pods affected (3/24 = 12.5% of pods, each pod handles equal traffic, so affected requests = same percentage)",
-    "Wait — 3/24 pods would be 12.5% of requests, not 0.1%. Re-examine.",
-    "Actually: 3 pods sometimes resolve the old IP (cache hit) and sometimes the new (cache refresh) — stochastic failure within those pods",
-    "Affected pods started before IP change — confirmed via kubectl get pods",
-    "Java resolves different IP than system DNS on affected pods"
+    "3 pods (out of 24) started before the IP change and haven't restarted since — confirmed via kubectl get pods",
+    "Java resolves a different IP than system DNS (nslookup/python) on those same pods",
+    "networkaddress.cache.ttl = -1 confirmed via -XshowSettings — the JVM cache never expires on its own"
   ],
   "evidence_against": [
-    "Error rate should be ~12.5% if all requests from those pods fail — but it's only 0.1%",
-    "Explanation: JVM cache has a TTL, but it was set to 600s (10 min) not infinity. So the cache refreshes periodically, and only requests during the stale window fail."
+    "If the stale IP were used for 100% of traffic through those 3 pods, error rate should be ~12.5% (3/24) — but it's only 0.1%",
+    "Explanation: the stale IP is cached, but most requests reuse already-established, still-healthy pooled HTTP connections that were opened before the migration. The stale-DNS path is only hit when those 3 pods need to open a *new* connection (pool eviction, connection reset, scale-related churn) — a small fraction of their overall traffic. That fraction, applied to 3/24 pods, works out to the observed 0.1%."
   ],
   "validation_steps": [
     "1. Exec into affected pod, confirm Java DNS resolution returns old IP",

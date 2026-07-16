@@ -54,23 +54,20 @@
 
     <!-- Chapter Header -->
     <header class="chapter-header">
-      <span class="badge badge-hard">Hard</span>
-      <h1>How Would You Design a Warehouse for Petabyte-Scale Analytics?</h1>
-      <div class="topics">
-        <span class="topic">Star Schema</span>
-        <span class="topic">Modeling</span>
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Star Schema</span>
+        <span class="badge badge-topic">Modeling</span>
       </div>
+      <h1>How Would You Design a Warehouse for Petabyte-Scale Analytics?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> A petabyte-scale warehouse needs mastery across three domains: logical design (star schemas with clearly defined grain, conformed dimensions, the right SCD strategy per attribute), physical design (time-based partitioning, clustering on high-cardinality filter columns, materialized views for hot paths), and operational design (medallion layering, cost governance). Physical design decisions like partitioning and clustering often matter more than logical modeling at this scale — a missing partition filter has turned $5K/month warehouses into $80K/month incidents.
+      </p>
     </header>
 
     <div class="search-container">
       <input type="search" class="search-input" placeholder="Search this chapter... (Ctrl+K or /)" aria-label="Search chapter content">
     </div>
-
-    <!-- Chapter Navigation -->
-    <nav class="chapter-nav">
-      <a href="ch08-query-suddenly-slow.html" class="prev">&larr; Ch 8: Query Suddenly Slow</a>
-      <a href="ch10-bigquery-internals.html" class="next">Ch 10: BigQuery Internals &rarr;</a>
-    </nav>
 
     <!-- Section 1: Interviewer Intent -->
     <section id="interviewer-intent">

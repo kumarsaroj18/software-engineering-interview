@@ -54,13 +54,15 @@
     </nav>
 
     <header class="chapter-header">
-      <span class="badge badge-hard">Hard</span>
-      <h1>MVCC Internals</h1>
-      <p class="subtitle">Explain MVCC from first principles.</p>
-      <div class="topics">
-        <span class="topic-tag">MVCC</span>
-        <span class="topic-tag">PostgreSQL</span>
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">MVCC</span>
+        <span class="badge badge-topic">PostgreSQL</span>
       </div>
+      <h1>MVCC Internals</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> MVCC keeps old row versions so readers see a consistent snapshot without blocking writers, trading storage space for concurrency. The operational cost of that trade is dead-tuple accumulation — PostgreSQL's VACUUM (or InnoDB's purge thread) must reclaim it continuously, and the single most common production failure mode is a long-running or abandoned transaction holding back the xmin horizon until a routine table quietly bloats to 5x its size.
+      </p>
     </header>
 
     <div class="search-container">
@@ -188,7 +190,11 @@ HEAP_XMAX_COMMITTED  = 0x0400  # xmax transaction committed
 HEAP_XMAX_INVALID    = 0x0800  # xmax transaction aborted/not set
 HEAP_XMIN_FROZEN     = 0x0300  # xmin is frozen (always visible)
 HEAP_UPDATED         = 0x2000  # tuple was result of an update
-HEAP_HOT_UPDATED     = 0x4000  # tuple has been HOT-updated</code></pre>
+
+# Key t_infomask2 bits (from htup_details.h)
+HEAP_KEYS_UPDATED   = 0x2000  # tuple was updated and key cols modified, or tuple deleted
+HEAP_HOT_UPDATED    = 0x4000  # tuple has been HOT-updated
+HEAP_ONLY_TUPLE     = 0x8000  # this is a heap-only tuple (not indexed directly)</code></pre>
 
       <p>These "hint bits" are critical for performance. Without them, every visibility check would require a CLOG (pg_xact) lookup. Once set, subsequent reads skip the CLOG entirely — but setting hint bits dirties the page. After a checkpoint with <code>full_page_writes</code> enabled, the next modification to a page triggers a full-page image write, which can indirectly increase WAL volume for read-heavy workloads hitting cold pages.</p>
 
@@ -1029,7 +1035,6 @@ psql -c "
           <tr><td>HOT update ratio</td><td><code>pg_stat_user_tables</code></td><td>&lt; 50% on high-update tables</td></tr>
         </tbody>
       </table>
-    </section>
 
       <h3>Grafana/Prometheus Queries for MVCC Monitoring</h3>
       <pre><code class="language-sql">-- Prometheus postgres_exporter custom queries (queries.yaml)

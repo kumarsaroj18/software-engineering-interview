@@ -5,10 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ch 17: Incorrect Dashboard Metrics | Data Engineering Interview Handbook</title>
   <link rel="stylesheet" href="../assets/css/style.css">
-  <link rel="stylesheet" href="../assets/css/code.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
 </head>
 <body>
-  <div class="layout">
     <!-- Sidebar -->
       <aside class="sidebar">
     <div class="sidebar-header">
@@ -1055,7 +1054,7 @@
           A developer changed a LEFT JOIN to an INNER JOIN while "cleaning up" the query, reasoning
           that "all orders should have a matching customer record":
         </p>
-        <pre><code>-- BEFORE (correct)
+        <pre><code class="language-sql">-- BEFORE (correct)
 SELECT
   o.order_id,
   o.amount,
@@ -1153,7 +1152,7 @@ INNER JOIN staging.customers c
             <strong>Assumptions are dangerous:</strong> Never change JOIN semantics based on assumptions
             about data completeness. Verify with production queries first. The developer should have
             run this query before changing the JOIN:
-            <pre><code>-- Verification query: how many orders have no matching customer?
+            <pre><code class="language-sql">-- Verification query: how many orders have no matching customer?
 SELECT COUNT(*) AS unmatched_orders
 FROM staging.orders o
 LEFT JOIN staging.customers c
@@ -1257,7 +1256,7 @@ WHERE c.customer_id IS NULL;</code></pre>
         </p>
 
         <h4>Schema-Level Tests (schema.yml)</h4>
-        <pre><code>version: 2
+        <pre><code class="language-yaml">version: 2
 
 models:
   - name: int_orders_enriched
@@ -1290,7 +1289,7 @@ models:
           max_value: 10000000</code></pre>
 
         <h4>Singular Test: Revenue Bounds Check</h4>
-        <pre><code>-- tests/assert_revenue_within_bounds.sql
+        <pre><code class="language-sql">-- tests/assert_revenue_within_bounds.sql
 -- This test fails if daily revenue deviates more than 30%
 -- from the 7-day rolling average
 
@@ -1324,7 +1323,7 @@ WHERE order_date = CURRENT_DATE - INTERVAL '1 day'
   AND ABS(total_revenue - rolling_7d_avg) / NULLIF(rolling_7d_avg, 0) > 0.30</code></pre>
 
         <h4>Singular Test: JOIN Completeness</h4>
-        <pre><code>-- tests/assert_no_dropped_orders.sql
+        <pre><code class="language-sql">-- tests/assert_no_dropped_orders.sql
 -- Ensures LEFT JOIN behavior: all source orders appear in enriched model
 
 SELECT
@@ -1338,7 +1337,7 @@ WHERE e.order_id IS NULL
   AND o.order_date >= CURRENT_DATE - INTERVAL '7 days'</code></pre>
 
         <h4>Freshness and Recency Test</h4>
-        <pre><code>-- tests/assert_data_freshness.sql
+        <pre><code class="language-sql">-- tests/assert_data_freshness.sql
 -- Ensures data is no more than 4 hours stale
 
 SELECT
@@ -1353,7 +1352,7 @@ HAVING TIMESTAMPDIFF(HOUR, MAX(event_timestamp), CURRENT_TIMESTAMP) > 4</code></
           A comprehensive Great Expectations suite for validating the orders pipeline:
         </p>
 
-        <pre><code># great_expectations/expectations/orders_suite.py
+        <pre><code class="language-python"># great_expectations/expectations/orders_suite.py
 import great_expectations as gx
 
 context = gx.get_context()
@@ -1433,7 +1432,7 @@ validator.expect_column_proportion_of_unique_values_to_be_between(
 # Or use a custom expectation class for integration with GE checkpoints</code></pre>
 
         <h4>Great Expectations Checkpoint Configuration</h4>
-        <pre><code># great_expectations/checkpoints/orders_checkpoint.yml
+        <pre><code class="language-yaml"># great_expectations/checkpoints/orders_checkpoint.yml
 name: orders_daily_checkpoint
 config_version: 1.0
 class_name: Checkpoint
@@ -1468,7 +1467,7 @@ action_list:
         </p>
 
         <h4>Row Count Reconciliation</h4>
-        <pre><code>-- Reconciliation: Source vs Warehouse row counts by date
+        <pre><code class="language-sql">-- Reconciliation: Source vs Warehouse row counts by date
 WITH source_counts AS (
   SELECT
     DATE(created_at) AS dt,
@@ -1512,7 +1511,7 @@ FULL OUTER JOIN warehouse_counts w ON s.dt = w.dt
 ORDER BY dt DESC;</code></pre>
 
         <h4>Duplicate Detection Query</h4>
-        <pre><code>-- Find duplicate events by event_id
+        <pre><code class="language-sql">-- Find duplicate events by event_id
 WITH duplicates AS (
   SELECT
     event_id,
@@ -1535,7 +1534,7 @@ SELECT
 FROM duplicates;</code></pre>
 
         <h4>Schema Drift Detection</h4>
-        <pre><code>-- Detect schema changes between consecutive loads
+        <pre><code class="language-sql">-- Detect schema changes between consecutive loads
 WITH current_schema AS (
   SELECT
     column_name,
@@ -1591,7 +1590,7 @@ WHERE c.data_type != e.data_type;</code></pre>
         </p>
 
         <h4>Data Contract Definition (YAML)</h4>
-        <pre><code># contracts/orders_contract.yml
+        <pre><code class="language-yaml"># contracts/orders_contract.yml
 apiVersion: datacontract/v1.0
 kind: DataContract
 metadata:
@@ -1670,7 +1669,7 @@ compatibility:
     - required_to_nullable</code></pre>
 
         <h4>Contract Validation in CI/CD</h4>
-        <pre><code># .github/workflows/data_contract_validation.yml
+        <pre><code class="language-yaml"># .github/workflows/data_contract_validation.yml
 name: Data Contract Validation
 
 on:
@@ -2116,13 +2115,16 @@ jobs:
 
 
       <!-- Chapter Navigation (bottom) -->
-      <div class="chapter-nav">
-        <a href="ch16-etl-pipeline-slow.html" class="nav-prev">← Ch 16: ETL Pipeline Slow</a>
-        <a href="ch18-lakehouse-platform.html" class="nav-next">Ch 18: Lakehouse Platform →</a>
-      </div>
+      <nav class="chapter-nav">
+        <a href="ch16-etl-pipeline-slow.html" class="prev">← Ch 16: ETL Pipeline Slow</a>
+        <a href="ch18-lakehouse-platform.html" class="next">Ch 18: Lakehouse Platform →</a>
+      </nav>
     </main>
-  </div>
 
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
   <script src="../assets/js/main.js"></script>
 </body>
 </html>

@@ -53,13 +53,15 @@
     </nav>
 
     <header class="chapter-header">
-      <span class="badge badge-medium">Medium</span>
-      <h1>Snowflake Internals</h1>
-      <p class="subtitle">Explain how Snowflake works internally.</p>
-      <div class="topics">
-        <span class="topic-tag">Snowflake</span>
-        <span class="topic-tag">Micro-partitions</span>
+      <div class="chapter-meta">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">Snowflake</span>
+        <span class="badge badge-topic">Micro-partitions</span>
       </div>
+      <h1>Snowflake Internals</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Snowflake's shared-data architecture decouples storage (immutable micro-partitions with zone maps for pruning), compute (elastic virtual warehouses that scale up for power and out for concurrency), and a cloud services layer that coordinates metadata, optimization, and caching — eliminating most traditional DBA work (no VACUUM, no indexes, no distribution keys) at the cost of needing new operational discipline around warehouse sizing, clustering, and credit spend.
+      </p>
     </header>
 
     <div class="search-container">

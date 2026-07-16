@@ -430,8 +430,13 @@ ALTER TABLE orders ALTER COLUMN status SET NOT NULL;</code></pre>
 
         <h3>MySQL/InnoDB Considerations</h3>
         <pre><code class="language-sql">-- MySQL 8.0+: INSTANT algorithm for adding columns
--- ⚠️ Limited to adding columns at the end of the table.
--- Some operations silently fall back to INPLACE or COPY.
+-- Before 8.0.29: limited to adding columns at the END of the table only.
+-- Since 8.0.29: columns can be added/dropped INSTANT at any position.
+-- ⚠️ Real limitation (any version): a table can accumulate at most 64
+-- "row versions" from INSTANT ADD/DROP operations before MySQL falls
+-- back to a full table rebuild (INPLACE/COPY) on the next such change.
+-- Some operations (e.g. adding a column with FULLTEXT/SPATIAL index) also
+-- silently fall back to INPLACE or COPY regardless of version.
 ALTER TABLE orders ADD COLUMN notes TEXT, ALGORITHM=INSTANT;
 
 -- pt-online-schema-change for type changes (Percona Toolkit)

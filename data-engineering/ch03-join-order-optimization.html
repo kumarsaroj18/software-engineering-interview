@@ -50,12 +50,15 @@
     </nav>
 
     <header class="chapter-header">
-      <span class="badge badge-hard">Hard</span>
-      <h1>How Do Query Optimizers Determine Join Order?</h1>
-      <div class="topics">
-        <span class="topic">Join Algorithms</span>
-        <span class="topic">Cardinality</span>
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Join Algorithms</span>
+        <span class="badge badge-topic">Cardinality</span>
       </div>
+      <h1>How Do Query Optimizers Determine Join Order?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Query optimizers use cost-based enumeration with dynamic programming (or heuristics beyond ~12 tables) to find the join order that minimizes total estimated I/O and CPU cost, relying on cardinality estimation from table statistics. The most common failure mode is stale statistics causing cascading underestimation, which leads to catastrophically wrong algorithm choices — most notably a nested loop join over millions of rows instead of a hash join.
+      </p>
     </header>
 
     <div class="search-container">

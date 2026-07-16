@@ -54,12 +54,15 @@
     </nav>
 
     <header class="chapter-header">
-      <span class="badge badge-medium">Medium</span>
-      <h1>Database Locking Mechanisms</h1>
-      <div class="topics">
-        <span class="topic-tag">Locks</span>
-        <span class="topic-tag">Deadlocks</span>
+      <div class="chapter-meta">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">Locks</span>
+        <span class="badge badge-topic">Deadlocks</span>
       </div>
+      <h1>Database Locking Mechanisms</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Locks coordinate concurrent access — shared locks allow multiple readers, exclusive locks isolate writers, and intent locks make multigranularity compatibility checks O(1) instead of scanning every row lock. MVCC eliminates most read-write contention, but write-write conflicts, DDL, and explicit `SELECT FOR UPDATE` still need locks, so deadlock prevention (consistent lock ordering, short transactions, `lock_timeout`) and monitoring (`pg_locks`, wait-for graphs) remain essential production skills.
+      </p>
     </header>
 
     <div class="search-container">

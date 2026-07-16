@@ -51,22 +51,20 @@
     </nav>
 
     <header class="chapter-header">
-      <h1>How Does BigQuery Execute SQL Differently from PostgreSQL?</h1>
-      <span class="badge badge-hard">Hard</span>
-      <div class="topics">
-        <span class="topic-tag">BigQuery</span>
-        <span class="topic-tag">Dremel</span>
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">BigQuery</span>
+        <span class="badge badge-topic">Dremel</span>
       </div>
+      <h1>How Does BigQuery Execute SQL Differently from PostgreSQL?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> BigQuery separates storage (Capacitor files on Colossus) from compute (dynamically allocated slots), executes queries via a multi-level Dremel serving tree instead of PostgreSQL's single-process volcano iterator, and prices queries by bytes scanned rather than compute time. It has no indexes, no VACUUM, and no connection limits — instead relying on partition pruning, clustering, and massive parallelism, which means the biggest cost risk isn't a slow query but an unfiltered `SELECT *` on a deeply nested table.
+      </p>
     </header>
 
     <div class="search-container">
       <input type="search" class="search-input" placeholder="Search this chapter... (Ctrl+K or /)" aria-label="Search chapter content">
     </div>
-
-    <nav class="chapter-nav">
-      <a class="prev" href="ch09-warehouse-design.html">← Ch 9: Warehouse Design</a>
-      <a class="next" href="ch11-snowflake-internals.html">Ch 11: Snowflake Internals →</a>
-    </nav>
 
     <!-- ============================================================
          SECTION 1: INTERVIEWER INTENT
@@ -2285,7 +2283,11 @@ FROM my_table;</code></pre>
     </nav>
   </main>
 
-  <script src="../assets/js/prism.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
   <script src="../assets/js/main.js"></script>
 </body>
 </html>

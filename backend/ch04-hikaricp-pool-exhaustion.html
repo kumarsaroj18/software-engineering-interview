@@ -714,7 +714,7 @@ spring:
       # - Pool appears exhausted even though connections exist</code></pre>
 
         <div class="callout callout-info">
-          <p><strong>HikariCP optimization:</strong> HikariCP skips validation if the connection was used less than 500ms ago (hardcoded constant <code>aliveBypassWindowMs = 500L</code>, not externally configurable). This means under sustained load, most borrows skip validation entirely. The risk is during idle-to-active transitions.</p>
+          <p><strong>HikariCP optimization:</strong> HikariCP skips validation if the connection was used less than 500ms ago (<code>aliveBypassWindowMs</code>, default 500L). This isn't exposed via <code>HikariConfig</code>/YAML like other pool settings — it can only be overridden with the JVM system property <code>-Dcom.zaxxer.hikari.aliveBypassWindowMs</code> (e.g. set to <code>-1</code> to force validation on every borrow). This means under sustained load, most borrows skip validation entirely. The risk is during idle-to-active transitions.</p>
         </div>
       </details>
     </section>

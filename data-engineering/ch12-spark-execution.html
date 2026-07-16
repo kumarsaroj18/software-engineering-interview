@@ -55,13 +55,15 @@
     </nav>
 
     <header class="chapter-header">
-      <span class="badge badge-hard">Hard</span>
-      <h1>Spark Execution</h1>
-      <p class="subtitle">Explain how Spark executes a job.</p>
-      <div class="topics">
-        <span class="topic-tag">DAG</span>
-        <span class="topic-tag">Catalyst</span>
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">DAG</span>
+        <span class="badge badge-topic">Catalyst</span>
       </div>
+      <h1>Spark Execution</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> An action triggers Spark's driver to build a DAG from lazy transformations, run it through Catalyst's four-phase optimizer (analysis, logical optimization, physical planning, code generation), split the physical plan into stages at shuffle boundaries, and dispatch tasks to executors that process data via Tungsten's off-heap binary format. Adaptive Query Execution then re-optimizes between stages using real shuffle statistics — coalescing partitions, switching join strategies, and splitting skewed keys — which is why most production Spark incidents (OOM, stragglers) trace back to a single skewed key or an AQE feature left disabled.
+      </p>
     </header>
 
     <div class="search-container">

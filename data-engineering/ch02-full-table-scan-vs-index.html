@@ -50,14 +50,17 @@
       <a href="index.html">Home</a> &rsaquo; <a href="index.html#part-i">Part I — SQL &amp; Query Processing Internals</a> &rsaquo; <span>Chapter 2</span>
     </nav>
 
-    <div class="chapter-header">
-      <h1>Why Did the Optimizer Choose a Full Table Scan Instead of Using an Index?</h1>
-      <span class="badge badge-hard">Hard</span>
-      <div class="chapter-topics">
-        <span class="topic-tag">Statistics</span>
-        <span class="topic-tag">Cost Model</span>
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Statistics</span>
+        <span class="badge badge-topic">Cost Model</span>
       </div>
-    </div>
+      <h1>Why Did the Optimizer Choose a Full Table Scan Instead of Using an Index?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> The query optimizer chooses between a sequential scan and an index scan based on cost, not habit. Once a predicate's selectivity crosses roughly 5-15% of the table (depending on correlation, caching, and hardware), sequential I/O becomes cheaper than the random I/O of index lookups. Diagnosing a "why did the plan flip" incident means checking statistics freshness, selectivity, and correlation — not fighting the optimizer with hints.
+      </p>
+    </header>
 
     <div class="search-container">
       <input type="search" class="search-input" placeholder="Search this chapter... (Ctrl+K or /)" aria-label="Search chapter content">

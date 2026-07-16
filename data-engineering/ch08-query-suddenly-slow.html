@@ -54,12 +54,15 @@
     </nav>
 
     <header class="chapter-header">
-      <span class="badge badge-hard">Hard</span>
-      <h1>Why Does a Query Suddenly Become Slow After Months of Working Correctly?</h1>
-      <div class="topics">
-        <span class="topic-tag">Statistics Drift</span>
-        <span class="topic-tag">Plan Cache</span>
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Statistics Drift</span>
+        <span class="badge badge-topic">Plan Cache</span>
       </div>
+      <h1>Why Does a Query Suddenly Become Slow After Months of Working Correctly?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> The query text is constant, but the execution plan is not — it depends on statistics, parameter values, available memory, and data distribution, all of which drift over time. The usual suspects are stale statistics causing cardinality misestimates, parameter sniffing poisoning the plan cache, data skew invalidating uniform-distribution assumptions, or work_mem exhaustion forcing a spill to disk, each triggered by gradual data growth silently crossing a planner tipping point.
+      </p>
     </header>
 
     <div class="search-container">

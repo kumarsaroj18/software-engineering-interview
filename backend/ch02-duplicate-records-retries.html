@@ -852,7 +852,7 @@ public class PaymentService {
         <div class="callout callout-warning">
           <p><strong>Deduplication vs Idempotency:</strong> <code>INSERT ... ON CONFLICT DO NOTHING</code> prevents duplicate rows — it is <em>deduplication</em>. True <em>idempotency</em> also means replaying the exact original response to the caller. A unique constraint alone cannot do that. For operations where the client needs the original response (e.g., the created order ID), pair the constraint with an idempotency key table.</p>
         </div>
-CREATE TABLE orders (
+        <pre><code class="language-sql">CREATE TABLE orders (
     id              BIGSERIAL PRIMARY KEY,
     user_id         BIGINT NOT NULL,
     cart_id         BIGINT NOT NULL,

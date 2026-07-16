@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Chapter 14 — Investigating Memory Leaks in Production | Interview Handbook</title>
   <link rel="stylesheet" href="../assets/css/style.css">
-  <link rel="stylesheet" href="../assets/css/prism.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
 </head>
 <body>
   <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
@@ -47,11 +47,16 @@
       <a href="../index.html">Home</a> &rsaquo; <a href="../index.html#part-iii">Part III — Production Engineering &amp; Debugging</a> &rsaquo; <span>Chapter 14</span>
     </nav>
 
-    <header>
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Heap Dumps</span>
+        <span class="badge badge-topic">Profiling</span>
+      </div>
       <h1>How Would You Investigate a Memory Leak That Only Appears After Several Days in Production?</h1>
-      <span class="badge badge-hard">Hard</span>
-      <span class="badge badge-topic">Heap Dumps</span>
-      <span class="badge badge-topic">Profiling</span>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> A Java memory leak is a reference leak, not a true unreachable-memory leak — objects stay reachable via unintended references (ThreadLocals, static collections, unregistered listeners) even though the GC is working correctly. Multi-day leaks require comparative heap dumps (day 1 vs day 5) and dominator-tree analysis to find what's growing, not a single snapshot.
+      </p>
     </header>
 
     <div class="search-container">
@@ -1887,7 +1892,8 @@ java -XX:+UseG1GC -XX:MaxGCPauseMillis=200
 # ZGC (Java 15+): Ultra-low pause regardless of heap size
 # + Pauses &lt; 10ms even with 16TB heap
 # + Concurrent compaction (no STW Full GC)
-# - Higher CPU overhead (~15%)
+# - 5-15% CPU/throughput overhead vs G1, varies by workload
+#   (generational ZGC, JDK 21+, trends toward the lower end)
 # - Slightly higher memory footprint
 java -XX:+UseZGC -XX:+ZGenerational  # Java 21+
 
@@ -1999,13 +2005,10 @@ jvm_memory_used_bytes{area="heap"} and on()
 
   </main>
 
-  <script src="../assets/js/prism.js" data-manual></script>
-  <script>
-    // Load Prism language components
-    Prism.languages.java = Prism.languages.java || {};
-    Prism.languages.yaml = Prism.languages.yaml || {};
-    Prism.languages.bash = Prism.languages.bash || {};
-  </script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
   <script src="../assets/js/main.js"></script>
 </body>
 </html>

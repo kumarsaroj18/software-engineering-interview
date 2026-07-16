@@ -1385,8 +1385,8 @@ spark = SparkSession.builder \
             "org.apache.spark.sql.execution.streaming.state."
             "RocksDBStateStoreProvider") \
     .getOrCreate()
-# Note: RocksDBStateStoreProvider is available in Spark 3.2+ (Databricks)
-# and open-source Spark 3.5+. Earlier versions use the default HDFS-backed store.
+# Note: RocksDBStateStoreProvider was introduced in open-source Apache Spark 3.2
+# (SPARK-34198). Earlier versions use the default HDFS-backed store.
 
 # Define schema for Kafka events
 event_schema = StructType([

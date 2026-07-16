@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Chapter 11 — Slow Downstream Service | Interview Handbook</title>
   <link rel="stylesheet" href="../assets/css/style.css">
-  <link rel="stylesheet" href="../assets/css/prism.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
 </head>
 <body>
   <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
@@ -48,18 +48,21 @@
       <a href="../index.html">Home</a> &rsaquo; <a href="../index.html#part-iii">Part III — Production Engineering &amp; Debugging</a> &rsaquo; <span>Chapter 11</span>
     </nav>
 
-    <h1>Chapter 11 — Slow Downstream Service</h1>
-    <div class="chapter-meta">
-      <span class="badge badge-medium">Medium</span>
-      <span class="badge badge-topic">Circuit Breaker</span>
-      <span class="badge badge-topic">Bulkhead</span>
-    </div>
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">Circuit Breaker</span>
+        <span class="badge badge-topic">Bulkhead</span>
+      </div>
+      <h1>One Downstream Service Is Taking 8 Seconds to Respond. How Do You Stop It From Affecting the Rest of the System?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> A slow (not failed) downstream dependency is the most dangerous failure mode — every inbound request blocks a thread or connection waiting on it until pools exhaust and the whole service stops serving traffic, including requests that never touch the slow dependency. Layered resilience — aggressive timeouts, circuit breakers, bulkheads, and fallbacks — contains the blast radius to just the failing dependency.
+      </p>
+    </header>
 
     <div class="search-container">
       <input type="search" class="search-input" placeholder="Search this chapter... (Ctrl+K or /)" aria-label="Search chapter content">
     </div>
-
-    <p class="chapter-question"><strong>"One downstream service is taking 8 seconds to respond. How do you stop it from affecting the rest of the system?"</strong></p>
 
 
     <!-- ============================================================ -->
@@ -1298,8 +1301,8 @@ histogram_quantile(0.99,
 )
 
 # Thread pool utilization
-tomcat_threads_busy_threads{application="order-service"}
-  / tomcat_threads_config_max_threads{application="order-service"}
+tomcat_threads_busy{application="order-service"}
+  / tomcat_threads_config_max{application="order-service"}
 
 # Circuit breaker state (0=CLOSED, 1=OPEN, 2=HALF_OPEN)
 resilience4j_circuitbreaker_state{name="paymentService"}
@@ -2194,10 +2197,10 @@ class PaymentIntegrationServiceTest {
 
   </main>
 
-  <script src="../assets/js/prism.js"></script>
-  <script src="../assets/js/prism-java.min.js"></script>
-  <script src="../assets/js/prism-yaml.min.js"></script>
-  <script src="../assets/js/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
   <script src="../assets/js/main.js"></script>
 </body>
 </html>

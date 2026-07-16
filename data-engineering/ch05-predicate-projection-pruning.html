@@ -53,12 +53,15 @@
     </nav>
 
     <header class="chapter-header">
-      <span class="badge badge-hard">Hard</span>
-      <h1>Predicate Pushdown, Projection Pushdown &amp; Nested Pruning</h1>
-      <div class="topics">
-        <span class="topic-tag">Pushdown</span>
-        <span class="topic-tag">Columnar</span>
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Pushdown</span>
+        <span class="badge badge-topic">Columnar</span>
       </div>
+      <h1>Predicate Pushdown, Projection Pushdown &amp; Nested Pruning</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Predicate pushdown skips data blocks using storage-layer statistics, projection pushdown reads only referenced columns from columnar storage, and nested pruning extends that down into struct/proto sub-fields — together they routinely cut bytes scanned by 99%+, which in pay-per-scan systems like BigQuery translates directly into dollar savings. The classic failure mode is a `SELECT *` on a table with a large nested payload column, which alone can turn a $0.01 query into a $50/day one.
+      </p>
     </header>
 
     <div class="search-container">

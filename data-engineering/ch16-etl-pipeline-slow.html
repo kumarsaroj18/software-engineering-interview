@@ -203,7 +203,7 @@ def check_volume_growth(table_path, lookback_days=7):
       <p>Shuffle is the most expensive operation in distributed data processing. When a pipeline suddenly slows down, shuffle spill is often the smoking gun — data that cannot fit in memory spills to disk, turning a memory-speed operation into a disk I/O-bound one.</p>
 
       <h3>How Shuffle Works</h3>
-      <p>During a shuffle (triggered by <code>groupBy</code>, <code>join</code>, <code>repartition</code>, <code>distinct</code>), each mapper writes shuffle files partitioned by the reduce key. Reducers then fetch their partitions over the network. With sort-based shuffle (Spark 2.0+), each mapper produces one output file regardless of reducer count, but every reducer must fetch its portion from every mapper — so the number of fetch requests scales as O(M × R) where M = mappers and R = reducers.</p>
+      <p>During a shuffle (triggered by <code>groupBy</code>, <code>join</code>, <code>repartition</code>, <code>distinct</code>), each mapper writes shuffle files partitioned by the reduce key. Reducers then fetch their partitions over the network. With sort-based shuffle (the default since Spark 1.2, and the only shuffle manager since hash-based shuffle was removed in Spark 2.0), each mapper produces one output file regardless of reducer count, but every reducer must fetch its portion from every mapper — so the number of fetch requests scales as O(M × R) where M = mappers and R = reducers.</p>
 
       <h3>Spark Shuffle Spill</h3>
       <p>When shuffle data exceeds available execution memory, Spark spills to disk:</p>

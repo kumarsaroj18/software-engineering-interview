@@ -50,12 +50,15 @@
     </nav>
 
     <header class="chapter-header">
-      <h1>Why Does Joining a Small Table with a Large Table Usually Perform Better?</h1>
-      <span class="badge badge-medium">Medium</span>
-      <div class="topics">
-        <span class="topic-tag">Hash Join</span>
-        <span class="topic-tag">Broadcast</span>
+      <div class="chapter-meta">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">Hash Join</span>
+        <span class="badge badge-topic">Broadcast</span>
       </div>
+      <h1>Why Does Joining a Small Table with a Large Table Usually Perform Better?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Joining small with large performs better because the small side can be materialized as an in-memory hash table (or broadcast to every executor), letting the large side stream through in a single O(n) pass with no shuffle. The failure mode is almost always "small" not staying small — stale statistics or unmonitored table growth causes the optimizer (or a hardcoded hint) to broadcast a table that's outgrown memory, turning a 12-minute query into an OOM incident.
+      </p>
     </header>
 
     <div class="search-container">

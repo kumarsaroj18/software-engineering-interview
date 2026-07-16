@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Chapter 13: Async Methods Still Blocking | Interview Handbook</title>
   <link rel="stylesheet" href="../assets/css/style.css">
-  <link rel="stylesheet" href="../assets/css/prism.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
 </head>
 <body>
   <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
@@ -49,16 +49,20 @@
     </nav>
 
     <header class="chapter-header">
-      <h1>Your Application Is Using Asynchronous Methods, but Requests Are Still Blocking. Why?</h1>
-      <div class="badges">
+      <div class="chapter-meta">
         <span class="badge badge-medium">Medium</span>
         <span class="badge badge-topic">@Async</span>
         <span class="badge badge-topic">Virtual Threads</span>
       </div>
-      <div class="search-container">
-        <input type="search" class="search-input" placeholder="Search this chapter... (Ctrl+K or /)" aria-label="Search this chapter">
-      </div>
+      <h1>Your Application Is Using Asynchronous Methods, but Requests Are Still Blocking. Why?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> @Async does not make code non-blocking — it offloads execution to another thread. If that thread pool is saturated, the caller blocks on <code>.get()</code>, or the proxy is bypassed via self-invocation, the request still blocks from the client's perspective. On Java 21+, virtual threads change the calculus by making blocking cheap.
+      </p>
     </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter... (Ctrl+K or /)" aria-label="Search this chapter">
+    </div>
 
 
     <!-- ============================== SECTION 1 ============================== -->
@@ -1158,7 +1162,7 @@ java -Djdk.tracePinnedThreads=full -jar app.jar
         <summary>Structured Concurrency (JEP 453 — Preview)</summary>
         <p>Structured concurrency ensures child tasks have a clear lifecycle tied to their parent scope, preventing thread leaks and orphaned operations:</p>
         <div class="callout callout-warning">
-          <p><strong>Preview feature:</strong> Structured Concurrency was incubating in JDK 21 (JEP 453) and became a preview feature in JDK 22+ (JEP 462). The API may change across versions. Use <code>--enable-preview</code> to compile and run.</p>
+          <p><strong>Preview feature:</strong> Structured Concurrency incubated in JDK 19 (JEP 428) and JDK 20 (JEP 437), then became a Preview feature in JDK 21 (JEP 453) and was re-previewed unchanged in JDK 22 (JEP 462) and later releases. The API may change across versions. Use <code>--enable-preview</code> to compile and run.</p>
         </div>
         <pre><code class="language-java">// Java 21+ (Preview feature)
 // --enable-preview required
@@ -2347,13 +2351,10 @@ public class HybridController {
 
   </main>
 
-  <script src="../assets/js/prism.js" data-manual></script>
-  <script>
-    // Load Prism language components
-    Prism.languages.java = Prism.languages.java || {};
-    Prism.languages.yaml = Prism.languages.yaml || {};
-    Prism.languages.bash = Prism.languages.bash || {};
-  </script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
   <script src="../assets/js/main.js"></script>
 </body>
 </html>
