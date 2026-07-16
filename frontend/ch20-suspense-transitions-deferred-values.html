@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 20: Suspense, Transitions &amp; Deferred Values | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <a href="../index.html">
+        <span class="chapter-num">Ch 20</span>
+        <span class="chapter-title">Suspense, Transitions &amp; Deferred Values</span>
+      </a>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#transitions-overview">Transitions Overview</a></li>
+        <li><a href="#use-transition">useTransition</a></li>
+        <li><a href="#start-transition-standalone">startTransition (Standalone)</a></li>
+        <li><a href="#use-deferred-value">useDeferredValue</a></li>
+        <li><a href="#suspense-data-fetching">Suspense for Data Fetching</a></li>
+        <li><a href="#suspense-lazy-components">Suspense for Lazy Components</a></li>
+        <li><a href="#suspense-boundaries-fallbacks">Boundaries &amp; Fallbacks</a></li>
+        <li><a href="#nested-suspense">Nested Suspense</a></li>
+        <li><a href="#suspense-list">SuspenseList</a></li>
+        <li><a href="#error-boundaries-suspense">Error Boundaries + Suspense</a></li>
+        <li><a href="#streaming-ssr-suspense">Streaming SSR Integration</a></li>
+        <li><a href="#suspense-server-components">Suspense for Server Components</a></li>
+        <li><a href="#production-patterns">Production Patterns</a></li>
+        <li><a href="#architecture-diagrams">Architecture Diagrams</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-iii">Part III — React Internals, Rendering Systems &amp; Architecture</a> &rsaquo;
+      <span>Chapter 20</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Suspense</span>
+        <span class="badge badge-topic">Transitions</span>
+        <span class="badge badge-topic">Concurrent Rendering</span>
+        <span class="badge badge-topic">Scheduling</span>
+      </div>
+      <h1>Suspense, Transitions &amp; Deferred Values</h1>
+      <blockquote class="chapter-question">
+        "Explain useTransition, useDeferredValue, and Suspense. How do they work together to keep UI responsive?"
+      </blockquote>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> All three mechanisms solve one problem from different angles: how to render something expensive or slow without blocking the parts of the UI the user is actively interacting with. <code>useTransition</code> marks an <em>update</em> as low-priority and interruptible; <code>useDeferredValue</code> marks a <em>value</em> as allowed to lag behind its source; <code>Suspense</code> lets a component <em>pause rendering entirely</em> until an async dependency resolves, showing a fallback in the meantime. None of them make work finish faster — they change the order and priority in which React is willing to do that work.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="text" class="search-input" placeholder="Search this chapter..." aria-label="Search">
+    </div>
+
+    <!-- Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details open>
+        <summary>What the interviewer is really testing</summary>
+        <div class="callout callout-info">
+          <strong>This question tests three capabilities simultaneously:</strong>
+        </div>
+        <ul>
+          <li><strong>Concurrent rendering fluency:</strong> do you understand these APIs are surface-level tools built on top of the Lane-based priority scheduler (Chapter 16), not independent features bolted onto React?</li>
+          <li><strong>Correct differentiation:</strong> can you clearly distinguish "defer a value" from "defer an update" from "pause rendering for async work" — the three most commonly confused concurrent APIs in the React surface area?</li>
+          <li><strong>Practical judgment:</strong> would you actually reach for these in a real input-lag or slow-render bug, or reach for <code>useMemo</code>/virtualization/debouncing instead, and do you know which problem each tool actually solves?</li>
+        </ul>
+        <div class="callout callout-warning">
+          <strong>Red flags for interviewers:</strong> "useTransition makes things faster" (it doesn't — it reprioritizes, the total work is often the same or more); confusing <code>useDeferredValue</code> with debouncing (they're related but mechanically different — deferred values still respond immediately if the browser is idle, debouncing always waits out a fixed timer); not knowing Suspense requires the suspending component to actually throw a promise, not just "be async."
+        </div>
+      </details>
+    </section>
+
+    <!-- 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details>
+        <summary>Structured response for time-pressured interviews</summary>
+        <p><strong><code>useTransition</code>:</strong> wraps a state update in a low-priority "transition," telling React it's allowed to interrupt that update's render if something more urgent (typing, a click) comes in, and exposes an <code>isPending</code> flag so you can show a stale-but-responsive UI while the transition is in flight.</p>
+        <p><strong><code>useDeferredValue</code>:</strong> takes a fast-changing value and returns a version of it that's allowed to "lag behind" during busy periods — the expensive subtree reading the deferred value re-renders at low priority, while the urgent update (e.g., updating the input's own displayed text) still commits immediately.</p>
+        <p><strong><code>Suspense</code>:</strong> lets a component "pause" rendering by throwing a promise; the nearest ancestor <code>&lt;Suspense&gt;</code> boundary catches it and shows its <code>fallback</code> until the promise resolves, at which point React re-attempts the render.</p>
+        <p><strong>How they combine:</strong> a typical responsive search UI wraps the results-fetching update in a transition (so typing stays instant), uses <code>useDeferredValue</code> on the query passed to an expensive results list (so filtering doesn't block each keystroke), and wraps the results themselves in Suspense (so the initial fetch shows a fallback without a manual loading-state <code>useState</code>).</p>
+      </details>
+    </section>
+
+    <!-- Transitions Overview -->
+    <section id="transitions-overview">
+      <h2>Transitions — Marking Non-Urgent Updates</h2>
+      <details>
+        <summary>Urgent vs Transition updates, and how this maps to Lanes</summary>
+        <p>React classifies updates into two broad buckets. <strong>Urgent updates</strong> — direct responses to discrete user input like typing, clicking, pressing a key — must feel instantaneous; React assigns them the <code>SyncLane</code> or <code>InputContinuousLane</code> (Chapter 16) and will interrupt anything else to process them. <strong>Transitions</strong> are updates that can visually lag without the user perceiving a broken interaction — switching a tab, filtering a large list, navigating between views — assigned to a <code>TransitionLane</code>, which is lower priority and, crucially, interruptible: if an urgent update comes in while a transition is rendering, React abandons the in-progress transition render and handles the urgent one first, resuming or restarting the transition afterward.</p>
+        <pre class="diagram">
+User types "a" in a search box while a large results list is mid-transition-render
+                                                              │
+                                                              ▼
+      ┌───────────────────────────┐        interrupts         ┌──────────────────────────┐
+      │ TransitionLane render      │◀───────────────────────── │ SyncLane: keystroke        │
+      │ (filtering 50k results)    │   render is torn down,     │ update (must feel instant) │
+      │                             │   not committed             │                            │
+      └───────────────────────────┘                              └──────────────────────────┘
+                                                              │
+                                          after urgent render commits,
+                                          the transition RESTARTS from scratch
+        </pre>
+        <div class="callout callout-info">
+          <strong>Transitions don't make rendering faster — they make it interruptible and de-prioritized.</strong> The actual computation (filtering 50k rows) still costs what it costs; what changes is that React is willing to throw away and restart that work rather than let it block a keystroke.
+        </div>
+      </details>
+    </section>
+
+    <!-- useTransition -->
+    <section id="use-transition">
+      <h2>useTransition (isPending + startTransition)</h2>
+      <details>
+        <summary>The hook form: pending state included</summary>
+        <pre><code class="language-jsx">function SearchPage() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [isPending, startTransition] = useTransition();
+
+  function handleChange(e) {
+    const value = e.target.value;
+    setQuery(value); // Urgent — the input must reflect keystrokes immediately
+
+    startTransition(() =&gt; {
+      // Marked non-urgent — React can interrupt/restart this if more typing arrives
+      setResults(filterLargeDataset(value));
+    });
+  }
+
+  return (
+    &lt;&gt;
+      &lt;input value={query} onChange={handleChange} /&gt;
+      &lt;div style={{ opacity: isPending ? 0.6 : 1 }}&gt;
+        &lt;ResultsList results={results} /&gt;
+      &lt;/div&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+        <p><code>isPending</code> becomes <code>true</code> the instant <code>startTransition</code> is called and flips back to <code>false</code> only once the transitioned update has actually committed — it's the tool for showing "stale content, dimmed, update in progress" instead of a jarring blank loading state.</p>
+        <div class="callout callout-warning">
+          <strong>Common mistake:</strong> wrapping the <code>setQuery(value)</code> call itself in <code>startTransition</code> — this makes the input's own displayed text lag behind typing, since now even the visible keystroke echo is de-prioritized. Only the <em>expensive derived work</em> belongs inside the transition; the input's own state must stay urgent.
+        </div>
+      </details>
+    </section>
+
+    <!-- startTransition standalone -->
+    <section id="start-transition-standalone">
+      <h2>startTransition (Standalone, No Pending State)</h2>
+      <details>
+        <summary>When you don't need the hook's isPending tracking</summary>
+        <pre><code class="language-jsx">import { startTransition } from 'react';
+
+// Usable outside components/hooks entirely — e.g. inside a non-React event handler,
+// a router's navigation callback, or utility code with no access to hook state
+function navigate(path) {
+  updateURL(path);
+  startTransition(() =&gt; {
+    setActiveRoute(path); // Marked low-priority, but no isPending flag is exposed here
+  });
+}</code></pre>
+        <div class="callout callout-tip">
+          <strong>React 19: async functions in <code>startTransition</code>.</strong> Passing an <code>async</code> function to <code>startTransition</code> keeps <code>isPending</code> (from the hook form) <code>true</code> across the <code>await</code>, not just until the first synchronous chunk finishes — this lets a transition encompass an actual network request, not only synchronous state updates, with the pending indicator correctly reflecting the entire async operation.
+        </div>
+        <pre><code class="language-jsx">const [isPending, startTransition] = useTransition();
+
+function handleSave() {
+  startTransition(async () =&gt; {
+    await saveToServer(formData); // isPending stays true through this await
+    setSaved(true);               // and the eventual state update is itself part of the transition
+  });
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- useDeferredValue -->
+    <section id="use-deferred-value">
+      <h2>useDeferredValue — Deferred Rendering</h2>
+      <details>
+        <summary>Deferring a value, not an update trigger</summary>
+        <p>Where <code>useTransition</code> requires you to control the state-setting call site, <code>useDeferredValue</code> lets you defer consumption of a value you don't control the updates of (e.g., a prop passed from a parent, or a fast-changing external value) — it hands back a version of the value that "trails behind" during busy renders, and React internally re-renders the deferred-value-consuming subtree at low priority once the urgent work is done.</p>
+        <pre><code class="language-jsx">function SearchPage({ query }) {
+  const deferredQuery = useDeferredValue(query);
+  // `deferredQuery` may lag one or more renders behind `query` during rapid typing;
+  // it "catches up" once the browser has spare time between urgent updates
+
+  return (
+    &lt;&gt;
+      &lt;input value={query} /* driven by the parent, always up to date */ /&gt;
+      {/* memo is what makes deferring actually pay off — see Common Mistakes */}
+      &lt;ExpensiveResultsList query={deferredQuery} /&gt;
+    &lt;/&gt;
+  );
+}
+
+const ExpensiveResultsList = memo(function ExpensiveResultsList({ query }) {
+  const results = filterLargeDataset(query); // expensive, only re-runs when `query` (deferred) changes
+  return &lt;ul&gt;{results.map((r) =&gt; &lt;li key={r.id}&gt;{r.title}&lt;/li&gt;)}&lt;/ul&gt;;
+});</code></pre>
+        <div class="callout callout-info">
+          <strong>vs debouncing:</strong> a debounced value only updates after a fixed pause in changes, regardless of how fast the device is. <code>useDeferredValue</code> updates as soon as React has spare rendering capacity — on a fast device with no other pending work, the deferred value can catch up almost immediately; on a slow device under load, it lags more. It's adaptive to actual render pressure rather than a fixed timer.
+        </div>
+      </details>
+    </section>
+
+    <!-- Suspense for Data Fetching -->
+    <section id="suspense-data-fetching">
+      <h2>Suspense for Data Fetching</h2>
+      <details>
+        <summary>How a component "pauses" — throwing a promise</summary>
+        <p>Suspense's underlying mechanism is deceptively simple: if a component throws a <em>Promise</em> during render (instead of throwing an Error), React catches it, treats the component as "not ready yet," shows the nearest ancestor Suspense boundary's fallback, and retries rendering that component once the promise resolves. Historically this required a hand-rolled "resource" wrapper; React 19's <code>use()</code> hook makes this the officially supported, ergonomic primitive.</p>
+        <pre><code class="language-jsx">// Simplified illustration of the underlying mechanism (not how you'd write this today)
+function createResource(promise) {
+  let status = 'pending';
+  let result;
+  const suspender = promise.then(
+    (data) =&gt; { status = 'success'; result = data; },
+    (err) =&gt; { status = 'error'; result = err; }
+  );
+  return {
+    read() {
+      if (status === 'pending') throw suspender; // &lt;-- this is what Suspense catches
+      if (status === 'error') throw result;
+      return result;
+    },
+  };
+}
+
+// React 19's supported, ergonomic version of the same idea:
+function ProfileDetails({ userPromise }) {
+  const user = use(userPromise); // suspends the component until userPromise resolves
+  return &lt;h1&gt;{user.name}&lt;/h1&gt;;
+}</code></pre>
+        <div class="callout callout-warning">
+          <strong>Suspense does not fetch data for you.</strong> It's a UI-coordination primitive — something else (a framework's data layer, <code>use()</code>, a Suspense-enabled library like Relay or React Query's suspense mode) must actually initiate the fetch and throw/return the right promise shape. Plain <code>useEffect</code> + <code>fetch</code> does not integrate with Suspense at all.
+        </div>
+      </details>
+    </section>
+
+    <!-- Suspense for Lazy Components -->
+    <section id="suspense-lazy-components">
+      <h2>Suspense for Lazy Components</h2>
+      <details>
+        <summary>Code-splitting, the original production use case for Suspense</summary>
+        <pre><code class="language-jsx">const HeavyChart = lazy(() =&gt; import('./HeavyChart'));
+
+function Dashboard() {
+  return (
+    &lt;Suspense fallback={&lt;ChartSkeleton /&gt;}&gt;
+      &lt;HeavyChart /&gt;
+    &lt;/Suspense&gt;
+  );
+}</code></pre>
+        <p><code>React.lazy</code> returns a component whose module import (a Promise) is thrown during its first render attempt if the module hasn't resolved yet — this was Suspense's first stable, production-ready use case (since React 16.6), well before Suspense-for-data-fetching was officially supported.</p>
+      </details>
+    </section>
+
+    <!-- Boundaries & Fallbacks -->
+    <section id="suspense-boundaries-fallbacks">
+      <h2>Suspense Boundaries &amp; Fallbacks</h2>
+      <details>
+        <summary>What actually happens to the subtree while suspended</summary>
+        <p>Suspense boundary behavior differs based on whether content has previously rendered:</p>
+        <ul>
+          <li><strong>Initial suspension (never mounted):</strong> The component never completes its first render, so no state is ever created. When data arrives, React renders the component from scratch — there's no state to "lose" because it never existed.</li>
+          <li><strong>Re-suspension (already visible content):</strong> React hides content and shows fallback, but only cleans up <em>layout Effects</em> (useLayoutEffect). Component state (useState/useReducer) is preserved. When ready to show again, layout Effects re-fire.</li>
+        </ul>
+        <div class="callout callout-warning">
+          <strong>Practical implication:</strong> For initial data loading, state never exists until the component fully mounts. For re-suspension of already-visible content (e.g., a transition re-fetch), existing state is preserved. Place Suspense boundaries narrowly around data-fetching components to limit the scope of components that must re-render from scratch on initial load.
+        </div>
+      </details>
+    </section>
+
+    <!-- Nested Suspense -->
+    <section id="nested-suspense">
+      <h2>Nested Suspense</h2>
+      <details>
+        <summary>Granularity controls what re-suspends together</summary>
+        <pre><code class="language-jsx">&lt;Suspense fallback={&lt;PageSkeleton /&gt;}&gt;
+  &lt;Header /&gt;
+  &lt;Suspense fallback={&lt;FeedSkeleton /&gt;}&gt;
+    &lt;Feed /&gt;   {/* only THIS falls back to FeedSkeleton if Feed suspends again later */}
+  &lt;/Suspense&gt;
+&lt;/Suspense&gt;</code></pre>
+        <p>A promise thrown by a component is caught by its <em>nearest</em> ancestor Suspense boundary — nesting boundaries lets independent parts of a tree suspend (and re-suspend on subsequent data refetches) without tearing down unrelated siblings or ancestors. Without the inner boundary, <code>Feed</code> suspending again later (e.g., a refetch) would fall the entire page back to <code>PageSkeleton</code>, discarding <code>Header</code>'s mounted state too.</p>
+      </details>
+    </section>
+
+    <!-- SuspenseList -->
+    <section id="suspense-list">
+      <h2>SuspenseList (Experimental)</h2>
+      <details>
+        <summary>Coordinating reveal order across multiple independent boundaries</summary>
+        <pre><code class="language-jsx">&lt;SuspenseList revealOrder="forwards" tail="collapsed"&gt;
+  &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;&lt;Comment id={1} /&gt;&lt;/Suspense&gt;
+  &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;&lt;Comment id={2} /&gt;&lt;/Suspense&gt;
+  &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;&lt;Comment id={3} /&gt;&lt;/Suspense&gt;
+&lt;/SuspenseList&gt;</code></pre>
+        <p>Without <code>SuspenseList</code>, three independent Suspense boundaries reveal in whatever order their data happens to resolve — visually jarring if comment 3 resolves before comment 1. <code>revealOrder="forwards"</code> forces them to reveal in document order regardless of resolution order (holding a resolved-but-out-of-turn item back until its predecessors are ready); <code>tail="collapsed"</code> shows only the next pending fallback instead of every remaining skeleton at once.</p>
+        <div class="callout callout-warning">
+          <strong>Status:</strong> <code>SuspenseList</code> was <em>removed entirely</em> from the React 19 release — it's not available in any stable React version. The coordinated-reveal problem it aimed to solve is real, but React currently has no built-in solution for it. In interviews, mention the <em>problem</em> (out-of-order reveals) to show awareness, but note there's no stable API for it. Custom solutions using Promise.all or waterfall patterns within a single Suspense boundary are the current workaround.
+        </div>
+      </details>
+    </section>
+
+    <!-- Error Boundaries + Suspense -->
+    <section id="error-boundaries-suspense">
+      <h2>Error Boundaries + Suspense</h2>
+      <details>
+        <summary>Two different "catch" mechanisms for two different throw types</summary>
+        <p>Error boundaries catch thrown <em>Error</em> objects (or any thrown value that isn't a thenable) during render, via the class component lifecycle methods <code>static getDerivedStateFromError</code>/<code>componentDidCatch</code> — there is no hook equivalent, so error boundaries must still be class components. Suspense catches thrown <em>Promises</em>. They compose, but solve different problems, and must be nested deliberately.</p>
+        <pre><code class="language-jsx">&lt;ErrorBoundary fallback={&lt;ErrorMessage /&gt;}&gt;
+  &lt;Suspense fallback={&lt;Loading /&gt;}&gt;
+    &lt;ProfileDetails userPromise={userPromise} /&gt;
+    {/* If userPromise REJECTS, `use()` re-throws the rejection reason
+        as a normal error during render — the ErrorBoundary (not Suspense) catches it */}
+  &lt;/Suspense&gt;
+&lt;/ErrorBoundary&gt;</code></pre>
+      </details>
+    </section>
+
+    <!-- Streaming SSR Integration -->
+    <section id="streaming-ssr-suspense">
+      <h2>Streaming SSR &amp; Suspense Integration</h2>
+      <details>
+        <summary>Ties directly into Chapter 17's streaming/selective hydration model</summary>
+        <p>On the server, <code>renderToPipeableStream</code> flushes the static shell immediately and streams each Suspense boundary's content into the HTML as an out-of-order <code>&lt;script&gt;</code>-driven patch once its data resolves server-side — the same boundary that determines client-side fallback granularity also determines server-side streaming granularity. Selective hydration then lets the client hydrate whichever streamed-in boundary the user interacts with first, independent of DOM order, exactly as covered in Chapter 17.</p>
+      </details>
+    </section>
+
+    <!-- Suspense for Server Components -->
+    <section id="suspense-server-components">
+      <h2>React 19: Suspense for Server Components</h2>
+      <details>
+        <summary>Ties directly into Chapter 21's Flight protocol</summary>
+        <p>An <code>async</code> Server Component that <code>await</code>s a slow data source effectively suspends the same way a client-side <code>use(promise)</code> call does — the nearest Suspense boundary's fallback is sent first in the Flight stream, and the resolved component's Flight row is streamed in afterward, letting independent Server Components resolve and appear progressively within a single response, as detailed in Chapter 21.</p>
+      </details>
+    </section>
+
+    <!-- Production Patterns -->
+    <section id="production-patterns">
+      <h2>Production Patterns</h2>
+      <details>
+        <summary>Combining all three in one responsive search UI</summary>
+        <pre><code class="language-jsx">function ProductSearch() {
+  const [query, setQuery] = useState('');
+  const deferredQuery = useDeferredValue(query);
+  const [isPending, startTransition] = useTransition();
+  const isStale = query !== deferredQuery;
+
+  return (
+    &lt;&gt;
+      &lt;input
+        value={query}
+        onChange={(e) =&gt; {
+          const value = e.target.value;
+          setQuery(value); // urgent — input stays responsive
+          // isPending from useTransition is unnecessary here since
+          // isStale (query !== deferredQuery) already indicates stale UI
+        }}
+      /&gt;
+      &lt;div style={{ opacity: isStale ? 0.5 : 1 }}&gt;
+        &lt;Suspense fallback={&lt;ResultsSkeleton /&gt;}&gt;
+          &lt;SearchResults query={deferredQuery} /&gt;
+        &lt;/Suspense&gt;
+      &lt;/div&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+        <p>Skeleton screens (a static, layout-matching placeholder) are strongly preferred over spinners for Suspense fallbacks in production — they eliminate layout shift when real content arrives and give the perception of faster loading, which is why nearly every major product (LinkedIn, Facebook, YouTube) popularized this pattern well before Suspense existed as an API.</p>
+      </details>
+    </section>
+
+    <!-- Architecture Diagrams -->
+    <section id="architecture-diagrams">
+      <h2>Architecture Diagrams</h2>
+      <details>
+        <summary>How the three mechanisms map onto the render pipeline</summary>
+        <pre class="diagram">
+                     ┌─────────────────────────────┐
+ Urgent update ─────▶│  SyncLane / InputContinuous  │──▶ renders + commits immediately,
+ (typing, click)     │  (cannot be interrupted)     │    can preempt a transition in flight
+                     └─────────────────────────────┘
+
+                     ┌─────────────────────────────┐
+ startTransition ────▶│  TransitionLane              │──▶ renders at low priority,
+ (or useTransition)   │  (interruptible, restartable)│    isPending=true until commit
+                     └─────────────────────────────┘
+
+                     ┌─────────────────────────────┐
+ useDeferredValue ───▶│  Secondary low-priority render│──▶ consuming subtree re-renders
+ (on the CONSUMING     │  of the SAME component, using │   again once the deferred value
+  component's render)  │  the previous value first     │   "catches up" to the real one
+                     └─────────────────────────────┘
+
+                     ┌─────────────────────────────┐
+ Suspense (throw a   ▶│  Render is abandoned entirely  │──▶ fallback shown, retried when
+ Promise during        │  for this subtree, NOT just    │    the promise resolves —
+ render)               │  de-prioritized                │    this is not a Lane/priority
+                     └─────────────────────────────┘        mechanism, it's a full pause
+        </pre>
+        <div class="callout callout-tip">
+          <strong>The distinction worth memorizing:</strong> transitions and deferred values are about <em>priority</em> — the work still happens, just later/interruptibly. Suspense is about <em>readiness</em> — the work cannot proceed at all until an external dependency resolves, regardless of priority.
+        </div>
+      </details>
+    </section>
+
+    <!-- Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Tab switching without a frozen UI during expensive tab renders</summary>
+        <pre><code class="language-jsx">function TabbedView() {
+  const [tab, setTab] = useState('home');
+  const [isPending, startTransition] = useTransition();
+
+  function selectTab(next) {
+    startTransition(() =&gt; setTab(next));
+  }
+
+  return (
+    &lt;&gt;
+      &lt;nav&gt;
+        &lt;button onClick={() =&gt; selectTab('home')} disabled={isPending}&gt;Home&lt;/button&gt;
+        &lt;button onClick={() =&gt; selectTab('analytics')} disabled={isPending}&gt;Analytics (slow)&lt;/button&gt;
+      &lt;/nav&gt;
+      {/* The OLD tab stays visible and interactive while the new one renders in the
+          background at low priority — no blank screen, no frozen click handlers */}
+      &lt;div style={{ opacity: isPending ? 0.7 : 1 }}&gt;
+        {tab === 'home' ? &lt;Home /&gt; : &lt;AnalyticsDashboard /&gt;}
+      &lt;/div&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Mistakes even experienced React engineers make</summary>
+        <ul>
+          <li><strong>Wrapping the input's own state update in <code>startTransition</code></strong> — makes the visible keystroke echo lag, defeating the point of keeping the input responsive.</li>
+          <li><strong>Forgetting <code>memo</code> on the component consuming a deferred value</strong> — without it, the parent re-rendering still re-renders the "deferred" child unconditionally, so the expensive work happens on every keystroke anyway; deferring only pays off when paired with a memoization boundary that can actually skip work.</li>
+          <li><strong>Treating <code>useDeferredValue</code> as a replacement for debouncing a network request</strong> — it defers local rendering work, not the decision of when to fire a fetch; you still need debouncing/cancellation for the actual I/O (Chapter 23).</li>
+          <li><strong>Drawing one giant Suspense boundary around an entire page</strong> — any single suspending child falls the whole page back to one fallback, discarding all sibling state and re-mounting effects across the whole tree unnecessarily.</li>
+          <li><strong>Assuming <code>isPending</code> reflects a network request's loading state</strong> — it reflects whether the <em>transition itself</em> (the render work) has committed, which is a different, React-scheduler-level concept from "has the fetch resolved," even though the two are often related in practice.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Decisions worth stating out loud</summary>
+        <ul>
+          <li><strong>Transitions vs debouncing:</strong> transitions keep the UI responsive by de-prioritizing render work adaptively based on actual device load; debouncing delays work by a fixed timer regardless of load. They solve overlapping but distinct problems and are often used together (debounce the network call, transition the resulting expensive render).</li>
+          <li><strong>Suspense boundary granularity:</strong> many small boundaries maximize independent streaming/responsiveness but require more deliberate fallback design and add more places state can be lost on re-suspension; one large boundary is simpler but reintroduces all-or-nothing loading.</li>
+          <li><strong><code>useDeferredValue</code> vs virtualization:</strong> deferring rendering reduces how often expensive work runs; virtualization reduces how much work each render actually does. For a genuinely huge list, virtualization is the more fundamental fix — deferring alone doesn't reduce the DOM node count, just when the re-render happens.</li>
+          <li><strong><code>SuspenseList</code>'s coordinated reveal vs independent boundaries:</strong> coordinated reveal produces a more polished, ordered loading experience but is still experimental and adds a dependency on an unstable API's continued existence.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- useOptimistic -->
+    <section id="use-optimistic">
+      <h2><code>useOptimistic</code> (React 19)</h2>
+      <details>
+        <summary>Instant UI feedback that auto-reverts when the real update lands</summary>
+        <pre><code class="language-jsx">function LikeButton({ postId, currentLikes }) {
+  const [optimisticLikes, addOptimistic] = useOptimistic(
+    currentLikes,
+    (current, increment) =&gt; current + increment
+  );
+
+  async function handleLike() {
+    addOptimistic(1); // Instantly shows +1
+    await likePost(postId); // Server call
+    // When this completes, optimistic state is automatically discarded
+    // and the real state (from revalidation) takes over
+  }
+
+  return &lt;button onClick={handleLike}&gt;♥ {optimisticLikes}&lt;/button&gt;;
+}</code></pre>
+        <p><code>useOptimistic</code> pairs naturally with transitions and Server Actions — it provides the instant feedback while the async operation resolves at TransitionLane priority. If the action fails, the optimistic value reverts automatically (no manual error rollback logic needed).</p>
+      </details>
+    </section>
+
+    <!-- Follow-up Interview Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Q1: If a transition update and a subsequent urgent update both change the same state, which one does the user see first?</summary>
+        <p><strong>Strong answer:</strong> the urgent update. React interrupts the in-progress transition render (discarding its incomplete work-in-progress tree) to process the higher-priority Lane first; once that commits, React restarts the transition's render from scratch against the new, current state — it doesn't resume the discarded partial work, since the state it was computed against may now be stale.</p>
+      </details>
+
+      <details>
+        <summary>Q2: Can you use <code>useDeferredValue</code> without ever seeing a difference in behavior?</summary>
+        <p><strong>Strong answer:</strong> yes — if the consuming subtree is cheap to render, or if the device/browser has spare idle capacity, the deferred value may update in the very next render with no perceptible lag at all. <code>useDeferredValue</code>'s effect is proportional to actual render pressure; it's not a fixed delay, so on a fast machine with light workloads it can appear to do nothing observable, which is expected, not a bug.</p>
+      </details>
+
+      <details>
+        <summary>Q3: Why must error boundaries remain class components even in a fully hooks-based codebase?</summary>
+        <p><strong>Strong answer:</strong> catching a render-phase error and deciding how to recover requires lifecycle hooks (<code>static getDerivedStateFromError</code> to compute fallback state, <code>componentDidCatch</code> for side-effect logging) that intercept the React reconciler's own error-propagation mechanism at a point no hook currently exposes — hooks run as part of a component's own render, and by the time a hook could theoretically "catch" something, the error has already propagated past that component's render entirely.</p>
+      </details>
+
+      <details>
+        <summary>Q4: What happens if the promise thrown for Suspense never resolves or never rejects?</summary>
+        <p><strong>Strong answer:</strong> the fallback remains visible indefinitely — React has no built-in timeout for a stuck promise. This is why production Suspense usage generally pairs a data-fetching layer with its own timeout/retry logic (an <code>AbortController</code>-based timeout that rejects after N seconds) rather than relying on Suspense itself to detect a hung request, since Suspense's contract is purely "resolved lets you proceed, rejected/thrown-error lets an Error Boundary catch it," with no third "gave up waiting" state of its own.</p>
+      </details>
+
+      <details>
+        <summary>Q5: How does React decide whether to show a Suspense fallback again on a re-suspension, versus keeping the previously rendered content visible?</summary>
+        <p><strong>Strong answer:</strong> this is governed by whether the update causing the re-suspension was itself wrapped in a transition. If the state update that triggers a component to suspend again is a transition, React keeps the previously committed content on screen (and sets <code>isPending</code> true) instead of immediately reverting to the fallback — this is precisely the mechanism that avoids "flash back to loading skeleton" on every filter change in a Suspense-integrated search UI. Without a transition, an urgent update that causes a re-suspension does immediately revert to the fallback.</p>
+      </details>
+    </section>
+
+    <!-- Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <div class="callout callout-tip">
+        <p><strong>Key mental models for the interview:</strong></p>
+        <ul>
+          <li><strong>Transitions = priority, not speed.</strong> The same work still has to happen; transitions just make it interruptible and de-prioritized relative to urgent input.</li>
+          <li><strong><code>useDeferredValue</code> defers consumption, <code>useTransition</code> defers the update that produces a value.</strong> Use the former when you don't control the update site; the latter when you do.</li>
+          <li><strong>Suspense is about readiness, not priority.</strong> A suspended subtree cannot render at all until its dependency resolves — no Lane priority changes that.</li>
+          <li><strong>Falling back is a real unmount, not a visual hide.</strong> For initial suspension, state is lost and effects clean up. For re-suspension of visible content, only layout effects clean up while state is preserved.</li>
+          <li><strong>Wrapping the causing update in a transition is what prevents "flash back to fallback"</strong> on re-suspension — this is the single most interview-relevant subtlety connecting transitions and Suspense.</li>
+        </ul>
+      </div>
+      <div class="callout callout-warning">
+        <p><strong>What NOT to say in an interview:</strong></p>
+        <ul>
+          <li>❌ "Transitions make React faster" — they change scheduling priority and interruptibility, not the total amount of work.</li>
+          <li>❌ "<code>useDeferredValue</code> is just debounce for React" — related in effect, different in mechanism (adaptive to render pressure vs a fixed timer).</li>
+          <li>❌ "Suspense automatically fetches your data" — it's a coordination primitive; something else must actually initiate the fetch and throw/return the right promise shape.</li>
+          <li>❌ "A Suspense fallback is just hidden with CSS" — the subtree actually unmounts, losing local state and re-running effects on remount.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-jsx.min.js"></script>
+</body>
+</html>

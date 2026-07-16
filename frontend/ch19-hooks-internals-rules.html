@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 19: Hooks Internals &amp; Rules | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <a href="../index.html">
+        <span class="chapter-num">Ch 19</span>
+        <span class="chapter-title">Hooks Internals &amp; Rules</span>
+      </a>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#hooks-linked-list">Hooks Linked List</a></li>
+        <li><a href="#hook-resolution-order">Hook Resolution by Call Order</a></li>
+        <li><a href="#usestate-internals">useState Internals</a></li>
+        <li><a href="#useeffect-internals">useEffect Internals</a></li>
+        <li><a href="#useref-stable-container">useRef — Stable Container</a></li>
+        <li><a href="#custom-hooks-composition">Custom Hooks Composition</a></li>
+        <li><a href="#rules-of-hooks">Rules of Hooks</a></li>
+        <li><a href="#strict-mode-double-invocation">Strict Mode Double-Invocation</a></li>
+        <li><a href="#closure-stale-state">Closure Stale State Problem</a></li>
+        <li><a href="#use-effect-event">useEffectEvent (Experimental)</a></li>
+        <li><a href="#use-hook-react19">React 19 use() Hook</a></li>
+        <li><a href="#production-anti-patterns">Production Anti-Patterns</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-iii">Part III — React Internals, Rendering Systems &amp; Architecture</a> &rsaquo;
+      <span>Chapter 19</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Hooks</span>
+        <span class="badge badge-topic">Fiber</span>
+        <span class="badge badge-topic">Closures</span>
+        <span class="badge badge-topic">Strict Mode</span>
+      </div>
+      <h1>Hooks Internals &amp; Rules</h1>
+      <blockquote class="chapter-question">
+        "How do React hooks work internally? Why must they be called in the same order, and what breaks if you don't?"
+      </blockquote>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Hooks aren't magic — each Fiber holds a singly linked list of plain Hook objects, and every hook call (<code>useState</code>, <code>useEffect</code>, <code>useRef</code>, ...) simply reads the next node in that list, in the exact order the calls happen. There is no name-based or identity-based matching at all — position in the call sequence <em>is</em> the hook's identity. This single fact explains the Rules of Hooks, why conditional hook calls corrupt state, why closures over stale state happen, and why <code>useRef</code> feels different from <code>useState</code>.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="text" class="search-input" placeholder="Search this chapter..." aria-label="Search">
+    </div>
+
+    <!-- Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details open>
+        <summary>What the interviewer is really testing</summary>
+        <div class="callout callout-info">
+          <strong>This question tests three capabilities simultaneously:</strong>
+        </div>
+        <ul>
+          <li><strong>Mechanism, not memorization:</strong> "don't call hooks conditionally" is a rule most candidates can recite; explaining <em>why</em> — the linked-list, call-order matching — is what separates a rule-follower from someone who understands the system.</li>
+          <li><strong>Real debugging experience:</strong> have you actually hit "Rendered more hooks than during the previous render" in production, and can you describe what code caused it and how you fixed it?</li>
+          <li><strong>Closure discipline:</strong> can you explain the stale closure problem precisely — which render's state/props a given closure "sees," and why — rather than just knowing "add it to the dependency array" as a magic incantation?</li>
+        </ul>
+        <div class="callout callout-warning">
+          <strong>Red flags for interviewers:</strong> "hooks work by tracking variable names" (they don't — order, not naming, is the mechanism); not knowing why <code>useRef</code> doesn't trigger re-renders while <code>useState</code> does, despite both persisting a value across renders; being unable to explain what Strict Mode's double-invocation in development is actually for.
+        </div>
+      </details>
+    </section>
+
+    <!-- 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details>
+        <summary>Structured response for time-pressured interviews</summary>
+        <p>Each Fiber node has a <code>memoizedState</code> field that, for function components, points to the head of a singly linked list of Hook objects — one node per hook call, in the exact order those calls appear in the function body. On the first render (mount), each hook call creates and appends a new node. On every subsequent render (update), React walks the <em>same</em> linked list from the start, and each hook call simply advances a cursor to the next node — there is no lookup by name, key, or any other identity; the <em>Nth hook call in this render</em> is matched to <em>the Nth node created during mount</em>, purely by position.</p>
+        <p>This is exactly why hooks must be called unconditionally, in the same order, on every render: an <code>if</code> statement around a hook call means that call might not happen on some renders, shifting every subsequent hook's position by one and causing them to read the wrong node's state — or, if React detects a hook-count mismatch across renders, throwing outright rather than silently corrupting state.</p>
+        <p><code>useState</code>'s node stores an update queue and the current memoized value; <code>useEffect</code>'s node stores the effect callback, its cleanup, and its dependency array for comparison; <code>useRef</code>'s node simply stores a stable <code>{ current }</code> object that never changes identity across renders and, critically, mutating <code>.current</code> does not schedule a re-render at all.</p>
+      </details>
+    </section>
+
+    <!-- Hooks Linked List -->
+    <section id="hooks-linked-list">
+      <h2>Hooks Linked List (fiber.memoizedState)</h2>
+      <details>
+        <summary>The actual data structure, simplified</summary>
+        <pre><code class="language-javascript">// Simplified shape of a single Hook node (React internals)
+const hook = {
+  memoizedState: null,   // the hook's current value (e.g. useState's stored value)
+  baseState: null,       // state before pending updates are applied
+  baseQueue: null,       // linked list of updates not yet processed
+  queue: null,           // the update queue (dispatch pushes here for useState/useReducer)
+  next: null,            // pointer to the NEXT hook called in this component — the whole mechanism
+};</code></pre>
+        <pre class="diagram">
+Fiber.memoizedState ──▶ Hook(useState #1) ──▶ Hook(useEffect #1) ──▶ Hook(useRef #1) ──▶ null
+                              │                     │                     │
+                         [count, setCount]     {create, destroy,    {current: domNode}
+                                                 deps: [...]}
+
+Component body, top to bottom:
+  const [count, setCount] = useState(0);   // creates/reads Hook node #1
+  useEffect(() =&gt; { ... }, [count]);       // creates/reads Hook node #2
+  const ref = useRef(null);                // creates/reads Hook node #3
+        </pre>
+        <div class="callout callout-info">
+          <strong>Mount vs update dispatcher:</strong> React actually swaps out the entire hook implementation between mount and update internally (<code>HooksDispatcherOnMount</code> vs <code>HooksDispatcherOnUpdate</code>) — on mount, <code>useState</code>'s implementation creates a new node and appends it; on update, a completely different implementation walks the existing list and reads the next node. This is why hook behavior can subtly differ between "first render" and "every render after" in ways that trip up naive reimplementations.
+        </div>
+      </details>
+    </section>
+
+    <!-- Hook Resolution by Call Order -->
+    <section id="hook-resolution-order">
+      <h2>Hook Resolution by Call Order</h2>
+      <details>
+        <summary>There is no name, key, or identity — only position</summary>
+        <pre><code class="language-jsx">// ❌ This is the exact mechanism the Rules of Hooks protect against
+function Profile({ userId, showBio }) {
+  const [name, setName] = useState('');
+
+  if (showBio) {
+    const [bio, setBio] = useState(''); // Hook node #2 ONLY exists on renders where showBio is true
+  }
+
+  const [avatar, setAvatar] = useState(null);
+  // When showBio is true:  node order is [name, bio, avatar]  → avatar is node #3
+  // When showBio is false: node order is [name, avatar]        → avatar is node #2
+  // If showBio FLIPS between renders, `avatar`'s hook call now reads
+  // whatever node happens to be at that position — which held `bio`'s state
+  // on the previous render. React's dev-mode hook-count check usually throws
+  // here rather than silently misattributing state, but the underlying cause
+  // is exactly this positional mismatch, not a special-cased error condition.
+}</code></pre>
+        <p>The fix is never to make the hook call itself conditional — instead, call the hook unconditionally and branch on what you <em>do</em> with its value:</p>
+        <pre><code class="language-jsx">// ✅ Hook call itself is unconditional; only its VALUE's relevance is conditional
+function Profile({ userId, showBio }) {
+  const [name, setName] = useState('');
+  const [bio, setBio] = useState(''); // always called — always node #2, regardless of showBio
+  const [avatar, setAvatar] = useState(null); // always node #3
+
+  return (
+    &lt;&gt;
+      {showBio &amp;&amp; &lt;p&gt;{bio}&lt;/p&gt;}
+    &lt;/&gt;
+  );
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- useState Internals -->
+    <section id="usestate-internals">
+      <h2>useState Internals (Queue, Dispatch, Reducer)</h2>
+      <details>
+        <summary>useState is useReducer with a built-in reducer</summary>
+        <p>Internally, <code>useState(initial)</code> is implemented as <code>useReducer(basicStateReducer, initial)</code>, where <code>basicStateReducer</code> simply returns the action if it's not a function, or calls it with the previous state if it is (the "functional update" form, <code>setCount(c =&gt; c + 1)</code>). The hook's node holds a <code>queue</code> — a linked list of pending updates — and calling <code>dispatch</code> (the <code>setCount</code> function) doesn't apply the update synchronously; it appends an update object to that queue and schedules a re-render. The queued updates are only actually processed, in order, the next time the component renders.</p>
+        <pre><code class="language-javascript">// Simplified mount-time implementation
+function mountState(initialState) {
+  const hook = mountWorkInProgressHook(); // creates and appends a new Hook node
+  hook.memoizedState = hook.baseState = initialState;
+  const queue = { pending: null, dispatch: null };
+  hook.queue = queue;
+
+  const dispatch = (action) =&gt; {
+    // Appends {action} to the circular pending queue and schedules work —
+    // does NOT synchronously recompute memoizedState here
+    const update = { action, next: null };
+    queue.pending = enqueue(queue.pending, update);
+    scheduleUpdateOnFiber(/* ... */);
+  };
+  queue.dispatch = dispatch;
+
+  return [hook.memoizedState, dispatch];
+}
+
+// Simplified update-time implementation
+function updateState() {
+  const hook = updateWorkInProgressHook(); // walks to the NEXT existing node
+  let newState = hook.baseState;
+  let update = hook.queue.pending?.next;
+  while (update) {
+    newState = typeof update.action === 'function' ? update.action(newState) : update.action;
+    update = update.next;
+  }
+  hook.memoizedState = newState;
+  return [hook.memoizedState, hook.queue.dispatch];
+}</code></pre>
+        <div class="callout callout-tip">
+          <strong>Why functional updates (<code>setCount(c =&gt; c + 1)</code>) are safer in rapid-fire scenarios:</strong> because the queue can accumulate multiple pending updates before a render actually processes them (e.g., multiple <code>dispatch</code> calls in the same event handler, or React 18's automatic batching across microtasks), each update function receives the <em>result of the previous update in the queue</em>, not a closure-captured stale value — this is what makes three consecutive <code>setCount(c =&gt; c + 1)</code> calls correctly increment by 3, while three <code>setCount(count + 1)</code> calls (closing over the same stale <code>count</code>) would not.
+        </div>
+      </details>
+    </section>
+
+    <!-- useEffect Internals -->
+    <section id="useeffect-internals">
+      <h2>useEffect Internals (Effect Tags, Destroy/Create)</h2>
+      <details>
+        <summary>Effects live in a separate circular list, processed after commit</summary>
+        <p>An effect's Hook node stores <code>{ create, destroy, deps, tag }</code>. During the render phase, React compares the new <code>deps</code> array against the previous one (via <code>Object.is</code> per element) — if any element differs (or no deps array was passed at all), the effect is tagged for execution this commit. Effects are collected into the Fiber's own circular effect list, separate from the hooks list, and processed in the commit phase: layout effects (<code>useLayoutEffect</code>) run synchronously right after DOM mutations but before the browser paints; passive effects (<code>useEffect</code>) are scheduled to run asynchronously after paint, so they don't block visual updates.</p>
+        <pre class="diagram">
+Commit phase, effect execution order for `useEffect`:
+
+  1. For EVERY effect whose deps changed, run its previous render's `destroy` (cleanup) FIRST
+     — all cleanups across the whole tree run before any new `create` runs
+  2. THEN run each changed effect's new `create` function
+  3. This happens AFTER the browser has painted (passive effects don't block paint)
+
+  useLayoutEffect follows the same destroy-then-create order, but BEFORE paint,
+  synchronously blocking the browser from showing the frame until effects finish
+        </pre>
+        <div class="callout callout-warning">
+          <strong>Common misconception:</strong> cleanup functions don't run "when the component unmounts" exclusively — they run before <em>every</em> re-execution of that same effect (i.e., whenever its dependencies change), and again on actual unmount. An effect with a non-empty dependency array can have its cleanup invoked many times over a component's life, not just once at the end.
+        </div>
+      </details>
+    </section>
+
+    <!-- useRef stable container -->
+    <section id="useref-stable-container">
+      <h2>useRef — Why It's a Stable Container</h2>
+      <details>
+        <summary>Same linked-list mechanism, but no update queue at all</summary>
+        <pre><code class="language-javascript">// Simplified mount-time implementation of useRef
+function mountRef(initialValue) {
+  const hook = mountWorkInProgressHook(); // same linked-list node as any other hook
+  const ref = { current: initialValue };
+  hook.memoizedState = ref;
+  return ref;
+}
+
+// Simplified update-time implementation — note there's no dispatch, no queue at all
+function updateRef() {
+  const hook = updateWorkInProgressHook();
+  return hook.memoizedState; // returns the SAME object reference created at mount, forever
+}</code></pre>
+        <p><code>useRef</code> uses the exact same positional linked-list mechanism as every other hook — its node just holds a plain mutable object with no update queue and no re-render scheduling attached to mutating <code>.current</code>. This is the entire explanation for why refs "persist across renders without causing re-renders": the object identity never changes (same node, same object, every render), and nothing in React ever inspects <code>.current</code>'s value to decide whether to schedule work.</p>
+      </details>
+    </section>
+
+    <!-- Custom Hooks Composition -->
+    <section id="custom-hooks-composition">
+      <h2>Custom Hooks — Composition Without Wrappers</h2>
+      <details>
+        <summary>A custom hook is just a function that calls other hooks — no extra Fiber, no wrapper node</summary>
+        <pre><code class="language-jsx">function useWindowWidth() {
+  const [width, setWidth] = useState(window.innerWidth);
+  useEffect(() =&gt; {
+    const handler = () =&gt; setWidth(window.innerWidth);
+    window.addEventListener('resize', handler);
+    return () =&gt; window.removeEventListener('resize', handler);
+  }, []);
+  return width;
+}
+
+function Layout() {
+  const width = useWindowWidth(); // inlines TWO hook calls (useState + useEffect) into Layout's own list
+  // Layout's hook list is: [useState(from useWindowWidth), useEffect(from useWindowWidth), ...]
+}</code></pre>
+        <p>When <code>Layout</code> calls <code>useWindowWidth()</code>, the <code>useState</code> and <code>useEffect</code> calls <em>inside</em> <code>useWindowWidth</code> append nodes directly onto <code>Layout</code>'s own Fiber hook list — there's no separate Fiber or wrapper node for the custom hook itself. This is why hook composition is "free": nesting custom hooks ten levels deep produces the same flat linked list on the actual component's Fiber as if you'd inlined every hook call by hand, with zero additional runtime indirection.</p>
+        <div class="callout callout-info">
+          <strong>This is also precisely why the Rules of Hooks apply transitively:</strong> a custom hook calling hooks conditionally has exactly the same effect as the consuming component doing so directly, because they share one flat list.
+        </div>
+      </details>
+    </section>
+
+    <!-- Rules of Hooks -->
+    <section id="rules-of-hooks">
+      <h2>Rules of Hooks — What Actually Breaks</h2>
+      <details>
+        <summary>Two rules, both direct consequences of the linked-list mechanism</summary>
+        <ol>
+          <li><strong>Only call hooks at the top level.</strong> Never inside conditions, loops, or nested (non-hook, non-component) functions — because those constructs can change whether/how-many-times a hook call executes between renders, shifting every subsequent hook's position in the list.</li>
+          <li><strong>Only call hooks from React function components or custom hooks.</strong> Regular JS functions aren't guaranteed to be called in a stable, render-tied sequence associated with a specific Fiber, so there's no linked list for them to append to.</li>
+        </ol>
+        <p>The <code>eslint-plugin-react-hooks</code> package enforces rule #1 <em>statically</em>, via AST analysis at lint time — it doesn't run your code, it pattern-matches hook calls appearing inside <code>if</code>/<code>for</code>/<code>while</code>/nested-function syntax nodes. React itself has a lightweight <em>runtime</em> check as a backstop: it counts hooks per render and throws <code>"Rendered more hooks than during the previous render"</code> if the count increases — but this only catches count <em>increases</em>, not every possible reordering (e.g., swapping the order of two always-called hooks around a conditional produces the same count but different attribution, and isn't caught by count comparison alone).</p>
+      </details>
+    </section>
+
+    <!-- Strict Mode Double-Invocation -->
+    <section id="strict-mode-double-invocation">
+      <h2>Strict Mode Double-Invocation</h2>
+      <details>
+        <summary>Deliberately surfacing non-idempotent renders and effects, development-only</summary>
+        <p>In development, <code>&lt;StrictMode&gt;</code> intentionally renders each component function twice in a row (discarding one result) and, for effects, runs an extra mount → unmount → mount cycle immediately after the initial commit. This has no effect in production builds — it's a deliberate development-only stress test designed to surface two classes of bugs before they reach users:</p>
+        <ul>
+          <li><strong>Non-idempotent render logic:</strong> a component body that mutates something outside itself (a module-level variable, a shared cache) during render will visibly misbehave when called twice — pure render functions are unaffected either way.</li>
+          <li><strong>Missing or incorrect effect cleanup:</strong> an effect that assumes "I only run once, ever" (e.g., opening a WebSocket with no cleanup) breaks immediately and obviously under the extra mount/unmount/mount cycle, instead of silently leaking in production the first time the component happens to remount for an unrelated reason.</li>
+        </ul>
+        <div class="callout callout-tip">
+          <strong>Practical framing:</strong> if double-invocation "breaks" your component, your component had a latent bug that would eventually surface anyway (React remounts components far more often than developers assume — route changes, key changes, Suspense re-suspension, list reordering without keys). Strict Mode just makes it happen immediately and deterministically in development instead of intermittently in production.
+        </div>
+      </details>
+    </section>
+
+    <!-- Closure Stale State -->
+    <section id="closure-stale-state">
+      <h2>Closure Stale State Problem</h2>
+      <details>
+        <summary>Which render's values a closure "sees," precisely</summary>
+        <pre><code class="language-jsx">// ❌ Classic stale closure: the setTimeout callback captures `count`
+// from the SPECIFIC render in which the effect ran, forever
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() =&gt; {
+    const id = setTimeout(() =&gt; {
+      console.log(count); // always logs the value from THIS render — never updates
+    }, 3000);
+    return () =&gt; clearTimeout(id);
+  }, []); // empty deps — effect runs once, closure over count=0 is captured forever
+
+  return &lt;button onClick={() =&gt; setCount((c) =&gt; c + 1)}&gt;{count}&lt;/button&gt;;
+}</code></pre>
+        <p>Each render of a function component executes the entire function body fresh, creating brand-new closures for every function defined inside it — including effect callbacks. Each of those closures captures the specific <code>props</code>/<code>state</code> values as they existed <em>during that particular render's execution</em>, via ordinary JS lexical scoping; there is no special React magic keeping a closure "live" against future state changes. An effect with <code>[]</code> deps only ever runs its <code>create</code> function once, so the closure it captured is permanently bound to that first render's values.</p>
+        <pre><code class="language-jsx">// ✅ Fix 1: include the dependency, so the effect re-creates its closure with fresh values
+useEffect(() =&gt; {
+  const id = setTimeout(() =&gt; console.log(count), 3000);
+  return () =&gt; clearTimeout(id);
+}, [count]); // re-runs (with a NEW closure) every time count changes
+
+// ✅ Fix 2: read the latest value via a ref, decoupling "latest value" from "reactive dependency"
+function Counter() {
+  const [count, setCount] = useState(0);
+  const countRef = useRef(count);
+  countRef.current = count; // updated on every render, read imperatively
+
+  useEffect(() =&gt; {
+    const id = setTimeout(() =&gt; console.log(countRef.current), 3000); // always current
+    return () =&gt; clearTimeout(id);
+  }, []);
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- useEffectEvent -->
+    <section id="use-effect-event">
+      <h2>useEffectEvent (Experimental)</h2>
+      <details>
+        <summary>An officially-supported answer to "I want the latest value, without it being a reactive dependency"</summary>
+        <div class="callout callout-warning">
+          <p><strong>Status (2024):</strong> <code>useEffectEvent</code> is experimental/unstable and was <em>not</em> included in the React 19 stable release. It was removed from the React 19 docs. In interviews, frame it as "an upcoming API React is developing" rather than "shipped in React 19." The underlying pattern (ref-based latest value) is the production workaround today.</p>
+        </div>
+        <p>The ref-based workaround above is exactly the pattern <code>useEffectEvent</code> formalizes: it lets you extract non-reactive logic out of an effect into an "Effect Event" that always sees the latest props/state (like a ref would), without needing to be listed in the effect's dependency array and without re-triggering the effect when those values change.</p>
+        <pre><code class="language-jsx">function ChatRoom({ roomId, theme }) {
+  const onConnected = useEffectEvent(() =&gt; {
+    showNotification('Connected!', theme); // always reads the LATEST theme, never stale
+  });
+
+  useEffect(() =&gt; {
+    const connection = createConnection(roomId);
+    connection.on('connected', () =&gt; onConnected());
+    connection.connect();
+    return () =&gt; connection.disconnect();
+    // `theme` is used inside onConnected but is intentionally NOT a dependency here —
+    // theme changes should NOT reconnect the chat room, only roomId changes should
+  }, [roomId]);
+}</code></pre>
+        <div class="callout callout-info">
+          <strong>Why this needs to be a distinct primitive rather than "just don't list it as a dependency":</strong> omitting a value from the dependency array while still closing over it directly (without <code>useEffectEvent</code>) reintroduces the exact stale-closure bug from the previous section — <code>useEffectEvent</code>'s implementation guarantees the function body always executes against the latest render's values, specifically by re-assigning its underlying implementation on every render (similar in spirit to the manual ref-reassignment pattern) while keeping a stable identity for the returned function itself.
+        </div>
+      </details>
+    </section>
+
+    <!-- use() Hook -->
+    <section id="use-hook-react19">
+      <h2>React 19 use() Hook</h2>
+      <details>
+        <summary>The one hook allowed to break the "top level only" rule</summary>
+        <p><code>use()</code> can read the value of a Promise (suspending the component via the Suspense mechanism from Chapter 20 until it resolves) or a Context. Unlike every other hook, <strong><code>use()</code> can be called conditionally, inside loops, and after early returns</strong> — because its resolution doesn't depend on positional matching. For Promises, it throws to the nearest Suspense boundary. For Context, while it still creates a hook node internally, the resolution is idempotent — reading from the nearest provider gives the same result regardless of call position, so React can safely exempt it from ordering constraints.</p>
+        <pre><code class="language-jsx">function Message({ messagePromise, show }) {
+  if (!show) return null;             // early return BEFORE a hook call — illegal for useState, fine for use()
+  const message = use(messagePromise); // conditionally reached, and that's explicitly supported
+  return &lt;p&gt;{message}&lt;/p&gt;;
+}</code></pre>
+        <div class="callout callout-warning">
+          <strong>Don't overgeneralize this exception in an interview.</strong> <code>use()</code> is a deliberate, narrow carve-out for exactly two use cases (Promises and Context) with their own resolution mechanism independent of the hooks linked list — it does not mean "the Rules of Hooks are being relaxed generally." <code>useState</code>, <code>useEffect</code>, and all other classic hooks remain strictly positional and must still follow the top-level-only rule.
+        </div>
+      </details>
+    </section>
+
+    <!-- Production Anti-Patterns -->
+    <section id="production-anti-patterns">
+      <h2>Production Anti-Patterns</h2>
+      <details>
+        <summary>Real bugs traced back to the mechanisms above</summary>
+        <pre><code class="language-jsx">// ❌ Early return BEFORE hooks — a genuinely common production bug,
+// often introduced by a well-intentioned "guard clause" refactor
+function UserProfile({ user }) {
+  if (!user) return &lt;LoginPrompt /&gt;; // hooks below this line become conditional!
+
+  const [isEditing, setIsEditing] = useState(false); // only called when `user` is truthy
+  const [draft, setDraft] = useState(user.bio);
+  // If `user` flips from truthy to falsy/back across renders (e.g. after an
+  // async auth check resolves), the number and identity of hook calls
+  // for THIS component changes between renders → hook-count mismatch
+
+  return &lt;Editor draft={draft} /&gt;;
+}
+
+// ✅ Hooks first, unconditionally; guard clause AFTER
+function UserProfile({ user }) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [draft, setDraft] = useState(user?.bio ?? '');
+
+  if (!user) return &lt;LoginPrompt /&gt;;
+
+  return &lt;Editor draft={draft} /&gt;;
+}</code></pre>
+        <pre><code class="language-jsx">// ❌ useRef misused to hold DERIVED state that should trigger re-renders
+function SearchBox({ items, query }) {
+  const filteredRef = useRef(items.filter((i) =&gt; i.name.includes(query)));
+  // filteredRef.current is computed ONCE, at mount — mutating it later
+  // doesn't re-render, and re-assigning it during render doesn't either,
+  // reliably, since refs are explicitly exempt from render scheduling
+  return &lt;List items={filteredRef.current} /&gt;; // stale after the first render
+}
+
+// ✅ Derived state belongs in useMemo (or plain computation), not a ref
+function SearchBox({ items, query }) {
+  const filtered = useMemo(() =&gt; items.filter((i) =&gt; i.name.includes(query)), [items, query]);
+  return &lt;List items={filtered} /&gt;;
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Minimal hook dispatcher reimplementation, for building intuition</summary>
+        <pre><code class="language-javascript">// A drastically simplified, single-component version of React's hook mechanism,
+// useful for building intuition about the linked list — not production code.
+let currentlyRenderingFiber = null;
+let workInProgressHook = null;
+
+function mountWorkInProgressHook() {
+  const hook = { memoizedState: null, next: null };
+  if (workInProgressHook === null) {
+    currentlyRenderingFiber.memoizedState = hook; // first hook — becomes the list head
+  } else {
+    workInProgressHook.next = hook; // append to the tail
+  }
+  workInProgressHook = hook;
+  return hook;
+}
+
+function useStateSimplified(initial) {
+  const hook = mountWorkInProgressHook();
+  hook.memoizedState = initial;
+  const setState = (value) =&gt; {
+    hook.memoizedState = value;
+    scheduleRerender(currentlyRenderingFiber);
+  };
+  return [hook.memoizedState, setState];
+}
+
+// On an UPDATE render, a parallel `updateWorkInProgressHook()` walks the
+// EXISTING list (fiber.memoizedState → hook.next → hook.next → ...) instead
+// of creating new nodes — this is the entire "same order every render" contract.</code></pre>
+      </details>
+    </section>
+
+    <!-- Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Mistakes even experienced React engineers make</summary>
+        <ul>
+          <li><strong>Early returns before all hook calls</strong> — the single most common real-world Rules of Hooks violation, often introduced during a refactor that adds a guard clause without checking what's below it.</li>
+          <li><strong>Believing the ESLint rule catches every possible violation</strong> — it's a static AST check; dynamically conditional hook-calling patterns hidden behind indirection (e.g., calling a custom hook only inside a callback) can sometimes slip past it.</li>
+          <li><strong>Treating <code>useRef</code> as a general-purpose "instance variable" for state that should affect rendering</strong> — refs are explicitly exempt from scheduling a re-render; derived/display state belongs in <code>useState</code>/<code>useMemo</code>.</li>
+          <li><strong>"Fixing" a stale closure by adding a value to a dependency array when it actually shouldn't be reactive</strong> — this re-runs the whole effect (including its cleanup/re-subscription) more often than intended, when a ref or <code>useEffectEvent</code> was the correct tool instead.</li>
+          <li><strong>Disabling Strict Mode to make an effect "stop breaking"</strong> instead of fixing the missing cleanup it was surfacing — the underlying bug still exists in production, just less deterministically triggered.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Decisions worth stating out loud</summary>
+        <ul>
+          <li><strong>Positional hook identity vs a hypothetical name-based system:</strong> position-based matching is extremely cheap at runtime (no map lookups, no key comparisons) but imposes the strict ordering rules this chapter covers; a name-based system (which no mainstream framework actually uses for this) would relax ordering constraints at the cost of runtime lookup overhead and naming-collision complexity.</li>
+          <li><strong>Ref-based "latest value" access vs <code>useEffectEvent</code>:</strong> the manual ref pattern works today across all supported React versions with no new API; <code>useEffectEvent</code> is more explicit about intent and slightly safer against misuse, but is a newer, more narrowly-versioned API to depend on.</li>
+          <li><strong>Strict Mode's double-invocation cost:</strong> genuinely doubles render-function execution time in development only — a real (if usually negligible) DX cost in exchange for catching non-idempotent-render and missing-cleanup bugs before production.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- React 19 New Hooks -->
+    <section id="react-19-hooks-landscape">
+      <h2>React 19 Hooks Landscape</h2>
+      <details>
+        <summary>New hooks that expand the hooks model beyond the positional linked list</summary>
+        <p>React 19 introduced several hooks that interact with form action boundaries rather than the traditional positional linked list:</p>
+        <ul>
+          <li><strong><code>useFormStatus()</code></strong> — reads the submission state (pending, data, method, action) of the nearest parent <code>&lt;form&gt;</code>. Only the component calling it re-renders on status change, not the entire form.</li>
+          <li><strong><code>useActionState(action, initialState)</code></strong> — manages state through a form action (renamed from <code>useFormState</code>). Returns <code>[state, formAction, isPending]</code>. Ties a reducer-like pattern to Server Actions.</li>
+          <li><strong><code>useOptimistic(state, updateFn)</code></strong> — creates an optimistic value that's shown immediately and automatically reverts when the async action completes/fails. Paired with transitions for instant UI feedback.</li>
+        </ul>
+        <p>These hooks are <em>positional</em> (they still follow Rules of Hooks), but their resolution depends on form action boundaries and async action lifecycles — expanding the hooks model beyond pure parent-child render propagation.</p>
+      </details>
+    </section>
+
+    <!-- Follow-up Interview Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Q1: Does calling the same number of hooks, but in a different order, between renders cause an error?</summary>
+        <p><strong>Strong answer:</strong> not necessarily an explicit thrown error — React's built-in runtime safeguard primarily compares hook <em>count</em> across renders, not the specific hook <em>type</em> at each position in all cases. Swapping the call order of, say, two <code>useState</code> calls around a conditional could silently misattribute state between them rather than throw, which is precisely why this class of bug is more dangerous and harder to detect than a straightforward count mismatch — it's also why the ESLint static rule matters more than relying on the runtime check alone.</p>
+      </details>
+
+      <details>
+        <summary>Q2: Why doesn't mutating a ref's <code>.current</code> property trigger a re-render, given that it's stored on the same Fiber as state?</summary>
+        <p><strong>Strong answer:</strong> re-renders are triggered explicitly by a hook's <code>dispatch</code> function calling <code>scheduleUpdateOnFiber</code> (as shown in the <code>useState</code> internals) — it's an intentional side effect of calling <code>setState</code>, not something that happens automatically whenever any value on the Fiber changes. A ref's node has no <code>dispatch</code>/<code>queue</code> at all; mutating <code>.current</code> is a plain JS object property assignment with nothing wired to the scheduler, by design.</p>
+      </details>
+
+      <details>
+        <summary>Q3: If two different custom hooks each call <code>useState</code> once, and a component calls both, how many hook nodes appear on that component's Fiber?</summary>
+        <p><strong>Strong answer:</strong> two — one per <code>useState</code> call, appended in the order the custom hooks are invoked in the component body. Custom hooks are not a boundary or namespace for hook storage; every hook call anywhere in the call chain reachable from the rendering component appends directly to that same flat linked list on that component's Fiber, in strict call order.</p>
+      </details>
+
+      <details>
+        <summary>Q4: Why is <code>use()</code> exempt from the Rules of Hooks when it's still a hook?</summary>
+        <p><strong>Strong answer:</strong> because its resolution mechanism isn't the fixed-position linked list at all — <code>use()</code> resolves a Promise via the Suspense boundary lookup mechanism or a Context via the Context provider tree lookup, both of which are found dynamically at the point of the call based on the current component tree structure, not by matching against a pre-existing node created during an earlier mount. There's no "wrong node" it could read, because it isn't reading from the hooks list in the first place.</p>
+      </details>
+
+      <details>
+        <summary>Q5: A component's effect has an empty dependency array but the interviewer says it still logs a stale prop value after the prop changes multiple times. Why, precisely?</summary>
+        <p><strong>Strong answer:</strong> an empty dependency array means the effect's <code>create</code> function only runs once, at mount — the closure created at that moment captured whatever the prop's value was during that specific render, and since the effect never re-runs, that closure (and the stale value it captured) is never replaced. This is the textbook stale-closure bug from this chapter's dedicated section, and the fix is either adding the prop to the dependency array (if the effect should legitimately re-run when it changes) or reading the latest value via a ref/<code>useEffectEvent</code> (if it shouldn't).</p>
+      </details>
+    </section>
+
+    <!-- Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <div class="callout callout-tip">
+        <p><strong>Key mental models for the interview:</strong></p>
+        <ul>
+          <li><strong>Hooks are a linked list on the Fiber, matched purely by call order.</strong> There is no name-based identity — position is identity.</li>
+          <li><strong>Custom hooks don't create their own storage.</strong> Their internal hook calls append directly to the calling component's own flat list.</li>
+          <li><strong><code>useRef</code> is the same mechanism as any hook, minus the update queue.</strong> That's the entire reason mutating it doesn't trigger a re-render.</li>
+          <li><strong>Closures capture the specific render's values, permanently, via ordinary JS scoping.</strong> "Stale closure" bugs are a direct consequence, not a React quirk — the fix is either re-running the effect (dependency array) or reading a mutable container (ref/<code>useEffectEvent</code>) instead of the closed-over value.</li>
+          <li><strong><code>use()</code> is a deliberate, narrow exception,</strong> not a general relaxation of the Rules of Hooks — it resolves dynamically against Suspense/Context, not the positional list.</li>
+        </ul>
+      </div>
+      <div class="callout callout-warning">
+        <p><strong>What NOT to say in an interview:</strong></p>
+        <ul>
+          <li>❌ "Hooks are matched by variable name" — there is no name tracking at runtime at all; it's purely positional.</li>
+          <li>❌ "Strict Mode's double rendering is a bug/annoyance to disable" — it's a deliberate, development-only tool for surfacing non-idempotent renders and missing effect cleanup.</li>
+          <li>❌ "<code>useEffectEvent</code>/refs are hacks to get around the dependency array" — they're the correct tool specifically when a value needs to be read at its latest value without being part of what triggers the effect to re-run.</li>
+          <li>❌ "<code>use()</code> means the Rules of Hooks are being phased out" — it's a narrowly-scoped exception for Promises/Context, not a general change to how <code>useState</code>/<code>useEffect</code>/etc. work.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-jsx.min.js"></script>
+</body>
+</html>

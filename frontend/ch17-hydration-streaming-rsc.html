@@ -1,0 +1,1853 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 17: Hydration, Streaming &amp; RSC | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <!-- Theme Toggle -->
+  <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">☀️</button>
+  <!-- Mobile Menu Toggle -->
+  <button class="mobile-menu-toggle" id="mobileMenuToggle" aria-label="Toggle menu">☰</button>
+
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="brand">Senior Frontend Interview Handbook</a>
+      <span class="chapter-num">Ch 17</span>
+      <span class="chapter-title">Hydration &amp; Streaming</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#traditional-ssr">Traditional SSR</a></li>
+        <li><a href="#hydration-mismatch">Hydration Mismatch</a></li>
+        <li><a href="#streaming-ssr">Streaming SSR</a></li>
+        <li><a href="#progressive-hydration">Progressive Hydration</a></li>
+        <li><a href="#selective-hydration">Selective Hydration</a></li>
+        <li><a href="#suspense-boundaries-streaming">Suspense &amp; Streaming</a></li>
+        <li><a href="#html-streaming-out-of-order">Out-of-Order Streaming</a></li>
+        <li><a href="#react-flight-protocol">React Flight Protocol</a></li>
+        <li><a href="#islands-architecture-comparison">Islands Comparison</a></li>
+        <li><a href="#core-web-vitals-impact">Core Web Vitals</a></li>
+        <li><a href="#hydration-strategy-decision">Strategy Decision</a></li>
+        <li><a href="#production-case-study">Case Study</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all" id="expandAll">Expand All</button>
+      <button class="collapse-all" id="collapseAll">Collapse All</button>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="main-content">
+    <!-- Breadcrumb -->
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <span>Part III — React Internals &amp; Architecture</span> &gt;
+      <span>Chapter 17</span>
+    </nav>
+
+    <!-- Badges -->
+    <div class="badges">
+      <span class="badge badge-hard">Hard</span>
+      <span class="badge badge-react">React</span>
+      <span class="badge badge-topic">Hydration</span>
+      <span class="badge badge-topic">Streaming SSR</span>
+      <span class="badge badge-topic">Server Components</span>
+    </div>
+
+    <!-- Title -->
+    <h1>Chapter 17: Hydration, Streaming &amp; React Server Components</h1>
+
+    <!-- Key Takeaway -->
+    <div class="takeaway">
+      <p><strong>Key Takeaway:</strong> Hydration attaches event handlers and React internals to server-rendered HTML. Traditional full hydration blocks interactivity until the entire tree is hydrated. React 18's streaming SSR (<code>renderToPipeableStream</code>) sends HTML progressively as Suspense boundaries resolve. Selective hydration prioritizes hydrating components the user interacts with first. Together these eliminate the all-or-nothing hydration bottleneck.</p>
+    </div>
+
+    <!-- Search -->
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search" />
+    </div>
+
+    <!-- Question -->
+    <div class="interview-question">
+      <p><strong>Interview Question:</strong> &ldquo;Explain React&rsquo;s hydration model. How do streaming SSR, progressive hydration, and selective hydration improve performance?&rdquo;</p>
+    </div>
+
+    <!-- Section 1: Interviewer Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details open>
+        <summary>Why interviewers ask this question</summary>
+        <div class="callout">
+          <p>Interviewers want to assess whether you understand:</p>
+          <ul>
+            <li>The fundamental cost of hydration and why it exists</li>
+            <li>How React 18 fundamentally changed the SSR story</li>
+            <li>The difference between streaming, progressive, and selective hydration</li>
+            <li>Real-world performance implications (TTFB, TTI, INP)</li>
+            <li>When to choose each strategy and the trade-offs involved</li>
+            <li>How React Server Components fit into the hydration picture</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 2: Quick Answer -->
+    <section id="quick-answer">
+      <h2>Quick Answer (30-Second Version)</h2>
+      <details open>
+        <summary>Concise answer for time-pressed interviews</summary>
+        <div class="callout">
+          <p>Hydration is the process of attaching event handlers and React state to server-rendered HTML. Traditional SSR with <code>renderToString</code> is all-or-nothing: the server must fetch all data, render the complete HTML, send it, then the client must hydrate the entire tree before anything is interactive.</p>
+          <p>React 18 solves this with three innovations:</p>
+          <ol>
+            <li><strong>Streaming SSR</strong> — <code>renderToPipeableStream</code> sends HTML progressively as Suspense boundaries resolve</li>
+            <li><strong>Progressive Hydration</strong> — Components hydrate in stages, not all at once</li>
+            <li><strong>Selective Hydration</strong> — React prioritizes hydrating whichever component the user interacts with first</li>
+          </ol>
+          <p>React Server Components (RSC) take this further by never sending component code to the client at all — they render on the server and stream a serialized tree via the React Flight protocol.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 3: Traditional SSR -->
+    <section id="traditional-ssr">
+      <h2>Traditional SSR &amp; Full Hydration</h2>
+      <details>
+        <summary>renderToString, data fetching bottleneck, hydration as second render</summary>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│               TRADITIONAL SSR TIMELINE                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Server:  [Fetch ALL data] → [Render ALL HTML] → [Send]        │
+│                                                    │            │
+│  Network:                                          [Transfer]   │
+│                                                         │       │
+│  Client:                                          [Parse HTML]  │
+│           [Download JS] → [Parse JS] → [Hydrate ENTIRE tree]   │
+│                                                         │       │
+│  User:    sees content ─────────────────────── can interact     │
+│           (TTFB)                                  (TTI)         │
+│                                                                 │
+│  Gap between FCP and TTI = "Uncanny Valley"                     │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+        <pre><code class="language-javascript">// Traditional SSR with renderToString (React 17 and earlier)
+import { renderToString } from 'react-dom/server';
+import App from './App';
+
+app.get('/', async (req, res) =&gt; {
+  // Problem 1: Must fetch ALL data before rendering anything
+  const userData = await fetchUser();
+  const posts = await fetchPosts();
+  const comments = await fetchComments(); // Slowest query blocks everything
+
+  // Problem 2: Render entire tree to string (synchronous, blocks event loop)
+  const html = renderToString(
+    &lt;App user={userData} posts={posts} comments={comments} /&gt;
+  );
+
+  // Problem 3: Nothing sent until everything is ready
+  res.send(`
+    &lt;!DOCTYPE html&gt;
+    &lt;html&gt;
+      &lt;body&gt;
+        &lt;div id="root"&gt;${html}&lt;/div&gt;
+        &lt;script src="/bundle.js"&gt;&lt;/script&gt;
+      &lt;/body&gt;
+    &lt;/html&gt;
+  `);
+});
+
+// Client-side: hydrate() must process entire tree
+import { hydrate } from 'react-dom';
+hydrate(&lt;App {...window.__DATA__} /&gt;, document.getElementById('root'));</code></pre>
+        <div class="callout">
+          <p><strong>The Four Bottlenecks of Traditional SSR:</strong></p>
+          <ol>
+            <li><strong>Data fetching</strong> — Server waits for ALL data before rendering begins</li>
+            <li><strong>Rendering</strong> — <code>renderToString</code> is synchronous; blocks the Node.js event loop</li>
+            <li><strong>Transfer</strong> — Entire HTML payload sent at once (large TTFB)</li>
+            <li><strong>Hydration</strong> — Client must process entire tree before ANY interactivity</li>
+          </ol>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: Hydration Mismatch -->
+    <section id="hydration-mismatch">
+      <h2>Hydration Mismatch</h2>
+      <details>
+        <summary>Causes, debugging, suppressHydrationWarning, consequences</summary>
+        <pre><code class="language-javascript">// Common causes of hydration mismatch
+
+// 1. Timestamps and Date objects
+function Header() {
+  // Server renders at time T, client hydrates at time T+N
+  return &lt;span&gt;{new Date().toLocaleTimeString()}&lt;/span&gt;; // ❌ MISMATCH
+}
+
+// Fix: useEffect for client-only values
+function Header() {
+  const [time, setTime] = useState(null);
+  useEffect(() =&gt; {
+    setTime(new Date().toLocaleTimeString());
+  }, []);
+  return &lt;span&gt;{time ?? 'Loading...'}&lt;/span&gt;; // ✅
+}
+
+// 2. Random values
+function Banner() {
+  // Different random value on server vs client
+  const variant = Math.random() &gt; 0.5 ? 'A' : 'B'; // ❌ MISMATCH
+  return &lt;div className={`banner-${variant}`} /&gt;;
+}
+
+// Fix: Seed random on server, pass via props or context
+function Banner({ variant }) {
+  return &lt;div className={`banner-${variant}`} /&gt;; // ✅
+}
+
+// 3. Browser-only APIs
+function WindowSize() {
+  // window doesn't exist on server
+  const width = window.innerWidth; // ❌ Crashes on server
+  return &lt;span&gt;{width}px&lt;/span&gt;;
+}
+
+// Fix: Check environment or use useEffect
+function WindowSize() {
+  const [width, setWidth] = useState(0);
+  useEffect(() =&gt; {
+    setWidth(window.innerWidth);
+  }, []);
+  return &lt;span&gt;{width}px&lt;/span&gt;; // ✅
+}
+
+// 4. Browser extensions injecting DOM nodes
+// Fix: Use suppressHydrationWarning on specific elements
+function Body() {
+  return &lt;div id="root" suppressHydrationWarning&gt;{children}&lt;/div&gt;;
+}
+
+// 5. Async data race conditions
+function Profile({ userId }) {
+  // If server and client fetch different versions of data
+  const data = useSWR(`/api/user/${userId}`); // ❌ Potential mismatch
+  return &lt;span&gt;{data?.name}&lt;/span&gt;;
+}
+
+// Fix: Serialize server data and reuse on client
+function Profile({ serverData }) {
+  const data = useSWR(`/api/user/${serverData.id}`, {
+    fallbackData: serverData // ✅ Client starts with same data
+  });
+  return &lt;span&gt;{data?.name}&lt;/span&gt;;
+}</code></pre>
+        <div class="callout">
+          <p><strong>Consequences of Hydration Mismatch:</strong></p>
+          <ul>
+            <li>React 17: Warns in dev mode; attempts to patch text content differences but provides no guarantees for attribute/structural mismatches (potentially leaving DOM inconsistent)</li>
+            <li>React 18: Logs error, falls back to client-side rendering for that subtree</li>
+            <li>React 19: More nuanced — text content mismatches are silently patched in-place (no full re-render), but structural mismatches (different element types, missing/extra nodes) still trigger client re-render with a console error</li>
+            <li>Performance cost: Mismatch forces React to discard server HTML and re-render from scratch</li>
+            <li>SEO risk: Content visible to crawlers differs from what users eventually see</li>
+          </ul>
+        </div>
+        <pre><code class="language-javascript">// Debugging hydration mismatches in React 18+
+// React provides detailed error messages:
+// "Text content does not match. Server: "Hello" Client: "World""
+// "Hydration failed because the initial UI does not match what was rendered on the server"
+
+// Strategy: Use React DevTools "Highlight updates" to spot re-renders
+// Or add this to your app temporarily:
+if (typeof window !== 'undefined') {
+  const originalError = console.error;
+  console.error = (...args) =&gt; {
+    if (args[0]?.includes?.('Hydration')) {
+      debugger; // Break on hydration errors
+    }
+    originalError.apply(console, args);
+  };
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Streaming SSR -->
+    <section id="streaming-ssr">
+      <h2>Streaming SSR</h2>
+      <details>
+        <summary>renderToPipeableStream, pipe(), onShellReady vs onAllReady, chunked transfer</summary>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│               STREAMING SSR TIMELINE                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Server:  [Render Shell] → [Stream chunk 1] → [chunk 2] → ...  │
+│                │                                                │
+│  Network:      [Shell HTML arrives]                             │
+│                     [chunk 1 arrives]                           │
+│                          [chunk 2 arrives]                      │
+│                                                                 │
+│  Client:  [Parse Shell] → [Hydrate Shell] → [Hydrate chunks]   │
+│                │                                                │
+│  User:    sees layout ── sees content ── full interactivity     │
+│           (fast TTFB)     (progressive)    (faster TTI)         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+        <pre><code class="language-javascript">// React 18 Streaming SSR with renderToPipeableStream
+import { renderToPipeableStream } from 'react-dom/server';
+import App from './App';
+
+app.get('/', (req, res) =&gt; {
+  // No need to await all data upfront!
+  const { pipe, abort } = renderToPipeableStream(
+    &lt;App /&gt;,
+    {
+      // bootstrapScripts tells React where the client bundle is
+      bootstrapScripts: ['/bundle.js'],
+
+      // onShellReady: fires when content outside all Suspense boundaries is ready
+      // Use for crawlers and real users
+      onShellReady() {
+        res.setHeader('Content-Type', 'text/html');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.statusCode = 200;
+        pipe(res); // Start streaming HTML to the client
+      },
+
+      // onShellError: fires if the shell itself fails to render
+      onShellError(error) {
+        res.statusCode = 500;
+        res.send('&lt;h1&gt;Server Error&lt;/h1&gt;');
+      },
+
+      // onAllReady: fires when ALL content (including Suspense) is ready
+      // Use for crawlers/bots that need complete HTML
+      onAllReady() {
+        // For bots: could delay pipe() until here
+        console.log('All Suspense boundaries resolved');
+      },
+
+      // onError: called for each rendering error
+      onError(error) {
+        console.error('Streaming error:', error);
+      }
+    }
+  );
+
+  // Timeout: abort streaming after 10 seconds
+  setTimeout(() =&gt; abort(), 10000);
+});
+
+// Bot detection: use onAllReady for crawlers
+app.get('/', (req, res) =&gt; {
+  const isBot = /bot|crawler|spider/i.test(req.headers['user-agent']);
+
+  const { pipe, abort } = renderToPipeableStream(&lt;App /&gt;, {
+    bootstrapScripts: ['/bundle.js'],
+    onShellReady() {
+      if (!isBot) {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/html');
+        pipe(res); // Stream immediately for real users
+      }
+    },
+    onAllReady() {
+      if (isBot) {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/html');
+        pipe(res); // Wait for complete HTML for bots
+      }
+    }
+  });
+});</code></pre>
+        <div class="callout">
+          <p><strong>How Chunked Transfer Works:</strong></p>
+          <ul>
+            <li>Server sends <code>Transfer-Encoding: chunked</code> header (no Content-Length)</li>
+            <li>Browser starts parsing and rendering HTML as chunks arrive</li>
+            <li>Each resolved Suspense boundary triggers a new chunk</li>
+            <li>React injects <code>&lt;script&gt;</code> tags that swap fallback content with resolved content</li>
+            <li>Connection stays open until all Suspense boundaries resolve or timeout</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 6: Progressive Hydration -->
+    <section id="progressive-hydration">
+      <h2>Progressive Hydration</h2>
+      <details>
+        <summary>Priority-based hydration, lazy hydration, reducing main-thread blocking</summary>
+        <pre><code class="language-javascript">// Progressive Hydration: Hydrate components in stages
+// Strategy: Defer hydration of below-fold content
+
+// Approach 1: Intersection Observer-based lazy hydration
+function LazyHydrate({ children, whenVisible = false, whenIdle = false }) {
+  const ref = useRef(null);
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() =&gt; {
+    if (whenVisible) {
+      const observer = new IntersectionObserver(
+        ([entry]) =&gt; {
+          if (entry.isIntersecting) {
+            setHydrated(true);
+            observer.disconnect();
+          }
+        },
+        { rootMargin: '200px' } // Start hydrating 200px before visible
+      );
+      if (ref.current) observer.observe(ref.current);
+      return () =&gt; observer.disconnect();
+    }
+
+    if (whenIdle) {
+      // Use requestIdleCallback for non-critical components
+      const id = requestIdleCallback(() =&gt; setHydrated(true));
+      return () =&gt; cancelIdleCallback(id);
+    }
+
+    setHydrated(true);
+  }, [whenVisible, whenIdle]);
+
+  // Server-rendered HTML preserved until hydration triggers
+  if (!hydrated) {
+    return (
+      &lt;div
+        ref={ref}
+        suppressHydrationWarning
+        dangerouslySetInnerHTML={{ __html: '' }}
+      /&gt;
+    );
+  }
+
+  return &lt;div ref={ref}&gt;{children}&lt;/div&gt;;
+}
+
+// Usage: Only hydrate footer when it scrolls into view
+function Page() {
+  return (
+    &lt;&gt;
+      &lt;Header /&gt;         {/* Hydrates immediately - interactive */}
+      &lt;HeroSection /&gt;    {/* Hydrates immediately - above fold */}
+
+      &lt;LazyHydrate whenIdle&gt;
+        &lt;ArticleBody /&gt;  {/* Hydrates during idle time */}
+      &lt;/LazyHydrate&gt;
+
+      &lt;LazyHydrate whenVisible&gt;
+        &lt;Comments /&gt;     {/* Hydrates when scrolled near */}
+      &lt;/LazyHydrate&gt;
+
+      &lt;LazyHydrate whenVisible&gt;
+        &lt;Footer /&gt;       {/* Hydrates when scrolled near */}
+      &lt;/LazyHydrate&gt;
+    &lt;/&gt;
+  );
+}
+
+// Approach 2: Priority queue for hydration
+const PRIORITY = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+
+class HydrationScheduler {
+  constructor() {
+    this.queue = [];
+    this.isProcessing = false;
+  }
+
+  enqueue(component, priority) {
+    this.queue.push({ component, priority });
+    this.queue.sort((a, b) =&gt; a.priority - b.priority);
+    if (!this.isProcessing) this.process();
+  }
+
+  async process() {
+    this.isProcessing = true;
+    while (this.queue.length &gt; 0) {
+      const { component } = this.queue.shift();
+      await component.hydrate();
+      // Yield to main thread between hydrations
+      await new Promise(resolve =&gt; setTimeout(resolve, 0));
+    }
+    this.isProcessing = false;
+  }
+}</code></pre>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│           PROGRESSIVE HYDRATION PRIORITY                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Priority 0 (Critical):  Navigation, Auth UI, Search Bar       │
+│  Priority 1 (High):      Above-fold interactive content        │
+│  Priority 2 (Medium):    Below-fold content (on idle)          │
+│  Priority 3 (Low):       Footer, analytics, non-essential UI   │
+│                                                                 │
+│  Timeline:                                                      │
+│  ──[P0]──[P1]──────[idle: P2]──────[visible: P3]──────▶       │
+│     │      │                                                    │
+│   Nav    Hero                                                   │
+│  works   interactive                                            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+        <div class="callout">
+          <p><strong>Key Benefits of Progressive Hydration:</strong></p>
+          <ul>
+            <li>Reduces main-thread blocking — hydration work is split into smaller chunks</li>
+            <li>Faster Time to Interactive (TTI) for critical UI elements</li>
+            <li>Reduces Total Blocking Time (TBT) by yielding between hydration tasks</li>
+            <li>Non-visible components never hydrate if user doesn&rsquo;t scroll to them</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 7: Selective Hydration -->
+    <section id="selective-hydration">
+      <h2>Selective Hydration (React 18)</h2>
+      <details>
+        <summary>User-interaction priority, event replay, hydrateRoot, priority inversion</summary>
+        <pre><code class="language-javascript">// Selective Hydration in React 18
+// React automatically prioritizes hydrating components the user clicks on
+
+import { hydrateRoot } from 'react-dom/client';
+
+// hydrateRoot enables concurrent features including selective hydration
+const root = hydrateRoot(document.getElementById('root'), &lt;App /&gt;);
+
+// How selective hydration works internally:
+// 1. React starts hydrating from top of tree
+// 2. When it hits a Suspense boundary, it can pause hydration
+// 3. If user clicks a not-yet-hydrated component, React:
+//    a. Intercepts the event in the capture phase
+//    b. Synchronously hydrates that component's subtree
+//    c. Event proceeds naturally through the now-hydrated DOM
+//    d. Resumes normal hydration order for remaining boundaries
+//
+// Note: If code for the boundary isn't downloaded yet (can't hydrate),
+// React calls stopPropagation() and increases the boundary's priority.
+
+// Example: Multiple Suspense boundaries with selective hydration
+function App() {
+  return (
+    &lt;&gt;
+      &lt;Header /&gt; {/* Hydrates first (no Suspense boundary) */}
+
+      &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+        &lt;Sidebar /&gt; {/* Can be deferred */}
+      &lt;/Suspense&gt;
+
+      &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+        &lt;MainContent /&gt; {/* Can be deferred */}
+      &lt;/Suspense&gt;
+
+      &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+        &lt;Comments /&gt; {/* Can be deferred */}
+      &lt;/Suspense&gt;
+    &lt;/&gt;
+  );
+}
+
+// If user clicks on Comments while Sidebar is still hydrating:
+// React pauses Sidebar hydration → hydrates Comments → click fires naturally
+// This is "priority inversion" — user intent overrides default order</code></pre>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│              SELECTIVE HYDRATION — EVENT-TRIGGERED PRIORITY      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Default hydration order: Header → Sidebar → Main → Comments   │
+│                                                                 │
+│  User clicks "Reply" button in Comments section                 │
+│                                                                 │
+│  React's response:                                              │
+│  1. Intercept click in capture phase (discrete = high priority) │
+│  2. Synchronously hydrate Comments subtree                      │
+│  3. Click event fires naturally on now-hydrated button          │
+│  4. User sees immediate response                                │
+│  5. Resume hydrating Sidebar and Main in background             │
+│                                                                 │
+│  Timeline:                                                      │
+│  ──[Header]──[Sidebar...]──╳ CLICK ──[Comments]──replay──▶    │
+│                                          │                      │
+│                               Priority inversion!               │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+        <div class="callout">
+          <p><strong>Event Replay Rules:</strong></p>
+          <ul>
+            <li><strong>Discrete events</strong> (click, keydown, input): Replayed after hydration</li>
+            <li><strong>Continuous events</strong> (scroll, mousemove): NOT replayed (stale by the time hydration completes)</li>
+            <li>Only the Suspense boundary containing the target is prioritized</li>
+            <li>If multiple clicks happen on different boundaries, React processes them in click order</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 8: Suspense Boundaries & Streaming -->
+    <section id="suspense-boundaries-streaming">
+      <h2>Suspense Boundaries &amp; Streaming</h2>
+      <details>
+        <summary>Suspense as streaming unit, fallback replacement, out-of-order completion, inline scripts</summary>
+        <pre><code class="language-javascript">// Suspense boundaries define the streaming units
+// Each boundary is an independent chunk that can resolve independently
+
+function ProductPage() {
+  return (
+    &lt;Layout&gt;
+      {/* Shell: renders immediately, sent in first chunk */}
+      &lt;Header /&gt;
+      &lt;ProductInfo productId={123} /&gt;
+
+      {/* Streaming boundary 1: Reviews (slow API) */}
+      &lt;Suspense fallback={&lt;ReviewsSkeleton /&gt;}&gt;
+        &lt;Reviews productId={123} /&gt;
+      &lt;/Suspense&gt;
+
+      {/* Streaming boundary 2: Recommendations (ML service) */}
+      &lt;Suspense fallback={&lt;RecommendationsSkeleton /&gt;}&gt;
+        &lt;Recommendations userId={user.id} /&gt;
+      &lt;/Suspense&gt;
+
+      {/* Streaming boundary 3: Inventory check (third-party) */}
+      &lt;Suspense fallback={&lt;InventorySkeleton /&gt;}&gt;
+        &lt;InventoryStatus productId={123} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/Layout&gt;
+  );
+}
+
+// What the client receives over time:
+// Chunk 1 (immediate): Shell + fallbacks
+// Chunk 2 (200ms later): InventoryStatus resolves (fastest API)
+// Chunk 3 (500ms later): Reviews resolve
+// Chunk 4 (800ms later): Recommendations resolve
+
+// Note: Chunks arrive in completion order, NOT document order!</code></pre>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│         SUSPENSE STREAMING: WHAT THE BROWSER RECEIVES           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Time 0ms ─ Initial Shell:                                      │
+│  ┌──────────────────────────────────────────┐                   │
+│  │ &lt;header&gt;...&lt;/header&gt;                     │                   │
+│  │ &lt;div&gt;Product Info&lt;/div&gt;                  │                   │
+│  │ &lt;template id="B:0"&gt;&lt;/template&gt;           │ ← Reviews slot   │
+│  │ &lt;div&gt;ReviewsSkeleton&lt;/div&gt;               │ ← Fallback       │
+│  │ &lt;!--/$--&gt;                                │                   │
+│  │ &lt;template id="B:1"&gt;&lt;/template&gt;           │ ← Recs slot      │
+│  │ &lt;div&gt;RecommendationsSkeleton&lt;/div&gt;       │                   │
+│  │ &lt;!--/$--&gt;                                │                   │
+│  └──────────────────────────────────────────┘                   │
+│                                                                 │
+│  Time 200ms ─ Inventory resolves:                               │
+│  ┌──────────────────────────────────────────┐                   │
+│  │ &lt;div hidden id="S:2"&gt;In Stock&lt;/div&gt;      │ ← Actual content │
+│  │ &lt;script&gt;$RC("B:2","S:2")&lt;/script&gt;        │ ← Swap script    │
+│  └──────────────────────────────────────────┘                   │
+│                                                                 │
+│  Time 500ms ─ Reviews resolve:                                  │
+│  ┌──────────────────────────────────────────┐                   │
+│  │ &lt;div hidden id="S:0"&gt;Reviews HTML&lt;/div&gt;  │                   │
+│  │ &lt;script&gt;$RC("B:0","S:0")&lt;/script&gt;        │                   │
+│  └──────────────────────────────────────────┘                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+        <div class="callout">
+          <p><strong>The Inline Script Injection Pattern:</strong></p>
+          <ul>
+            <li>React sends resolved content in a hidden <code>&lt;div&gt;</code> at the end of the stream</li>
+            <li>An inline <code>&lt;script&gt;</code> calls <code>$RC</code> (completeBoundary) to swap fallback with real content</li>
+            <li>This works without JavaScript loaded — the swap happens via tiny inline scripts</li>
+            <li>Content appears progressively even if the main bundle hasn&rsquo;t downloaded yet</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 9: HTML Streaming Out-of-Order -->
+    <section id="html-streaming-out-of-order">
+      <h2>Out-of-Order HTML Streaming</h2>
+      <details>
+        <summary>$RC template swapping, progressive enhancement, shell-first architecture</summary>
+        <pre><code class="language-javascript">// How React's out-of-order streaming works under the hood
+
+// The runtime functions injected at the start of the stream:
+// $RC = completeBoundary - swaps fallback with resolved content
+// $RA = completeSegment - adds content to existing boundary
+// $RX = errorBoundary - replaces fallback with error UI
+
+// Simplified implementation of $RC (completeBoundary):
+function $RC(boundaryId, contentId) {
+  // Find the boundary marker (template tag)
+  const boundary = document.getElementById(boundaryId);
+  // Find the hidden content that was streamed later
+  const content = document.getElementById(contentId);
+
+  if (boundary &amp;&amp; content) {
+    // Get all nodes between boundary start and end markers
+    const fallbackNodes = [];
+    let node = boundary.nextSibling;
+    while (node &amp;&amp; node.nodeType !== 8 /* Comment: /$  */) {
+      fallbackNodes.push(node);
+      node = node.nextSibling;
+    }
+
+    // Remove fallback content
+    fallbackNodes.forEach(n =&gt; n.remove());
+
+    // Move resolved content from hidden div to boundary location
+    while (content.firstChild) {
+      boundary.parentNode.insertBefore(content.firstChild, boundary.nextSibling);
+    }
+
+    // Clean up
+    content.remove();
+    boundary.remove();
+  }
+}
+
+// What the complete streamed document looks like:
+/*
+&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;head&gt;
+  &lt;script&gt;
+    // Tiny runtime for boundary completion (~1KB)
+    function $RC(b,c) { ... }
+    function $RX(b,e) { ... }
+  &lt;/script&gt;
+&lt;/head&gt;
+&lt;body&gt;
+  &lt;div id="root"&gt;
+    &lt;header&gt;Navigation&lt;/header&gt;
+    &lt;main&gt;
+      &lt;!--$?--&gt;&lt;template id="B:0"&gt;&lt;/template&gt;
+      &lt;div class="skeleton"&gt;Loading...&lt;/div&gt;
+      &lt;!--/$--&gt;
+    &lt;/main&gt;
+  &lt;/div&gt;
+
+  &lt;!-- Streamed later when data resolves --&gt;
+  &lt;div hidden id="S:0"&gt;
+    &lt;div class="reviews"&gt;Actual review content...&lt;/div&gt;
+  &lt;/div&gt;
+  &lt;script&gt;$RC("B:0","S:0")&lt;/script&gt;
+
+  &lt;!-- Bootstrap script loads last --&gt;
+  &lt;script src="/bundle.js" async&gt;&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+*/</code></pre>
+        <div class="callout">
+          <p><strong>Progressive Enhancement Properties:</strong></p>
+          <ul>
+            <li>Content is visible even if JavaScript fails to load (it&rsquo;s real HTML)</li>
+            <li>The $RC swap scripts are tiny and inline — no bundle dependency</li>
+            <li>Browsers render content as it arrives (streaming HTML parsing)</li>
+            <li>If streaming aborts, users still see the shell and any resolved content</li>
+            <li>Search engines can crawl the content regardless of JS execution</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: React Flight Protocol -->
+    <section id="react-flight-protocol">
+      <h2>React Flight Protocol (RSC Wire Format)</h2>
+      <details>
+        <summary>RSC wire format, serialized component tree, client/server references</summary>
+        <pre><code class="language-javascript">// React Server Components use the "Flight" protocol
+// It's a streaming JSON-like format that describes the component tree
+
+// Server Component (runs ONLY on server, zero bundle cost)
+// app/page.tsx
+async function ProductPage({ params }) {
+  const product = await db.query('SELECT * FROM products WHERE id = ?', [params.id]);
+
+  return (
+    &lt;Layout&gt;
+      &lt;ProductDetails product={product} /&gt;
+      {/* Client Component: marked with 'use client' */}
+      &lt;AddToCartButton productId={product.id} /&gt;
+      &lt;Suspense fallback={&lt;ReviewsSkeleton /&gt;}&gt;
+        &lt;Reviews productId={product.id} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/Layout&gt;
+  );
+}
+
+// The Flight protocol wire format (simplified):
+// Each line is a row with an ID and value
+// M = Module reference (client component)
+// S = Symbol
+// J = JSON model (rendered output)
+
+/*
+0:["$","div",null,{"className":"layout","children":[...]}]
+1:I["./AddToCartButton.js","AddToCartButton"]
+2:["$","$1",null,{"productId":42}]
+3:["$","$Suspense",null,{"fallback":["$","div",null,{"className":"skeleton"}]}]
+*/
+
+// Actual streaming format example:
+/*
+0:"$Sreact.suspense"
+1:["$","div",null,{"className":"product-page","children":[
+  ["$","h1",null,{"children":"Widget Pro"}],
+  ["$","p",null,{"children":"$19.99"}],
+  ["$","$L1",null,{"productId":42}]
+]}]
+1:I{"id":"./src/AddToCartButton.js","chunks":["chunk-abc"],"name":"AddToCartButton"}
+2:["$","div",null,{"className":"reviews","children":[...]}]
+*/</code></pre>
+        <div class="callout callout-info">
+          <p><strong>Note:</strong> The Flight wire format is React-internal and subject to change between versions. React 19 uses updated row prefixes (<code>$L</code> for client references, <code>$</code> for server references). The conceptual model (streaming rows describing a component tree) is stable, but don't memorize exact syntax for interviews — focus on understanding <em>what</em> it encodes (element tree + module references + chunks) and <em>why</em> (enables streaming without full serialization).</p>
+        </div>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│              REACT FLIGHT PROTOCOL CONCEPTS                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Server Component Tree:                                         │
+│  ┌─────────────────────────────────────┐                        │
+│  │ Layout (server)                     │                        │
+│  │  ├── ProductDetails (server)        │ → Serialized as JSON   │
+│  │  ├── AddToCartButton (client ref)   │ → Module reference     │
+│  │  └── Suspense                       │                        │
+│  │       └── Reviews (server)          │ → Streamed later       │
+│  └─────────────────────────────────────┘                        │
+│                                                                 │
+│  Wire Format:                                                   │
+│  ┌─────────────────────────────────────┐                        │
+│  │ Client References: "use client"     │                        │
+│  │  → Module ID + export name          │                        │
+│  │  → Client downloads &amp; renders       │                        │
+│  │                                     │                        │
+│  │ Server References: "use server"     │                        │
+│  │  → Server action ID                 │                        │
+│  │  → Client calls via fetch           │                        │
+│  └─────────────────────────────────────┘                        │
+│                                                                 │
+│  Key Insight: Server components = ZERO JavaScript sent to       │
+│  client. Only their rendered output (HTML/JSON) is sent.        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+        <div class="callout">
+          <p><strong>Flight Protocol Key Properties:</strong></p>
+          <ul>
+            <li><strong>Streaming</strong> — Rows arrive incrementally, client renders as they arrive</li>
+            <li><strong>Resumable</strong> — Can pause and resume across network boundaries</li>
+            <li><strong>Typed References</strong> — Client components are references, not serialized code</li>
+            <li><strong>No Hydration for Server Components</strong> — They never run on client, so no hydration cost</li>
+            <li><strong>Composable</strong> — Server and client components interleave freely in the tree</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 11: Islands Architecture Comparison -->
+    <section id="islands-architecture-comparison">
+      <h2>Islands Architecture Comparison</h2>
+      <details>
+        <summary>Islands (Astro) vs React streaming, partial vs selective hydration, trade-offs</summary>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│         ISLANDS vs REACT STREAMING COMPARISON                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Islands Architecture (Astro, Fresh):                           │
+│  ┌──────────────────────────────────────────┐                   │
+│  │  Static HTML (zero JS)                   │                   │
+│  │  ┌─────┐           ┌─────────┐          │                   │
+│  │  │Island│           │ Island  │          │                   │
+│  │  │(React)           │(Svelte) │          │                   │
+│  │  └─────┘           └─────────┘          │                   │
+│  │         Static HTML (zero JS)            │                   │
+│  │              ┌──────────┐                │                   │
+│  │              │  Island   │               │                   │
+│  │              │  (Vue)    │               │                   │
+│  │              └──────────┘                │                   │
+│  │         Static HTML (zero JS)            │                   │
+│  └──────────────────────────────────────────┘                   │
+│                                                                 │
+│  React Streaming + Selective Hydration:                         │
+│  ┌──────────────────────────────────────────┐                   │
+│  │  React Tree (single runtime)             │                   │
+│  │  ┌─────────────────────────────────┐     │                   │
+│  │  │ Suspense Boundary (deferred)    │     │                   │
+│  │  └─────────────────────────────────┘     │                   │
+│  │  ┌─────────────────────────────────┐     │                   │
+│  │  │ Suspense Boundary (deferred)    │     │                   │
+│  │  └─────────────────────────────────┘     │                   │
+│  │  Entire tree is React (shared state)     │                   │
+│  └──────────────────────────────────────────┘                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+        <table>
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>Islands (Astro)</th>
+              <th>React Streaming + RSC</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>JS sent to client</td>
+              <td>Only island code</td>
+              <td>React runtime + client components</td>
+            </tr>
+            <tr>
+              <td>Hydration scope</td>
+              <td>Per-island (isolated)</td>
+              <td>Per-Suspense boundary (connected)</td>
+            </tr>
+            <tr>
+              <td>Shared state</td>
+              <td>Difficult (separate islands)</td>
+              <td>Natural (single React tree)</td>
+            </tr>
+            <tr>
+              <td>Framework mixing</td>
+              <td>Yes (React + Vue + Svelte)</td>
+              <td>React only</td>
+            </tr>
+            <tr>
+              <td>Client navigation</td>
+              <td>Full page reload (MPA)</td>
+              <td>SPA transitions (shared layout)</td>
+            </tr>
+            <tr>
+              <td>Best for</td>
+              <td>Content sites, blogs, docs</td>
+              <td>Apps, dashboards, e-commerce</td>
+            </tr>
+            <tr>
+              <td>Runtime overhead</td>
+              <td>Minimal (no global runtime)</td>
+              <td>React runtime always present (~40KB)</td>
+            </tr>
+            <tr>
+              <td>Complexity</td>
+              <td>Simple mental model</td>
+              <td>More complex (Suspense, RSC rules)</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout">
+          <p><strong>Key Distinction:</strong> Islands use <em>partial hydration</em> (only interactive components hydrate, rest is static HTML with no framework awareness). React uses <em>selective hydration</em> (entire tree is React-aware, but hydration is prioritized and deferred). RSC bridges the gap — server components are like static islands within a React tree.</p>
+          <p><strong>Partial Prerendering (PPR, Next.js 14+/React 19):</strong> Blurs the line further — the static shell is prerendered at build time, and dynamic "holes" (Suspense boundaries) are filled via streaming at request time. Result: instant TTFB for the static shell + streaming for dynamic content. This is the latest evolution in the islands-vs-streaming spectrum.</p>
+          <p><strong>Server Actions (<code>"use server"</code>):</strong> The mutation counterpart to RSC's data fetching. Form handlers marked with <code>"use server"</code> execute on the server without shipping handler code to the client — eliminating the need to hydrate form submission logic. This further reduces client-side JS for forms.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 12: Core Web Vitals Impact -->
+    <section id="core-web-vitals-impact">
+      <h2>Core Web Vitals Impact</h2>
+      <details>
+        <summary>TTFB, LCP, INP improvements, hydration cost, metric strategies</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Traditional SSR</th>
+              <th>Streaming SSR</th>
+              <th>+ Selective Hydration</th>
+              <th>+ RSC</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>TTFB</td>
+              <td>High (wait for all data)</td>
+              <td>Low (shell sent immediately)</td>
+              <td>Low</td>
+              <td>Low</td>
+            </tr>
+            <tr>
+              <td>FCP</td>
+              <td>Delayed by slowest query</td>
+              <td>Fast (shell renders first)</td>
+              <td>Fast</td>
+              <td>Fast</td>
+            </tr>
+            <tr>
+              <td>LCP</td>
+              <td>Blocked by full render</td>
+              <td>Improved (content streams in)</td>
+              <td>Improved</td>
+              <td>Best (less JS to parse)</td>
+            </tr>
+            <tr>
+              <td>INP</td>
+              <td>Poor (full hydration blocks)</td>
+              <td>Moderate</td>
+              <td>Good (priority hydration)</td>
+              <td>Best (less to hydrate)</td>
+            </tr>
+            <tr>
+              <td>TTI</td>
+              <td>Late (entire tree hydrated)</td>
+              <td>Moderate</td>
+              <td>Fast (critical path only)</td>
+              <td>Fastest</td>
+            </tr>
+            <tr>
+              <td>TBT</td>
+              <td>High (long hydration task)</td>
+              <td>Moderate</td>
+              <td>Low (broken into chunks)</td>
+              <td>Lowest</td>
+            </tr>
+          </tbody>
+        </table>
+        <pre><code class="language-javascript">// Strategies for each Core Web Vital
+
+// TTFB: Use streaming — send shell immediately
+// Instead of waiting for all data:
+const { pipe } = renderToPipeableStream(&lt;App /&gt;, {
+  onShellReady() { pipe(res); } // Shell sent without waiting for Suspense
+});
+
+// LCP: Ensure LCP element is in the shell (not behind Suspense)
+function Page() {
+  return (
+    &lt;&gt;
+      {/* LCP element: hero image — in shell, not Suspense-wrapped */}
+      &lt;img src="/hero.jpg" alt="Hero" fetchpriority="high" /&gt;
+
+      {/* Non-LCP content can be streamed */}
+      &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+        &lt;SlowContent /&gt;
+      &lt;/Suspense&gt;
+    &lt;/&gt;
+  );
+}
+
+// INP: Reduce hydration cost with selective hydration + code splitting
+// Break large bundles so hydration doesn't block main thread
+const HeavyComponent = lazy(() =&gt; import('./HeavyComponent'));
+
+function Dashboard() {
+  return (
+    &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+      &lt;HeavyComponent /&gt; {/* Hydrates only when interacted with */}
+    &lt;/Suspense&gt;
+  );
+}
+
+// TBT: Yield between hydration tasks using React's scheduler
+// React 18 automatically yields using the concurrent scheduler
+// But you can help by adding more Suspense boundaries:
+function LongList({ items }) {
+  return (
+    &lt;&gt;
+      &lt;Suspense&gt;
+        &lt;ListChunk items={items.slice(0, 20)} /&gt;
+      &lt;/Suspense&gt;
+      &lt;Suspense&gt;
+        &lt;ListChunk items={items.slice(20, 40)} /&gt;
+      &lt;/Suspense&gt;
+      &lt;Suspense&gt;
+        &lt;ListChunk items={items.slice(40)} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+        <div class="callout">
+          <p><strong>Hydration Cost on INP:</strong> Each hydration pass is a synchronous React render. For a component tree with 1000 nodes, hydration can block the main thread for 100-300ms. Selective hydration breaks this into per-boundary chunks of 10-50ms, staying under the 200ms INP threshold.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 13: Hydration Strategy Decision Matrix -->
+    <section id="hydration-strategy-decision">
+      <h2>Hydration Strategy Decision Matrix</h2>
+      <details>
+        <summary>When to use full, progressive, selective, or islands hydration</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Best For</th>
+              <th>Complexity</th>
+              <th>JS Sent</th>
+              <th>TTI</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Full Hydration</td>
+              <td>Small apps, admin panels</td>
+              <td>Low</td>
+              <td>All components</td>
+              <td>Slowest</td>
+            </tr>
+            <tr>
+              <td>Progressive Hydration</td>
+              <td>Content-heavy pages, blogs</td>
+              <td>Medium</td>
+              <td>All (deferred load)</td>
+              <td>Moderate</td>
+            </tr>
+            <tr>
+              <td>Selective Hydration</td>
+              <td>Interactive dashboards, SPAs</td>
+              <td>Medium</td>
+              <td>All (deferred exec)</td>
+              <td>Fast</td>
+            </tr>
+            <tr>
+              <td>Islands</td>
+              <td>Mostly static sites, docs</td>
+              <td>Low-Medium</td>
+              <td>Only islands</td>
+              <td>Fastest</td>
+            </tr>
+            <tr>
+              <td>RSC + Selective</td>
+              <td>Full-stack apps, e-commerce</td>
+              <td>High</td>
+              <td>Client components only</td>
+              <td>Fast</td>
+            </tr>
+          </tbody>
+        </table>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│              DECISION FLOWCHART                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Is it mostly static content?                                   │
+│  ├── YES → Islands (Astro, Fresh)                               │
+│  └── NO                                                         │
+│       │                                                         │
+│       Is it a complex interactive app?                          │
+│       ├── YES → Does it need SSR?                               │
+│       │         ├── YES → React Streaming + Selective + RSC     │
+│       │         └── NO  → Client-side rendering (SPA)           │
+│       └── NO                                                    │
+│            │                                                    │
+│            Is content below-fold important?                     │
+│            ├── YES → Progressive Hydration                      │
+│            └── NO  → Full Hydration (simplest)                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+        <div class="callout">
+          <p><strong>Rule of Thumb:</strong> Start with the simplest strategy that meets your performance budget. Add complexity only when metrics demand it. Most apps don&rsquo;t need islands architecture if they&rsquo;re already using React — selective hydration with RSC gives most of the benefits within the React ecosystem.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 14: Production Case Study -->
+    <section id="production-case-study">
+      <h2>Production Case Study</h2>
+      <details>
+        <summary>E-commerce product page: 3.2s TTI → 1.1s TTI with streaming + selective hydration</summary>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│     E-COMMERCE PRODUCT PAGE: BEFORE vs AFTER                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  BEFORE (renderToString + full hydration):                      │
+│  ─────────────────────────────────────────                      │
+│  Server: fetchProduct(200ms) + fetchReviews(800ms)              │
+│        + fetchRecommendations(1200ms) + fetchInventory(300ms)   │
+│  Total server time: 1200ms (parallel) or 2500ms (serial)       │
+│                                                                 │
+│  TTFB: 1400ms  │  FCP: 1600ms  │  TTI: 3200ms                  │
+│  Bundle: 340KB JS  │  Hydration: 850ms                          │
+│                                                                 │
+│  ─────────────────────────────────────────────────────────────  │
+│                                                                 │
+│  AFTER (streaming SSR + selective hydration + RSC):             │
+│  ─────────────────────────────────────────────                  │
+│  Server: Shell ready in 50ms (product data pre-cached)          │
+│  Streaming: Reviews at +600ms, Recs at +1000ms                  │
+│                                                                 │
+│  TTFB: 120ms   │  FCP: 300ms   │  TTI: 1100ms                  │
+│  Bundle: 140KB JS (RSC eliminated 200KB)  │  Hydration: 280ms  │
+│                                                                 │
+│  Improvements:                                                  │
+│  • TTFB: -91% (1400ms → 120ms)                                 │
+│  • TTI:  -66% (3200ms → 1100ms)                                │
+│  • JS:   -59% (340KB → 140KB)                                  │
+│  • INP:  -67% (850ms tasks → 280ms broken into 50ms chunks)    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+        <pre><code class="language-javascript">// BEFORE: Traditional SSR approach
+app.get('/product/:id', async (req, res) =&gt; {
+  // All fetches must complete before any HTML is sent
+  const [product, reviews, recommendations, inventory] = await Promise.all([
+    fetchProduct(req.params.id),      // 200ms
+    fetchReviews(req.params.id),      // 800ms
+    fetchRecommendations(req.user),   // 1200ms ← Bottleneck!
+    fetchInventory(req.params.id)     // 300ms
+  ]);
+
+  const html = renderToString(
+    &lt;ProductPage
+      product={product}
+      reviews={reviews}
+      recommendations={recommendations}
+      inventory={inventory}
+    /&gt;
+  );
+
+  res.send(wrapInHTML(html)); // 1200ms after request started
+});
+
+// AFTER: Streaming SSR with Suspense boundaries
+// app/product/[id]/page.tsx (RSC)
+async function ProductPage({ params }) {
+  // Only fetch what's needed for the shell
+  const product = await fetchProduct(params.id); // 200ms (cached: 5ms)
+
+  return (
+    &lt;ProductLayout&gt;
+      {/* Shell: sent immediately */}
+      &lt;ProductHero product={product} /&gt;
+      &lt;AddToCartButton productId={product.id} price={product.price} /&gt;
+
+      {/* Streams when ready (300ms) */}
+      &lt;Suspense fallback={&lt;InventoryBadgeSkeleton /&gt;}&gt;
+        &lt;InventoryStatus productId={product.id} /&gt;
+      &lt;/Suspense&gt;
+
+      {/* Streams when ready (800ms) */}
+      &lt;Suspense fallback={&lt;ReviewsSkeleton /&gt;}&gt;
+        &lt;Reviews productId={product.id} /&gt;
+      &lt;/Suspense&gt;
+
+      {/* Streams when ready (1200ms) — no longer blocks anything */}
+      &lt;Suspense fallback={&lt;RecommendationsSkeleton /&gt;}&gt;
+        &lt;Recommendations userId={product.id} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/ProductLayout&gt;
+  );
+}
+
+// Result: User sees product + can add to cart in ~300ms
+// Reviews stream in at 800ms, recommendations at 1200ms
+// None of the slow queries block the critical purchase flow</code></pre>
+        <div class="callout">
+          <p><strong>Key Architecture Decisions:</strong></p>
+          <ul>
+            <li>Product data cached at edge (5ms) — keeps shell TTFB under 100ms</li>
+            <li>AddToCartButton is a Client Component (needs interactivity) — only 12KB</li>
+            <li>ProductHero, Reviews, Recommendations are Server Components — zero client JS</li>
+            <li>Each slow data source wrapped in its own Suspense boundary</li>
+            <li>Critical user action (Add to Cart) hydrates first via selective hydration</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 15: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>renderToPipeableStream setup, Suspense for streaming, selective hydration, debugging</summary>
+        <pre><code class="language-javascript">// Example 1: Complete renderToPipeableStream server setup
+import express from 'express';
+import { renderToPipeableStream } from 'react-dom/server';
+import { createReadStream } from 'fs';
+import App from './App';
+
+const app = express();
+
+app.get('*', (req, res) =&gt; {
+  // Determine if request is from a bot
+  const isBot = /bot|googlebot|crawler|spider|robot|crawling/i.test(
+    req.headers['user-agent'] || ''
+  );
+
+  let didError = false;
+  let shellReady = false;
+
+  const { pipe, abort } = renderToPipeableStream(
+    &lt;App url={req.url} /&gt;,
+    {
+      bootstrapScripts: ['/static/js/bundle.js'],
+      bootstrapScriptContent: `window.__INITIAL_URL__ = "${req.url}"`,
+
+      onShellReady() {
+        shellReady = true;
+        if (!isBot) {
+          res.statusCode = didError ? 500 : 200;
+          res.setHeader('Content-Type', 'text/html; charset=utf-8');
+          res.setHeader('Transfer-Encoding', 'chunked');
+          // Enable streaming — don't buffer
+          res.setHeader('X-Accel-Buffering', 'no'); // Nginx
+          pipe(res);
+        }
+      },
+
+      onAllReady() {
+        if (isBot) {
+          res.statusCode = didError ? 500 : 200;
+          res.setHeader('Content-Type', 'text/html; charset=utf-8');
+          pipe(res); // Bots get complete HTML
+        }
+      },
+
+      onShellError(error) {
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'text/html');
+        res.send('&lt;h1&gt;Something went wrong&lt;/h1&gt;');
+        console.error('Shell error:', error);
+      },
+
+      onError(error) {
+        didError = true;
+        console.error('Streaming error:', error);
+      }
+    }
+  );
+
+  // Abort streaming after timeout
+  setTimeout(() =&gt; {
+    if (!shellReady) {
+      abort();
+      res.statusCode = 504;
+      res.end('&lt;h1&gt;Gateway Timeout&lt;/h1&gt;');
+    }
+  }, 10000);
+});
+
+app.listen(3000);</code></pre>
+        <pre><code class="language-javascript">// Example 2: Suspense boundaries for streaming data
+import { Suspense } from 'react';
+import { use } from 'react'; // React 19
+
+// Data fetching with Suspense (React 19 'use' hook)
+// ⚠️ CRITICAL: The Promise must be created OUTSIDE the component render.
+// Calling use(fetch(...)) directly creates a new Promise each render → infinite loop!
+// Pass the Promise from a parent, cache, or module scope:
+function Reviews({ productId, reviewsPromise }) {
+  const reviews = use(reviewsPromise); // Suspends until resolved
+  return (
+    &lt;section className="reviews"&gt;
+      &lt;h2&gt;Customer Reviews ({reviews.length})&lt;/h2&gt;
+      {reviews.map(review =&gt; (
+        &lt;ReviewCard key={review.id} review={review} /&gt;
+      ))}
+    &lt;/section&gt;
+  );
+}
+
+// Nested Suspense for granular streaming
+function ProductPage({ productId }) {
+  return (
+    &lt;div className="product-page"&gt;
+      {/* Immediate: part of shell */}
+      &lt;ProductHeader productId={productId} /&gt;
+
+      {/* Level 1 streaming: product details */}
+      &lt;Suspense fallback={&lt;DetailsSkeleton /&gt;}&gt;
+        &lt;ProductDetails productId={productId} /&gt;
+
+        {/* Level 2 streaming: nested within details */}
+        &lt;Suspense fallback={&lt;PricingSkeleton /&gt;}&gt;
+          &lt;DynamicPricing productId={productId} /&gt;
+        &lt;/Suspense&gt;
+      &lt;/Suspense&gt;
+
+      {/* Independent streaming boundary */}
+      &lt;Suspense fallback={&lt;ReviewsSkeleton /&gt;}&gt;
+        &lt;Reviews productId={productId} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+        <pre><code class="language-javascript">// Example 3: Selective hydration demonstration
+import { hydrateRoot } from 'react-dom/client';
+import { StrictMode, Suspense, lazy } from 'react';
+
+// Lazy-loaded components enable code-splitting + selective hydration
+const Sidebar = lazy(() =&gt; import('./Sidebar'));
+const Comments = lazy(() =&gt; import('./Comments'));
+const RelatedPosts = lazy(() =&gt; import('./RelatedPosts'));
+
+function App() {
+  return (
+    &lt;StrictMode&gt;
+      &lt;Header /&gt; {/* Hydrates immediately (no Suspense) */}
+
+      &lt;div className="layout"&gt;
+        &lt;Suspense fallback={&lt;SidebarSkeleton /&gt;}&gt;
+          &lt;Sidebar /&gt; {/* Hydrates when code loads OR user clicks */}
+        &lt;/Suspense&gt;
+
+        &lt;main&gt;
+          &lt;Article /&gt; {/* Hydrates with shell */}
+
+          &lt;Suspense fallback={&lt;CommentsSkeleton /&gt;}&gt;
+            &lt;Comments /&gt; {/* User clicks "Reply" → hydrates immediately */}
+          &lt;/Suspense&gt;
+        &lt;/main&gt;
+
+        &lt;Suspense fallback={&lt;RelatedSkeleton /&gt;}&gt;
+          &lt;RelatedPosts /&gt; {/* Lowest priority — hydrates last */}
+        &lt;/Suspense&gt;
+      &lt;/div&gt;
+    &lt;/StrictMode&gt;
+  );
+}
+
+// Enable selective hydration with hydrateRoot (not legacy hydrate)
+hydrateRoot(document.getElementById('root'), &lt;App /&gt;);</code></pre>
+        <pre><code class="language-javascript">// Example 4: Hydration error debugging utility
+function HydrationDebugger({ children }) {
+  const [hydrationError, setHydrationError] = useState(null);
+
+  if (hydrationError) {
+    return (
+      &lt;div className="hydration-error"&gt;
+        &lt;h3&gt;Hydration Mismatch Detected&lt;/h3&gt;
+        &lt;pre&gt;{hydrationError.message}&lt;/pre&gt;
+        &lt;details&gt;
+          &lt;summary&gt;Stack Trace&lt;/summary&gt;
+          &lt;pre&gt;{hydrationError.stack}&lt;/pre&gt;
+        &lt;/details&gt;
+      &lt;/div&gt;
+    );
+  }
+
+  return children;
+}
+
+// In development, patch console.error to catch hydration warnings
+if (process.env.NODE_ENV === 'development') {
+  const originalError = console.error;
+  console.error = (...args) =&gt; {
+    const message = args.join(' ');
+    if (
+      message.includes('did not match') ||
+      message.includes('Hydration failed') ||
+      message.includes('hydrating')
+    ) {
+      // Log with component stack
+      console.groupCollapsed('🔴 Hydration Mismatch');
+      console.trace();
+      console.groupEnd();
+
+      // Optionally report to monitoring
+      reportHydrationError({ message, url: window.location.href });
+    }
+    originalError.apply(console, args);
+  };
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 16: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>5 critical mistakes to avoid with hydration and streaming</summary>
+        <pre><code class="language-javascript">// ❌ Mistake 1: Hydration mismatch from Date.now() or timestamps
+function LastUpdated() {
+  return &lt;span&gt;Updated: {Date.now()}&lt;/span&gt;; // ❌ Different on server vs client
+}
+
+// ✅ Fix: Use useEffect for time-dependent values
+function LastUpdated({ serverTimestamp }) {
+  const [displayTime, setDisplayTime] = useState(serverTimestamp);
+  useEffect(() =&gt; {
+    setDisplayTime(Date.now()); // Update after hydration
+  }, []);
+  return &lt;span&gt;Updated: {new Date(displayTime).toLocaleString()}&lt;/span&gt;;
+}
+
+// ─────────────────────────────────────────────────────────────────
+
+// ❌ Mistake 2: Not using Suspense boundaries for streaming
+// Without Suspense, streaming provides no benefit
+function Page() {
+  const data = await fetchSlowData(); // Blocks entire page!
+  return &lt;div&gt;{data.content}&lt;/div&gt;;
+}
+
+// ✅ Fix: Wrap slow data fetching in Suspense
+function Page() {
+  return (
+    &lt;div&gt;
+      &lt;FastContent /&gt; {/* In shell — sent immediately */}
+      &lt;Suspense fallback={&lt;Loading /&gt;}&gt;
+        &lt;SlowContent /&gt; {/* Streams when ready */}
+      &lt;/Suspense&gt;
+    &lt;/div&gt;
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+
+// ❌ Mistake 3: Hydrating entire page when only header is interactive
+function StaticArticle({ content }) {
+  // This entire component hydrates even though it has NO interactivity
+  return (
+    &lt;article&gt;
+      &lt;div dangerouslySetInnerHTML={{ __html: content }} /&gt;
+    &lt;/article&gt;
+  );
+}
+
+// ✅ Fix: Make it a Server Component (RSC) or skip hydration
+// Option A: Server Component (zero JS sent)
+// article.tsx (no 'use client' directive)
+async function StaticArticle({ slug }) {
+  const content = await getArticle(slug);
+  return &lt;article&gt;{content}&lt;/article&gt;; // Never hydrates
+}
+
+// Option B: Skip hydration for non-interactive sections
+function Page() {
+  return (
+    &lt;&gt;
+      &lt;InteractiveHeader /&gt; {/* Needs hydration */}
+      &lt;div
+        suppressHydrationWarning
+        dangerouslySetInnerHTML={{ __html: staticContent }}
+      /&gt; {/* Skip hydration */}
+    &lt;/&gt;
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+
+// ❌ Mistake 4: Not handling streaming errors gracefully
+const { pipe } = renderToPipeableStream(&lt;App /&gt;, {
+  onShellReady() { pipe(res); }
+  // Missing: onShellError, onError handlers!
+});
+
+// ✅ Fix: Handle all error cases
+const { pipe, abort } = renderToPipeableStream(&lt;App /&gt;, {
+  onShellReady() {
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/html');
+    pipe(res);
+  },
+  onShellError(error) {
+    // Shell failed — send fallback HTML or redirect
+    res.statusCode = 500;
+    res.send(fallbackHTML);
+    logError('shell-error', error);
+  },
+  onError(error) {
+    // Individual Suspense boundary failed
+    // React will show the nearest error boundary's fallback
+    logError('streaming-error', error);
+  }
+});
+
+// Always set a timeout
+setTimeout(() =&gt; abort(), 15000);
+
+// ─────────────────────────────────────────────────────────────────
+
+// ❌ Mistake 5: Client-only code without dynamic import
+import Chart from 'chart.js'; // ❌ Crashes on server (uses window/canvas)
+
+function Dashboard() {
+  return &lt;Chart data={chartData} /&gt;;
+}
+
+// ✅ Fix: Dynamic import with ssr: false (Next.js) or lazy + useEffect
+// Next.js approach:
+const Chart = dynamic(() =&gt; import('../components/Chart'), {
+  ssr: false, // Skip server rendering entirely
+  loading: () =&gt; &lt;ChartSkeleton /&gt;
+});
+
+// Generic React approach:
+function Dashboard() {
+  const [ChartComponent, setChart] = useState(null);
+
+  useEffect(() =&gt; {
+    import('./Chart').then(mod =&gt; setChart(() =&gt; mod.default));
+  }, []);
+
+  if (!ChartComponent) return &lt;ChartSkeleton /&gt;;
+  return &lt;ChartComponent data={chartData} /&gt;;
+}</code></pre>
+        <div class="callout">
+          <p><strong>Quick Checklist Before Interview:</strong></p>
+          <ul>
+            <li>✅ Never use <code>Date.now()</code>, <code>Math.random()</code>, or <code>window</code> during render</li>
+            <li>✅ Every slow data source should be behind a Suspense boundary</li>
+            <li>✅ Only hydrate what needs interactivity (use RSC for the rest)</li>
+            <li>✅ Always handle <code>onShellError</code> and <code>onError</code> in streaming</li>
+            <li>✅ Use dynamic import for browser-only libraries</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 17: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Full vs Progressive vs Selective vs Islands — complexity vs performance</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>JS Bundle</th>
+              <th>TTI</th>
+              <th>Complexity</th>
+              <th>State Sharing</th>
+              <th>SEO</th>
+              <th>Framework Lock-in</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Full Hydration</td>
+              <td>Large</td>
+              <td>Slow</td>
+              <td>Low</td>
+              <td>Easy</td>
+              <td>Good</td>
+              <td>High (React)</td>
+            </tr>
+            <tr>
+              <td>Progressive</td>
+              <td>Large (deferred)</td>
+              <td>Moderate</td>
+              <td>Medium</td>
+              <td>Easy</td>
+              <td>Good</td>
+              <td>High (React)</td>
+            </tr>
+            <tr>
+              <td>Selective (React 18)</td>
+              <td>Large (deferred)</td>
+              <td>Fast</td>
+              <td>Medium</td>
+              <td>Easy</td>
+              <td>Good</td>
+              <td>High (React)</td>
+            </tr>
+            <tr>
+              <td>RSC + Selective</td>
+              <td>Small (server only)</td>
+              <td>Fast</td>
+              <td>High</td>
+              <td>Moderate</td>
+              <td>Excellent</td>
+              <td>Very High (Next.js)</td>
+            </tr>
+            <tr>
+              <td>Islands (Astro)</td>
+              <td>Minimal</td>
+              <td>Fastest</td>
+              <td>Low-Medium</td>
+              <td>Difficult</td>
+              <td>Excellent</td>
+              <td>Low (any framework)</td>
+            </tr>
+          </tbody>
+        </table>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│          COMPLEXITY vs PERFORMANCE SPECTRUM                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Performance ▲                                                  │
+│              │                                                   │
+│              │              ★ Islands                            │
+│              │         ★ RSC + Selective                         │
+│              │    ★ Selective Hydration                          │
+│              │  ★ Progressive                                    │
+│              │★ Full Hydration                                   │
+│              │                                                   │
+│              └──────────────────────────────▶ Complexity         │
+│                                                                 │
+│  Sweet spot for most React apps: Selective + RSC                │
+│  Sweet spot for content sites: Islands (Astro)                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+        <div class="callout">
+          <p><strong>When NOT to optimize hydration:</strong></p>
+          <ul>
+            <li>Internal tools and admin panels — full hydration is fine</li>
+            <li>Apps behind authentication (not SEO-sensitive) — CSR may suffice</li>
+            <li>Small apps (&lt;50KB JS) — hydration cost is negligible</li>
+            <li>When the team lacks SSR expertise — complexity cost outweighs perf gains</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 18: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>7 likely follow-up questions with detailed answers</summary>
+
+        <h3>1. How does React detect which component to hydrate first when multiple clicks happen?</h3>
+        <div class="callout">
+          <p>React uses event delegation at the root. When a click event fires on a not-yet-hydrated Suspense boundary, React captures it in its event system. It then synchronously hydrates the target boundary by calling the <code>hydrateRoot</code> internal path for that subtree. If multiple boundaries receive clicks in rapid succession, React processes them in event order (first click, first hydrated). The discrete event is replayed after hydration completes for that boundary.</p>
+        </div>
+
+        <h3>2. What happens if streaming aborts mid-way (timeout or error)?</h3>
+        <div class="callout">
+          <p>If you call <code>abort()</code> or the connection drops:</p>
+          <ul>
+            <li>Content already sent to the client remains visible (HTML is progressive)</li>
+            <li>Unresolved Suspense boundaries keep showing their fallback UI</li>
+            <li>Once client JS loads, React attempts client-side rendering for unresolved boundaries</li>
+            <li>The <code>onError</code> callback fires for the aborted boundaries</li>
+            <li>Users see a degraded but functional page rather than a blank screen</li>
+          </ul>
+        </div>
+
+        <h3>3. Can you mix Server Components and Client Components in the same tree?</h3>
+        <div class="callout">
+          <p>Yes — this is the primary design goal of RSC. Rules:</p>
+          <ul>
+            <li>Server Components can render Client Components (pass them as children or import them)</li>
+            <li>Client Components CANNOT import Server Components directly (but can accept them as <code>children</code> props)</li>
+            <li>Props passed from Server → Client must be serializable (no functions, classes, or Symbols)</li>
+            <li>The boundary is the <code>&quot;use client&quot;</code> directive at the top of a file</li>
+          </ul>
+        </div>
+
+        <h3>4. How do you handle authentication state with streaming SSR?</h3>
+        <div class="callout">
+          <p>Authentication typically lives in the shell (not behind Suspense) because:</p>
+          <ul>
+            <li>Nav bar and user avatar should appear immediately</li>
+            <li>Auth state determines what content to show</li>
+            <li>Pattern: Read session cookie on server, pass user to shell components, wrap personalized content in Suspense for streaming</li>
+          </ul>
+          <pre><code class="language-javascript">// Auth in streaming SSR
+async function Layout({ children }) {
+  const session = await getSession(); // Fast: cookie/JWT decode
+  return (
+    &lt;&gt;
+      &lt;NavBar user={session?.user} /&gt; {/* In shell */}
+      &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+        {children} {/* Personalized content streams */}
+      &lt;/Suspense&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+        </div>
+
+        <h3>5. What is the &ldquo;double data problem&rdquo; with SSR and how does RSC solve it?</h3>
+        <div class="callout">
+          <p>With traditional SSR, data is fetched on the server, rendered to HTML, then serialized as JSON in a <code>&lt;script&gt;</code> tag so the client can hydrate with the same data. This means the data is sent TWICE (once as HTML, once as JSON). RSC solves this because server components never re-render on the client — their output is the final HTML. Only client components receive serialized props, and those are typically minimal (IDs, flags) rather than large data sets.</p>
+        </div>
+
+        <h3>6. How does streaming SSR interact with CDN caching?</h3>
+        <div class="callout">
+          <p>Streaming and caching are at tension:</p>
+          <ul>
+            <li>Streamed responses use <code>Transfer-Encoding: chunked</code> — most CDNs buffer these</li>
+            <li>Solution 1: Cache the shell separately, stream dynamic content from origin</li>
+            <li>Solution 2: Use edge runtimes (Vercel Edge, Cloudflare Workers) that support streaming</li>
+            <li>Solution 3: Use stale-while-revalidate — serve cached version while generating fresh stream</li>
+            <li>Some CDNs (Cloudflare) support streaming through without buffering</li>
+          </ul>
+        </div>
+
+        <h3>7. What is &ldquo;resumability&rdquo; (Qwik) and how does it differ from hydration?</h3>
+        <div class="callout">
+          <p>Resumability (Qwik framework) eliminates hydration entirely:</p>
+          <ul>
+            <li><strong>Hydration:</strong> Re-execute component code on client to rebuild state and attach listeners</li>
+            <li><strong>Resumability:</strong> Serialize all state, closures, and listener references into HTML. Client resumes exactly where server left off — zero re-execution</li>
+            <li>Trade-off: Qwik requires a custom compiler and specific coding patterns. React chose selective hydration as a more pragmatic approach within existing JS semantics</li>
+            <li>Resumability = O(1) startup. Hydration = O(n) where n = component count</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 19: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details open>
+        <summary>Mental models and what NOT to say in interviews</summary>
+        <div class="callout">
+          <p><strong>Mental Models to Remember:</strong></p>
+          <ul>
+            <li><strong>Hydration = &ldquo;watering dry HTML&rdquo;</strong> — Server HTML is static; hydration makes it alive</li>
+            <li><strong>Streaming = &ldquo;don&rsquo;t wait for the slowest&rdquo;</strong> — Send what&rsquo;s ready, stream the rest</li>
+            <li><strong>Selective = &ldquo;hydrate what matters to the user&rdquo;</strong> — Clicked components jump the queue</li>
+            <li><strong>RSC = &ldquo;components that never ship to client&rdquo;</strong> — Zero JS cost for server-only logic</li>
+            <li><strong>Islands = &ldquo;interactive oases in a static desert&rdquo;</strong> — Only interactive bits get JavaScript</li>
+          </ul>
+        </div>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│                    EVOLUTION TIMELINE                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  React 16: renderToString → hydrate() [all-or-nothing]          │
+│       │                                                         │
+│  React 16.6: Suspense (client-only, code splitting)             │
+│       │                                                         │
+│  React 18: renderToPipeableStream + hydrateRoot                 │
+│       │    [streaming + selective hydration]                     │
+│       │                                                         │
+│  React 18 + Next 13: React Server Components                    │
+│       │    [zero-JS server components + streaming]              │
+│       │                                                         │
+│  React 19: use() hook, improved RSC, Server Actions             │
+│            [full-stack React without API routes]                │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        </pre>
+        <div class="callout">
+          <p><strong>What NOT to Say in Interviews:</strong></p>
+          <ul>
+            <li>❌ &ldquo;Hydration just re-renders everything on the client&rdquo; — It ATTACHES to existing DOM, not re-renders</li>
+            <li>❌ &ldquo;Streaming SSR requires React Server Components&rdquo; — Streaming works without RSC</li>
+            <li>❌ &ldquo;Selective hydration means some components never hydrate&rdquo; — They ALL hydrate, just in priority order</li>
+            <li>❌ &ldquo;Islands and RSC are the same thing&rdquo; — Islands are framework-agnostic MPA; RSC is React-specific SPA</li>
+            <li>❌ &ldquo;renderToString is deprecated&rdquo; — It still works, just not recommended for new apps</li>
+            <li>❌ &ldquo;You need Next.js for streaming SSR&rdquo; — <code>renderToPipeableStream</code> works in any Node.js server</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+  </main>
+
+  <!-- Scripts -->
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+</body>
+</html>

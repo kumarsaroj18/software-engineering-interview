@@ -1,0 +1,2201 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 14: Type-Safe API Design Patterns | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">&#9728;&#65039;</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">&#9776;</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <a href="../index.html">
+        <span class="chapter-num">Ch 14</span>
+        <span class="chapter-title">Type-Safe API Design</span>
+      </a>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#runtime-vs-compile">Runtime vs Compile-Time</a></li>
+        <li><a href="#schema-libraries">Schema Libraries</a></li>
+        <li><a href="#inferring-types">Inferring Types</a></li>
+        <li><a href="#fetch-wrappers">Fetch Wrappers</a></li>
+        <li><a href="#api-client-patterns">API Client Patterns</a></li>
+        <li><a href="#error-handling">Error &amp; Result Pattern</a></li>
+        <li><a href="#discriminated-responses">Discriminated Responses</a></li>
+        <li><a href="#react-query-integration">React Query Integration</a></li>
+        <li><a href="#contract-first">Contract-First (OpenAPI)</a></li>
+        <li><a href="#trpc-pattern">tRPC Pattern</a></li>
+        <li><a href="#monorepo-shared-types">Monorepo Shared Types</a></li>
+        <li><a href="#production-architecture">Production Architecture</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <span>Part II &mdash; TypeScript Advanced Patterns</span> &gt;
+      <span>Chapter 14</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-ts">TypeScript</span>
+        <span class="badge badge-concept">API Design</span>
+        <span class="badge badge-tool">Zod</span>
+        <span class="badge badge-tool">tRPC</span>
+        <span class="badge badge-concept">Runtime Validation</span>
+      </div>
+      <h1>Chapter 14: Type-Safe API Design Patterns</h1>
+      <p class="chapter-question">&ldquo;How would you design a type-safe, runtime-validated API layer for a large application?&rdquo;</p>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> TypeScript types are erased at runtime &mdash; they can&rsquo;t validate external data (API responses, user input, env vars). A type-safe API layer combines compile-time types with runtime validation schemas (Zod, io-ts) so that validated data is automatically typed. The holy grail is single-source-of-truth schemas that generate both runtime validators and TypeScript types, eliminating the drift between what the API actually returns and what your code believes it returns.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search" />
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent" class="content-section">
+      <h2>Interviewer&rsquo;s Intent</h2>
+      <p>When an interviewer asks about type-safe API design, they&rsquo;re probing for:</p>
+      <ul>
+        <li><strong>Trust boundaries:</strong> Do you understand that external data is inherently untyped?</li>
+        <li><strong>Schema-first thinking:</strong> Can you define contracts that serve both runtime and compile time?</li>
+        <li><strong>Practical tooling:</strong> Do you know Zod, io-ts, tRPC, OpenAPI codegen, and when each is appropriate?</li>
+        <li><strong>Error handling philosophy:</strong> Can you model errors as data, not exceptions?</li>
+        <li><strong>Architecture awareness:</strong> How do you structure type safety across a full-stack or monorepo?</li>
+      </ul>
+      <div class="callout callout-info">
+        <strong>Senior signal:</strong> Juniors cast <code>as</code> on fetch responses. Seniors validate and parse at the boundary, letting types flow from validated schemas.
+      </div>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer" class="content-section">
+      <h2>60-Second Answer</h2>
+      <details open>
+        <summary>Concise interview response</summary>
+        <blockquote>
+          <p>&ldquo;TypeScript types disappear at runtime, so every trust boundary &mdash; API responses, user input, environment variables &mdash; needs runtime validation. I use schema libraries like Zod as the single source of truth: define the schema once, infer the TypeScript type from it, and parse incoming data through it. This gives you both compile-time safety and runtime guarantees with zero type duplication.</p>
+          <p>For the API layer, I wrap fetch in a generic function that accepts request/response schemas, validates the response, and returns a typed Result&lt;T, E&gt; discriminated union instead of throwing. This composes well with React Query&rsquo;s generics.</p>
+          <p>At scale, I reach for contract-first approaches &mdash; either OpenAPI codegen for REST APIs or tRPC for full-stack TypeScript projects where the router types flow directly to the client without code generation.&rdquo;</p>
+        </blockquote>
+      </details>
+    </section>
+
+    <!-- Section 3: Runtime vs Compile-Time Validation -->
+    <section id="runtime-vs-compile" class="content-section">
+      <h2>Runtime vs Compile-Time Validation</h2>
+
+      <h3>Why TypeScript Types Aren&rsquo;t Enough</h3>
+      <p>TypeScript&rsquo;s type system is <em>structural</em> and <em>erased</em>. After compilation, there is no runtime representation of your interfaces. This is fine for internal code, but dangerous at system boundaries:</p>
+
+<pre class="diagram">
+┌─────────────────────────────────────────────────────────┐
+│                    YOUR APPLICATION                       │
+│                                                          │
+│   ┌──────────┐     ┌──────────┐     ┌──────────┐       │
+│   │ Internal │────▶│ Internal │────▶│ Internal │       │
+│   │  Code    │     │  Code    │     │  Code    │       │
+│   └──────────┘     └──────────┘     └──────────┘       │
+│        ▲                                    │            │
+│        │          TRUST BOUNDARY            ▼            │
+│ ───────┼────────────────────────────────────┼─────────  │
+│        │                                    │            │
+│   ┌────┴─────┐                        ┌────┴─────┐     │
+│   │API Resp. │                        │User Input│     │
+│   │(unknown) │                        │(unknown) │     │
+│   └──────────┘                        └──────────┘     │
+└─────────────────────────────────────────────────────────┘
+
+  TS types safe here ──▶  BUT NOT HERE (external data)
+</pre>
+
+      <h3>The Trust Boundary Concept</h3>
+      <p>A <strong>trust boundary</strong> is any point where data enters your application from an external source:</p>
+      <ul>
+        <li>API responses (REST, GraphQL, WebSocket messages)</li>
+        <li>User input (forms, URL params, query strings)</li>
+        <li>Environment variables</li>
+        <li>Local storage / IndexedDB reads</li>
+        <li>Third-party SDK callbacks</li>
+        <li>Deserialized data (JSON.parse, postMessage)</li>
+      </ul>
+
+<pre><code class="language-typescript">// ❌ DANGEROUS: Type assertion on external data
+interface User {
+  id: number;
+  name: string;
+  email: string;
+}
+
+const response = await fetch('/api/user/1');
+const user = (await response.json()) as User; // LIES!
+// If the API returns { id: "abc" }, TypeScript won't catch it
+
+// ✅ SAFE: Runtime validation at the boundary
+import { z } from 'zod';
+
+const UserSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  email: z.string().email(),
+});
+
+type User = z.infer&lt;typeof UserSchema&gt;; // Types derived from schema
+
+const response = await fetch('/api/user/1');
+const data = await response.json();
+const user = UserSchema.parse(data); // Throws ZodError if invalid
+// `user` is now BOTH typed AND validated</code></pre>
+
+      <h3>Where Validation Belongs</h3>
+      <div class="callout callout-tip">
+        <strong>Rule of thumb:</strong> Validate at the <em>outermost boundary</em>, then trust the data internally. Don&rsquo;t re-validate inside every function call &mdash; that defeats the purpose of a type system.
+      </div>
+
+<pre><code class="language-typescript">// Validation layer pattern
+//
+// External World → [Validation Layer] → Typed Internal World
+//                       ▲
+//                  Parse, don't validate
+//                  (return typed data or error)
+
+// The "parse, don't validate" philosophy:
+// - Parsing: takes unknown input, returns typed output or error
+// - Validation: takes typed input, returns boolean
+// Parsing is strictly more powerful because it narrows types.</code></pre>
+    </section>
+
+    <!-- Section 4: Schema Libraries -->
+    <section id="schema-libraries" class="content-section">
+      <h2>Zod, io-ts, Valibot &mdash; Schema-First Approach</h2>
+
+      <h3>Library Comparison</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Feature</th>
+            <th>Zod</th>
+            <th>io-ts</th>
+            <th>Valibot</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Bundle size (min+gz)</td>
+            <td>~14–15 kB (Zod 3.23+; Zod 4 targets significant reduction)</td>
+            <td>~6 kB (+ fp-ts ~18 kB)</td>
+            <td>~1-5 kB (tree-shakeable)</td>
+          </tr>
+          <tr>
+            <td>API style</td>
+            <td>Method chaining</td>
+            <td>Functional combinators</td>
+            <td>Pipe-based functions</td>
+          </tr>
+          <tr>
+            <td>Error messages</td>
+            <td>Excellent (structured)</td>
+            <td>Minimal (needs reporters)</td>
+            <td>Good</td>
+          </tr>
+          <tr>
+            <td>Type inference</td>
+            <td>z.infer&lt;typeof schema&gt;</td>
+            <td>Codec extracting Output</td>
+            <td>InferOutput&lt;typeof schema&gt;</td>
+          </tr>
+          <tr>
+            <td>Ecosystem</td>
+            <td>Largest (React Hook Form, tRPC)</td>
+            <td>FP-focused</td>
+            <td>Growing</td>
+          </tr>
+          <tr>
+            <td>Tree-shaking</td>
+            <td>Poor (class-based)</td>
+            <td>Moderate</td>
+            <td>Excellent</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Syntax Comparison</h3>
+      <details>
+        <summary>Zod syntax</summary>
+<pre><code class="language-typescript">import { z } from 'zod';
+
+const UserSchema = z.object({
+  id: z.number().int().positive(),
+  name: z.string().min(1).max(100),
+  email: z.string().email(),
+  role: z.enum(['admin', 'user', 'viewer']),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  createdAt: z.string().datetime(),
+});
+
+type User = z.infer&lt;typeof UserSchema&gt;;
+// { id: number; name: string; email: string; role: 'admin'|'user'|'viewer'; ... }</code></pre>
+      </details>
+
+      <details>
+        <summary>io-ts syntax</summary>
+<pre><code class="language-typescript">import * as t from 'io-ts';
+import { pipe } from 'fp-ts/function';
+import { fold } from 'fp-ts/Either';
+
+const UserCodec = t.type({
+  id: t.number,
+  name: t.string,
+  email: t.string,
+  role: t.union([t.literal('admin'), t.literal('user'), t.literal('viewer')]),
+});
+
+type User = t.TypeOf&lt;typeof UserCodec&gt;;
+
+// Decoding returns Either&lt;Errors, User&gt;
+const result = UserCodec.decode(unknownData);
+pipe(
+  result,
+  fold(
+    (errors) =&gt; console.error('Validation failed', errors),
+    (user) =&gt; console.log('Valid user', user)
+  )
+);</code></pre>
+      </details>
+
+      <details>
+        <summary>Valibot syntax</summary>
+<pre><code class="language-typescript">import * as v from 'valibot';
+
+const UserSchema = v.object({
+  id: v.pipe(v.number(), v.integer(), v.minValue(1)),
+  name: v.pipe(v.string(), v.minLength(1), v.maxLength(100)),
+  email: v.pipe(v.string(), v.email()),
+  role: v.picklist(['admin', 'user', 'viewer']),
+});
+
+type User = v.InferOutput&lt;typeof UserSchema&gt;;</code></pre>
+      </details>
+
+      <div class="callout callout-info">
+        <p><strong>2024/2025 trend — Standard Schema:</strong> The emerging <a href="https://github.com/standard-schema/standard-schema">Standard Schema</a> specification defines a common interface for schema libraries (supported by Zod 4, Valibot, ArkType). It enables frameworks (tRPC, React Hook Form, etc.) to accept any compliant schema without library-specific adapters. Mentioning this in a senior interview shows ecosystem awareness beyond individual libraries.</p>
+      </div>
+
+      <h3>Parsing vs Validation</h3>
+      <div class="callout callout-warning">
+        <strong>Key distinction:</strong> <em>Parsing</em> transforms <code>unknown → T | Error</code>. <em>Validation</em> checks <code>T → boolean</code>. Always prefer parsing at boundaries because it narrows types. Zod&rsquo;s <code>.parse()</code> and <code>.safeParse()</code> are parsers, not validators.
+      </div>
+      <div class="callout callout-tip">
+        <strong>Production recommendation:</strong> Default to <code>safeParse()</code> for data parsing — never throw in hot paths. Reserve <code>.parse()</code> (which throws) for fail-fast scenarios like startup config validation where an error means the process should crash immediately. The fetch wrapper example below uses <code>safeParse</code> for this reason.
+      </div>
+
+<pre><code class="language-typescript">// safeParse returns a discriminated union — no exceptions
+const result = UserSchema.safeParse(data);
+
+if (result.success) {
+  // result.data is fully typed as User
+  console.log(result.data.email);
+} else {
+  // result.error is a ZodError with structured issues
+  console.error(result.error.flatten());
+}
+
+// Composability: schemas compose like types
+const PaginatedResponse = &lt;T extends z.ZodTypeAny&gt;(itemSchema: T) =&gt;
+  z.object({
+    items: z.array(itemSchema),
+    total: z.number(),
+    page: z.number(),
+    pageSize: z.number(),
+  });
+
+const PaginatedUsers = PaginatedResponse(UserSchema);
+type PaginatedUsers = z.infer&lt;typeof PaginatedUsers&gt;;</code></pre>
+    </section>
+
+    <!-- Section 5: Inferring Types from Schemas -->
+    <section id="inferring-types" class="content-section">
+      <h2>Inferring Types from Schemas</h2>
+
+      <h3>Single Source of Truth Pattern</h3>
+      <p>The core principle: <strong>define the schema, derive the type</strong>. Never maintain a separate interface alongside a schema.</p>
+
+<pre><code class="language-typescript">// ❌ ANTI-PATTERN: Dual maintenance
+interface User {
+  id: number;
+  name: string;
+  email: string;
+}
+
+const UserSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  email: z.string(),
+});
+// These WILL drift apart over time!
+
+// ✅ CORRECT: Schema is the single source of truth
+const UserSchema = z.object({
+  id: z.number().int().positive(),
+  name: z.string().min(1),
+  email: z.string().email(),
+  role: z.enum(['admin', 'user', 'viewer']),
+  avatarUrl: z.string().url().nullable(),
+  createdAt: z.coerce.date(),
+});
+
+// Type is DERIVED — always in sync
+type User = z.infer&lt;typeof UserSchema&gt;;
+
+// Partial types for updates
+const UserUpdateSchema = UserSchema.partial().omit({ id: true, createdAt: true });
+type UserUpdate = z.infer&lt;typeof UserUpdateSchema&gt;;
+
+// Pick for specific use cases
+const UserSummarySchema = UserSchema.pick({ id: true, name: true, avatarUrl: true });
+type UserSummary = z.infer&lt;typeof UserSummarySchema&gt;;</code></pre>
+
+      <h3>Keeping Types and Runtime in Sync</h3>
+<pre><code class="language-typescript">// Schema transformations that affect the inferred type
+const ApiUserSchema = z.object({
+  id: z.number(),
+  created_at: z.string().datetime(),  // API returns snake_case string
+  full_name: z.string(),
+});
+
+// Transform at the boundary — types follow automatically
+const UserSchema = ApiUserSchema.transform((apiUser) =&gt; ({
+  id: apiUser.id,
+  createdAt: new Date(apiUser.created_at),  // string → Date
+  fullName: apiUser.full_name,               // snake_case → camelCase
+}));
+
+type User = z.infer&lt;typeof UserSchema&gt;;
+// { id: number; createdAt: Date; fullName: string }
+// The TRANSFORM is the source of truth for your internal type!</code></pre>
+
+      <h3>Avoiding Manual Type Duplication</h3>
+      <div class="callout callout-tip">
+        <strong>Pattern:</strong> Export schemas from a shared module. Consumers import the schema for validation AND the inferred type for compile-time use. One import gives you both.
+      </div>
+
+<pre><code class="language-typescript">// schemas/user.ts — THE source of truth
+export const UserSchema = z.object({ /* ... */ });
+export type User = z.infer&lt;typeof UserSchema&gt;;
+
+export const CreateUserSchema = UserSchema.omit({ id: true, createdAt: true });
+export type CreateUser = z.infer&lt;typeof CreateUserSchema&gt;;
+
+// api/users.ts — uses both the type AND the schema
+import { UserSchema, type User, CreateUserSchema, type CreateUser } from '../schemas/user';
+
+async function createUser(input: CreateUser): Promise&lt;User&gt; {
+  const validated = CreateUserSchema.parse(input); // runtime check
+  const response = await fetch('/api/users', {
+    method: 'POST',
+    body: JSON.stringify(validated),
+  });
+  return UserSchema.parse(await response.json()); // validate response too!
+}</code></pre>
+    </section>
+
+    <!-- Section 6: Type-Safe Fetch Wrappers -->
+    <section id="fetch-wrappers" class="content-section">
+      <h2>Type-Safe Fetch Wrappers</h2>
+
+      <h3>Generic Fetch with Response Validation</h3>
+<pre><code class="language-typescript">import { z } from 'zod';
+
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
+interface RequestConfig&lt;TBody = unknown&gt; {
+  method: HttpMethod;
+  url: string;
+  body?: TBody;
+  headers?: Record&lt;string, string&gt;;
+  signal?: AbortSignal;
+}
+
+// Core type-safe fetch function
+async function typedFetch&lt;TResponse&gt;(
+  config: RequestConfig,
+  responseSchema: z.ZodType&lt;TResponse&gt;
+): Promise&lt;TResponse&gt; {
+  const { method, url, body, headers, signal } = config;
+
+  const response = await fetch(url, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      ...headers,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    signal,
+  });
+
+  if (!response.ok) {
+    throw new ApiError(response.status, await response.text());
+  }
+
+  const data = await response.json();
+  return responseSchema.parse(data); // Runtime validation!
+}
+
+// Usage — fully typed, fully validated
+const user = await typedFetch(
+  { method: 'GET', url: '/api/users/1' },
+  UserSchema
+);
+// typeof user === User (guaranteed by Zod)</code></pre>
+
+      <h3>Type-Safe Query Parameters</h3>
+<pre><code class="language-typescript">// Query params as a schema — validated before sending
+const UserQuerySchema = z.object({
+  page: z.number().int().positive().default(1),
+  pageSize: z.number().int().min(1).max(100).default(20),
+  search: z.string().optional(),
+  role: z.enum(['admin', 'user', 'viewer']).optional(),
+  sortBy: z.enum(['name', 'createdAt', 'email']).default('createdAt'),
+  order: z.enum(['asc', 'desc']).default('desc'),
+});
+
+type UserQuery = z.infer&lt;typeof UserQuerySchema&gt;;
+
+function buildQueryString&lt;T extends z.ZodObject&lt;any&gt;&gt;(
+  schema: T,
+  params: z.input&lt;T&gt;
+): string {
+  const validated = schema.parse(params);
+  const searchParams = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(validated)) {
+    if (value !== undefined &amp;&amp; value !== null) {
+      searchParams.set(key, String(value));
+    }
+  }
+
+  return searchParams.toString();
+}</code></pre>
+
+      <h3>Path Parameter Typing</h3>
+<pre><code class="language-typescript">// Extract path params from template literal types
+type ExtractPathParams&lt;T extends string&gt; =
+  T extends `${infer _Start}:${infer Param}/${infer Rest}`
+    ? Param | ExtractPathParams&lt;`/${Rest}`&gt;
+    : T extends `${infer _Start}:${infer Param}`
+      ? Param
+      : never;
+
+type Params = ExtractPathParams&lt;'/users/:userId/posts/:postId'&gt;;
+// 'userId' | 'postId'
+
+// Type-safe URL builder
+function buildUrl&lt;T extends string&gt;(
+  template: T,
+  params: Record&lt;ExtractPathParams&lt;T&gt;, string | number&gt;
+): string {
+  let url: string = template;
+  for (const [key, value] of Object.entries(params)) {
+    url = url.replace(`:${key}`, encodeURIComponent(String(value)));
+  }
+  return url;
+}
+
+// Usage — TypeScript enforces correct params
+const url = buildUrl('/users/:userId/posts/:postId', {
+  userId: 123,
+  postId: 456,
+});
+// Error if you forget a param or add an extra one!</code></pre>
+    </section>
+
+    <!-- Section 7: Generic API Client Patterns -->
+    <section id="api-client-patterns" class="content-section">
+      <h2>Generic API Client Patterns</h2>
+
+      <h3>Resource-Based Client</h3>
+<pre><code class="language-typescript">import { z } from 'zod';
+
+// Generic CRUD resource client
+function createResourceClient&lt;
+  TSchema extends z.ZodObject&lt;any&gt;,
+  TCreate extends z.ZodObject&lt;any&gt;,
+  TUpdate extends z.ZodObject&lt;any&gt;
+&gt;(config: {
+  baseUrl: string;
+  schema: TSchema;
+  createSchema: TCreate;
+  updateSchema: TUpdate;
+}) {
+  type Resource = z.infer&lt;typeof config.schema&gt;;
+  type CreateInput = z.infer&lt;typeof config.createSchema&gt;;
+  type UpdateInput = z.infer&lt;typeof config.updateSchema&gt;;
+
+  const listSchema = z.object({
+    items: z.array(config.schema),
+    total: z.number(),
+  });
+
+  return {
+    async list(params?: Record&lt;string, string&gt;): Promise&lt;z.infer&lt;typeof listSchema&gt;&gt; {
+      const query = params ? '?' + new URLSearchParams(params).toString() : '';
+      const res = await fetch(`${config.baseUrl}${query}`);
+      return listSchema.parse(await res.json());
+    },
+
+    async get(id: string | number): Promise&lt;Resource&gt; {
+      const res = await fetch(`${config.baseUrl}/${id}`);
+      return config.schema.parse(await res.json());
+    },
+
+    async create(input: CreateInput): Promise&lt;Resource&gt; {
+      const validated = config.createSchema.parse(input);
+      const res = await fetch(config.baseUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(validated),
+      });
+      return config.schema.parse(await res.json());
+    },
+
+    async update(id: string | number, input: UpdateInput): Promise&lt;Resource&gt; {
+      const validated = config.updateSchema.parse(input);
+      const res = await fetch(`${config.baseUrl}/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(validated),
+      });
+      return config.schema.parse(await res.json());
+    },
+
+    async delete(id: string | number): Promise&lt;void&gt; {
+      await fetch(`${config.baseUrl}/${id}`, { method: 'DELETE' });
+    },
+  };
+}
+
+// Usage
+const usersClient = createResourceClient({
+  baseUrl: '/api/users',
+  schema: UserSchema,
+  createSchema: CreateUserSchema,
+  updateSchema: UpdateUserSchema,
+});
+
+const users = await usersClient.list({ role: 'admin' });
+// users.items is typed as User[]</code></pre>
+
+      <h3>Interceptors with Typed Config</h3>
+<pre><code class="language-typescript">type Interceptor = {
+  request?: (config: RequestConfig) =&gt; RequestConfig | Promise&lt;RequestConfig&gt;;
+  response?: (response: Response) =&gt; Response | Promise&lt;Response&gt;;
+  error?: (error: ApiError) =&gt; ApiError | Promise&lt;never&gt;;
+};
+
+class TypedApiClient {
+  private interceptors: Interceptor[] = [];
+  private baseUrl: string;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl;
+  }
+
+  use(interceptor: Interceptor): this {
+    this.interceptors.push(interceptor);
+    return this; // method chaining
+  }
+
+  async request&lt;T&gt;(config: RequestConfig, schema: z.ZodType&lt;T&gt;): Promise&lt;T&gt; {
+    let finalConfig = { ...config, url: this.baseUrl + config.url };
+
+    // Run request interceptors
+    for (const { request } of this.interceptors) {
+      if (request) finalConfig = await request(finalConfig);
+    }
+
+    let response = await fetch(finalConfig.url, {
+      method: finalConfig.method,
+      headers: finalConfig.headers,
+      body: finalConfig.body ? JSON.stringify(finalConfig.body) : undefined,
+    });
+
+    // Run response interceptors
+    for (const { response: respInterceptor } of this.interceptors) {
+      if (respInterceptor) response = await respInterceptor(response);
+    }
+
+    if (!response.ok) {
+      const error = new ApiError(response.status, await response.text());
+      for (const { error: errHandler } of this.interceptors) {
+        if (errHandler) await errHandler(error);
+      }
+      throw error;
+    }
+
+    return schema.parse(await response.json());
+  }
+}
+
+// Configure with interceptors
+const api = new TypedApiClient('https://api.example.com')
+  .use({
+    request: (config) =&gt; ({
+      ...config,
+      headers: { ...config.headers, Authorization: `Bearer ${getToken()}` },
+    }),
+  })
+  .use({
+    error: async (error) =&gt; {
+      if (error.status === 401) await refreshToken();
+      throw error;
+    },
+  });</code></pre>
+
+      <h3>Retry/Timeout Integration</h3>
+<pre><code class="language-typescript">interface RetryConfig {
+  maxRetries: number;
+  backoffMs: number;
+  retryOn: number[]; // HTTP status codes to retry
+}
+
+async function withRetry&lt;T&gt;(
+  fn: () =&gt; Promise&lt;T&gt;,
+  config: RetryConfig
+): Promise&lt;T&gt; {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt &lt;= config.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (
+        error instanceof ApiError &amp;&amp;
+        config.retryOn.includes(error.status) &amp;&amp;
+        attempt &lt; config.maxRetries
+      ) {
+        await sleep(config.backoffMs * Math.pow(2, attempt));
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw lastError;
+}
+
+// Timeout wrapper with AbortController
+function withTimeout&lt;T&gt;(
+  fn: (signal: AbortSignal) =&gt; Promise&lt;T&gt;,
+  timeoutMs: number
+): Promise&lt;T&gt; {
+  const controller = new AbortController();
+  const timeout = setTimeout(() =&gt; controller.abort(), timeoutMs);
+
+  return fn(controller.signal).finally(() =&gt; clearTimeout(timeout));
+}</code></pre>
+    </section>
+
+    <!-- Section 8: Error Types & Result Pattern -->
+    <section id="error-handling" class="content-section">
+      <h2>Error Types &amp; Result Pattern</h2>
+
+      <h3>Discriminated Union for Errors</h3>
+<pre><code class="language-typescript">// The Result type — errors as data, not exceptions
+type Result&lt;T, E = ApiError&gt; =
+  | { success: true; data: T }
+  | { success: false; error: E };
+
+// Never-throw fetch wrapper
+async function safeFetch&lt;T&gt;(
+  config: RequestConfig,
+  schema: z.ZodType&lt;T&gt;
+): Promise&lt;Result&lt;T, ApiError&gt;&gt; {
+  try {
+    const response = await fetch(config.url, {
+      method: config.method,
+      headers: config.headers,
+      body: config.body ? JSON.stringify(config.body) : undefined,
+    });
+
+    if (!response.ok) {
+      return {
+        success: false,
+        error: new ApiError(response.status, await response.text()),
+      };
+    }
+
+    const data = await response.json();
+    const parsed = schema.safeParse(data);
+
+    if (!parsed.success) {
+      return {
+        success: false,
+        error: new ApiError(500, 'Response validation failed', parsed.error),
+      };
+    }
+
+    return { success: true, data: parsed.data };
+  } catch (e) {
+    return {
+      success: false,
+      error: e instanceof ApiError ? e : new ApiError(0, 'Network error'),
+    };
+  }
+}</code></pre>
+
+      <h3>Typed Error Codes &amp; Hierarchy</h3>
+<pre><code class="language-typescript">// Typed error codes as a const enum alternative
+const ErrorCode = {
+  NETWORK_ERROR: 'NETWORK_ERROR',
+  VALIDATION_ERROR: 'VALIDATION_ERROR',
+  NOT_FOUND: 'NOT_FOUND',
+  UNAUTHORIZED: 'UNAUTHORIZED',
+  FORBIDDEN: 'FORBIDDEN',
+  RATE_LIMITED: 'RATE_LIMITED',
+  SERVER_ERROR: 'SERVER_ERROR',
+} as const;
+
+type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
+
+// Discriminated error union — exhaustive handling
+type AppError =
+  | { code: 'NETWORK_ERROR'; message: string }
+  | { code: 'VALIDATION_ERROR'; message: string; fields: Record&lt;string, string[]&gt; }
+  | { code: 'NOT_FOUND'; message: string; resource: string; id: string }
+  | { code: 'UNAUTHORIZED'; message: string }
+  | { code: 'FORBIDDEN'; message: string; requiredRole: string }
+  | { code: 'RATE_LIMITED'; message: string; retryAfter: number }
+  | { code: 'SERVER_ERROR'; message: string; traceId?: string };
+
+// Exhaustive error handler
+function handleError(error: AppError): string {
+  switch (error.code) {
+    case 'NETWORK_ERROR':
+      return 'Check your internet connection';
+    case 'VALIDATION_ERROR':
+      return `Invalid fields: ${Object.keys(error.fields).join(', ')}`;
+    case 'NOT_FOUND':
+      return `${error.resource} with id ${error.id} not found`;
+    case 'UNAUTHORIZED':
+      return 'Please log in';
+    case 'FORBIDDEN':
+      return `Requires ${error.requiredRole} role`;
+    case 'RATE_LIMITED':
+      return `Too many requests. Retry in ${error.retryAfter}s`;
+    case 'SERVER_ERROR':
+      return `Server error${error.traceId ? ` (trace: ${error.traceId})` : ''}`;
+    default:
+      const _exhaustive: never = error;
+      return _exhaustive; // Compile error if a case is missing
+  }
+}</code></pre>
+
+      <h3>Result Pattern vs try/catch</h3>
+      <div class="callout callout-info">
+        <strong>Why prefer Result?</strong>
+        <ul>
+          <li><code>try/catch</code> loses type information — the caught error is <code>unknown</code></li>
+          <li>Result forces callers to handle the error path — can&rsquo;t accidentally ignore it</li>
+          <li>Composable: you can <code>map</code>, <code>flatMap</code>, <code>unwrapOr</code> on results</li>
+          <li>No hidden control flow — errors are just data in the return type</li>
+        </ul>
+      </div>
+
+<pre><code class="language-typescript">// Utility functions for Result
+function mapResult&lt;T, U, E&gt;(
+  result: Result&lt;T, E&gt;,
+  fn: (data: T) =&gt; U
+): Result&lt;U, E&gt; {
+  if (result.success) return { success: true, data: fn(result.data) };
+  return result;
+}
+
+function unwrapOr&lt;T, E&gt;(result: Result&lt;T, E&gt;, defaultValue: T): T {
+  return result.success ? result.data : defaultValue;
+}
+
+// Usage in components
+const result = await safeFetch({ method: 'GET', url: '/api/user' }, UserSchema);
+
+if (result.success) {
+  renderUser(result.data); // data is typed as User
+} else {
+  showError(handleError(result.error)); // error is typed as ApiError
+}</code></pre>
+    </section>
+
+    <!-- Section 9: Discriminated Union Responses -->
+    <section id="discriminated-responses" class="content-section">
+      <h2>Discriminated Union Responses</h2>
+
+      <h3>Typing API Responses</h3>
+<pre><code class="language-typescript">// API responses as discriminated unions
+const SuccessResponseSchema = &lt;T extends z.ZodTypeAny&gt;(dataSchema: T) =&gt;
+  z.object({
+    status: z.literal('success'),
+    data: dataSchema,
+    meta: z.object({
+      requestId: z.string(),
+      timestamp: z.string().datetime(),
+    }).optional(),
+  });
+
+const ErrorResponseSchema = z.object({
+  status: z.literal('error'),
+  error: z.object({
+    code: z.string(),
+    message: z.string(),
+    details: z.record(z.string(), z.array(z.string())).optional(),
+  }),
+});
+
+const ApiResponseSchema = &lt;T extends z.ZodTypeAny&gt;(dataSchema: T) =&gt;
+  z.discriminatedUnion('status', [
+    SuccessResponseSchema(dataSchema),
+    ErrorResponseSchema,
+  ]);
+
+// Usage
+const UserResponseSchema = ApiResponseSchema(UserSchema);
+type UserResponse = z.infer&lt;typeof UserResponseSchema&gt;;
+// { status: 'success'; data: User; meta?: {...} }
+// | { status: 'error'; error: { code: string; message: string; ... } }</code></pre>
+
+      <h3>Pattern Matching on Response</h3>
+<pre><code class="language-typescript">async function fetchUser(id: string): Promise&lt;User&gt; {
+  const res = await fetch(`/api/users/${id}`);
+  const json = await res.json();
+  const response = UserResponseSchema.parse(json);
+
+  // TypeScript narrows based on discriminant
+  switch (response.status) {
+    case 'success':
+      return response.data; // TypeScript knows: User
+    case 'error':
+      throw new AppError(response.error.code, response.error.message);
+  }
+}
+
+// Exhaustive handling helper
+function assertNever(x: never): never {
+  throw new Error(`Unexpected value: ${JSON.stringify(x)}`);
+}
+
+function handleResponse&lt;T&gt;(
+  response: { status: 'success'; data: T } | { status: 'error'; error: { code: string; message: string } }
+): T {
+  switch (response.status) {
+    case 'success':
+      return response.data;
+    case 'error':
+      throw new AppError(response.error.code, response.error.message);
+    default:
+      return assertNever(response); // Compile error if not exhaustive
+  }
+}</code></pre>
+
+      <h3>Multiple Response Shapes</h3>
+<pre><code class="language-typescript">// Some APIs return different shapes based on status code
+const UserEndpointResponse = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('success'), data: UserSchema }),
+  z.object({ status: z.literal('not_found'), message: z.string() }),
+  z.object({ status: z.literal('forbidden'), requiredRole: z.string() }),
+]);
+
+type UserEndpointResponse = z.infer&lt;typeof UserEndpointResponse&gt;;
+
+// Each variant is narrowed independently
+function render(response: UserEndpointResponse) {
+  switch (response.status) {
+    case 'success':
+      return &lt;UserProfile user={response.data} /&gt;;
+    case 'not_found':
+      return &lt;NotFound message={response.message} /&gt;;
+    case 'forbidden':
+      return &lt;AccessDenied role={response.requiredRole} /&gt;;
+  }
+}</code></pre>
+    </section>
+
+    <!-- Section 10: React Query / SWR Integration -->
+    <section id="react-query-integration" class="content-section">
+      <h2>Type-Safe React Query / SWR Integration</h2>
+
+      <h3>Typed Query Keys</h3>
+<pre><code class="language-typescript">// Query key factory — type-safe and consistent
+const queryKeys = {
+  users: {
+    all: ['users'] as const,
+    lists: () =&gt; [...queryKeys.users.all, 'list'] as const,
+    list: (filters: UserQuery) =&gt; [...queryKeys.users.lists(), filters] as const,
+    details: () =&gt; [...queryKeys.users.all, 'detail'] as const,
+    detail: (id: number) =&gt; [...queryKeys.users.details(), id] as const,
+  },
+  posts: {
+    all: ['posts'] as const,
+    byUser: (userId: number) =&gt; [...queryKeys.posts.all, 'user', userId] as const,
+  },
+} as const;</code></pre>
+
+      <h3>Typed Custom Hooks</h3>
+<pre><code class="language-typescript">import { useQuery, useMutation, UseQueryOptions } from '@tanstack/react-query';
+
+// Generic hook factory
+function createQueryHook&lt;TInput, TOutput&gt;(config: {
+  queryKey: (input: TInput) =&gt; readonly unknown[];
+  queryFn: (input: TInput) =&gt; Promise&lt;TOutput&gt;;
+}) {
+  return (
+    input: TInput,
+    options?: Omit&lt;UseQueryOptions&lt;TOutput&gt;, 'queryKey' | 'queryFn'&gt;
+  ) =&gt;
+    useQuery({
+      queryKey: config.queryKey(input),
+      queryFn: () =&gt; config.queryFn(input),
+      ...options,
+    });
+}
+
+// Specific hook — fully typed
+const useUser = createQueryHook({
+  queryKey: (id: number) =&gt; queryKeys.users.detail(id),
+  queryFn: async (id: number) =&gt; {
+    const res = await fetch(`/api/users/${id}`);
+    return UserSchema.parse(await res.json());
+  },
+});
+
+// Usage — data is typed as User | undefined
+function UserProfile({ userId }: { userId: number }) {
+  const { data: user, error, isLoading } = useUser(userId);
+
+  if (isLoading) return &lt;Spinner /&gt;;
+  if (error) return &lt;ErrorDisplay error={error} /&gt;;
+  return &lt;div&gt;{user.name}&lt;/div&gt;; // user is User
+}</code></pre>
+
+      <h3>Typed Mutations</h3>
+<pre><code class="language-typescript">function useCreateUser() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (input: CreateUser) =&gt; {
+      const validated = CreateUserSchema.parse(input);
+      const res = await fetch('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(validated),
+      });
+      return UserSchema.parse(await res.json());
+    },
+    onSuccess: (newUser) =&gt; {
+      // newUser is typed as User
+      queryClient.setQueryData(
+        queryKeys.users.detail(newUser.id),
+        newUser
+      );
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.lists() });
+    },
+  });
+}
+
+// Optimistic updates with proper typing
+function useUpdateUser() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ id, data }: { id: number; data: UserUpdate }) =&gt; {
+      const res = await fetch(`/api/users/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(UpdateUserSchema.parse(data)),
+      });
+      return UserSchema.parse(await res.json());
+    },
+    onMutate: async ({ id, data }) =&gt; {
+      await queryClient.cancelQueries({ queryKey: queryKeys.users.detail(id) });
+      const previous = queryClient.getQueryData&lt;User&gt;(queryKeys.users.detail(id));
+
+      if (previous) {
+        queryClient.setQueryData&lt;User&gt;(queryKeys.users.detail(id), {
+          ...previous,
+          ...data,
+        });
+      }
+
+      return { previous };
+    },
+    onError: (_err, { id }, context) =&gt; {
+      if (context?.previous) {
+        queryClient.setQueryData(queryKeys.users.detail(id), context.previous);
+      }
+    },
+  });
+}</code></pre>
+
+      <h3>Infinite Query Typing</h3>
+<pre><code class="language-typescript">const PaginatedUsersSchema = z.object({
+  items: z.array(UserSchema),
+  nextCursor: z.string().nullable(),
+  total: z.number(),
+});
+
+function useInfiniteUsers(filters: Omit&lt;UserQuery, 'page'&gt;) {
+  return useInfiniteQuery({
+    queryKey: queryKeys.users.list(filters as UserQuery),
+    queryFn: async ({ pageParam }) =&gt; {
+      const params = new URLSearchParams({
+        ...filters,
+        cursor: pageParam ?? '',
+      } as Record&lt;string, string&gt;);
+      const res = await fetch(`/api/users?${params}`);
+      return PaginatedUsersSchema.parse(await res.json());
+    },
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) =&gt; lastPage.nextCursor,
+  });
+}</code></pre>
+    </section>
+
+    <!-- Section 11: Contract-First Development -->
+    <section id="contract-first" class="content-section">
+      <h2>Contract-First Development (OpenAPI &rarr; Types)</h2>
+
+      <h3>OpenAPI Spec to TypeScript</h3>
+      <p>Contract-first reverses the flow: instead of inferring types from code, you define the API contract first (OpenAPI/Swagger) and generate TypeScript types + clients from it.</p>
+
+<pre class="diagram">
+┌──────────────────────────────────────────────────────────┐
+│                  CONTRACT-FIRST FLOW                       │
+│                                                           │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐  │
+│  │  OpenAPI    │───▶│  Code Gen   │───▶│ TS Types +  │  │
+│  │  Spec       │    │  Tool       │    │ API Client  │  │
+│  │ (YAML/JSON) │    │             │    │             │  │
+│  └─────────────┘    └─────────────┘    └─────────────┘  │
+│        │                                      │          │
+│        │         ┌─────────────┐              │          │
+│        └────────▶│  Backend    │◀─────────────┘          │
+│                  │  Validates  │   Types shared           │
+│                  │  Against    │   between FE + BE        │
+│                  │  Same Spec  │                          │
+│                  └─────────────┘                          │
+└──────────────────────────────────────────────────────────┘
+</pre>
+
+      <h3>Tooling</h3>
+<pre><code class="language-typescript">// openapi-typescript — generates types from OpenAPI spec
+// Install: npm i -D openapi-typescript
+
+// Generate types:
+// npx openapi-typescript ./api-spec.yaml -o ./src/api/types.ts
+
+// Generated output looks like:
+export interface paths {
+  '/users': {
+    get: {
+      parameters: {
+        query: {
+          page?: number;
+          pageSize?: number;
+          search?: string;
+        };
+      };
+      responses: {
+        200: {
+          content: {
+            'application/json': {
+              items: components['schemas']['User'][];
+              total: number;
+            };
+          };
+        };
+      };
+    };
+    post: {
+      requestBody: {
+        content: {
+          'application/json': components['schemas']['CreateUser'];
+        };
+      };
+      responses: {
+        201: {
+          content: {
+            'application/json': components['schemas']['User'];
+          };
+        };
+      };
+    };
+  };
+}
+
+// openapi-fetch — type-safe client using generated types
+import createClient from 'openapi-fetch';
+import type { paths } from './api/types';
+
+const client = createClient&lt;paths&gt;({ baseUrl: 'https://api.example.com' });
+
+// Fully typed — params, body, and response all inferred from spec
+const { data, error } = await client.GET('/users', {
+  params: { query: { page: 1, search: 'john' } },
+});
+// data is typed as { items: User[]; total: number } | undefined</code></pre>
+
+      <h3>Keeping Generated Types Fresh (CI Integration)</h3>
+<pre><code class="language-typescript">// package.json scripts
+{
+  "scripts": {
+    "api:generate": "openapi-typescript ./api-spec.yaml -o ./src/api/types.ts",
+    "api:validate": "openapi-typescript ./api-spec.yaml -o /dev/null",
+    "api:check": "npm run api:generate &amp;&amp; git diff --exit-code src/api/types.ts"
+  }
+}
+
+// CI pipeline step — fails if generated types are out of date
+// .github/workflows/typecheck.yml
+// - run: npm run api:generate
+// - run: git diff --exit-code src/api/types.ts
+//   # Fails if someone updated the spec but forgot to regenerate</code></pre>
+
+      <div class="callout callout-tip">
+        <strong>Orval</strong> goes further than openapi-typescript: it generates React Query hooks, MSW mocks, and Zod schemas from your OpenAPI spec. Great for teams that want a batteries-included approach.
+      </div>
+    </section>
+
+    <!-- Section 12: tRPC Pattern -->
+    <section id="trpc-pattern" class="content-section">
+      <h2>End-to-End Type Safety (tRPC Pattern)</h2>
+
+      <h3>How tRPC Achieves E2E Types</h3>
+      <p>tRPC eliminates the API layer abstraction entirely. Instead of REST endpoints with separate client/server types, the server&rsquo;s router type <em>is</em> the client&rsquo;s API type &mdash; no code generation needed.</p>
+
+<pre class="diagram">
+┌──────────────────────────────────────────────────────────┐
+│                    tRPC ARCHITECTURE                       │
+│                                                           │
+│  SERVER                              CLIENT               │
+│  ┌─────────────────┐                ┌─────────────────┐  │
+│  │ Router          │  Type Export   │ Typed Client    │  │
+│  │ ┌─────────────┐ │───────────────▶│                 │  │
+│  │ │ user.get    │ │   (no codegen) │ trpc.user.get() │  │
+│  │ │ user.create │ │                │ trpc.user.create│  │
+│  │ │ post.list   │ │                │ trpc.post.list()│  │
+│  │ └─────────────┘ │                └─────────────────┘  │
+│  └─────────────────┘                                      │
+│                                                           │
+│  Types flow through TypeScript's module system            │
+│  No HTTP schema, no code generation, no OpenAPI spec      │
+└──────────────────────────────────────────────────────────┘
+</pre>
+
+      <h3>Router Definition</h3>
+<pre><code class="language-typescript">// server/trpc.ts
+import { initTRPC } from '@trpc/server';
+import { z } from 'zod';
+
+const t = initTRPC.context&lt;Context&gt;().create();
+
+export const router = t.router;
+export const publicProcedure = t.procedure;
+export const protectedProcedure = t.procedure.use(authMiddleware);
+
+// server/routers/user.ts
+export const userRouter = router({
+  getById: publicProcedure
+    .input(z.object({ id: z.number() }))
+    .output(UserSchema)
+    .query(async ({ input, ctx }) =&gt; {
+      const user = await ctx.db.user.findUnique({ where: { id: input.id } });
+      if (!user) throw new TRPCError({ code: 'NOT_FOUND' });
+      return user; // Validated against UserSchema automatically
+    }),
+
+  create: protectedProcedure
+    .input(CreateUserSchema)
+    .output(UserSchema)
+    .mutation(async ({ input, ctx }) =&gt; {
+      return ctx.db.user.create({ data: input });
+    }),
+
+  list: publicProcedure
+    .input(UserQuerySchema)
+    .output(z.object({
+      items: z.array(UserSchema),
+      total: z.number(),
+    }))
+    .query(async ({ input, ctx }) =&gt; {
+      const [items, total] = await Promise.all([
+        ctx.db.user.findMany({
+          skip: (input.page - 1) * input.pageSize,
+          take: input.pageSize,
+          where: input.search ? { name: { contains: input.search } } : undefined,
+        }),
+        ctx.db.user.count(),
+      ]);
+      return { items, total };
+    }),
+});
+
+// server/root.ts
+export const appRouter = router({
+  user: userRouter,
+  post: postRouter,
+});
+
+export type AppRouter = typeof appRouter; // ← THIS is the magic export</code></pre>
+
+      <h3>Client Usage</h3>
+<pre><code class="language-typescript">// client/trpc.ts
+import { createTRPCReact } from '@trpc/react-query';
+import type { AppRouter } from '../server/root'; // Type-only import!
+
+export const trpc = createTRPCReact&lt;AppRouter&gt;();
+
+// client/components/UserProfile.tsx
+function UserProfile({ userId }: { userId: number }) {
+  // Fully typed: input, output, error — all inferred from server router
+  const { data: user } = trpc.user.getById.useQuery({ id: userId });
+  //     ^? User | undefined — matches the server's output schema
+
+  const createUser = trpc.user.create.useMutation();
+  //    ^? { mutate: (input: CreateUser) =&gt; void, data: User | undefined, ... }
+
+  return user ? &lt;div&gt;{user.name}&lt;/div&gt; : null;
+}</code></pre>
+
+      <h3>tRPC vs GraphQL + Codegen</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Aspect</th>
+            <th>tRPC</th>
+            <th>GraphQL + Codegen</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Code generation</td>
+            <td>None needed</td>
+            <td>Required (graphql-codegen)</td>
+          </tr>
+          <tr>
+            <td>Language requirement</td>
+            <td>TypeScript on both ends</td>
+            <td>Any language</td>
+          </tr>
+          <tr>
+            <td>Schema definition</td>
+            <td>Zod schemas in TS</td>
+            <td>GraphQL SDL</td>
+          </tr>
+          <tr>
+            <td>Client flexibility</td>
+            <td>TS/JS only</td>
+            <td>Any language with GraphQL client</td>
+          </tr>
+          <tr>
+            <td>Setup complexity</td>
+            <td>Minimal</td>
+            <td>Moderate (codegen config, watchers)</td>
+          </tr>
+          <tr>
+            <td>Best for</td>
+            <td>Full-stack TS monorepos</td>
+            <td>Multi-client, multi-language APIs</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Section 13: Monorepo Shared Types -->
+    <section id="monorepo-shared-types" class="content-section">
+      <h2>Monorepo Shared Types</h2>
+
+      <h3>Shared Type Packages</h3>
+<pre><code class="language-typescript">// packages/api-contracts/package.json
+{
+  "name": "@myapp/api-contracts",
+  "version": "1.0.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "import": "./dist/index.js", "types": "./dist/index.d.ts" },
+    "./users": { "import": "./dist/users.js", "types": "./dist/users.d.ts" },
+    "./posts": { "import": "./dist/posts.js", "types": "./dist/posts.d.ts" }
+  },
+  "dependencies": {
+    "zod": "^3.22.0"
+  }
+}
+
+// packages/api-contracts/src/users.ts
+import { z } from 'zod';
+
+export const UserSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  email: z.string().email(),
+  role: z.enum(['admin', 'user', 'viewer']),
+  createdAt: z.string().datetime(),
+});
+
+export type User = z.infer&lt;typeof UserSchema&gt;;
+
+export const CreateUserSchema = UserSchema.omit({ id: true, createdAt: true });
+export type CreateUser = z.infer&lt;typeof CreateUserSchema&gt;;
+
+// Endpoint contracts — defines the shape of each API call
+export const UserEndpoints = {
+  getById: {
+    input: z.object({ id: z.number() }),
+    output: UserSchema,
+  },
+  list: {
+    input: z.object({ page: z.number(), pageSize: z.number() }),
+    output: z.object({ items: z.array(UserSchema), total: z.number() }),
+  },
+  create: {
+    input: CreateUserSchema,
+    output: UserSchema,
+  },
+} as const;</code></pre>
+
+      <h3>Workspace Protocols</h3>
+<pre><code class="language-typescript">// pnpm-workspace.yaml
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+// apps/frontend/package.json — consumes the shared contracts
+{
+  "dependencies": {
+    "@myapp/api-contracts": "workspace:*"
+  }
+}
+
+// apps/backend/package.json — also consumes contracts
+{
+  "dependencies": {
+    "@myapp/api-contracts": "workspace:*"
+  }
+}
+
+// Both apps import from the same source
+import { UserSchema, type User } from '@myapp/api-contracts/users';</code></pre>
+
+      <h3>Version Management &amp; Type Testing</h3>
+<pre><code class="language-typescript">// Type testing with tsd or expect-type
+import { expectTypeOf } from 'expect-type';
+import { UserSchema, type User } from '@myapp/api-contracts/users';
+import { z } from 'zod';
+
+// Verify schema infers correct type
+expectTypeOf&lt;z.infer&lt;typeof UserSchema&gt;&gt;().toEqualTypeOf&lt;User&gt;();
+
+// Verify required fields
+expectTypeOf&lt;User&gt;().toHaveProperty('id');
+expectTypeOf&lt;User&gt;().toHaveProperty('email');
+
+// Verify field types
+expectTypeOf&lt;User['role']&gt;().toEqualTypeOf&lt;'admin' | 'user' | 'viewer'&gt;();
+
+// Breaking change detection in CI:
+// Run type tests in the pipeline. If someone changes a schema
+// in a way that breaks consumers, the type tests fail BEFORE deploy.</code></pre>
+
+      <div class="callout callout-warning">
+        <strong>Version discipline:</strong> Treat shared type packages like published APIs. Use semantic versioning &mdash; breaking schema changes are major versions. In a monorepo with <code>workspace:*</code>, breaking changes are caught at build time, but in multi-repo setups you need explicit version bumps.
+      </div>
+    </section>
+
+    <!-- Section 14: Production Architecture -->
+    <section id="production-architecture" class="content-section">
+      <h2>Production Architecture</h2>
+
+      <h3>Full Architecture Overview</h3>
+<pre class="diagram">
+┌────────────────────────────────────────────────────────────────┐
+│                    PRODUCTION TYPE-SAFE API LAYER               │
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │                   SCHEMA REGISTRY                          │ │
+│  │  @myapp/contracts: UserSchema, PostSchema, ErrorSchema... │ │
+│  └────────────────────────┬──────────────────────────────────┘ │
+│                           │                                     │
+│            ┌──────────────┼──────────────┐                     │
+│            ▼              ▼              ▼                      │
+│  ┌──────────────┐ ┌─────────────┐ ┌──────────────┐           │
+│  │  BACKEND     │ │  CLIENT SDK │ │  MOCK SERVER │           │
+│  │  Middleware  │ │  (Generated)│ │  (MSW/Mirage)│           │
+│  │  validates   │ │  validates  │ │  validates   │           │
+│  │  req + res   │ │  responses  │ │  both sides  │           │
+│  └──────┬───────┘ └──────┬──────┘ └──────────────┘           │
+│         │                 │                                     │
+│         ▼                 ▼                                     │
+│  ┌──────────────┐ ┌──────────────┐                            │
+│  │  Error       │ │  React Query │                            │
+│  │  Boundary    │ │  Hooks       │                            │
+│  │  Integration │ │  (typed)     │                            │
+│  └──────────────┘ └──────────────┘                            │
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │  MONITORING: Log validation errors, track schema drift    │ │
+│  └───────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+</pre>
+
+      <h3>Schema Registry</h3>
+<pre><code class="language-typescript">// packages/contracts/src/registry.ts
+import { z } from 'zod';
+import { UserSchema, CreateUserSchema } from './schemas/user';
+import { PostSchema, CreatePostSchema } from './schemas/post';
+
+// Central registry of all API endpoints
+export const apiRegistry = {
+  'GET /users': {
+    query: z.object({ page: z.number(), search: z.string().optional() }),
+    response: z.object({ items: z.array(UserSchema), total: z.number() }),
+  },
+  'GET /users/:id': {
+    params: z.object({ id: z.coerce.number() }),
+    response: UserSchema,
+  },
+  'POST /users': {
+    body: CreateUserSchema,
+    response: UserSchema,
+  },
+  'GET /posts': {
+    query: z.object({ userId: z.number().optional(), limit: z.number() }),
+    response: z.array(PostSchema),
+  },
+  'POST /posts': {
+    body: CreatePostSchema,
+    response: PostSchema,
+  },
+} as const;
+
+export type ApiRegistry = typeof apiRegistry;
+export type ApiEndpoint = keyof ApiRegistry;</code></pre>
+
+      <h3>Validation Middleware</h3>
+<pre><code class="language-typescript">// Backend middleware that validates against the same schemas
+import { apiRegistry, type ApiEndpoint } from '@myapp/contracts';
+
+function createValidationMiddleware(endpoint: ApiEndpoint) {
+  const config = apiRegistry[endpoint];
+
+  return async (req: Request, res: Response, next: NextFunction) =&gt; {
+    try {
+      // Validate request
+      if ('params' in config) req.params = config.params.parse(req.params);
+      if ('query' in config) req.query = config.query.parse(req.query);
+      if ('body' in config) req.body = config.body.parse(req.body);
+
+      // Wrap response to validate outgoing data
+      const originalJson = res.json.bind(res);
+      res.json = (data: unknown) =&gt; {
+        const validated = config.response.parse(data);
+        return originalJson(validated);
+      };
+
+      next();
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({
+          status: 'error',
+          error: { code: 'VALIDATION_ERROR', issues: error.flatten() },
+        });
+      } else {
+        next(error);
+      }
+    }
+  };
+}</code></pre>
+
+      <h3>Monitoring Type Errors</h3>
+<pre><code class="language-typescript">// Client-side: log validation failures without crashing
+function createMonitoredParser&lt;T&gt;(schema: z.ZodType&lt;T&gt;, endpoint: string) {
+  return (data: unknown): T =&gt; {
+    const result = schema.safeParse(data);
+
+    if (result.success) return result.data;
+
+    // Log the schema drift — don't crash in production
+    reportError({
+      type: 'SCHEMA_VALIDATION_FAILURE',
+      endpoint,
+      issues: result.error.issues,
+      receivedData: JSON.stringify(data).slice(0, 1000), // truncate for safety
+      timestamp: new Date().toISOString(),
+    });
+
+    // Decide: throw (strict) or return raw data (lenient)
+    if (process.env.NODE_ENV === 'development') {
+      throw result.error; // Fail loudly in dev
+    }
+
+    // In production, return data with a warning (graceful degradation)
+    console.warn(`Schema validation failed for ${endpoint}`, result.error);
+    return data as T; // Unsafe but keeps app running
+  };
+}</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Team decision:</strong> The graceful degradation pattern above (<code>return data as T</code> on validation failure) is pragmatic but controversial. You're operating on potentially malformed data — some teams consider this unacceptable and prefer crashing with a clear error over silent data corruption. In an interview, acknowledge both approaches: "In my team we [chose X because Y]." The key insight is that this is a <em>product decision</em> (availability vs correctness tradeoff), not a purely technical one.</p>
+        </div>
+    </section>
+
+    <!-- Section 15: Code Examples -->
+    <section id="code-examples" class="content-section">
+      <h2>Code Examples</h2>
+
+      <details open>
+        <summary>Full Type-Safe API Client with Zod</summary>
+<pre><code class="language-typescript">import { z } from 'zod';
+
+// --- Schema Definitions ---
+const UserSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  email: z.string().email(),
+  role: z.enum(['admin', 'user', 'viewer']),
+  avatar: z.string().url().nullable(),
+  createdAt: z.string().datetime(),
+});
+type User = z.infer&lt;typeof UserSchema&gt;;
+
+// --- Result Type ---
+type Result&lt;T, E = Error&gt; =
+  | { ok: true; data: T }
+  | { ok: false; error: E };
+
+// --- API Error ---
+class ApiError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+    public details?: unknown
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+// --- Type-Safe Client ---
+class TypeSafeApiClient {
+  constructor(private baseUrl: string, private token?: string) {}
+
+  private async request&lt;T&gt;(
+    method: string,
+    path: string,
+    schema: z.ZodType&lt;T&gt;,
+    body?: unknown
+  ): Promise&lt;Result&lt;T, ApiError&gt;&gt; {
+    try {
+      const response = await fetch(`${this.baseUrl}${path}`, {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.token &amp;&amp; { Authorization: `Bearer ${this.token}` }),
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.json().catch(() =&gt; ({}));
+        return {
+          ok: false,
+          error: new ApiError(
+            response.status,
+            errorBody.code ?? 'UNKNOWN',
+            errorBody.message ?? response.statusText,
+            errorBody.details
+          ),
+        };
+      }
+
+      const data = await response.json();
+      const parsed = schema.safeParse(data);
+
+      if (!parsed.success) {
+        return {
+          ok: false,
+          error: new ApiError(
+            0,
+            'VALIDATION_ERROR',
+            'Response did not match expected schema',
+            parsed.error.flatten()
+          ),
+        };
+      }
+
+      return { ok: true, data: parsed.data };
+    } catch (e) {
+      return {
+        ok: false,
+        error: new ApiError(0, 'NETWORK_ERROR', e instanceof Error ? e.message : 'Unknown error'),
+      };
+    }
+  }
+
+  // Typed endpoint methods
+  users = {
+    get: (id: number) =&gt;
+      this.request('GET', `/users/${id}`, UserSchema),
+
+    list: (params?: { page?: number; search?: string }) =&gt;
+      this.request('GET', `/users?${new URLSearchParams(params as any)}`,
+        z.object({ items: z.array(UserSchema), total: z.number() })),
+
+    create: (input: Omit&lt;User, 'id' | 'createdAt'&gt;) =&gt;
+      this.request('POST', '/users', UserSchema, input),
+
+    update: (id: number, input: Partial&lt;Omit&lt;User, 'id' | 'createdAt'&gt;&gt;) =&gt;
+      this.request('PATCH', `/users/${id}`, UserSchema, input),
+
+    delete: (id: number) =&gt;
+      this.request('DELETE', `/users/${id}`, z.object({ success: z.boolean() })),
+  };
+}
+
+// Usage
+const api = new TypeSafeApiClient('https://api.example.com', authToken);
+const result = await api.users.get(1);
+
+if (result.ok) {
+  console.log(result.data.name); // Typed as string
+} else {
+  console.error(result.error.code); // Typed as string
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>tRPC-like Router (Simplified Implementation)</summary>
+<pre><code class="language-typescript">import { z } from 'zod';
+
+// Simplified tRPC-like procedure builder
+type ProcedureConfig&lt;TInput, TOutput&gt; = {
+  input: z.ZodType&lt;TInput&gt;;
+  output: z.ZodType&lt;TOutput&gt;;
+  handler: (input: TInput) =&gt; Promise&lt;TOutput&gt;;
+};
+
+function procedure&lt;TInput, TOutput&gt;(
+  config: ProcedureConfig&lt;TInput, TOutput&gt;
+) {
+  return {
+    ...config,
+    call: async (rawInput: unknown): Promise&lt;TOutput&gt; =&gt; {
+      const input = config.input.parse(rawInput);
+      const output = await config.handler(input);
+      return config.output.parse(output);
+    },
+  };
+}
+
+// Define router
+const userRouter = {
+  getById: procedure({
+    input: z.object({ id: z.number() }),
+    output: UserSchema,
+    handler: async ({ id }) =&gt; {
+      return db.users.findById(id);
+    },
+  }),
+  create: procedure({
+    input: z.object({ name: z.string(), email: z.string().email() }),
+    output: UserSchema,
+    handler: async (input) =&gt; {
+      return db.users.create(input);
+    },
+  }),
+};
+
+// Type-safe client (inferred from router definition)
+type RouterType = typeof userRouter;
+
+type TypedClient&lt;T&gt; = {
+  [K in keyof T]: T[K] extends ProcedureConfig&lt;infer I, infer O&gt;
+    ? (input: I) =&gt; Promise&lt;O&gt;
+    : never;
+};
+
+function createClient&lt;T extends Record&lt;string, any&gt;&gt;(router: T): TypedClient&lt;T&gt; {
+  const client = {} as any;
+  for (const [key, proc] of Object.entries(router)) {
+    client[key] = (input: unknown) =&gt; proc.call(input);
+  }
+  return client;
+}
+
+const client = createClient(userRouter);
+const user = await client.getById({ id: 1 }); // Typed as User</code></pre>
+      </details>
+
+      <details>
+        <summary>Environment Config Validator</summary>
+<pre><code class="language-typescript">// Validate environment variables at startup — crash early if misconfigured
+const EnvSchema = z.object({
+  NODE_ENV: z.enum(['development', 'staging', 'production']),
+  API_URL: z.string().url(),
+  API_KEY: z.string().min(1),
+  DATABASE_URL: z.string().url(),
+  REDIS_URL: z.string().url().optional(),
+  PORT: z.coerce.number().int().positive().default(3000),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  ENABLE_CACHE: z.coerce.boolean().default(true),
+  MAX_UPLOAD_SIZE_MB: z.coerce.number().positive().default(10),
+});
+
+type Env = z.infer&lt;typeof EnvSchema&gt;;
+
+// Parse and validate at module load — fail fast
+function loadEnv(): Env {
+  const result = EnvSchema.safeParse(process.env);
+
+  if (!result.success) {
+    console.error('❌ Invalid environment variables:');
+    console.error(result.error.flatten().fieldErrors);
+    process.exit(1);
+  }
+
+  return Object.freeze(result.data);
+}
+
+export const env = loadEnv();
+
+// Now `env.API_URL` is typed as string (guaranteed non-empty URL)
+// `env.PORT` is typed as number (coerced from string)
+// `env.REDIS_URL` is typed as string | undefined</code></pre>
+      </details>
+
+      <details>
+        <summary>Typed Form with Validation</summary>
+<pre><code class="language-typescript">import { z } from 'zod';
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+
+// Schema is the source of truth for form validation + types
+const RegistrationSchema = z.object({
+  username: z.string()
+    .min(3, 'Username must be at least 3 characters')
+    .max(20, 'Username must be at most 20 characters')
+    .regex(/^[a-zA-Z0-9_]+$/, 'Only letters, numbers, and underscores'),
+  email: z.string().email('Invalid email address'),
+  password: z.string()
+    .min(8, 'Password must be at least 8 characters')
+    .regex(/[A-Z]/, 'Must contain an uppercase letter')
+    .regex(/[0-9]/, 'Must contain a number'),
+  confirmPassword: z.string(),
+  acceptTerms: z.literal(true, {
+    errorMap: () =&gt; ({ message: 'You must accept the terms' }),
+  }),
+}).refine((data) =&gt; data.password === data.confirmPassword, {
+  message: 'Passwords do not match',
+  path: ['confirmPassword'],
+});
+
+type RegistrationForm = z.infer&lt;typeof RegistrationSchema&gt;;
+
+function RegistrationPage() {
+  const { register, handleSubmit, formState: { errors } } = useForm&lt;RegistrationForm&gt;({
+    resolver: zodResolver(RegistrationSchema),
+  });
+
+  const onSubmit = async (data: RegistrationForm) =&gt; {
+    // `data` is fully typed AND validated
+    const result = await api.users.register(data);
+    // ...
+  };
+
+  return (
+    &lt;form onSubmit={handleSubmit(onSubmit)}&gt;
+      &lt;input {...register('username')} /&gt;
+      {errors.username &amp;&amp; &lt;span&gt;{errors.username.message}&lt;/span&gt;}
+
+      &lt;input type="email" {...register('email')} /&gt;
+      {errors.email &amp;&amp; &lt;span&gt;{errors.email.message}&lt;/span&gt;}
+
+      &lt;input type="password" {...register('password')} /&gt;
+      {errors.password &amp;&amp; &lt;span&gt;{errors.password.message}&lt;/span&gt;}
+
+      &lt;input type="password" {...register('confirmPassword')} /&gt;
+      {errors.confirmPassword &amp;&amp; &lt;span&gt;{errors.confirmPassword.message}&lt;/span&gt;}
+
+      &lt;label&gt;
+        &lt;input type="checkbox" {...register('acceptTerms')} /&gt;
+        I accept the terms
+      &lt;/label&gt;
+      {errors.acceptTerms &amp;&amp; &lt;span&gt;{errors.acceptTerms.message}&lt;/span&gt;}
+
+      &lt;button type="submit"&gt;Register&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 16: Common Mistakes -->
+    <section id="common-mistakes" class="content-section">
+      <h2>Common Mistakes</h2>
+
+      <details open>
+        <summary>1. Trusting API responses without validation</summary>
+        <div class="mistake-content">
+<pre><code class="language-typescript">// ❌ Trusting external data blindly
+const users: User[] = await fetch('/api/users').then(r =&gt; r.json());
+// If the API changes shape, your app breaks silently with runtime errors
+// deep in component trees — far from the actual problem.
+
+// ✅ Validate at the boundary
+const raw = await fetch('/api/users').then(r =&gt; r.json());
+const users = z.array(UserSchema).parse(raw);
+// Fails fast at the boundary with a clear error message</code></pre>
+        </div>
+      </details>
+
+      <details>
+        <summary>2. Type assertions on fetch responses</summary>
+        <div class="mistake-content">
+<pre><code class="language-typescript">// ❌ `as` gives you a false sense of safety
+const data = (await response.json()) as ApiResponse;
+// TypeScript trusts you — but the runtime doesn't care about your assertion
+
+// ❌ Even worse: double assertion
+const data = (await response.json()) as unknown as ComplexType;
+// This bypasses ALL type checking
+
+// ✅ Parse, don't assert
+const data = ApiResponseSchema.parse(await response.json());
+// Runtime guarantee matches compile-time type</code></pre>
+        </div>
+      </details>
+
+      <details>
+        <summary>3. Duplicating types alongside schemas</summary>
+        <div class="mistake-content">
+<pre><code class="language-typescript">// ❌ Dual maintenance — these WILL drift apart
+interface User {
+  id: number;
+  name: string;
+  email: string;
+  role: 'admin' | 'user'; // Someone added 'viewer' to schema but forgot here
+}
+
+const UserSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  email: z.string(),
+  role: z.enum(['admin', 'user', 'viewer']), // ← Drift!
+});
+
+// ✅ Single source of truth
+const UserSchema = z.object({ /* ... */ });
+type User = z.infer&lt;typeof UserSchema&gt;; // Always in sync</code></pre>
+        </div>
+      </details>
+
+      <details>
+        <summary>4. Over-engineering for simple APIs</summary>
+        <div class="mistake-content">
+<pre><code class="language-typescript">// ❌ Building a full tRPC-like system for 3 endpoints
+// Sometimes a simple typed fetch wrapper is enough:
+
+// ✅ Right-sized solution for a small app
+async function getUser(id: number): Promise&lt;User&gt; {
+  const res = await fetch(`/api/users/${id}`);
+  return UserSchema.parse(await res.json());
+}
+
+// Scale up when:
+// - You have 20+ endpoints
+// - Multiple teams consume the same API
+// - You need code generation or contract testing</code></pre>
+        </div>
+      </details>
+
+      <details>
+        <summary>5. Not handling unknown error shapes</summary>
+        <div class="mistake-content">
+<pre><code class="language-typescript">// ❌ Assuming error shape
+try {
+  await api.createUser(data);
+} catch (error) {
+  // error is `unknown` — you can't access .message safely
+  showToast(error.message); // 💥 Runtime error if error isn't an Error
+
+  // Even worse: assuming API error shape
+  showFieldErrors(error.response.data.fields); // 💥💥
+}
+
+// ✅ Validate error shapes too
+const ApiErrorSchema = z.object({
+  code: z.string(),
+  message: z.string(),
+  fields: z.record(z.array(z.string())).optional(),
+});
+
+try {
+  await api.createUser(data);
+} catch (e) {
+  const parsed = ApiErrorSchema.safeParse(e);
+  if (parsed.success) {
+    showFieldErrors(parsed.data.fields);
+  } else {
+    showToast('An unexpected error occurred');
+  }
+}</code></pre>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 17: Trade-offs -->
+    <section id="trade-offs" class="content-section">
+      <h2>Trade-offs</h2>
+
+      <h3>Zod vs io-ts vs Valibot</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Criteria</th>
+            <th>Zod</th>
+            <th>io-ts</th>
+            <th>Valibot</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Learning curve</td>
+            <td>Low</td>
+            <td>High (FP knowledge)</td>
+            <td>Low</td>
+          </tr>
+          <tr>
+            <td>Bundle size</td>
+            <td>~14-15 kB</td>
+            <td>~6 kB + fp-ts</td>
+            <td>~1-5 kB</td>
+          </tr>
+          <tr>
+            <td>Tree-shaking</td>
+            <td>Poor</td>
+            <td>Moderate</td>
+            <td>Excellent</td>
+          </tr>
+          <tr>
+            <td>Ecosystem integration</td>
+            <td>Best (tRPC, RHF, etc.)</td>
+            <td>FP ecosystem</td>
+            <td>Growing</td>
+          </tr>
+          <tr>
+            <td>Error messages</td>
+            <td>Excellent</td>
+            <td>Requires custom reporters</td>
+            <td>Good</td>
+          </tr>
+          <tr>
+            <td>Best for</td>
+            <td>Most projects</td>
+            <td>FP-heavy codebases</td>
+            <td>Bundle-sensitive apps</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Code Generation vs Runtime Validation</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Aspect</th>
+            <th>Code Generation</th>
+            <th>Runtime Validation</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Source of truth</td>
+            <td>OpenAPI/GraphQL spec</td>
+            <td>Zod schemas in code</td>
+          </tr>
+          <tr>
+            <td>Runtime cost</td>
+            <td>Zero (types only)</td>
+            <td>Small parsing overhead</td>
+          </tr>
+          <tr>
+            <td>Safety guarantee</td>
+            <td>Compile-time only</td>
+            <td>Runtime + compile-time</td>
+          </tr>
+          <tr>
+            <td>Freshness</td>
+            <td>Requires regeneration</td>
+            <td>Always up-to-date</td>
+          </tr>
+          <tr>
+            <td>Multi-language</td>
+            <td>Yes (spec is language-agnostic)</td>
+            <td>TypeScript only</td>
+          </tr>
+          <tr>
+            <td>Complexity</td>
+            <td>CI pipeline, tooling</td>
+            <td>Simple, in-code</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>tRPC vs REST + OpenAPI</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Aspect</th>
+            <th>tRPC</th>
+            <th>REST + OpenAPI</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Type safety</td>
+            <td>End-to-end, automatic</td>
+            <td>Requires codegen step</td>
+          </tr>
+          <tr>
+            <td>Language lock-in</td>
+            <td>TypeScript both ends</td>
+            <td>Any language</td>
+          </tr>
+          <tr>
+            <td>External consumers</td>
+            <td>Difficult (TS clients only)</td>
+            <td>Easy (spec is universal)</td>
+          </tr>
+          <tr>
+            <td>Caching</td>
+            <td>Custom (no HTTP caching)</td>
+            <td>Standard HTTP caching</td>
+          </tr>
+          <tr>
+            <td>Tooling ecosystem</td>
+            <td>Growing</td>
+            <td>Mature (Swagger UI, Postman)</td>
+          </tr>
+          <tr>
+            <td>Best for</td>
+            <td>Internal TS monorepos</td>
+            <td>Public APIs, multi-client</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Bundle Size Impact</h3>
+      <div class="callout callout-info">
+        <strong>Real-world numbers:</strong> Zod adds ~14-15 kB gzipped (Zod 4 aims to reduce this significantly). For most apps this is negligible. For performance-critical landing pages, consider Valibot (~1-5 kB tree-shaken) or validate only on the server and trust the typed response in the client (accepting the risk).
+      </div>
+    </section>
+
+    <!-- Section 18: Follow-up Questions -->
+    <section id="follow-up-questions" class="content-section">
+      <h2>Follow-up Questions</h2>
+
+      <details>
+        <summary>1. How do you handle API versioning with type safety?</summary>
+        <p>Use discriminated unions per version or namespace schemas: <code>v1.UserSchema</code>, <code>v2.UserSchema</code>. At the boundary, detect the version (header, URL prefix) and parse with the corresponding schema. Transform older versions to the latest internal type so application code only deals with one shape.</p>
+      </details>
+
+      <details>
+        <summary>2. What about performance? Isn&rsquo;t runtime validation expensive?</summary>
+        <p>Zod parsing is fast (~0.1-1ms for typical payloads). The cost is negligible compared to network latency. For hot paths (WebSocket messages at high frequency), you can validate in development and skip in production, or use a faster validator like Valibot. Profile before optimizing &mdash; network I/O dominates.</p>
+      </details>
+
+      <details>
+        <summary>3. How do you test schemas themselves?</summary>
+        <p>Use property-based testing (fast-check) to generate random valid/invalid data and verify schemas accept/reject correctly. Also use <code>expect-type</code> or <code>tsd</code> for compile-time type tests. Snapshot the schema&rsquo;s inferred type to catch accidental breaking changes in PRs.</p>
+      </details>
+
+      <details>
+        <summary>4. How do you handle optional vs nullable vs undefined?</summary>
+        <p>Zod distinguishes: <code>.optional()</code> means the key can be missing, <code>.nullable()</code> means the value can be <code>null</code>, <code>.nullish()</code> means either. Be explicit about which your API uses. Transform at the boundary: <code>.nullable().transform(v =&gt; v ?? defaultValue)</code> keeps internal code simple.</p>
+      </details>
+
+      <details>
+        <summary>5. Can you use this approach with GraphQL?</summary>
+        <p>Yes. GraphQL codegen (<code>graphql-codegen</code>) generates TypeScript types from your schema + operations. For runtime validation, you can add Zod schemas for critical queries. The GraphQL type system provides compile-time safety; Zod adds runtime guarantees for the specific shape your component expects.</p>
+      </details>
+
+      <details>
+        <summary>6. How do you handle file uploads with typed APIs?</summary>
+        <p>File uploads break the JSON-only pattern. Define a schema for the metadata and handle the file separately via FormData. Type the upload endpoint differently: <code>input: z.object({ file: z.instanceof(File), metadata: MetadataSchema })</code>. The response schema remains the same pattern.</p>
+      </details>
+
+      <details>
+        <summary>7. What about WebSocket/real-time data validation?</summary>
+        <p>Use discriminated unions for message types: <code>z.discriminatedUnion('type', [ChatMessageSchema, PresenceSchema, ErrorSchema])</code>. Validate incoming messages at the WebSocket <code>onmessage</code> handler. For high-frequency messages (gaming, trading), consider validating only in dev mode or sampling in production to reduce overhead.</p>
+      </details>
+    </section>
+
+    <!-- Section 19: Summary -->
+    <section id="summary" class="content-section">
+      <h2>Summary</h2>
+
+      <h3>Mental Models</h3>
+      <ul>
+        <li><strong>&ldquo;Parse, don&rsquo;t validate&rdquo;</strong> &mdash; Transform unknown data into typed data at boundaries. Parsers narrow types; validators just return booleans.</li>
+        <li><strong>&ldquo;Schema as source of truth&rdquo;</strong> &mdash; Define once (Zod schema), derive everything (TS type, validation, form rules, documentation).</li>
+        <li><strong>&ldquo;Trust boundary&rdquo;</strong> &mdash; Internal code trusts the type system. External data is untrusted until parsed. Validation lives at the boundary, nowhere else.</li>
+        <li><strong>&ldquo;Errors as data&rdquo;</strong> &mdash; Use Result&lt;T, E&gt; discriminated unions instead of try/catch. Makes error handling explicit, typed, and composable.</li>
+        <li><strong>&ldquo;Types flow, not duplicate&rdquo;</strong> &mdash; Whether it&rsquo;s tRPC (types flow from server to client) or Zod (types flow from schema to code), never maintain parallel type definitions.</li>
+      </ul>
+
+      <h3>What NOT to Say</h3>
+      <div class="callout callout-warning">
+        <ul>
+          <li>&ldquo;I just use <code>as</code> to cast the response.&rdquo; &mdash; Shows no understanding of runtime safety.</li>
+          <li>&ldquo;TypeScript guarantees the API response is correct.&rdquo; &mdash; Types are erased at runtime; they guarantee nothing about external data.</li>
+          <li>&ldquo;I validate inside every function.&rdquo; &mdash; Over-validation defeats the type system. Validate at boundaries only.</li>
+          <li>&ldquo;We just write interfaces and keep them in sync manually.&rdquo; &mdash; Manual sync doesn&rsquo;t scale. Senior engineers automate this.</li>
+          <li>&ldquo;Runtime validation is too expensive.&rdquo; &mdash; It&rsquo;s negligible (sub-ms) compared to network latency. Profile, don&rsquo;t assume.</li>
+        </ul>
+      </div>
+
+      <h3>Key Takeaways</h3>
+      <ol>
+        <li>TypeScript types are <strong>compile-time only</strong> &mdash; external data needs runtime validation</li>
+        <li>Use <strong>schema libraries</strong> (Zod, Valibot) as the single source of truth for types + validation</li>
+        <li>Validate at <strong>trust boundaries</strong>, then trust types internally</li>
+        <li>Model errors as <strong>discriminated unions</strong> (Result pattern), not exceptions</li>
+        <li>Choose the right tool: <strong>tRPC</strong> for TS monorepos, <strong>OpenAPI codegen</strong> for multi-language, <strong>Zod wrappers</strong> for simple apps</li>
+      </ol>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+</body>
+</html>

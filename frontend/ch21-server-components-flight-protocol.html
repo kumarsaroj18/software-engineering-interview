@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 21: Server Components &amp; React Flight Protocol | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <a href="../index.html">
+        <span class="chapter-num">Ch 21</span>
+        <span class="chapter-title">Server Components &amp; Flight Protocol</span>
+      </a>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#server-vs-client-components">Server vs Client Components</a></li>
+        <li><a href="#use-client-use-server">"use client" / "use server"</a></li>
+        <li><a href="#zero-bundle-size">Zero-Bundle-Size Components</a></li>
+        <li><a href="#flight-protocol">React Flight Protocol</a></li>
+        <li><a href="#serialization-rules">Serialization Rules</a></li>
+        <li><a href="#composition-patterns">Composition Patterns</a></li>
+        <li><a href="#client-waterfalls">Client Waterfalls</a></li>
+        <li><a href="#data-fetching-rsc">Data Fetching in RSC</a></li>
+        <li><a href="#caching-revalidation">Caching &amp; Revalidation</a></li>
+        <li><a href="#partial-prerendering">Partial Prerendering</a></li>
+        <li><a href="#server-actions">Server Actions</a></li>
+        <li><a href="#rsc-vs-islands-vs-ssr">RSC vs Islands vs SSR</a></li>
+        <li><a href="#nextjs-integration">Next.js App Router</a></li>
+        <li><a href="#production-architecture">Production Architecture</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-iii">Part III — React Internals, Rendering Systems &amp; Architecture</a> &rsaquo;
+      <span>Chapter 21</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">RSC</span>
+        <span class="badge badge-topic">Flight Protocol</span>
+        <span class="badge badge-topic">Streaming</span>
+        <span class="badge badge-topic">Next.js</span>
+      </div>
+      <h1>Server Components &amp; React Flight Protocol</h1>
+      <blockquote class="chapter-question">
+        "What are React Server Components? How does the React Flight protocol stream component payloads?"
+      </blockquote>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Server Components run exclusively on the server, ship zero JavaScript to the client for their own code, and can access server-only resources (databases, filesystems, secrets) directly. They don't render to HTML strings the way traditional SSR does — they serialize to a custom streaming wire format (the Flight protocol) describing a tree of element descriptors, which the client reconstructs into real React elements, interleaving Client Component "holes" that hydrate normally. The entire model is a composition problem: Server Components can render Client Components, but Client Components cannot import Server Components — they can only receive them as opaque <code>children</code>.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="text" class="search-input" placeholder="Search this chapter..." aria-label="Search">
+    </div>
+
+    <!-- Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details open>
+        <summary>What the interviewer is really testing</summary>
+        <div class="callout callout-info">
+          <strong>This question tests three capabilities simultaneously:</strong>
+        </div>
+        <ul>
+          <li><strong>Precision about what RSC actually is:</strong> can you distinguish "runs on the server" from "renders to an HTML string" — the single most common conceptual error candidates make about Server Components?</li>
+          <li><strong>Composition model fluency:</strong> do you know why a Server Component can render a Client Component but not vice versa, and how to correctly pass server-fetched data into client interactivity despite that constraint?</li>
+          <li><strong>Production trade-off awareness:</strong> can you explain when RSC helps (large dependency trees moved off the client bundle, direct backend access, reduced client-server waterfalls) versus when it adds complexity (two rendering environments, cache invalidation, mental model overhead) without a clear win?</li>
+        </ul>
+        <div class="callout callout-warning">
+          <strong>Red flags for interviewers:</strong> saying "Server Components are just SSR" (conflates a static, one-time render output with an interactive streaming component model); not knowing that Server Components re-render on the server on every navigation/refetch, not once at build time; claiming Server Components can use <code>useState</code> or <code>useEffect</code> (they cannot — they have no client lifecycle at all).
+        </div>
+      </details>
+    </section>
+
+    <!-- 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details>
+        <summary>Structured response for time-pressured interviews</summary>
+        <p>React Server Components (RSC) are components that execute exclusively on the server (or at build time), never ship their own code to the browser, and can directly access server-only resources — a database client, the filesystem, environment secrets — without an API layer in between. They render into a serialized description of the resulting UI tree, not an HTML string; this format (the React Flight protocol) is streamed to the client in chunks as data becomes available, letting parts of the page appear progressively rather than waiting for everything to resolve.</p>
+        <p><strong>The composition rule that defines the whole model:</strong> Server Components can import and render Client Components (marked with <code>"use client"</code>) directly. Client Components cannot import Server Components — because a client bundle can't contain server-only code — but a Server Component can be passed into a Client Component as <code>children</code>/props, since by that point it's already been rendered into serializable output, not live server code.</p>
+        <p><strong>Why this matters in practice:</strong> heavy dependencies (a markdown parser, a date library, a charting library used only for server-side data transformation) never reach the client bundle if they're only used inside Server Components — reducing bundle size without manual code-splitting. Combined with Suspense, each Server Component can stream in independently, avoiding the "wait for the slowest fetch" problem of traditional SSR.</p>
+      </details>
+    </section>
+
+    <!-- Server vs Client Components -->
+    <section id="server-vs-client-components">
+      <h2>Server Components vs Client Components</h2>
+      <details>
+        <summary>Two component types, two runtimes, one tree</summary>
+        <table>
+          <thead>
+            <tr><th></th><th>Server Component</th><th>Client Component</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Where it executes</td><td>Server only (or build time)</td><td>Server (for initial HTML) + browser (hydration + re-renders)</td></tr>
+            <tr><td>Ships JS to browser?</td><td>No — zero bundle cost</td><td>Yes</td></tr>
+            <tr><td>Can use <code>useState</code>/<code>useEffect</code>?</td><td>No</td><td>Yes</td></tr>
+            <tr><td>Can access DB/filesystem/secrets directly?</td><td>Yes</td><td>No</td></tr>
+            <tr><td>Can handle click/input events?</td><td>No</td><td>Yes</td></tr>
+            <tr><td>Re-renders on?</td><td>Navigation, revalidation, server action result</td><td>State/prop changes, same as classic React</td></tr>
+          </tbody>
+        </table>
+        <p>Every component is a Server Component <em>by default</em> in a framework that supports RSC (e.g. Next.js App Router) — you opt <em>into</em> the client runtime explicitly with a directive, not the other way around. This default is deliberate: it pushes you toward shipping less JavaScript unless a component specifically needs interactivity.</p>
+      </details>
+    </section>
+
+    <!-- "use client" / "use server" -->
+    <section id="use-client-use-server">
+      <h2>"use client" / "use server" Directives</h2>
+      <details>
+        <summary>Boundary markers, not runtime toggles</summary>
+        <pre><code class="language-jsx">// This file, and everything it imports, is bundled for the CLIENT.
+// It becomes the boundary: everything above this component in the tree
+// can be a Server Component; this component and everything it renders
+// beneath it runs in the client's React runtime (with hydration).
+'use client';
+
+import { useState } from 'react';
+
+export function LikeButton({ initialCount }) {
+  const [count, setCount] = useState(initialCount);
+  return &lt;button onClick={() =&gt; setCount((c) =&gt; c + 1)}&gt;{count} likes&lt;/button&gt;;
+}</code></pre>
+        <pre><code class="language-jsx">// Marks a function as callable FROM the client, but executed ON the server —
+// this is what powers Server Actions (form submissions, mutations)
+'use server';
+
+export async function likePost(postId) {
+  await db.posts.update(postId, { $inc: { likes: 1 } });
+}</code></pre>
+        <div class="callout callout-warning">
+          <strong>"use client" marks a boundary, not the component itself as "client-only forever."</strong> A component marked <code>"use client"</code> is still rendered once on the server as part of the initial HTML/Flight payload (for fast first paint), then hydrated in the browser — it isn't skipped server-side, it's just bundled and re-executed on the client after hydration, unlike a pure Server Component which never ships its code to the client at all.
+        </div>
+      </details>
+    </section>
+
+    <!-- Zero-Bundle-Size -->
+    <section id="zero-bundle-size">
+      <h2>Zero-Bundle-Size Server Components</h2>
+      <details>
+        <summary>What "zero bundle size" actually means, mechanically</summary>
+        <p>When a bundler (webpack, Turbopack, Rollup via a framework's RSC integration) builds the client bundle, it treats <code>"use client"</code> files as bundle entry points and everything else (the default, Server Component graph) as excluded from the client build entirely — not tree-shaken after the fact, but never included in the client compilation graph in the first place.</p>
+        <pre><code class="language-jsx">// This heavy markdown parser (and its dependencies) is only ever imported
+// by a Server Component — it NEVER appears in the client JS bundle,
+// regardless of its size, because this file is never part of the client build.
+import { marked } from 'marked'; // ~40KB, zero client cost here
+
+export async function ArticleBody({ slug }) {
+  const raw = await db.articles.getContent(slug);
+  const html = marked.parse(raw);
+  return &lt;div dangerouslySetInnerHTML={{ __html: html }} /&gt;;
+}</code></pre>
+        <div class="callout callout-tip">
+          <strong>Contrast with traditional code-splitting:</strong> <code>React.lazy</code>/dynamic <code>import()</code> still ship the code to the client eventually (just deferred until needed) — it's still part of the client bundle graph. A Server Component's dependencies are excluded from that graph entirely; there's no client-side loading state to manage for them because they never load client-side at all.
+        </div>
+      </details>
+    </section>
+
+    <!-- React Flight Protocol -->
+    <section id="flight-protocol">
+      <h2>React Flight Protocol — Wire Format</h2>
+      <details>
+        <summary>Not HTML, not JSON — a streamable element-description format</summary>
+        <p>When Server Components render, the result isn't serialized to an HTML string (that's a separate, additional step for the initial page load). It's serialized to the Flight format: a stream of newline-delimited, indexed rows, each describing either a React element, a reference to a Client Component module (to be resolved and hydrated on the client), or a chunk of resolved data.</p>
+        <pre><code class="language-text">0:["$","div",null,{"className":"article","children":["$","h1",null,{"children":"Hello"}]}]
+1:{"module":"./LikeButton.client.js","name":"LikeButton"}
+2:["$","@1",null,{"initialCount":42}]
+</code></pre>
+        <p>Row <code>0</code> describes a plain host element tree (server-rendered content, inlined directly). Row <code>1</code> is a <strong>Client Reference</strong> — a pointer to a client module the browser must separately fetch and execute; it is not the component's code, just a reference to where to find it. Row <code>2</code> instantiates that client reference (<code>@1</code>) with props, exactly where the <code>LikeButton</code> was rendered inside the server tree.</p>
+        <div class="callout callout-info">
+          <strong>Why streaming, row-by-row, matters:</strong> the client doesn't need the entire payload before it can start reconstructing the UI — rows arrive incrementally as each Server Component (and any <code>await</code> inside it) resolves, and React can begin rendering the parts that are already available while later rows are still in flight over the network, exactly analogous to how Suspense streams HTML in traditional streaming SSR (Chapter 17), but for this richer, component-aware format instead of raw markup.
+        </div>
+        <div class="callout callout-warning">
+          <p><strong>Format is internal and evolving:</strong> The exact row encoding (prefixes like <code>$</code>, <code>@</code>, <code>$L</code>, type indicators <code>J:</code>, <code>M:</code>, <code>S:</code>, <code>I:</code>) has changed between React versions. Don't memorize specific syntax for interviews — focus on understanding <em>what</em> it encodes (element tree + client module references + streaming chunks) and <em>why</em> this format exists (enables progressive rendering without full payload).</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Serialization Rules -->
+    <section id="serialization-rules">
+      <h2>Serialization Rules (What Can Cross the Boundary)</h2>
+      <details>
+        <summary>Props passed from Server to Client Components must be serializable</summary>
+        <table>
+          <thead>
+            <tr><th>Allowed across the boundary</th><th>NOT allowed</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Strings, numbers, booleans, null/undefined</td><td>Functions (unless a Server Action)</td></tr>
+            <tr><td>Plain objects, arrays (JSON-serializable)</td><td>Class instances (except those below)</td></tr>
+            <tr><td>React elements (including Server Components as children)</td><td>Symbols</td></tr>
+            <tr><td>Promises (React 19 <code>use()</code> unwraps them client-side)</td><td>Non-serializable values like open DB connections, file handles</td></tr>
+            <tr><td><code>Date</code>, <code>Map</code>, <code>Set</code>, <code>TypedArray</code>, <code>FormData</code> (natively supported in React 19)</td><td>Arbitrary closures capturing server-only state</td></tr>
+            <tr><td>Server Actions (functions marked <code>"use server"</code> — serialized as a reference + invoked via RPC)</td><td></td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-jsx">// ❌ Passing a plain function from a Server Component to a Client Component
+// throws at build/runtime — functions aren't serializable across the boundary
+function ServerParent() {
+  const handleClick = () =&gt; console.log('server-side closure');
+  return &lt;ClientButton onClick={handleClick} /&gt;; // Error: functions cannot be passed
+}
+
+// ✅ Pass a Server Action instead — React serializes it as an invocable reference
+async function like(id) {
+  'use server';
+  await db.posts.like(id);
+}
+
+function ServerParent({ postId }) {
+  return &lt;ClientButton onLike={like.bind(null, postId)} /&gt;; // Works — Server Actions are the exception
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Composition Patterns -->
+    <section id="composition-patterns">
+      <h2>Composition Patterns (Server Wrapping Client)</h2>
+      <details>
+        <summary>The "children as a slot" pattern for mixing Server and Client trees</summary>
+        <p>The rule "Client Components cannot import Server Components" has an important, frequently-tested exception: a Client Component <em>can</em> render whatever React elements it receives as <code>children</code> or other props, even if those elements were produced by a Server Component — because by the time they're passed down, they're already-rendered element descriptors, not live server-only code the client bundle would need to include.</p>
+        <pre><code class="language-jsx">// Client Component — interactive shell (tabs, modal, layout with local state)
+'use client';
+export function InteractiveShell({ children }) {
+  const [tab, setTab] = useState('overview');
+  return (
+    &lt;div&gt;
+      &lt;nav&gt;
+        &lt;button onClick={() =&gt; setTab('overview')}&gt;Overview&lt;/button&gt;
+      &lt;/nav&gt;
+      {/* `children` is opaque to InteractiveShell — it doesn't need to know
+          or care that it was produced by a Server Component */}
+      &lt;main&gt;{children}&lt;/main&gt;
+    &lt;/div&gt;
+  );
+}
+
+// Server Component — composes the two together
+export default async function Page() {
+  const data = await db.dashboard.getStats(); // server-only data fetch
+  return (
+    &lt;InteractiveShell&gt;
+      &lt;DashboardStats data={data} /&gt; {/* still a Server Component, rendered server-side */}
+    &lt;/InteractiveShell&gt;
+  );
+}</code></pre>
+        <div class="callout callout-tip">
+          <strong>Interview framing:</strong> "Server and Client Components aren't a strict layered hierarchy — the client tree can have server-rendered 'holes' passed in as children, which is exactly how frameworks let you keep interactive chrome (nav, modals, tabs) client-side while keeping the actual data-heavy content server-rendered and zero-bundle."
+        </div>
+      </details>
+    </section>
+
+    <!-- Client Waterfalls -->
+    <section id="client-waterfalls">
+      <h2>Client Waterfalls — Causes &amp; Fixes</h2>
+      <details>
+        <summary>How RSC eliminates a whole class of request waterfalls — and where new ones sneak in</summary>
+        <pre><code class="language-jsx">// ❌ Client-fetched waterfall: the browser must first receive and parse
+// the component's JS, THEN fire this fetch — the component's own code and
+// the data fetch cannot happen concurrently, they're sequential
+'use client';
+function Profile({ userId }) {
+  const [user, setUser] = useState(null);
+  useEffect(() =&gt; {
+    fetch(`/api/users/${userId}`).then((r) =&gt; r.json()).then(setUser);
+  }, [userId]);
+  // ...
+}</code></pre>
+        <pre><code class="language-jsx">// ✅ Server Component fetch: the data fetch happens ON THE SERVER, concurrently
+// with the rest of the page's rendering — no client round-trip needed just
+// to KICK OFF the fetch, and no client JS is needed for this component at all
+async function Profile({ userId }) {
+  const user = await db.users.findById(userId); // direct server-side access
+  return &lt;div&gt;{user.name}&lt;/div&gt;;
+}</code></pre>
+        <div class="callout callout-warning">
+          <strong>Where a new waterfall sneaks back in:</strong> sequentially <code>await</code>-ing independent data fetches inside one Server Component still serializes them.
+        </div>
+        <pre><code class="language-jsx">// ❌ Sequential awaits create a server-side waterfall even without any client involved
+async function Page({ id }) {
+  const user = await getUser(id);      // waits...
+  const posts = await getPosts(id);    // ...then waits again, even though independent
+  return &lt;Dashboard user={user} posts={posts} /&gt;;
+}
+
+// ✅ Fire independent fetches concurrently, await together
+async function Page({ id }) {
+  const [user, posts] = await Promise.all([getUser(id), getPosts(id)]);
+  return &lt;Dashboard user={user} posts={posts} /&gt;;
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Data Fetching in RSC -->
+    <section id="data-fetching-rsc">
+      <h2>Data Fetching in Server Components</h2>
+      <details>
+        <summary>async/await as the primary data-fetching primitive</summary>
+        <p>A Server Component can simply be an <code>async function</code> — <code>await</code>-ing a database query or fetch call directly in the component body, with no <code>useEffect</code>, no loading state management, and no client-side request at all. Suspense boundaries placed around slower Server Components let independent parts of the page stream in as their data resolves, rather than blocking the entire page on the slowest one.</p>
+        <pre><code class="language-jsx">// Each of these Server Components fetches and streams independently
+export default function Page() {
+  return (
+    &lt;&gt;
+      &lt;Suspense fallback={&lt;HeaderSkeleton /&gt;}&gt;
+        &lt;Header /&gt;             {/* fast — streams in first */}
+      &lt;/Suspense&gt;
+      &lt;Suspense fallback={&lt;FeedSkeleton /&gt;}&gt;
+        &lt;Feed /&gt;               {/* slow DB query — streams in when ready, doesn't block Header */}
+      &lt;/Suspense&gt;
+    &lt;/&gt;
+  );
+}
+
+async function Feed() {
+  const posts = await db.posts.findRecent(); // Suspense-compatible: the await itself suspends
+  return &lt;ul&gt;{posts.map((p) =&gt; &lt;li key={p.id}&gt;{p.title}&lt;/li&gt;)}&lt;/ul&gt;;
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Caching & Revalidation -->
+    <section id="caching-revalidation">
+      <h2>Caching &amp; Revalidation Strategies</h2>
+      <details>
+        <summary>Where framework-level caching sits relative to RSC itself</summary>
+        <p>RSC as a React feature is agnostic about caching — caching semantics (like Next.js's <code>fetch</code> memoization, full-route cache, and <code>revalidatePath</code>/<code>revalidateTag</code>) are framework-layer decisions built on top of the Flight protocol, not part of React's own spec. Interviewers sometimes conflate the two — a precise answer separates "what React's RSC model provides" from "what a specific meta-framework adds."</p>
+        <div class="callout callout-tip">
+          <p><strong>React's <code>cache()</code> function:</strong> React 19 provides <code>cache()</code> as a React-level deduplication primitive for Server Components. It memoizes function results <em>per request</em> — so if two Server Components in the same render call <code>cache(getUser)(userId)</code>, only one actual computation runs. This is distinct from framework-level <code>fetch</code> caching — <code>cache()</code> is React's own API for request-scoped deduplication of any async function, not just fetches.</p>
+        </div>
+        <table>
+          <thead>
+            <tr><th>Layer</th><th>Provided by</th><th>Example</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Component tree serialization/streaming</td><td>React (Flight protocol)</td><td>The wire format itself</td></tr>
+            <tr><td>Request-level deduplication</td><td>React (<code>cache()</code>) + Framework (<code>fetch</code> extension)</td><td>Same function called twice in one render → one execution</td></tr>
+            <tr><td>Cross-request/full-route caching</td><td>Framework</td><td>Cached HTML/RSC payload reused across users until revalidated</td></tr>
+            <tr><td>On-demand invalidation</td><td>Framework</td><td><code>revalidateTag('posts')</code> after a mutation</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout-warning">
+          <p><strong>Next.js caching changed significantly between versions.</strong> Next.js 14 cached <code>fetch</code> responses by default; Next.js 15 reversed this (no caching by default, opt-in via <code>cache: 'force-cache'</code>). In interviews, focus on the conceptual layer separation rather than citing specific Next.js defaults, which may not match the interviewer's version.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Partial Prerendering -->
+    <section id="partial-prerendering">
+      <h2>Partial Prerendering (PPR)</h2>
+      <details>
+        <summary>Static shell, dynamic holes, one response</summary>
+        <p>Partial Prerendering (an experimental Next.js technique built on Suspense + RSC) precomputes the static portions of a route at build time into a shell, and leaves Suspense-boundary "holes" for anything dynamic (personalized data, request-specific content) to stream in at request time — combining the instant-TTFB feel of static generation with per-request freshness, in a single HTTP response instead of a separate static-then-hydrate-then-fetch sequence.</p>
+        <pre class="diagram">
+Request comes in
+      │
+      ▼
+┌───────────────────────────────────────────────┐
+│ Static shell served IMMEDIATELY (prebuilt)     │
+│  Header, layout, nav — no per-request work     │
+│  ┌─────────────────────────────────────────┐   │
+│  │ Suspense hole: &lt;PersonalizedFeed /&gt;      │───┼──▶ starts rendering NOW, streams in
+│  │ (fallback shown until this resolves)     │   │     when its data is ready
+│  └─────────────────────────────────────────┘   │
+└───────────────────────────────────────────────┘
+        </pre>
+      </details>
+    </section>
+
+    <!-- Server Actions -->
+    <section id="server-actions">
+      <h2>Server Actions (React 19)</h2>
+      <details>
+        <summary>Callable server functions wired directly to client forms</summary>
+        <pre><code class="language-jsx">// actions.js
+'use server';
+export async function createComment(formData) {
+  const text = formData.get('text');
+  await db.comments.create({ text });
+  revalidatePath('/posts/123');
+}
+
+// Client Component — no manual fetch/onSubmit wiring, no client-side JSON serialization code
+'use client';
+import { createComment } from './actions';
+
+export function CommentForm() {
+  return (
+    &lt;form action={createComment}&gt;
+      &lt;input name="text" /&gt;
+      &lt;button type="submit"&gt;Post&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+        <p>React serializes the reference to <code>createComment</code> (not its source code) into the Flight payload; submitting the form triggers an RPC-style POST that invokes the actual function on the server, with automatic progressive enhancement — the form works even before client JS has hydrated, since it's a real HTML <code>&lt;form&gt;</code> submission under the hood.</p>
+        <div class="callout callout-tip">
+          <strong><code>useActionState</code> and <code>useFormStatus</code> (React 19)</strong> pair with Server Actions to expose pending/error/result state back in the Client Component without hand-rolling a fetch + loading-state dance.
+        </div>
+      </details>
+    </section>
+
+    <!-- Comparison -->
+    <section id="rsc-vs-islands-vs-ssr">
+      <h2>Comparison: RSC vs Islands vs Traditional SSR</h2>
+      <details>
+        <summary>Three different answers to "minimize client JS while staying fast"</summary>
+        <table>
+          <thead>
+            <tr><th></th><th>Traditional SSR</th><th>Islands (Astro, Qwik-ish)</th><th>RSC</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Unit of "no JS shipped"</td><td>None — whole app hydrates</td><td>Per explicitly-marked island</td><td>Per component, opt-in to client via directive</td></tr>
+            <tr><td>Server ↔ Client composition</td><td>N/A — one tree, fully hydrated</td><td>Static HTML with independent islands, no shared tree</td><td>Single component tree spanning both, Server can wrap/be-wrapped-by Client per composition rules</td></tr>
+            <tr><td>Re-render on navigation</td><td>Full page reload or full client re-render</td><td>Typically full page reload (MPA-style)</td><td>Server re-renders just the affected Server Component subtree, streamed back</td></tr>
+            <tr><td>Data fetching model</td><td>Fetch before render, pass as props</td><td>Per-island, independent</td><td><code>async</code>/<code>await</code> directly in Server Components, Suspense-streamed</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout-info">
+          <strong>Key distinction:</strong> Islands architecture treats interactivity as isolated, independent widgets dropped into otherwise-static HTML with no shared component tree or state between them. RSC keeps one unified React tree — Server and Client Components compose within the same tree, share the same props/children model, and can be reasoned about with ordinary React composition rules, just split across two execution environments.
+        </div>
+      </details>
+    </section>
+
+    <!-- Next.js Integration -->
+    <section id="nextjs-integration">
+      <h2>Next.js App Router Integration</h2>
+      <details>
+        <summary>How the concepts above map onto file-system routing</summary>
+        <pre><code class="language-text">app/
+  layout.js        → Server Component by default, wraps every route below it
+  page.js          → Server Component by default, the route's entry point
+  loading.js       → Automatic Suspense fallback for this route segment
+  error.js         → Must be a Client Component (error boundaries need lifecycle)
+  template.js      → Like layout, but remounts (fresh state) on navigation
+</code></pre>
+        <p><code>loading.js</code> is syntactic sugar: Next.js automatically wraps the route segment's Server Component in a <code>&lt;Suspense fallback={&lt;Loading /&gt;}&gt;</code> boundary, which is exactly the mechanism from the "Data Fetching in Server Components" section above, just wired up by file convention instead of a manual <code>&lt;Suspense&gt;</code> in your own JSX.</p>
+      </details>
+    </section>
+
+    <!-- Production Architecture -->
+    <section id="production-architecture">
+      <h2>Production Architecture</h2>
+      <details>
+        <summary>Case study: migrating a dashboard's data-heavy widgets to RSC</summary>
+        <div class="callout callout-warning">
+          <strong>Starting point:</strong> a client-rendered analytics dashboard shipped ~380KB of JS (gzipped) including a charting library, a large date-manipulation library, and a markdown-based report renderer — all bundled client-side even though most of that logic only ever transformed server-fetched data before display.
+        </div>
+        <h3>Migration</h3>
+        <ul>
+          <li>Converted data-transformation-only widgets (chart data prep, report rendering) to Server Components — their heavy dependencies dropped out of the client bundle entirely.</li>
+          <li>Kept genuinely interactive pieces (the chart's hover tooltips, zoom/pan controls, filter dropdowns) as Client Components, composed as children/props from the Server Component parents.</li>
+          <li>Replaced several <code>useEffect</code>-driven client fetches with direct <code>async</code>/<code>await</code> in Server Components, wrapped in per-widget <code>&lt;Suspense&gt;</code> boundaries so slow widgets no longer blocked the whole dashboard's first paint.</li>
+        </ul>
+        <h3>Results</h3>
+        <ul>
+          <li>Client JS bundle dropped from ~380KB to ~140KB gzipped — the charting/date/markdown libraries no longer shipped to the browser at all.</li>
+          <li>Time-to-interactive improved because less JS needed parsing/executing/hydrating on the client.</li>
+          <li>Perceived load time improved further because independent widgets streamed in as their own data resolved, instead of the dashboard waiting on the single slowest client-side fetch.</li>
+        </ul>
+        <h3>Lessons Learned</h3>
+        <ul>
+          <li>The biggest wins came from moving <em>data-transformation-heavy, non-interactive</em> code server-side — chasing 100% RSC adoption for genuinely interactive widgets would have added complexity (prop-serialization constraints) without a proportional benefit.</li>
+          <li>Suspense boundary granularity mattered as much as the Server/Client split itself — one giant Suspense boundary around the whole dashboard would have reintroduced the "wait for the slowest thing" problem RSC was meant to solve.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>A complete Server + Client composition, end to end</summary>
+        <pre><code class="language-jsx">// app/posts/[id]/page.js — Server Component (default, no directive needed)
+import { Suspense } from 'react';
+import { LikeButton } from './LikeButton.client';
+import { CommentForm } from './actions';
+
+export default async function PostPage({ params }) {
+  const post = await db.posts.findById(params.id); // direct server-side data access
+
+  return (
+    &lt;article&gt;
+      &lt;h1&gt;{post.title}&lt;/h1&gt;
+      &lt;p&gt;{post.body}&lt;/p&gt;
+
+      {/* Client Component composed directly — hydrates for interactivity */}
+      &lt;LikeButton postId={post.id} initialCount={post.likes} /&gt;
+
+      &lt;Suspense fallback={&lt;p&gt;Loading comments…&lt;/p&gt;}&gt;
+        &lt;Comments postId={post.id} /&gt;   {/* independent Server Component, streams separately */}
+      &lt;/Suspense&gt;
+
+      &lt;CommentForm postId={post.id} /&gt;  {/* Client Component wired to a Server Action */}
+    &lt;/article&gt;
+  );
+}
+
+async function Comments({ postId }) {
+  const comments = await db.comments.findByPost(postId); // slow query, isolated by Suspense
+  return &lt;ul&gt;{comments.map((c) =&gt; &lt;li key={c.id}&gt;{c.text}&lt;/li&gt;)}&lt;/ul&gt;;
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Mistakes even experienced React engineers make with RSC</summary>
+        <ul>
+          <li><strong>Marking a component <code>"use client"</code> just because it's slow or complex</strong> — the directive is about needing browser APIs/interactivity/hooks, not about performance; slow Server Components should get a Suspense boundary, not be pushed to the client.</li>
+          <li><strong>Sequential <code>await</code>s inside one Server Component</strong> re-creating the exact request waterfall RSC is supposed to eliminate — always check whether independent fetches can be <code>Promise.all</code>'d.</li>
+          <li><strong>Trying to pass functions/class instances/non-serializable values as props from Server to Client Components</strong> and being surprised by a build or runtime error — only JSON-serializable values (plus React elements and Server Actions) can cross the boundary.</li>
+          <li><strong>Assuming Server Components are equivalent to "runs once at build time" (SSG)</strong> — by default they re-execute on the server per request/navigation unless a framework's caching layer explicitly opts them into static/ISR-style caching.</li>
+          <li><strong>Wrapping the entire page in one giant Suspense boundary,</strong> reintroducing an all-or-nothing wait instead of the granular, independent streaming RSC + Suspense are meant to enable.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Decisions worth stating out loud</summary>
+        <ul>
+          <li><strong>RSC vs pure client-rendered SPA:</strong> RSC reduces client bundle size and enables direct backend access, at the cost of introducing two execution environments to reason about, stricter serialization rules at the boundary, and dependency on framework-level plumbing (most production usage today is via Next.js) rather than a standalone library choice.</li>
+          <li><strong>RSC vs Islands architecture:</strong> RSC's unified tree gives you ordinary React composition across the server/client boundary; Islands keep server and client concerns fully separate and simpler to reason about individually, at the cost of no shared component tree or state between islands.</li>
+          <li><strong>Granular Suspense boundaries vs one big one:</strong> granular boundaries maximize independent streaming and perceived performance but require more deliberate placement and fallback design; one big boundary is simpler to add but reverts to blocking on the slowest piece.</li>
+          <li><strong>Server Actions vs a traditional REST/API-route mutation:</strong> Server Actions remove boilerplate (no separate endpoint, no manual fetch/serialization code, progressive enhancement for free) but couple the mutation's invocation mechanism tightly to the framework's RSC implementation, making it less portable than a plain HTTP API a non-React client could also call.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Follow-up Interview Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Q1: Can a Server Component have internal state that persists across re-renders?</summary>
+        <p><strong>Strong answer:</strong> no — Server Components have no client-side lifecycle at all; there's no <code>useState</code>, no component instance that persists in memory across requests. Each render is a fresh function execution against fresh data. Anything that needs to persist across interactions (a counter, a toggle, an open/closed panel) must live in a Client Component, or as actual server-side/database state re-fetched on each render if it needs to survive navigations.</p>
+      </details>
+
+      <details>
+        <summary>Q2: If a Client Component needs data that requires a server-only API key, how do you get that data to it without exposing the key?</summary>
+        <p><strong>Strong answer:</strong> fetch the data in a Server Component (which has access to the secret via server-only environment variables) and pass only the resulting serializable data down as props to the Client Component — the key itself never crosses the Flight boundary because it's never referenced by any code the client needs to execute. This is a direct security benefit of the Server/Client split: secrets naturally stay server-side as long as they're only touched inside Server Component code, not accidentally imported into a <code>"use client"</code> file.</p>
+      </details>
+
+      <details>
+        <summary>Q3: How does React know which parts of a Flight payload correspond to already-hydrated Client Components on a subsequent navigation, versus which need fresh module downloads?</summary>
+        <p><strong>Strong answer:</strong> Client References in the Flight payload are keyed by a stable module identifier; the client-side React runtime keeps a registry of already-loaded client modules from previous navigations/hydration. When a new Flight payload arrives referencing a module the client has already fetched and instantiated, React reuses the existing module rather than re-fetching it — only genuinely new Client Component modules (not yet loaded in this session) trigger a fresh network request.</p>
+      </details>
+
+      <details>
+        <summary>Q4: What happens if a Server Component throws an error partway through streaming — does the whole response fail?</summary>
+        <p><strong>Strong answer:</strong> no, not if error boundaries are placed appropriately — an error inside a Suspense-boundary-wrapped Server Component is caught by the nearest enclosing error boundary (which, per React's rules, must itself be a Client Component since error boundaries rely on lifecycle methods), and only that boundary's fallback UI is affected. Parts of the page that already streamed successfully (or belong to sibling Suspense boundaries) are unaffected — this granular failure isolation is one of the practical benefits of splitting a page into multiple independently-streamed Suspense boundaries rather than one monolithic render.</p>
+      </details>
+
+      <details>
+        <summary>Q5: Why can't "use server" functions just be normal exported functions called directly from the client bundle?</summary>
+        <p><strong>Strong answer:</strong> because their implementation may reference server-only modules (database drivers, filesystem access, secrets) that cannot exist in a browser bundle at all — attempting to include them client-side would either fail to bundle or leak server-only code/credentials into client JS. Marking them <code>"use server"</code> tells the build tooling to replace the client-side reference with a serializable RPC stub (an ID plus argument-serialization logic) while keeping the real implementation server-only, invoked over the network when called.</p>
+      </details>
+    </section>
+
+    <!-- Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <div class="callout callout-tip">
+        <p><strong>Key mental models for the interview:</strong></p>
+        <ul>
+          <li><strong>RSC ≠ SSR.</strong> SSR renders to an HTML string once, on demand, then hands off to full client hydration. RSC is a persistent, streamable, component-aware serialization format that composes with Client Components in a single tree.</li>
+          <li><strong>The composition rule is one-directional.</strong> Server Components can render Client Components; Client Components can only receive already-rendered Server Component output as opaque children/props.</li>
+          <li><strong>Only serializable values cross the boundary</strong> — functions are disallowed except for the special-cased Server Actions, which are serialized as invocable references, not source code.</li>
+          <li><strong>Zero-bundle-size means excluded from the client build graph entirely,</strong> not lazily loaded — a meaningfully stronger guarantee than code-splitting.</li>
+          <li><strong>Granular Suspense boundaries are what make streaming actually pay off.</strong> Wrapping too much in one boundary reintroduces the waterfall RSC is meant to solve.</li>
+        </ul>
+      </div>
+      <div class="callout callout-warning">
+        <p><strong>What NOT to say in an interview:</strong></p>
+        <ul>
+          <li>❌ "Server Components are just SSR with extra steps" — conflates a one-shot render-to-string with a streaming, composable component model.</li>
+          <li>❌ "You can use <code>useState</code> in a Server Component, it just doesn't update the UI" — Server Components cannot use <code>useState</code> at all; this is a hard constraint, not a limitation with a workaround.</li>
+          <li>❌ "RSC eliminates all client-server waterfalls" — it eliminates the client-fetch-triggering-another-fetch pattern, but sequential <code>await</code>s inside a single Server Component can still create one.</li>
+          <li>❌ "Islands and RSC are the same idea with different names" — Islands have no shared component tree across islands; RSC's Server and Client Components compose within one unified tree.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-jsx.min.js"></script>
+</body>
+</html>

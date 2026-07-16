@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Senior Backend Interview Handbook</title>
-  <meta name="description" content="FAANG-level Senior Backend Engineer Interview Handbook — Spring Boot, Distributed Systems, JVM, Kafka, Kubernetes & Production Debugging">
+  <title>Senior Interview Handbook</title>
+  <meta name="description" content="FAANG-level Senior Engineer Interview Handbook — Backend, Frontend, Data Engineering. Spring Boot, React, TypeScript, Distributed Systems, JVM, Kafka & Production Debugging">
   <link rel="stylesheet" href="assets/css/style.css">
   <style>
     /* Index-specific styles */
@@ -143,26 +143,26 @@
   <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
 
   <div class="hero">
-    <h1>Senior Backend Interview Handbook</h1>
+    <h1>Senior Interview Handbook</h1>
     <p class="subtitle">
-      15 real-world production scenarios that FAANG interviewers ask Senior &amp; Staff Backend Engineers.
-      Deep dives into Spring Boot, Distributed Systems, JVM, Kafka, Kubernetes &amp; Production Debugging.
+      Real-world production scenarios that FAANG interviewers ask Senior &amp; Staff Engineers.
+      Deep dives into Backend, Frontend &amp; Data Engineering — covering Spring Boot, React, TypeScript, Distributed Systems, JVM, Kafka &amp; more.
     </p>
     <div class="stats">
       <div class="stat">
-        <div class="stat-number">15</div>
+        <div class="stat-number">57</div>
         <div class="stat-label">Chapters</div>
       </div>
       <div class="stat">
-        <div class="stat-number">150+</div>
+        <div class="stat-number">500+</div>
         <div class="stat-label">Code Examples</div>
       </div>
       <div class="stat">
-        <div class="stat-number">100+</div>
+        <div class="stat-number">300+</div>
         <div class="stat-label">Diagrams</div>
       </div>
       <div class="stat">
-        <div class="stat-number">12+</div>
+        <div class="stat-number">10+</div>
         <div class="stat-label">Years Experience Target</div>
       </div>
     </div>
@@ -345,6 +345,262 @@
           <span class="badge badge-topic">Snowflake</span>
           <span class="badge badge-topic">Kafka</span>
           <span class="badge badge-topic">Lakehouse</span>
+        </div>
+      </a>
+    </div>
+
+    <!-- Frontend Engineering Handbook -->
+    <div class="part-header" id="frontend" style="margin-top: 4rem; border-color: var(--accent);">
+      <h2>🌐 Senior Frontend Interview Handbook</h2>
+      <p>JavaScript Internals, TypeScript Advanced Patterns, React 18/19 Concurrency, Rendering Systems, Performance &amp; Low-Level Design</p>
+    </div>
+
+    <!-- Frontend Part I -->
+    <div class="part-header" id="frontend-part-i">
+      <h2>Part I — JavaScript Engine Internals</h2>
+      <p>Event loop, closures, prototypes, async mechanics, memory management, modules, rendering pipeline &amp; performance</p>
+    </div>
+    <div class="chapter-grid">
+      <a href="frontend/ch01-event-loop-microtasks.html" class="chapter-card">
+        <span class="chapter-number">Chapter 1</span>
+        <h3>How does the JavaScript event loop actually work, and why can a microtask starve the rendering pipeline?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Event Loop</span>
+          <span class="badge badge-topic">Microtasks</span>
+        </div>
+      </a>
+      <a href="frontend/ch02-closures-scope-memory.html" class="chapter-card">
+        <span class="chapter-number">Chapter 2</span>
+        <h3>Explain closures from the engine's perspective. How do they cause memory leaks?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Closures</span>
+          <span class="badge badge-topic">V8 Internals</span>
+        </div>
+      </a>
+      <a href="frontend/ch03-prototypes-inheritance.html" class="chapter-card">
+        <span class="chapter-number">Chapter 3</span>
+        <h3>How does prototypal inheritance differ from classical inheritance at the engine level?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-medium">Medium</span>
+          <span class="badge badge-topic">Prototypes</span>
+          <span class="badge badge-topic">Hidden Classes</span>
+        </div>
+      </a>
+      <a href="frontend/ch04-promises-async-internals.html" class="chapter-card">
+        <span class="chapter-number">Chapter 4</span>
+        <h3>Walk through the internal mechanics of Promises. How does async/await desugar?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Promises</span>
+          <span class="badge badge-topic">Async/Await</span>
+        </div>
+      </a>
+      <a href="frontend/ch05-memory-leaks-browser.html" class="chapter-card">
+        <span class="chapter-number">Chapter 5</span>
+        <h3>Investigate a memory leak that only appears after hours of SPA usage</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Memory</span>
+          <span class="badge badge-topic">DevTools</span>
+        </div>
+      </a>
+      <a href="frontend/ch06-module-systems-bundling.html" class="chapter-card">
+        <span class="chapter-number">Chapter 6</span>
+        <h3>CommonJS vs ES Modules at the engine level. How does tree-shaking work?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-medium">Medium</span>
+          <span class="badge badge-topic">Modules</span>
+          <span class="badge badge-topic">Bundling</span>
+        </div>
+      </a>
+      <a href="frontend/ch07-web-apis-browser-internals.html" class="chapter-card">
+        <span class="chapter-number">Chapter 7</span>
+        <h3>How does the browser's rendering pipeline work, and where can JavaScript block it?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Rendering</span>
+          <span class="badge badge-topic">Web Vitals</span>
+        </div>
+      </a>
+      <a href="frontend/ch08-performance-critical-rendering.html" class="chapter-card">
+        <span class="chapter-number">Chapter 8</span>
+        <h3>Production SPA takes 6s to become interactive — reduce TTI to under 2 seconds</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Performance</span>
+          <span class="badge badge-topic">TTI</span>
+        </div>
+      </a>
+    </div>
+
+    <!-- Frontend Part II -->
+    <div class="part-header" id="frontend-part-ii">
+      <h2>Part II — TypeScript Advanced Patterns</h2>
+      <p>Structural typing, generics, conditional types, mapped types, type-safe API design &amp; module augmentation</p>
+    </div>
+    <div class="chapter-grid">
+      <a href="frontend/ch09-advanced-type-system.html" class="chapter-card">
+        <span class="chapter-number">Chapter 9</span>
+        <h3>How does TypeScript's structural type system differ from nominal typing?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">TypeScript</span>
+          <span class="badge badge-topic">Structural Typing</span>
+        </div>
+      </a>
+      <a href="frontend/ch10-generics-conditional-types.html" class="chapter-card">
+        <span class="chapter-number">Chapter 10</span>
+        <h3>Explain generics, conditional types, and infer. Build a type-safe event emitter</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Generics</span>
+          <span class="badge badge-topic">Conditional Types</span>
+        </div>
+      </a>
+      <a href="frontend/ch11-type-narrowing-guards.html" class="chapter-card">
+        <span class="chapter-number">Chapter 11</span>
+        <h3>How does TypeScript narrow types? Implement exhaustive checking at scale</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-medium">Medium</span>
+          <span class="badge badge-topic">Narrowing</span>
+          <span class="badge badge-topic">Type Guards</span>
+        </div>
+      </a>
+      <a href="frontend/ch12-mapped-template-literal-types.html" class="chapter-card">
+        <span class="chapter-number">Chapter 12</span>
+        <h3>Mapped types and template literal types — type a REST API client</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Mapped Types</span>
+          <span class="badge badge-topic">Template Literals</span>
+        </div>
+      </a>
+      <a href="frontend/ch13-declaration-merging-module-augmentation.html" class="chapter-card">
+        <span class="chapter-number">Chapter 13</span>
+        <h3>Declaration merging and module augmentation — extending third-party types</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-medium">Medium</span>
+          <span class="badge badge-topic">Declaration Merging</span>
+          <span class="badge badge-topic">Augmentation</span>
+        </div>
+      </a>
+      <a href="frontend/ch14-type-safe-api-design.html" class="chapter-card">
+        <span class="chapter-number">Chapter 14</span>
+        <h3>Design a type-safe, runtime-validated API layer for a large application</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Zod</span>
+          <span class="badge badge-topic">tRPC</span>
+        </div>
+      </a>
+    </div>
+
+    <!-- Frontend Part III -->
+    <div class="part-header" id="frontend-part-iii">
+      <h2>Part III — React Internals &amp; Architecture</h2>
+      <p>Fiber, concurrent rendering, lanes, hydration, state management, hooks, Suspense, Server Components &amp; reconciliation</p>
+    </div>
+    <div class="chapter-grid">
+      <a href="frontend/ch15-react-fiber-concurrent.html" class="chapter-card">
+        <span class="chapter-number">Chapter 15</span>
+        <h3>Explain React Fiber architecture. How does concurrent rendering differ from legacy sync?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Fiber</span>
+          <span class="badge badge-topic">Concurrent</span>
+        </div>
+      </a>
+      <a href="frontend/ch16-lanes-priority-scheduling.html" class="chapter-card">
+        <span class="chapter-number">Chapter 16</span>
+        <h3>How does React's Lane model work for priority scheduling?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Lanes</span>
+          <span class="badge badge-topic">Scheduling</span>
+        </div>
+      </a>
+      <a href="frontend/ch17-hydration-streaming-rsc.html" class="chapter-card">
+        <span class="chapter-number">Chapter 17</span>
+        <h3>React's hydration model — streaming SSR, progressive &amp; selective hydration</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Hydration</span>
+          <span class="badge badge-topic">Streaming</span>
+        </div>
+      </a>
+      <a href="frontend/ch18-state-management-rerender-control.html" class="chapter-card">
+        <span class="chapter-number">Chapter 18</span>
+        <h3>Dashboard re-renders 200 components on single input change — diagnose and fix</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">State</span>
+          <span class="badge badge-topic">Re-Renders</span>
+        </div>
+      </a>
+      <a href="frontend/ch19-hooks-internals-rules.html" class="chapter-card">
+        <span class="chapter-number">Chapter 19</span>
+        <h3>How do React hooks work internally? Why must they be called in the same order?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Hooks</span>
+          <span class="badge badge-topic">Linked List</span>
+        </div>
+      </a>
+      <a href="frontend/ch20-suspense-transitions-deferred-values.html" class="chapter-card">
+        <span class="chapter-number">Chapter 20</span>
+        <h3>useTransition, useDeferredValue, and Suspense — keeping UI responsive</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Suspense</span>
+          <span class="badge badge-topic">Transitions</span>
+        </div>
+      </a>
+      <a href="frontend/ch21-server-components-flight-protocol.html" class="chapter-card">
+        <span class="chapter-number">Chapter 21</span>
+        <h3>React Server Components — how does React Flight stream component payloads?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">RSC</span>
+          <span class="badge badge-topic">React Flight</span>
+        </div>
+      </a>
+      <a href="frontend/ch22-reconciliation-virtual-dom.html" class="chapter-card">
+        <span class="chapter-number">Chapter 22</span>
+        <h3>How does React's reconciliation algorithm work? When does the VDOM hurt?</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-hard">Hard</span>
+          <span class="badge badge-topic">Reconciliation</span>
+          <span class="badge badge-topic">Virtual DOM</span>
+        </div>
+      </a>
+    </div>
+
+    <!-- Frontend Part IV -->
+    <div class="part-header" id="frontend-part-iv">
+      <h2>Part IV — React Low-Level Design (LLD)</h2>
+      <p>Production-quality component implementations with performance optimization, accessibility &amp; edge cases</p>
+    </div>
+    <div class="chapter-grid">
+      <a href="frontend/ch23-lld-search-autocomplete-infinite-scroll.html" class="chapter-card">
+        <span class="chapter-number">Chapter 23</span>
+        <h3>LLD — Search with Debouncing, Autocomplete &amp; Infinite Scroll</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-medium">Medium</span>
+          <span class="badge badge-topic">Debounce</span>
+          <span class="badge badge-topic">Autocomplete</span>
+          <span class="badge badge-topic">Virtualization</span>
+        </div>
+      </a>
+      <a href="frontend/ch24-lld-modal-theme-form-todo-counter.html" class="chapter-card">
+        <span class="chapter-number">Chapter 24</span>
+        <h3>LLD — Modal, Theme Switcher, Form Validation, Todo &amp; Counter</h3>
+        <div class="chapter-tags">
+          <span class="badge badge-medium">Medium</span>
+          <span class="badge badge-topic">Portals</span>
+          <span class="badge badge-topic">Context API</span>
+          <span class="badge badge-topic">Accessibility</span>
         </div>
       </a>
     </div>

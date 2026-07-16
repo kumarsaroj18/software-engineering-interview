@@ -1563,8 +1563,168 @@ spec:
       </details>
     </section>
 
-    <!-- Sections: common-mistakes, trade-offs, follow-up-questions, summary -->
-    <!-- These sections are referenced in the sidebar nav but pending content creation -->
+    <!-- Section: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Mistakes that cause duplicate execution in production</summary>
+
+        <h3>Mistake 1: Relying solely on @Scheduled without coordination</h3>
+        <p><strong>The mistake:</strong> Deploying a Spring Boot app with <code>@Scheduled</code> across multiple pods without any distributed lock or leader election.</p>
+        <p><strong>Why it fails:</strong> Each pod has its own scheduler. With 5 pods, you get 5 executions per cron tick. Auto-scaling makes it worse — the duplicate count is unpredictable.</p>
+        <pre><code class="language-java">// ⚠️ This runs on EVERY pod independently
+@Scheduled(cron = "0 0 * * * *")
+public void sendHourlyDigest() {
+    emailService.sendDigestToAllUsers(); // 5 pods = 5 duplicate emails
+}</code></pre>
+
+        <h3>Mistake 2: Using in-memory locks in a distributed environment</h3>
+        <p><strong>The mistake:</strong> Using <code>synchronized</code>, <code>ReentrantLock</code>, or an in-memory flag to prevent duplicate execution.</p>
+        <p><strong>Why it fails:</strong> JVM-level locks only prevent concurrency within a single process. They have no effect across pods.</p>
+
+        <h3>Mistake 3: Setting ShedLock lockAtLeastFor too short</h3>
+        <p><strong>The mistake:</strong> Setting <code>lockAtLeastFor</code> to a very short duration (e.g., 1 second) thinking it minimizes lock contention.</p>
+        <p><strong>Why it fails:</strong> If the task's real execution time (including GC pauses or slow I/O) exceeds <code>lockAtLeastFor</code>, the lock can be released — or another node can compute it as expired — before the task actually finishes, letting a second pod acquire it while the first is still executing. Set <code>lockAtLeastFor</code> to at least the expected execution time. Note: this is a task-duration risk, not a clock-skew risk — if you're using <code>usingDbTime()</code> (recommended, see the Configuration section above), lock expiry is computed entirely from the lock store's clock, so per-pod clock skew doesn't factor in here at all. Clock skew only becomes relevant if you fall back to each pod's local clock for lock timing.</p>
+
+        <h3>Mistake 4: Not making the job idempotent as a safety net</h3>
+        <p><strong>The mistake:</strong> Trusting the coordination mechanism 100% and not designing the job to be safe when run twice.</p>
+        <p><strong>Why it fails:</strong> Every distributed lock has failure modes (split brain, GC pauses, clock drift). Idempotency is the last line of defense. Design jobs so that running them twice produces the same outcome as running once.</p>
+
+        <h3>Mistake 5: Using Kubernetes CronJob without concurrencyPolicy</h3>
+        <p><strong>The mistake:</strong> Leaving <code>concurrencyPolicy</code> at its default value (<code>Allow</code>).</p>
+        <p><strong>Why it fails:</strong> If a job overruns its schedule, Kubernetes launches a new Job alongside the still-running one. Set <code>concurrencyPolicy: Forbid</code> to prevent overlapping executions.</p>
+      </details>
+    </section>
+
+    <!-- Section: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+
+      <details>
+        <summary>Comparing coordination strategies</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Complexity</th>
+              <th>External Dependency</th>
+              <th>Failover</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>ShedLock</strong></td>
+              <td>Low</td>
+              <td>DB (existing) or Redis</td>
+              <td>Automatic (any pod can acquire)</td>
+              <td>Spring Boot apps with simple scheduling needs</td>
+            </tr>
+            <tr>
+              <td><strong>Quartz Cluster</strong></td>
+              <td>High</td>
+              <td>RDBMS (dedicated tables)</td>
+              <td>Automatic (JDBC-based election)</td>
+              <td>Complex scheduling (dependencies, calendars, persistence)</td>
+            </tr>
+            <tr>
+              <td><strong>Kubernetes CronJob</strong></td>
+              <td>Medium</td>
+              <td>Kubernetes API</td>
+              <td>Platform-managed</td>
+              <td>Stateless batch jobs, infrastructure-level scheduling</td>
+            </tr>
+            <tr>
+              <td><strong>Redis Distributed Lock</strong></td>
+              <td>Medium</td>
+              <td>Redis</td>
+              <td>Manual (Redlock for HA)</td>
+              <td>Sub-second coordination, already using Redis</td>
+            </tr>
+            <tr>
+              <td><strong>Leader Election (K8s)</strong></td>
+              <td>Medium</td>
+              <td>Kubernetes API (Lease)</td>
+              <td>Automatic (leader re-election)</td>
+              <td>Single-leader pattern, long-running coordinators</td>
+            </tr>
+            <tr>
+              <td><strong>Database Advisory Lock</strong></td>
+              <td>Low</td>
+              <td>PostgreSQL/MySQL</td>
+              <td>Automatic (session-scoped)</td>
+              <td>Simple coordination without extra infrastructure</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-info">
+          <p><strong>Key principle:</strong> The best strategy depends on what infrastructure you already have. Don't add Redis just for locking if your app already has a database. Don't add Quartz if ShedLock's "at most once" guarantee is sufficient.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Q1: What happens if the pod holding the lock crashes mid-execution?</summary>
+        <p><strong>Strong answer:</strong> It depends on the lock mechanism. ShedLock uses <code>lockAtMostFor</code> as a lease timeout — if the pod dies, the lock expires after that duration and another pod can acquire it. Redis locks use TTL for the same purpose. Quartz's JDBC store detects the dead scheduler via a heartbeat mechanism and reassigns the trigger. The key tradeoff is lease duration: too short risks dual execution; too long means delayed recovery. The job must be idempotent regardless, because there's always a window where both the crashed pod (before death) and the new acquirer might have done partial work.</p>
+      </details>
+
+      <details>
+        <summary>Q2: How do you handle a job that must run exactly once, even across failures?</summary>
+        <p><strong>Strong answer:</strong> "Exactly once" in distributed systems is achieved through idempotency + at-least-once delivery. The job should write a completion record (e.g., a row with a unique constraint on the job execution ID) as part of the same transaction as its side effects. If the job runs again, the unique constraint violation (or a pre-check) prevents duplicate work. Combine this with ShedLock or similar for coordination — the lock prevents concurrent execution, and idempotency prevents duplicates from crash recovery.</p>
+      </details>
+
+      <details>
+        <summary>Q3: Why is Redlock controversial? Would you use it in production?</summary>
+        <p><strong>Strong answer:</strong> Martin Kleppmann's 2016 analysis showed that Redlock can fail under clock skew, GC pauses, or network partitions — a process could hold a lock it believes is valid while another process has already acquired it. The fundamental issue is that Redis doesn't have a consensus protocol. For advisory locks (where duplicate execution is inconvenient but not catastrophic), Redlock is fine. For correctness-critical locks (financial transactions), use a consensus-based system (ZooKeeper, etcd) or a fencing token approach where the protected resource validates the token monotonically.</p>
+      </details>
+
+      <details>
+        <summary>Q4: How would you monitor for duplicate job execution in production?</summary>
+        <p><strong>Strong answer:</strong> Emit a metric with the job name and execution ID at start and completion. Alert on: (1) more than one <code>job_started</code> event for the same scheduled slot within the expected window, (2) lock acquisition failures trending upward, (3) job duration exceeding <code>lockAtMostFor</code>. Also log a correlation ID per execution so you can trace duplicates post-mortem. For Kubernetes CronJobs, monitor for <code>concurrencyPolicy</code> violations in events.</p>
+      </details>
+
+      <details>
+        <summary>Q5: ShedLock vs Quartz — when would you choose each?</summary>
+        <p><strong>Strong answer:</strong> ShedLock is a lock library, not a scheduler — it ensures at-most-once execution of jobs triggered by Spring's <code>@Scheduled</code>. It's lightweight, needs only one DB table, and works in 15 minutes. Quartz is a full scheduling engine with persistent job state, trigger dependencies, misfire handling, and clustered execution. Choose ShedLock for simple periodic tasks (cleanup, digest emails, sync jobs). Choose Quartz when you need: dynamic job creation at runtime, complex trigger expressions, job chaining, or persistent job state that survives full cluster restarts.</p>
+      </details>
+
+      <details>
+        <summary>Q6: How does clock skew affect distributed scheduling?</summary>
+        <p><strong>Strong answer:</strong> If Pod A's clock is 3 seconds ahead of Pod B, and <code>lockAtLeastFor</code> is 5 seconds, there's a 3-second window where Pod B might see the lock as expired while Pod A is still executing. Mitigations: (1) use NTP with tight sync tolerances (&lt;1s), (2) set <code>lockAtLeastFor</code> significantly longer than expected clock skew, (3) use server-side timestamps (Redis TIME command, DB NOW()) rather than client clocks for lock expiry calculations. ShedLock uses the lock store's timestamp, which eliminates client clock skew from the equation.</p>
+      </details>
+    </section>
+
+    <!-- Section: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Key mental models for the interview:</strong></p>
+        <ul>
+          <li><strong>@Scheduled is per-JVM.</strong> Without coordination, N pods = N executions. Always add a distributed lock or leader election.</li>
+          <li><strong>ShedLock for simplicity, Quartz for power.</strong> Most teams don't need Quartz. ShedLock + @Scheduled covers 90% of use cases.</li>
+          <li><strong>Idempotency is the safety net.</strong> No lock is perfect. Design every scheduled job so running it twice is harmless.</li>
+          <li><strong>Lease timeouts are a tradeoff.</strong> Short = risk of dual execution during GC pauses. Long = slow recovery on crash. Set to 2-3x expected execution time.</li>
+          <li><strong>Kubernetes CronJob solves a different problem.</strong> It's for infrastructure-level scheduling (backups, batch ETL), not application-level business logic that needs Spring context.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout-warning">
+        <p><strong>What NOT to say in an interview:</strong></p>
+        <ul>
+          <li>❌ "Just use a database flag" — doesn't explain how you handle concurrent reads of that flag (you need SELECT FOR UPDATE or an atomic operation).</li>
+          <li>❌ "Redis SETNX is enough" — doesn't address what happens when the lock holder dies (need TTL + renewal).</li>
+          <li>❌ "We don't need coordination because our jobs are fast" — fast jobs still duplicate when 10 pods all fire at the same cron second.</li>
+          <li>❌ "Redlock solves everything" — shows you haven't read Kleppmann's analysis. Acknowledge the tradeoffs.</li>
+        </ul>
+      </div>
+    </section>
 
     <!-- Chapter Navigation -->
     <nav class="chapter-nav">

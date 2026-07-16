@@ -1,0 +1,1364 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 2: Closures from the Engine's Perspective | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <!-- Sidebar Navigation -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 2</span>
+      <span class="chapter-title">Closures, Scope & Memory</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#lexical-environment">Lexical Environment Internals</a></li>
+        <li><a href="#scope-chain">Scope Chain Construction</a></li>
+        <li><a href="#closure-memory">Closure Memory in V8</a></li>
+        <li><a href="#hidden-classes">Hidden Classes & Inline Caches</a></li>
+        <li><a href="#memory-leaks">Memory Leaks via Closures</a></li>
+        <li><a href="#detached-dom">Detached DOM Trees</a></li>
+        <li><a href="#event-listeners">Event Listener Accumulation</a></li>
+        <li><a href="#weak-references">WeakRef & FinalizationRegistry</a></li>
+        <li><a href="#garbage-collection">Garbage Collection</a></li>
+        <li><a href="#heap-snapshots">Heap Snapshots & Allocation Timelines</a></li>
+        <li><a href="#production-debugging">Production Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-i">Part I — JavaScript Engine Internals</a> &rsaquo;
+      <span>Chapter 2</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Closures</span>
+        <span class="badge badge-topic">V8 Internals</span>
+        <span class="badge badge-topic">Memory</span>
+        <span class="badge badge-topic">GC</span>
+      </div>
+      <h1>Explain closures from the engine's perspective. How do they cause memory leaks in long-lived applications?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> A closure is not just "a function that remembers its outer scope." In V8, it's a function object paired with a <code>Context</code> object that holds the captured variables. When a closure survives longer than expected — via event listeners, timers, or global references — it pins its entire <code>Context</code> chain in memory, potentially retaining megabytes of unreachable objects.
+      </p>
+    </header>
+
+    <!-- Search -->
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter... (Ctrl+K or /)" aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <div class="callout callout-info">
+        <p><strong>What they're really testing:</strong></p>
+        <ul>
+          <li>Can you explain closures at the engine level — not just the textbook definition?</li>
+          <li>Do you understand how V8 represents scope and captured variables in memory?</li>
+          <li>Can you identify closure-related memory leaks in a production SPA?</li>
+          <li>Do you know the difference between what the spec says (Lexical Environment) and what the engine does (Context objects, scope analysis)?</li>
+          <li>Have you used heap snapshots to trace retained memory back to a closure?</li>
+        </ul>
+      </div>
+      <p>At the senior level, "a closure is a function that has access to its outer scope" is a starting point, not an answer. Interviewers want to hear about V8's scope analysis during parsing, how it decides which variables to capture, how <code>Context</code> objects form a chain, and why a single long-lived closure can retain an entire scope tree — including variables the closure never uses (in older engines or unoptimized paths).</p>
+    </section>
+
+    <!-- Section 2: 60-Second Interview Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Interview Answer</h2>
+      <div class="callout callout-tip">
+        <p><strong>Use this in the interview:</strong></p>
+        <blockquote>
+          "A closure is a function bundled with a reference to its lexical environment. At the engine level — in V8 specifically — this is implemented as a <code>JSFunction</code> object that holds a pointer to a <code>Context</code> object.
+          <br><br>
+          <strong>How V8 creates closures:</strong> During parsing, V8 performs scope analysis to determine which variables are referenced by inner functions. Only those variables are 'context-allocated' — moved from the stack to a heap-allocated <code>Context</code> object. Variables that aren't captured stay on the stack and are cheap.
+          <br><br>
+          <strong>The memory leak pattern:</strong> A closure retains its entire <code>Context</code> object. If multiple closures share the same scope, they share the same Context. So even if only one closure references a large variable, <em>all</em> sibling closures keep that Context (and the large variable) alive.
+          <br><br>
+          <strong>Common SPA leak sources:</strong>
+          <br>• Event listeners that capture component state but are never removed
+          <br>• setInterval callbacks that outlive their intended lifecycle
+          <br>• Closures stored in module-level caches or Maps
+          <br>• React useEffect closures that capture stale references to large objects
+          <br><br>
+          I diagnose these using Chrome DevTools heap snapshots — specifically the 'Retainers' tab, which shows the reference chain from GC root to the retained object. The fix is usually to null out references, use WeakRef for caches, or properly clean up listeners and timers."
+        </blockquote>
+      </div>
+    </section>
+
+    <!-- Section 3: Lexical Environment Internals -->
+    <section id="lexical-environment">
+      <h2>Lexical Environment Internals</h2>
+
+      <details>
+        <summary>The ECMAScript Specification Model</summary>
+        <p>The spec defines closures in terms of <strong>Lexical Environments</strong>:</p>
+        <ul>
+          <li><strong>Environment Record</strong> — stores the actual bindings (variables, functions, parameters)</li>
+          <li><strong>Outer Environment Reference</strong> — pointer to the parent Lexical Environment</li>
+        </ul>
+        <p>When a function is created, it captures a reference to the Lexical Environment that was active at that point. This captured reference is stored as the function's internal <code>[[Environment]]</code> slot.</p>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────┐
+│  Global Lexical Environment                             │
+│  ┌────────────────────────────────────────────────────┐│
+│  │ Environment Record: { x: 10, createCounter: fn }   ││
+│  │ Outer: null                                        ││
+│  └────────────────────────────────────────────────────┘│
+│         ▲                                               │
+│         │ outer reference                               │
+│  ┌──────┴─────────────────────────────────────────────┐│
+│  │ createCounter() Lexical Environment                ││
+│  │ ┌──────────────────────────────────────────────┐   ││
+│  │ │ Environment Record: { count: 0 }             │   ││
+│  │ │ Outer: → Global Environment                  │   ││
+│  │ └──────────────────────────────────────────────┘   ││
+│  │         ▲                                          ││
+│  │         │ [[Environment]]                          ││
+│  │  ┌──────┴────────────┐                            ││
+│  │  │ increment (fn)     │                            ││
+│  │  │ [[Environment]] ───┘                            ││
+│  │  └───────────────────┘                            ││
+│  └────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────┘
+        </pre>
+        <pre><code class="language-javascript">function createCounter() {
+  let count = 0;  // Captured by inner function → lives in Lexical Environment
+  
+  return function increment() {
+    return ++count;  // References 'count' via [[Environment]] → outer Env Record
+  };
+}
+
+const counter = createCounter();
+counter(); // 1
+counter(); // 2
+// 'count' persists because increment's [[Environment]] keeps the
+// createCounter Lexical Environment alive.</code></pre>
+      </details>
+
+      <details>
+        <summary>Variable Environment vs Lexical Environment — the subtle difference</summary>
+        <p>Each Execution Context has two environment references:</p>
+        <ul>
+          <li><strong>VariableEnvironment</strong> — where <code>var</code> and <code>function</code> declarations are hoisted and stored</li>
+          <li><strong>LexicalEnvironment</strong> — where <code>let</code>, <code>const</code>, and block-scoped bindings live</li>
+        </ul>
+        <p>For closures, this distinction matters in block-scoped loops:</p>
+        <pre><code class="language-javascript">// var — shares one binding across all iterations (VariableEnvironment)
+for (var i = 0; i < 3; i++) {
+  setTimeout(() => console.log(i), 0); // 3, 3, 3
+}
+
+// let — creates a new binding per iteration (new LexicalEnvironment per block)
+for (let i = 0; i < 3; i++) {
+  setTimeout(() => console.log(i), 0); // 0, 1, 2
+}
+
+// Why: the spec mandates that each iteration of a for-let loop
+// creates a fresh LexicalEnvironment with a copy of the binding.
+// Each closure captures a DIFFERENT environment.</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 4: Scope Chain Construction -->
+    <section id="scope-chain">
+      <h2>Scope Chain Construction</h2>
+
+      <details>
+        <summary>How the scope chain is built at function creation time</summary>
+        <p>The scope chain is NOT built at call time — it's determined at <em>definition</em> time (lexical scoping). When V8 parses a function:</p>
+        <ol>
+          <li><strong>Parse phase:</strong> The parser identifies all variable references in the function body</li>
+          <li><strong>Scope resolution:</strong> For each reference, V8 walks up the enclosing scopes to find where it's declared</li>
+          <li><strong>Context allocation decision:</strong> Variables referenced by inner functions are marked as "context-allocated" (heap) rather than "stack-allocated"</li>
+          <li><strong>Function creation:</strong> The <code>JSFunction</code> object stores a pointer to the current <code>Context</code> — this becomes its <code>[[Environment]]</code></li>
+        </ol>
+        <pre><code class="language-javascript">function outer() {
+  let a = 1;       // Referenced by inner → context-allocated (heap)
+  let b = 2;       // Referenced by inner → context-allocated (heap)
+  let huge = new Array(1000000);  // NOT referenced by inner → stack-allocated
+  
+  function inner() {
+    return a + b;  // Only references a and b
+  }
+  
+  return inner;
+}
+
+const fn = outer();
+// After outer() returns:
+// - 'a' and 'b' survive in the Context object (heap)
+// - 'huge' is eligible for GC (was on the stack, not captured)
+// V8's scope analysis determined 'huge' wasn't needed by inner</code></pre>
+        <div class="callout callout-info">
+          <p><strong>V8's optimization:</strong> V8 does NOT capture the entire scope blindly. Its parser performs static analysis to determine exactly which variables are referenced by inner functions. Only those variables are allocated on the heap in a Context object. This is why <code>huge</code> in the example above gets garbage collected after <code>outer()</code> returns — V8 knows <code>inner</code> never references it.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>The eval() exception — defeating scope analysis</summary>
+        <p>When <code>eval()</code> or <code>with</code> is present, V8 cannot statically determine which variables will be accessed. It must pessimistically context-allocate ALL variables in the enclosing scope:</p>
+        <pre><code class="language-javascript">function leakyScope() {
+  let a = 1;
+  let b = 2;
+  let huge = new Array(1000000); // Will be context-allocated!
+  
+  function inner() {
+    // eval can reference ANY variable in scope
+    return eval('huge.length'); // V8 can't analyze this statically
+  }
+  
+  return inner;
+}
+
+// 'huge' is now retained even though a simple static analysis
+// wouldn't find a direct reference. V8 must keep everything alive
+// because eval() could reference any variable.
+
+// Same problem with: new Function(), with statement, direct eval
+// Note: INDIRECT eval — (0, eval)('...') — doesn't trigger this
+// because it runs in global scope, not the local scope.</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Senior insight:</strong> This is why "don't use eval" isn't just a style rule — it disables V8's most important closure optimization. A single <code>eval</code> in a nested function forces the entire scope chain to be heap-allocated, potentially causing memory retention orders of magnitude larger than necessary.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 5: Closure Memory Representation in V8 -->
+    <section id="closure-memory">
+      <h2>Closure Memory Representation in V8</h2>
+
+      <details>
+        <summary>How V8 stores closures — JSFunction + Context chain</summary>
+        <p>In V8's internal representation:</p>
+        <ul>
+          <li><strong>JSFunction</strong> — the function object. Contains: pointer to compiled code (SharedFunctionInfo), pointer to Context, prototype, etc.</li>
+          <li><strong>Context</strong> — a fixed-size array that holds captured variables. Has a pointer to the parent Context (forming a chain).</li>
+          <li><strong>ScopeInfo</strong> — metadata describing variable names and positions in the Context (used for debugging/DevTools).</li>
+        </ul>
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────────────┐
+│                    V8 Heap                                    │
+│                                                              │
+│  ┌─────────────────────┐                                    │
+│  │    JSFunction        │                                    │
+│  │  (inner function)    │                                    │
+│  ├─────────────────────┤                                    │
+│  │  shared_info ────────┼──► SharedFunctionInfo (bytecode)   │
+│  │  context ────────────┼──┐                                │
+│  │  prototype_or_initial│  │                                │
+│  └─────────────────────┘  │                                │
+│                            │                                │
+│                            ▼                                │
+│  ┌─────────────────────────────────────────┐               │
+│  │  Context (createCounter scope)           │               │
+│  ├─────────────────────────────────────────┤               │
+│  │  [0] parent ────────────────────────────┼──┐            │
+│  │  [1] count = 0                          │  │            │
+│  │  [2] scope_info → ScopeInfo             │  │            │
+│  └─────────────────────────────────────────┘  │            │
+│                                                │            │
+│                                                ▼            │
+│  ┌─────────────────────────────────────────┐               │
+│  │  Context (global/module scope)           │               │
+│  ├─────────────────────────────────────────┤               │
+│  │  [0] parent → null (native context)     │               │
+│  │  [1] globalVar = ...                    │               │
+│  │  ...                                    │               │
+│  └─────────────────────────────────────────┘               │
+└──────────────────────────────────────────────────────────────┘
+        </pre>
+      </details>
+
+      <details>
+        <summary>Shared Context problem — sibling closures retain each other's variables</summary>
+        <p>When multiple closures are created in the same scope, they share the <strong>same Context object</strong>. This has a critical memory implication:</p>
+        <pre><code class="language-javascript">function createHandlers() {
+  const hugeData = new Array(1_000_000).fill('x'); // 1M strings
+  const metadata = { created: Date.now() };
+  
+  // Both closures share the SAME Context object
+  const getMetadata = () => metadata;  // Only needs 'metadata'
+  const processData = () => hugeData;  // Only needs 'hugeData'
+  
+  return { getMetadata, processData };
+}
+
+const { getMetadata } = createHandlers();
+// We only kept getMetadata, discarded processData...
+// But 'hugeData' is STILL retained!
+// 
+// Why? getMetadata's Context contains BOTH 'hugeData' and 'metadata'
+// because V8 creates ONE Context per scope, shared by all closures.
+// Even though getMetadata never references hugeData, the shared
+// Context keeps it alive.</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Critical insight:</strong> V8 allocates one Context per scope level, not per closure. All closures defined in the same scope point to the same Context. This means a lightweight closure can accidentally retain large objects captured by a sibling closure. The fix is to restructure code so large objects are in a separate scope from long-lived closures.</p>
+        </div>
+        <pre><code class="language-javascript">// ✅ FIX: Separate scopes to isolate Context objects
+function createHandlers() {
+  const getMetadata = (() => {
+    const metadata = { created: Date.now() };
+    return () => metadata;  // Own Context: only contains 'metadata'
+  })();
+  
+  const processData = (() => {
+    const hugeData = new Array(1_000_000).fill('x');
+    return () => hugeData;  // Own Context: only contains 'hugeData'
+  })();
+  
+  return { getMetadata, processData };
+}
+
+const { getMetadata } = createHandlers();
+// Now hugeData CAN be GC'd — getMetadata's Context doesn't include it</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 6: Hidden Classes & Inline Caches -->
+    <section id="hidden-classes">
+      <h2>Hidden Classes & Inline Caches</h2>
+
+      <details>
+        <summary>How closures interact with V8's optimization pipeline</summary>
+        <p>V8 optimizes property access using <strong>Hidden Classes</strong> (called Maps internally) and <strong>Inline Caches</strong>. Closures can either help or hinder these optimizations:</p>
+        <ul>
+          <li><strong>Hidden Class (Map):</strong> A structural descriptor that tells V8 the shape of an object — which properties it has and at what offsets. Objects with the same property additions in the same order share a Hidden Class.</li>
+          <li><strong>Inline Cache (IC):</strong> At each property access site, V8 remembers the Hidden Class it last saw. If the next object has the same Hidden Class, the access is a single pointer dereference (monomorphic). If different classes appear, it becomes polymorphic (slower) or megamorphic (much slower).</li>
+        </ul>
+        <pre><code class="language-javascript">// ✅ GOOD — all objects have the same Hidden Class
+function createPoint(x, y) {
+  return { x, y }; // Same property order every time → same Hidden Class
+}
+const points = Array.from({ length: 10000 }, (_, i) => createPoint(i, i * 2));
+points.forEach(p => p.x + p.y); // Monomorphic IC → fast
+
+// ⚠️ BAD — closures creating different shapes
+function createHandler(type) {
+  const handler = {};
+  if (type === 'click') handler.onClick = () => {};
+  if (type === 'hover') handler.onHover = () => {};
+  handler.type = type;
+  return handler;
+}
+// Each branch creates a different Hidden Class
+// Code that processes these handlers becomes polymorphic → slower</code></pre>
+      </details>
+
+      <details>
+        <summary>Closure allocation and TurboFan escape analysis</summary>
+        <p>V8's optimizing compiler (TurboFan) can perform <strong>escape analysis</strong> on closures:</p>
+        <ul>
+          <li>If a closure is created and consumed within the same function (doesn't "escape"), TurboFan can allocate it on the stack or even inline it entirely</li>
+          <li>If a closure escapes (returned, stored in a variable, passed to another function), it must be heap-allocated</li>
+        </ul>
+        <pre><code class="language-javascript">// ✅ Closure may be stack-allocated (doesn't escape)
+function sumArray(arr) {
+  let total = 0;
+  arr.forEach((item) => { total += item; }); // Closure doesn't escape forEach
+  return total;
+  // TurboFan may inline this entirely — no heap allocation for the closure
+}
+
+// ❌ Closure must be heap-allocated (escapes)
+function createAdder(x) {
+  return (y) => x + y; // Escapes via return → heap-allocated JSFunction + Context
+}</code></pre>
+        <p>This is why factory-function patterns (closures that escape) always incur a memory cost, while closures used as callbacks in tight loops (forEach, map, filter) may be optimized away entirely by TurboFan.</p>
+      </details>
+    </section>
+
+    <!-- Section 7: Memory Leaks via Closures -->
+    <section id="memory-leaks">
+      <h2>Memory Leaks via Closures</h2>
+
+      <details>
+        <summary>What makes a closure a "leak" vs legitimate retention</summary>
+        <p>A memory leak is not simply "memory being used." It's memory that is <strong>retained</strong> (reachable from a GC root) but <strong>no longer needed</strong> by the application. Closures become leaks when:</p>
+        <ol>
+          <li>The closure outlives its intended purpose (e.g., event handler for a removed element)</li>
+          <li>The closure's Context retains objects far larger than what the closure uses</li>
+          <li>Closures accumulate over time without cleanup (e.g., subscribing without unsubscribing)</li>
+        </ol>
+        <pre class="diagram">
+GC Root (Window / global)
+    │
+    ├── module.cache (Map)
+    │       │
+    │       └── closure A ──► Context ──► largeDataset (10MB)
+    │                                         ↑
+    │                          LEAK: cache entry never evicted
+    │
+    ├── DOM element.onclick
+    │       │
+    │       └── closure B ──► Context ──► componentState
+    │                                         ↑
+    │                          LEAK: element removed but handler
+    │                                still referenced
+    │
+    └── setInterval callback
+            │
+            └── closure C ──► Context ──► staleReferences
+                                              ↑
+                              LEAK: interval never cleared
+        </pre>
+      </details>
+
+      <details>
+        <summary>Pattern: Closure over loop variable accumulation</summary>
+        <pre><code class="language-javascript">// ⚠️ LEAK: closures accumulate, each retaining its data
+class DataProcessor {
+  #handlers = [];
+  
+  processStream(stream) {
+    stream.on('data', (chunk) => {
+      // This closure captures 'chunk' — a new closure per event
+      const processed = this.#transform(chunk);
+      this.#handlers.push(() => processed); // Stored forever!
+    });
+  }
+  
+  // #handlers grows unboundedly, each closure retaining 'processed'
+}
+
+// ✅ FIX: Store data, not closures
+class DataProcessor {
+  #results = [];
+  
+  processStream(stream) {
+    stream.on('data', (chunk) => {
+      const processed = this.#transform(chunk);
+      this.#results.push(processed); // Store the value, not a closure
+    });
+  }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Pattern: Module-level closure retention</summary>
+        <pre><code class="language-javascript">// ⚠️ LEAK: module-level Map never releases entries
+// utils/cache.js
+const cache = new Map();
+
+export function memoize(fn) {
+  return (...args) => {
+    const key = JSON.stringify(args);
+    if (cache.has(key)) return cache.get(key);
+    
+    const result = fn(...args); // 'result' could be large
+    cache.set(key, result);     // Retained forever (module lives for app lifetime)
+    return result;
+  };
+}
+
+// ✅ FIX: Use WeakMap where keys are objects, or add eviction
+const cache = new Map();
+const MAX_SIZE = 100;
+
+export function memoize(fn) {
+  return (...args) => {
+    const key = JSON.stringify(args);
+    if (cache.has(key)) return cache.get(key);
+    
+    const result = fn(...args);
+    cache.set(key, result);
+    
+    // LRU eviction
+    if (cache.size > MAX_SIZE) {
+      const firstKey = cache.keys().next().value;
+      cache.delete(firstKey);
+    }
+    return result;
+  };
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 8: Detached DOM Trees -->
+    <section id="detached-dom">
+      <h2>Detached DOM Trees</h2>
+
+      <details>
+        <summary>How closures keep removed DOM elements alive</summary>
+        <p>A <strong>detached DOM tree</strong> is a set of DOM nodes that have been removed from the document (not in <code>document.body</code>) but are still reachable from JavaScript — typically via a closure:</p>
+        <pre><code class="language-javascript">// ⚠️ LEAK: closure retains reference to removed element
+function initComponent() {
+  const container = document.createElement('div');
+  container.innerHTML = generateHugeTable(10000); // 10K rows
+  document.body.appendChild(container);
+  
+  const button = document.getElementById('refresh');
+  button.addEventListener('click', () => {
+    // This closure captures 'container' in its Context
+    container.innerHTML = generateHugeTable(10000);
+  });
+  
+  // Later: component is "destroyed"
+  return () => {
+    container.remove(); // Removed from DOM...
+    // But the click handler's closure STILL references 'container'!
+    // 'container' and its 10K child nodes remain in memory.
+  };
+}
+
+// ✅ FIX: Null out references and remove listeners
+function initComponent() {
+  let container = document.createElement('div');
+  container.innerHTML = generateHugeTable(10000);
+  document.body.appendChild(container);
+  
+  const button = document.getElementById('refresh');
+  const handler = () => {
+    container.innerHTML = generateHugeTable(10000);
+  };
+  button.addEventListener('click', handler);
+  
+  return () => {
+    button.removeEventListener('click', handler);
+    container.remove();
+    container = null; // Release reference — allows GC
+  };
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Identifying detached DOM in heap snapshots</summary>
+        <p>In Chrome DevTools Memory panel:</p>
+        <ol>
+          <li>Take a heap snapshot</li>
+          <li>In the filter box, type <code>Detached</code></li>
+          <li>Look for <code>Detached HTMLDivElement</code>, <code>Detached HTMLTableElement</code>, etc.</li>
+          <li>Click on a detached node → check the <strong>Retainers</strong> panel</li>
+          <li>The retainer chain shows you <em>why</em> it's alive — usually a closure → Context → variable</li>
+        </ol>
+        <p>Common retainer chains for detached DOM:</p>
+        <pre class="diagram">
+GC Root
+  └── Window
+        └── listener (in EventTarget)
+              └── closure (JSFunction)
+                    └── Context
+                          └── container (Detached HTMLDivElement)
+                                └── children (Detached HTMLTableElement, 10K rows)
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 9: Event Listener Accumulation -->
+    <section id="event-listeners">
+      <h2>Event Listener Accumulation</h2>
+
+      <details>
+        <summary>Why addEventListener without removeEventListener leaks</summary>
+        <p>Each call to <code>addEventListener</code> stores a reference to the callback function. If the callback is a closure, the closure (and its Context) stays alive as long as the event target exists:</p>
+        <pre><code class="language-javascript">// ⚠️ LEAK: each re-render adds a NEW listener (React class component pattern)
+class OldComponent {
+  componentDidMount() {
+    // Every time this component remounts, a new listener is added
+    window.addEventListener('resize', () => {
+      // Closure captures 'this' → entire component instance retained
+      this.setState({ width: window.innerWidth });
+    });
+  }
+  // Missing componentWillUnmount → listeners accumulate!
+}
+
+// ⚠️ LEAK: Repeated subscription without cleanup (hooks pattern)
+function BadComponent() {
+  useEffect(() => {
+    const handler = () => console.log('resized');
+    window.addEventListener('resize', handler);
+    // Missing cleanup function! New listener added on every effect run.
+  }); // No deps → runs every render
+
+  return &lt;div /&gt;;
+}
+
+// ✅ FIX: Always return cleanup
+function GoodComponent() {
+  useEffect(() => {
+    const handler = () => console.log('resized');
+    window.addEventListener('resize', handler);
+    return () => window.removeEventListener('resize', handler);
+  }, []); // Empty deps → runs once, cleanup on unmount
+
+  return &lt;div /&gt;;
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>AbortController pattern for bulk listener cleanup</summary>
+        <pre><code class="language-javascript">// ✅ Modern pattern: AbortController removes all listeners at once
+function setupInteractiveWidget(element) {
+  const controller = new AbortController();
+  const { signal } = controller;
+  
+  element.addEventListener('click', handleClick, { signal });
+  element.addEventListener('mouseenter', handleHover, { signal });
+  element.addEventListener('keydown', handleKey, { signal });
+  window.addEventListener('resize', handleResize, { signal });
+  document.addEventListener('visibilitychange', handleVisibility, { signal });
+  
+  // Single call removes ALL listeners registered with this signal
+  return () => controller.abort();
+}
+
+// Usage in React:
+useEffect(() => {
+  const cleanup = setupInteractiveWidget(ref.current);
+  return cleanup; // All listeners removed on unmount
+}, []);</code></pre>
+      </details>
+
+      <details>
+        <summary>Detecting listener leaks with getEventListeners() (Chrome-only)</summary>
+        <pre><code class="language-javascript">// In Chrome DevTools console:
+getEventListeners(window);
+// Returns: { resize: [{listener: ƒ, ...}, {listener: ƒ, ...}], ... }
+
+// If you see growing arrays of listeners, you have a leak.
+// Also available: monitorEvents(element, 'click') to live-watch.</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 10: WeakRef & FinalizationRegistry -->
+    <section id="weak-references">
+      <h2>WeakRef & FinalizationRegistry</h2>
+
+      <details>
+        <summary>WeakRef — holding a reference without preventing GC</summary>
+        <p>A <code>WeakRef</code> holds a reference to an object without preventing it from being garbage collected. This is the primary tool for building caches and observers that don't leak:</p>
+        <pre><code class="language-javascript">// ✅ Cache that doesn't prevent GC
+class WeakCache {
+  #cache = new Map(); // key → WeakRef(value)
+  
+  set(key, value) {
+    this.#cache.set(key, new WeakRef(value));
+  }
+  
+  get(key) {
+    const ref = this.#cache.get(key);
+    if (!ref) return undefined;
+    
+    const value = ref.deref(); // Returns object or undefined (if GC'd)
+    if (value === undefined) {
+      this.#cache.delete(key); // Clean up stale entry
+    }
+    return value;
+  }
+}
+
+// Usage:
+const cache = new WeakCache();
+let bigObject = createLargeObject();
+cache.set('data', bigObject);
+
+bigObject = null; // Only reference is now the WeakRef
+// On next GC, bigObject MAY be collected
+// cache.get('data') will return undefined after collection</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Important:</strong> <code>WeakRef.deref()</code> may return the object even after all strong references are gone — GC is non-deterministic. Never write code that <em>depends</em> on an object being collected at a specific time. WeakRef is for optimization (caches), not correctness.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>FinalizationRegistry — cleanup callbacks when objects are GC'd</summary>
+        <pre><code class="language-javascript">// FinalizationRegistry calls a callback when a registered object is GC'd
+const registry = new FinalizationRegistry((heldValue) => {
+  // Called (eventually) after the registered object is collected
+  console.log(`Object with id ${heldValue} was garbage collected`);
+  // Use this for: closing file handles, releasing external resources,
+  // removing entries from caches, logging metrics
+});
+
+class ResourceManager {
+  #registry = new FinalizationRegistry((id) => {
+    // Clean up external resource when JS object is GC'd
+    this.#releaseExternalResource(id);
+  });
+  
+  acquire(id) {
+    const resource = this.#createResource(id);
+    // Register: when 'resource' is GC'd, call cleanup with 'id'
+    this.#registry.register(resource, id);
+    return resource;
+  }
+  
+  #releaseExternalResource(id) { /* ... */ }
+  #createResource(id) { /* ... */ }
+}
+
+// ⚠️ CAVEAT: FinalizationRegistry callbacks are NOT guaranteed to run.
+// The spec allows implementations to never call them (e.g., on page unload).
+// Use them for optimization/cleanup, not for critical logic.</code></pre>
+      </details>
+
+      <details>
+        <summary>WeakMap and WeakSet — the earlier (and more common) weak reference tools</summary>
+        <pre><code class="language-javascript">// WeakMap: keys must be objects, and don't prevent GC of the key
+// Perfect for attaching private data to objects without leaking
+
+const privateData = new WeakMap();
+
+class Component {
+  constructor() {
+    // Private data stored externally — if Component instance is GC'd,
+    // the WeakMap entry is automatically cleaned up
+    privateData.set(this, {
+      renderCount: 0,
+      lastProps: null,
+      cachedResult: null
+    });
+  }
+  
+  render(props) {
+    const data = privateData.get(this);
+    data.renderCount++;
+    data.lastProps = props;
+    // ...
+  }
+}
+
+// WeakSet: for tracking object membership without preventing GC
+const processedNodes = new WeakSet();
+
+function processNode(node) {
+  if (processedNodes.has(node)) return; // Already processed
+  processedNodes.add(node);
+  // ... process node
+  // If 'node' is removed from DOM and all other references cleared,
+  // it will be GC'd regardless of WeakSet membership
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 11: Garbage Collection (Mark-Sweep, Generational) -->
+    <section id="garbage-collection">
+      <h2>Garbage Collection in V8</h2>
+
+      <details>
+        <summary>Generational GC — Young and Old space</summary>
+        <p>V8 uses a generational garbage collector based on the observation that most objects die young:</p>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│                      V8 Heap                                 │
+│                                                             │
+│  ┌─────────────────────────────────────┐                   │
+│  │     Young Generation (1-8MB)        │                   │
+│  │                                     │                   │
+│  │  ┌──────────┐   ┌──────────┐       │                   │
+│  │  │ Semi-     │   │ Semi-     │       │  ◄── Scavenger    │
+│  │  │ space     │   │ space     │       │      (Minor GC)   │
+│  │  │ (From)    │   │ (To)      │       │      ~1-2ms       │
+│  │  └──────────┘   └──────────┘       │                   │
+│  └─────────────────────────────────────┘                   │
+│           │ survives 2 collections                          │
+│           ▼                                                 │
+│  ┌─────────────────────────────────────┐                   │
+│  │     Old Generation (hundreds MB)    │                   │
+│  │                                     │  ◄── Mark-Compact │
+│  │  Objects that survived Young Gen    │      (Major GC)   │
+│  │  Long-lived closures live here      │      ~10-100ms    │
+│  │  Module-level variables             │                   │
+│  │                                     │                   │
+│  └─────────────────────────────────────┘                   │
+└─────────────────────────────────────────────────────────────┘
+        </pre>
+        <ul>
+          <li><strong>Scavenger (Minor GC):</strong> Collects the Young Generation. Very fast (1-2ms). Uses semi-space copying — live objects are copied from one space to the other, dead objects are simply abandoned.</li>
+          <li><strong>Mark-Compact (Major GC):</strong> Collects the Old Generation. Slower (10-100ms). Marks all reachable objects from GC roots, then compacts (moves) live objects to eliminate fragmentation.</li>
+          <li><strong>Incremental Marking:</strong> Major GC work is split across multiple small steps interleaved with JavaScript execution to avoid long pauses.</li>
+          <li><strong>Concurrent Marking/Sweeping:</strong> GC work happens on background threads while JS continues running on the main thread.</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>Why closures end up in Old Generation</summary>
+        <p>Closures that escape their creating function (returned, stored in a variable, attached as event handlers) typically survive multiple Scavenger cycles and get promoted to Old Generation. This means:</p>
+        <ul>
+          <li>They're only collected during Major GC (less frequent)</li>
+          <li>They contribute to Major GC pressure (more objects to mark)</li>
+          <li>They may never be collected if they remain reachable from a GC root</li>
+        </ul>
+        <pre><code class="language-javascript">// This closure is allocated in Young Gen...
+function createClosureInLoop() {
+  for (let i = 0; i < 1000; i++) {
+    const handler = () => i; // Created in Young Gen
+    
+    if (i === 999) {
+      // Only one escapes → only it gets promoted to Old Gen
+      globalThis.savedHandler = handler;
+    }
+    // The other 999 closures die in Young Gen (cheap Scavenger collection)
+  }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>GC roots — what keeps objects alive</summary>
+        <p>An object is alive (won't be collected) if it's reachable from any GC root:</p>
+        <ul>
+          <li><strong>Global object</strong> (window/globalThis)</li>
+          <li><strong>Currently executing functions</strong> (call stack frames)</li>
+          <li><strong>Active timers/intervals</strong> (setTimeout, setInterval references)</li>
+          <li><strong>Event listeners</strong> attached to live DOM nodes</li>
+          <li><strong>Module-level variables</strong> (ES modules persist for app lifetime)</li>
+          <li><strong>Web API callbacks</strong> (pending Promises, fetch, observers)</li>
+        </ul>
+        <p>If a closure is reachable from ANY of these roots, its entire Context chain remains alive.</p>
+      </details>
+    </section>
+
+    <!-- Section 12: Heap Snapshots & Allocation Timelines -->
+    <section id="heap-snapshots">
+      <h2>Heap Snapshots & Allocation Timelines</h2>
+
+      <details>
+        <summary>Three-snapshot technique for finding leaks</summary>
+        <p>The most reliable method for identifying closure-related memory leaks:</p>
+        <ol>
+          <li><strong>Snapshot 1:</strong> Take a baseline heap snapshot after the app is in a stable state</li>
+          <li><strong>Perform the suspected leaky operation</strong> (navigate to a page, open a modal, resize, etc.)</li>
+          <li><strong>Undo the operation</strong> (navigate back, close the modal, etc.)</li>
+          <li><strong>Force GC</strong> (click the trash can icon in DevTools Memory panel)</li>
+          <li><strong>Snapshot 2:</strong> Take another snapshot</li>
+          <li><strong>Compare:</strong> Use "Comparison" view between Snapshot 1 and 2. Objects present in 2 but not in 1 are potential leaks</li>
+        </ol>
+        <p>For cumulative leaks, repeat steps 2-3 multiple times before taking Snapshot 2. This amplifies the leak signal.</p>
+        <div class="callout callout-tip">
+          <p><strong>DevTools tip:</strong> In the heap snapshot view, filter by <code>system / Context</code> to see V8's closure Context objects directly. Each one represents a captured scope. Growing counts of these objects between snapshots is a strong signal of closure-related leaks. You can also type <code>Detached</code> in the filter to find DOM nodes still referenced by closures.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Reading the Retainers panel for closures</summary>
+        <pre class="diagram">
+DevTools Memory Panel — Retainer Chain Example:
+
+Object: Array @123456 (Retained size: 8,388,608 bytes)
+
+Retainers:
+  └── hugeData in Context @234567
+        └── context in processData() @345678
+              └── handlers[0] in Object @456789
+                    └── #cache in DataService @567890
+                          └── dataService in Object @678901
+                                └── Window / global
+
+Reading bottom-up: The Window holds a dataService,
+which has a #cache, which has a handlers array,
+which contains processData (a closure), whose Context
+holds hugeData (8MB array).
+
+FIX: Either remove the handler from the cache,
+or restructure so processData doesn't share a Context with hugeData.
+        </pre>
+      </details>
+
+      <details>
+        <summary>Allocation instrumentation timeline</summary>
+        <p>For slow/gradual leaks, the <strong>Allocation instrumentation on timeline</strong> (DevTools Memory panel) shows exactly when objects are allocated and which survive GC:</p>
+        <ul>
+          <li><strong>Blue bars:</strong> Objects allocated at that time point</li>
+          <li><strong>Gray bars:</strong> Objects that were allocated but have since been collected (not a leak)</li>
+          <li><strong>Remaining blue bars:</strong> Objects still alive — zoom in to investigate</li>
+        </ul>
+        <pre><code class="language-javascript">// Programmatic heap measurement for CI/monitoring
+// (Chrome-only API; values are coarse/bucketed by design to mitigate
+// Spectre-style timing attacks — don't rely on precise byte counts)
+async function measureMemoryGrowth(operation, iterations = 10) {
+  // Force GC before measurement (Chrome DevTools protocol)
+  if (window.gc) window.gc();
+  
+  const before = performance.memory.usedJSHeapSize;
+  
+  for (let i = 0; i < iterations; i++) {
+    await operation();
+  }
+  
+  if (window.gc) window.gc();
+  await new Promise(r => setTimeout(r, 100)); // Let GC settle
+  
+  const after = performance.memory.usedJSHeapSize;
+  const growth = after - before;
+  const perIteration = growth / iterations;
+  
+  console.log(`Memory growth: ${(growth / 1024).toFixed(1)}KB total, ${(perIteration / 1024).toFixed(1)}KB/iteration`);
+  
+  if (perIteration > 10240) { // > 10KB per iteration
+    console.warn('Potential memory leak detected!');
+  }
+  
+  return { before, after, growth, perIteration };
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 13: Production Debugging Workflow -->
+    <section id="production-debugging">
+      <h2>Production Debugging Workflow — SPA Memory Leak Investigation</h2>
+
+      <details>
+        <summary>Symptoms</summary>
+        <ul>
+          <li>Customer support reports that a CRM dashboard becomes "sluggish" after 2-3 hours of use</li>
+          <li>Browser tab memory grows from 150MB to 800MB+ over time</li>
+          <li>Page eventually crashes with "Out of Memory" (Aw, Snap!)</li>
+          <li>Refreshing the page fixes it temporarily</li>
+          <li>Only affects users who navigate frequently between views (SPA routing)</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>Root Cause</summary>
+        <p>A data visualization library created closures for chart event handlers. When users navigated away, the React component unmounted, but the chart library's internal event system retained references to the closures. Each closure captured the component's state (including large dataset arrays).</p>
+        <pre><code class="language-javascript">// ⚠️ THE PROBLEMATIC CODE
+function ChartView({ data }) {
+  const chartRef = useRef(null);
+  
+  useEffect(() => {
+    const chart = new ChartLibrary(chartRef.current);
+    
+    // These closures capture 'data' (large array) in their Context
+    chart.on('hover', (point) => {
+      showTooltip(point, data); // Closure captures 'data'
+    });
+    
+    chart.on('click', (point) => {
+      drillDown(point, data); // Closure captures 'data'
+    });
+    
+    chart.render(data);
+    
+    // Cleanup removes the DOM canvas...
+    return () => {
+      chart.destroy(); // But chart.destroy() doesn't remove internal listeners!
+      // The chart library's event emitter still holds references to our closures
+      // Our closures still reference 'data' (potentially megabytes)
+    };
+  }, [data]);
+  
+  return &lt;div ref={chartRef} /&gt;;
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Investigation steps</summary>
+        <ol>
+          <li><strong>Reproduce:</strong> Navigate between Dashboard → Chart → Dashboard → Chart 10 times</li>
+          <li><strong>DevTools Memory:</strong> Take heap snapshots before and after navigation cycles</li>
+          <li><strong>Comparison view:</strong> Filter by "Detached" — found hundreds of detached canvas elements</li>
+          <li><strong>Retainer chain:</strong> Canvas → ChartLibrary.#listeners → closure → Context → data (Array, 5MB each)</li>
+          <li><strong>Confirm:</strong> After 10 navigations, 10 copies of data retained (~50MB leaked)</li>
+        </ol>
+      </details>
+
+      <details>
+        <summary>Resolution</summary>
+        <pre><code class="language-javascript">// ✅ THE FIX
+function ChartView({ data }) {
+  const chartRef = useRef(null);
+  const chartInstance = useRef(null);
+  
+  useEffect(() => {
+    const chart = new ChartLibrary(chartRef.current);
+    chartInstance.current = chart;
+    
+    // Use named handlers so we can remove them explicitly
+    const handleHover = (point) => showTooltip(point, data);
+    const handleClick = (point) => drillDown(point, data);
+    
+    chart.on('hover', handleHover);
+    chart.on('click', handleClick);
+    chart.render(data);
+    
+    return () => {
+      // Explicitly remove all listeners BEFORE destroy
+      chart.off('hover', handleHover);
+      chart.off('click', handleClick);
+      chart.destroy();
+      chartInstance.current = null;
+    };
+  }, [data]);
+  
+  return &lt;div ref={chartRef} /&gt;;
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Lessons Learned</summary>
+        <ul>
+          <li><strong>Library .destroy() ≠ full cleanup:</strong> Never assume a third-party library's destroy method removes all internal references. Explicitly remove event handlers you registered.</li>
+          <li><strong>Test navigation cycles:</strong> SPA memory leaks often only manifest after repeated navigation. Add automated tests that navigate N times and check memory growth.</li>
+          <li><strong>Monitor in production:</strong> Use <code>performance.measureUserAgentSpecificMemory()</code> (cross-origin isolated contexts) or <code>performance.memory</code> (Chrome) to track memory in RUM.</li>
+          <li><strong>Closure capture audit:</strong> When closures capture large objects (datasets, DOM trees), ensure the closure's lifetime matches the object's intended lifetime.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 14: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+
+      <details>
+        <summary>Interview classic — the closure in a loop</summary>
+        <pre><code class="language-javascript">// ⚠️ Classic bug — all callbacks share one binding
+for (var i = 0; i < 5; i++) {
+  setTimeout(() => console.log(i), i * 100);
+}
+// Output: 5, 5, 5, 5, 5 (all closures see the same 'i')
+
+// ✅ Fix 1: let (block scoping — new LexicalEnvironment per iteration)
+for (let i = 0; i < 5; i++) {
+  setTimeout(() => console.log(i), i * 100);
+}
+// Output: 0, 1, 2, 3, 4
+
+// ✅ Fix 2: IIFE (creates a new scope per iteration — pre-ES6 pattern)
+for (var i = 0; i < 5; i++) {
+  ((j) => {
+    setTimeout(() => console.log(j), j * 100);
+  })(i);
+}
+// Output: 0, 1, 2, 3, 4
+
+// ✅ Fix 3: bind (creates a new function with i pre-filled)
+for (var i = 0; i < 5; i++) {
+  setTimeout(console.log.bind(console, i), i * 100);
+}
+// Output: 0, 1, 2, 3, 4</code></pre>
+        <p><strong>Engine perspective:</strong> With <code>var</code>, there's one Context object for the entire function scope containing a single <code>i</code> binding. With <code>let</code>, the spec requires a new LexicalEnvironment per iteration — V8 implements this as a fresh Context per loop body, each with its own copy of <code>i</code>.</p>
+      </details>
+
+      <details>
+        <summary>Closure-based private state — the module pattern</summary>
+        <pre><code class="language-javascript">// Module pattern — closure provides encapsulation
+const Counter = (() => {
+  // These are in the IIFE's Context — inaccessible from outside
+  let count = 0;
+  const history = [];
+  
+  return {
+    increment() {
+      count++;
+      history.push({ action: 'inc', time: Date.now() });
+      return count;
+    },
+    decrement() {
+      count--;
+      history.push({ action: 'dec', time: Date.now() });
+      return count;
+    },
+    getHistory() {
+      return [...history]; // Return copy, not reference
+    }
+  };
+})();
+
+// V8 representation:
+// Counter.increment → JSFunction → Context { count: 0, history: [] }
+// Counter.decrement → JSFunction → same Context (shared!)
+// Counter.getHistory → JSFunction → same Context (shared!)
+//
+// All three methods share ONE Context object.
+// Memory implication: even if you only keep a reference to getHistory,
+// 'count' stays alive because the shared Context contains it.</code></pre>
+      </details>
+
+      <details>
+        <summary>Practical closure: debounce with cancel</summary>
+        <pre><code class="language-javascript">// Each call to createDebouncedFn returns a closure over 'timeoutId'
+function createDebouncedFn(fn, delay) {
+  let timeoutId = null; // Context-allocated (captured by inner functions)
+  
+  function debounced(...args) {
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => {
+      fn.apply(this, args); // 'args' captured per invocation
+    }, delay);
+  }
+  
+  debounced.cancel = () => {
+    clearTimeout(timeoutId);
+    timeoutId = null;
+  };
+  
+  debounced.flush = () => {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+      fn(); // Execute immediately
+      timeoutId = null;
+    }
+  };
+  
+  return debounced;
+}
+
+// Memory note: 'fn' is captured in the Context.
+// If fn is a large closure itself, it's retained for the lifetime
+// of the debounced function. Ensure cleanup:
+const debouncedSearch = createDebouncedFn(handleSearch, 300);
+// Later, when no longer needed:
+debouncedSearch.cancel();
+// But 'fn' (handleSearch) is still retained by debouncedSearch's Context!
+// The only way to fully release is to lose all references to debouncedSearch.</code></pre>
+      </details>
+
+      <details>
+        <summary>Closure memory measurement utility</summary>
+        <pre><code class="language-javascript">/**
+ * Utility to detect closure-related memory leaks in development.
+ * Tracks the number of active closures created by a factory function.
+ */
+class ClosureTracker {
+  #active = new Set();
+  #registry = new FinalizationRegistry((id) => {
+    this.#active.delete(id);
+    console.log(`[ClosureTracker] Closure ${id} was GC'd. Active: ${this.#active.size}`);
+  });
+  
+  #nextId = 0;
+  
+  track(closure) {
+    const id = this.#nextId++;
+    this.#active.add(id);
+    this.#registry.register(closure, id);
+    return closure;
+  }
+  
+  get activeCount() {
+    return this.#active.size;
+  }
+  
+  report() {
+    console.log(`[ClosureTracker] ${this.#active.size} closures still alive`);
+  }
+}
+
+// Usage in development:
+const tracker = new ClosureTracker();
+
+function createHandler(data) {
+  const handler = () => process(data);
+  return tracker.track(handler);
+}
+
+// After some operations:
+tracker.report(); // Shows how many handlers are still alive</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 15: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Mistake 1: Assuming closures only capture what they reference</summary>
+        <p><strong>The mistake:</strong> "My closure only uses <code>x</code>, so only <code>x</code> is retained."</p>
+        <p><strong>Reality:</strong> V8's scope analysis is usually precise — it only context-allocates referenced variables. But ALL closures in the same scope share one Context object. If a sibling closure references <code>y</code>, your closure's Context also contains <code>y</code>.</p>
+        <pre><code class="language-javascript">function setup() {
+  const small = 'hello';
+  const huge = new Array(1_000_000);
+  
+  const lightClosure = () => small;  // "Only uses small"
+  const heavyClosure = () => huge;   // Uses huge
+  
+  // BOTH closures share Context { small, huge }
+  // Keeping lightClosure alive retains 'huge' too!
+  
+  globalThis.saved = lightClosure; // huge is now retained forever
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Mistake 2: Not cleaning up in useEffect</summary>
+        <p><strong>The mistake:</strong> Adding subscriptions/listeners in useEffect without returning a cleanup function.</p>
+        <pre><code class="language-javascript">// ⚠️ Every re-render with new 'query' adds a listener, never removes old one
+useEffect(() => {
+  const ws = new WebSocket(`wss://api.example.com?q=${query}`);
+  ws.onmessage = (event) => {
+    setResults(JSON.parse(event.data)); // Closure captures setResults
+  };
+  // Missing: return () => ws.close();
+}, [query]);
+
+// ✅ Fixed
+useEffect(() => {
+  const ws = new WebSocket(`wss://api.example.com?q=${query}`);
+  ws.onmessage = (event) => {
+    setResults(JSON.parse(event.data));
+  };
+  return () => ws.close(); // Cleanup: close old connection
+}, [query]);</code></pre>
+      </details>
+
+      <details>
+        <summary>Mistake 3: Closures in class fields and prototype pollution</summary>
+        <p><strong>The mistake:</strong> Creating closures inside constructors, creating unique functions per instance where prototype methods would suffice.</p>
+        <pre><code class="language-javascript">// ⚠️ Each instance creates new function objects (closure per instance)
+class Button {
+  constructor(label) {
+    // These closures capture 'label' — new JSFunction + Context per instance
+    this.handleClick = () => console.log(`Clicked: ${label}`);
+    this.handleHover = () => console.log(`Hovered: ${label}`);
+  }
+}
+// 1000 Buttons = 2000 JSFunction objects + 1000 Context objects
+
+// ✅ Use methods (shared via prototype) when closure capture isn't needed
+class Button {
+  #label;
+  constructor(label) {
+    this.#label = label;
+  }
+  handleClick() { console.log(`Clicked: ${this.#label}`); }  // On prototype
+  handleHover() { console.log(`Hovered: ${this.#label}`); }  // On prototype
+}
+// 1000 Buttons = 0 extra function objects (methods shared on prototype)</code></pre>
+      </details>
+
+      <details>
+        <summary>Mistake 4: console.log retaining objects in production</summary>
+        <p><strong>The mistake:</strong> Leaving <code>console.log(largeObject)</code> in production code.</p>
+        <p><strong>Reality:</strong> The DevTools console retains references to all logged objects (so you can expand them later). In Chrome, this can keep large objects alive for the browser session. This isn't technically a closure issue, but it interacts with closure retention — a logged closure prevents its Context (and all captured variables) from being collected.</p>
+        <pre><code class="language-javascript">// ⚠️ In production with DevTools open, this retains closureWithHugeContext
+console.log('Handler:', closureWithHugeContext);
+// DevTools holds a reference → Context alive → huge data retained
+
+// ✅ Log only what you need, strip console.* in production builds
+console.log('Handler registered for:', handlerName);</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 16: Follow-up Interview Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Q1: What's the difference between a closure's Context in V8 and the spec's LexicalEnvironment?</summary>
+        <p><strong>Strong answer:</strong> The spec defines Lexical Environments as an abstract concept — an Environment Record (bindings) plus an outer reference. V8 implements this as a <code>Context</code> object: a fixed-size array on the heap where each slot holds a captured variable. The key difference: the spec's model is per-block (every block can have its own LexicalEnvironment), while V8 optimizes by only creating Context objects for scopes that actually have captured variables. Non-captured variables stay on the stack. Additionally, V8 creates one Context per scope level shared by all closures in that scope, while the spec treats each function's [[Environment]] independently.</p>
+      </details>
+
+      <details>
+        <summary>Q2: How would you find a memory leak caused by closures in a production application?</summary>
+        <p><strong>Strong answer:</strong> I'd use the three-snapshot technique: (1) baseline snapshot, (2) trigger the suspected leaky operation N times, (3) take another snapshot and compare. I filter for growing object counts — especially "system / Context" objects (V8's closure contexts). For each retained object, I trace the Retainer chain backwards from the object to the GC root. Typically I find: event listener → closure → Context → large object. The fix is to ensure cleanup functions (removeEventListener, clearInterval, AbortController.abort) actually sever the reference chain. For production monitoring without DevTools, I use <code>performance.measureUserAgentSpecificMemory()</code> in cross-origin isolated contexts to track overall growth trends.</p>
+      </details>
+
+      <details>
+        <summary>Q3: Can V8 collect a variable that a closure could theoretically access but never actually uses?</summary>
+        <p><strong>Strong answer:</strong> Yes, in most cases. V8's parser performs static scope analysis during compilation and only context-allocates variables that are actually referenced by inner functions. Unreferenced variables stay on the stack and are freed when the function returns. However, there are exceptions: if the closure contains <code>eval()</code> (direct eval), V8 must pessimistically keep ALL variables alive because eval could reference any of them. The same applies to <code>with</code> statements. Indirect eval — <code>(0, eval)('code')</code> — runs in global scope and doesn't trigger this pessimization.</p>
+      </details>
+
+      <details>
+        <summary>Q4: Why does the shared Context problem make the module pattern potentially dangerous for memory?</summary>
+        <p><strong>Strong answer:</strong> In the module pattern (or any scope with multiple closures), all closures share a single Context object. If one closure in the group is long-lived (e.g., an event handler kept on a global element) while others are short-lived, the long-lived closure keeps the entire shared Context alive — including variables only used by the short-lived closures. The fix is scope isolation: wrap distinct variable groups in their own IIFEs or blocks so they get separate Context objects. This is especially important in modules where top-level variables persist for the application lifetime.</p>
+      </details>
+
+      <details>
+        <summary>Q5: How do WeakRef and WeakMap differ in preventing closure-related leaks?</summary>
+        <p><strong>Strong answer:</strong> <code>WeakMap</code> uses objects as keys and doesn't prevent GC of those keys — perfect for associating data with objects (like DOM nodes or component instances) without leaking. <code>WeakRef</code> is for holding a reference to a value that might be collected — you must check <code>.deref()</code> each time. Use WeakMap when you want "data dies with its owner." Use WeakRef when you want "data may disappear and that's OK" (caches, canonicalization maps). Neither solves the closure Context retention problem directly — for that, you need to either null out variables, restructure scopes, or remove the closure from wherever it's registered.</p>
+      </details>
+
+      <details>
+        <summary>Q6: Explain how for-let creates separate closures per iteration at the engine level.</summary>
+        <p><strong>Strong answer:</strong> The ECMAScript spec requires that each iteration of a for-loop with <code>let</code> creates a fresh Lexical Environment containing a copy of the loop variable. V8 implements this by creating a new Context object per iteration. Each closure created inside the loop body captures a reference to its iteration's Context. So if you create 5 closures in a for-let loop, there are 5 separate Context objects, each with its own <code>i</code> binding. With <code>var</code>, there's a single Context for the function scope, and all closures share the same <code>i</code>. The per-iteration Context allocation is why for-let is slightly more expensive than for-var in tight loops — but the cost is negligible in practice and enables correct behavior.</p>
+      </details>
+
+      <details>
+        <summary>Q7: In React, how does the stale closure problem manifest, and how does it relate to useRef?</summary>
+        <p><strong>Strong answer:</strong> In React, each render creates new closures for event handlers and effect callbacks. These closures capture the state values from that render (via their Context). If an effect or handler runs later but still references old closures (e.g., a setTimeout scheduled during a previous render), it sees stale state — the values from when the closure was created, not the current values. <code>useRef</code> solves this because it returns a stable object (same reference across renders). By writing current state into <code>ref.current</code>, any closure can read the latest value through the ref — the closure doesn't need to capture the value directly, it captures the ref container (which never changes). This decouples the closure's lifetime from the state's freshness.</p>
+        <pre><code class="language-javascript">// ⚠️ STALE CLOSURE — logs the count from when the effect ran
+function Timer() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      console.log(count); // Always logs 0 — closure captured initial count
+    }, 1000);
+    return () => clearInterval(id);
+  }, []); // Empty deps → closure created once, never refreshed
+
+  return &lt;button onClick={() => setCount(c => c + 1)}>Count: {count}&lt;/button>;
+}
+
+// ✅ FIX — useRef holds the latest value, closure reads through ref
+function Timer() {
+  const [count, setCount] = useState(0);
+  const countRef = useRef(count);
+  countRef.current = count; // Update ref on every render
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      console.log(countRef.current); // Always reads latest count
+    }, 1000);
+    return () => clearInterval(id);
+  }, []); // Closure captures countRef (stable), not count (stale)
+
+  return &lt;button onClick={() => setCount(c => c + 1)}>Count: {count}&lt;/button>;
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 17: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Key mental models for the interview:</strong></p>
+        <ul>
+          <li><strong>Closure = JSFunction + Context.</strong> The Context is a heap-allocated array holding captured variables with a pointer to the parent Context.</li>
+          <li><strong>V8 is smart about capture.</strong> Only variables referenced by inner functions are context-allocated. Unreferenced variables stay on the stack and don't leak.</li>
+          <li><strong>Shared Context is the trap.</strong> Sibling closures share one Context per scope level. A lightweight closure can retain heavy data captured by its sibling.</li>
+          <li><strong>eval() defeats optimization.</strong> Direct eval forces all variables to be context-allocated because V8 can't statically analyze what eval will access.</li>
+          <li><strong>Leaks = retained beyond intended lifetime.</strong> Event listeners, timers, module-level caches, and subscriptions are the usual suspects.</li>
+          <li><strong>Three-snapshot technique</strong> is the gold standard for finding closure leaks. Trace the Retainer chain from leaked object back to GC root.</li>
+          <li><strong>WeakRef/WeakMap for caches.</strong> Use them when you want the GC to reclaim entries when they're no longer needed elsewhere.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout-warning">
+        <p><strong>What NOT to say in an interview:</strong></p>
+        <ul>
+          <li>❌ "A closure is a function that remembers its outer variables" — too simplistic for a senior role. Explain the engine mechanism.</li>
+          <li>❌ "JavaScript has no memory leaks because it has GC" — GC collects unreachable objects. Closures keep things reachable.</li>
+          <li>❌ "Just use WeakRef everywhere to prevent leaks" — WeakRef doesn't solve the fundamental problem of closures retaining their Context. The closure itself must become unreachable.</li>
+          <li>❌ "V8 captures the entire scope" — incorrect (except with eval). V8 performs precise scope analysis.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+</body>
+</html>

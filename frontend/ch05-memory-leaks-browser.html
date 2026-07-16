@@ -1,0 +1,1435 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 5: Memory Leaks in Browser Applications | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <a href="../index.html">
+        <span class="chapter-num">Ch 5</span>
+        <span class="chapter-title">Memory Leaks in Browser</span>
+      </a>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#browser-memory-model">Browser Memory Model</a></li>
+        <li><a href="#heap-generations">Heap Generations</a></li>
+        <li><a href="#gc-algorithms">GC Algorithms in V8</a></li>
+        <li><a href="#leak-patterns">Common SPA Leak Patterns</a></li>
+        <li><a href="#devtools-memory">DevTools Memory Panel</a></li>
+        <li><a href="#heap-snapshots">Heap Snapshots Comparison</a></li>
+        <li><a href="#allocation-instrumentation">Allocation Instrumentation</a></li>
+        <li><a href="#memory-api">Memory Measurement API</a></li>
+        <li><a href="#weak-references">WeakMap, WeakSet, WeakRef</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging-workflow">Debugging Workflow</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <a href="../index.html#part-1">Part I — JavaScript Engine Internals</a> &gt;
+      <span>Chapter 5</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-memory">Memory</span>
+        <span class="badge badge-v8">V8</span>
+        <span class="badge badge-devtools">DevTools</span>
+        <span class="badge badge-performance">Performance</span>
+      </div>
+      <h1>Memory Leaks in Browser Applications</h1>
+      <blockquote class="chapter-question">
+        "How would you investigate a memory leak that only appears after hours of usage in a single-page application?"
+      </blockquote>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Memory leaks in SPAs are objects that remain reachable from GC roots but serve no purpose. The three-snapshot technique, allocation timelines, and retainer chain analysis in Chrome DevTools are your primary investigative tools. The most common causes — detached DOM nodes, forgotten event listeners, closures over stale state, uncleared timers, and growing global collections — all share one root cause: references that outlive their intended lifecycle.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="text" class="search-input" placeholder="Search this chapter..." aria-label="Search">
+    </div>
+
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details>
+        <summary>What the interviewer is really testing</summary>
+        <div class="callout callout-info">
+          <strong>This question tests three capabilities simultaneously:</strong>
+        </div>
+        <ul>
+          <li><strong>Systematic debugging approach:</strong> Can you methodically isolate a leak that takes hours to manifest, rather than guessing? Do you have a reproducible workflow?</li>
+          <li><strong>Understanding of browser memory model:</strong> Do you know how V8 manages memory, what constitutes a GC root, and why certain patterns prevent collection?</li>
+          <li><strong>Production experience:</strong> Have you actually debugged memory issues in real applications? Can you describe specific tooling, metrics, and war stories?</li>
+        </ul>
+        <p>Senior candidates should demonstrate fluency with Chrome DevTools Memory panel, articulate the difference between shallow and retained size, and explain why SPA architecture inherently creates more leak opportunities than traditional multi-page apps.</p>
+        <div class="callout callout-warning">
+          <strong>Red flags for interviewers:</strong> Candidates who jump straight to "use a profiler" without explaining what they'd look for, or who can't differentiate between high memory usage and an actual leak (monotonically growing heap).
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details>
+        <summary>Structured response for time-pressured interviews</summary>
+        <div class="callout callout-tip">
+          <strong>Framework: Detect → Isolate → Identify → Fix → Prevent</strong>
+        </div>
+        <p><strong>Investigation methodology:</strong> I'd start by confirming it's a true leak (monotonically increasing heap, not just high watermark) using <code>performance.measureUserAgentSpecificMemory()</code> in production or the Performance Monitor in DevTools. Then I'd use the three-snapshot technique: snapshot baseline, perform the suspected leaking action repeatedly, snapshot again, compare retained objects.</p>
+        <p><strong>Common causes in SPAs:</strong></p>
+        <ol>
+          <li>Detached DOM trees held by JavaScript references</li>
+          <li>Event listeners on removed elements (or window/document listeners never removed)</li>
+          <li>Closures capturing large scopes in long-lived callbacks</li>
+          <li>Uncleared <code>setInterval</code>/<code>setTimeout</code> chains</li>
+          <li>Growing collections (Maps, arrays, caches) without eviction</li>
+        </ol>
+        <p><strong>Tools:</strong> Chrome DevTools Memory panel (heap snapshots, allocation timeline), Performance Monitor for real-time tracking, <code>memlab</code> from Meta for automated detection in CI.</p>
+        <p><strong>Fix patterns:</strong> Proper cleanup in component unmount/destroy lifecycle, WeakMap/WeakRef for caches, AbortController for fetch + event listeners, bounded LRU caches for data stores.</p>
+      </details>
+    </section>
+
+    <!-- Section 3: Browser Memory Model -->
+    <section id="browser-memory-model">
+      <h2>Browser Memory Model</h2>
+      <details>
+        <summary>V8 heap structure, process isolation, and memory limits</summary>
+        <h3>V8 Heap Architecture</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────┐
+│                    V8 Heap (per Isolate)                 │
+├──────────────────┬──────────────────────────────────────┤
+│   Young Gen      │           Old Gen                    │
+│  ┌────┬────┐     │  ┌──────────────────────────────┐    │
+│  │From│ To │     │  │  Old Pointer Space            │    │
+│  │Space│Space│   │  ├──────────────────────────────┤    │
+│  └────┴────┘     │  │  Old Data Space               │    │
+│  (1-8 MB)        │  └──────────────────────────────┘    │
+│                   │  (up to ~4 GB on 64-bit)            │
+├──────────────────┼──────────────────────────────────────┤
+│  Large Object Space (objects &gt; 128KB, never moved)      │
+├─────────────────────────────────────────────────────────┤
+│  Code Space (JIT-compiled machine code)                 │
+├─────────────────────────────────────────────────────────┤
+│  Map Space (hidden classes / object shapes)             │
+└─────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Process Isolation</h3>
+        <p>Each browser tab (origin) runs in its own renderer process with its own V8 isolate. This means:</p>
+        <ul>
+          <li>A leak in one tab cannot directly affect another tab's memory</li>
+          <li>Each tab has independent GC scheduling and heap limits</li>
+          <li>Site Isolation (Chrome 67+) ensures cross-origin iframes get separate processes</li>
+          <li>Service Workers get their own isolate but share the registration's memory budget</li>
+        </ul>
+
+        <h3>Memory Limits</h3>
+        <table>
+          <thead>
+            <tr><th>Platform</th><th>Default Heap Limit</th><th>Configurable?</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>64-bit Desktop</td><td>~4 GB</td><td>Yes (--max-old-space-size in Node)</td></tr>
+            <tr><td>32-bit</td><td>~1.5 GB</td><td>Limited</td></tr>
+            <tr><td>Mobile (Android)</td><td>~512 MB - 1.5 GB</td><td>Device-dependent</td></tr>
+            <tr><td>WebWorker</td><td>Same as parent</td><td>Shares process limit</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Shared Memory</h3>
+        <p><code>SharedArrayBuffer</code> allows sharing raw byte buffers between workers and the main thread. It lives outside the normal V8 heap in a separately allocated memory region, and is not subject to GC — it's reference-counted across agents.</p>
+        <div class="callout callout-warning">
+          <strong>Cross-origin isolation required:</strong> <code>SharedArrayBuffer</code> requires <code>Cross-Origin-Opener-Policy: same-origin</code> and <code>Cross-Origin-Embedder-Policy: require-corp</code> headers since Spectre mitigations (Chrome 92+).
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: Heap Generations -->
+    <section id="heap-generations">
+      <h2>Heap Generations</h2>
+      <details>
+        <summary>Young Gen scavenging, Old Gen compaction, and promotion</summary>
+        <h3>Young Generation: Scavenger (Semi-Space Copying)</h3>
+        <p>The Young Generation is divided into two equal semi-spaces: <strong>From-Space</strong> (active) and <strong>To-Space</strong> (empty). When From-Space fills up:</p>
+        <ol>
+          <li>Live objects are identified by tracing from GC roots</li>
+          <li>Live objects are copied to To-Space (compacting in the process)</li>
+          <li>From-Space and To-Space labels are swapped</li>
+          <li>Dead objects are implicitly freed (the old From-Space is now empty To-Space)</li>
+        </ol>
+        <pre><code class="language-javascript">// Objects here are short-lived — most die in Young Gen
+function processEvent(event) {
+  const temp = { x: event.clientX, y: event.clientY }; // Born, used, dies
+  return temp.x + temp.y;
+  // temp becomes unreachable, collected in next scavenge
+}</code></pre>
+
+        <h3>Old Generation: Mark-Compact</h3>
+        <p>Objects that survive Young Gen are promoted to Old Gen, where a full Mark-Sweep-Compact cycle runs less frequently:</p>
+        <ul>
+          <li><strong>Mark:</strong> Traverse from roots, mark all reachable objects</li>
+          <li><strong>Sweep:</strong> Iterate heap, free unmarked objects, build free lists</li>
+          <li><strong>Compact:</strong> Move surviving objects to eliminate fragmentation</li>
+        </ul>
+
+        <h3>Promotion Criteria</h3>
+        <div class="callout callout-info">
+          An object is promoted to Old Gen when it has <strong>survived two scavenger cycles</strong> (configurable but rarely changed). This is the "generational hypothesis" — if an object survived two GCs, it's likely long-lived.
+        </div>
+
+        <h3>Large Object Space</h3>
+        <p>Objects larger than ~128KB are allocated directly in Large Object Space. They are <strong>never moved</strong> by the GC (copying them would be too expensive), and are individually collected via mark-sweep.</p>
+
+        <h3>Why Leaks End Up in Old Gen</h3>
+        <p>A leaked object by definition persists across many GC cycles. After surviving two scavenges (~seconds), it's promoted to Old Gen where it will remain until the retainer chain is broken. This is why leaks cause Old Gen growth — and why Old Gen pressure triggers expensive full GCs that cause visible jank.</p>
+      </details>
+    </section>
+
+    <!-- Section 5: GC Algorithms in V8 -->
+    <section id="gc-algorithms">
+      <h2>Garbage Collection Algorithms in V8</h2>
+      <details>
+        <summary>Mark-Sweep-Compact, incremental/concurrent marking, and Orinoco</summary>
+        <h3>Mark-Sweep-Compact Overview</h3>
+        <pre class="diagram">
+  GC Roots (window, stack, handles)
+       │
+       ▼
+  ┌─────────┐    Mark Phase         ┌─────────────────────┐
+  │  Root   │───────────────────────▶│ Traverse object graph│
+  │  Set    │                        │ Mark reachable = live│
+  └─────────┘                        └─────────────────────┘
+                                              │
+                                              ▼
+                                     ┌─────────────────────┐
+                                     │ Sweep: free unmarked │
+                                     │ Compact: defragment  │
+                                     └─────────────────────┘
+        </pre>
+
+        <h3>Incremental Marking</h3>
+        <p>Full marking can take 100ms+ on large heaps. V8 breaks this into small increments (~5ms chunks) interleaved with application execution using a <strong>write barrier</strong> to track mutations during marking:</p>
+        <pre><code class="language-javascript">// Conceptual write barrier (V8 internal)
+function writeBarrier(object, field, value) {
+  object[field] = value;
+  if (isMarking &amp;&amp; isBlack(object) &amp;&amp; isWhite(value)) {
+    // Object was already marked but now points to unmarked value
+    markGray(value); // Re-add to marking worklist
+  }
+}</code></pre>
+
+        <h3>Concurrent Marking</h3>
+        <p>Since V8 6.3, marking happens on <strong>background threads</strong> concurrently with JavaScript execution. The main thread only handles write barriers and finalization. This reduced GC pause times by 60-70%.</p>
+
+        <h3>Parallel Scavenging</h3>
+        <p>Young Gen scavenging uses multiple threads to copy objects in parallel. Each thread claims a portion of From-Space and copies to To-Space using atomic pointer operations to handle cross-thread references.</p>
+
+        <h3>Orinoco GC Improvements</h3>
+        <ul>
+          <li><strong>Concurrent sweeping:</strong> Free lists are built on background threads</li>
+          <li><strong>Concurrent compaction:</strong> Page evacuation happens off main thread</li>
+          <li><strong>Lazy sweeping:</strong> Pages are swept on-demand when allocation fails</li>
+          <li><strong>Black allocation:</strong> Objects allocated during marking are born black (marked)</li>
+        </ul>
+
+        <h3>GC Triggers and Heuristics</h3>
+        <table>
+          <thead>
+            <tr><th>Trigger</th><th>Action</th><th>When</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Young Gen full</td><td>Scavenge</td><td>Every ~1-8 MB allocated</td></tr>
+            <tr><td>Old Gen growing</td><td>Incremental marking start</td><td>Heuristic: predicted to fill before next idle</td></tr>
+            <tr><td>Allocation failure</td><td>Full GC</td><td>Cannot allocate, must collect now</td></tr>
+            <tr><td>Idle notification</td><td>Incremental marking step</td><td>requestIdleCallback or between frames</td></tr>
+            <tr><td>Memory pressure</td><td>Aggressive GC</td><td>OS signals low memory</td></tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 6: Common SPA Leak Patterns -->
+    <section id="leak-patterns">
+      <h2>Common SPA Leak Patterns</h2>
+
+      <details>
+        <summary>Detached DOM Nodes</summary>
+        <p>A detached DOM node is an element removed from the document tree but still referenced by JavaScript. The entire subtree under that element is retained.</p>
+        <pre><code class="language-javascript">// ❌ LEAK: Reference prevents GC of entire subtree
+let cachedElement = null;
+
+function showModal() {
+  const modal = document.createElement('div');
+  modal.innerHTML = '&lt;div class="modal"&gt;&lt;p&gt;Large content...&lt;/p&gt;&lt;/div&gt;';
+  document.body.appendChild(modal);
+  cachedElement = modal; // Strong reference retained
+}
+
+function hideModal() {
+  cachedElement.remove(); // Removed from DOM...
+  // But cachedElement still points to it! Detached but not collected.
+}</code></pre>
+        <pre><code class="language-javascript">// ✅ FIX: Null the reference after removal
+function hideModal() {
+  cachedElement.remove();
+  cachedElement = null; // Allow GC
+}
+
+// ✅ BETTER: Use WeakRef if you need conditional re-access
+let cachedRef = null;
+
+function showModal() {
+  const modal = document.createElement('div');
+  document.body.appendChild(modal);
+  cachedRef = new WeakRef(modal);
+}
+
+function getCachedModal() {
+  return cachedRef?.deref(); // Returns undefined if GC'd
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Forgotten Event Listeners</summary>
+        <p>Event listeners on <code>window</code>, <code>document</code>, or long-lived elements create closures that capture their enclosing scope. If the component is destroyed but the listener remains, the entire closure scope is retained.</p>
+        <pre><code class="language-javascript">// ❌ LEAK: Listener on window outlives component
+class ChatWidget {
+  constructor(container) {
+    this.container = container;
+    this.messages = []; // Grows unbounded
+    window.addEventListener('resize', () =&gt; {
+      this.relayout(); // Closure captures `this` (the whole ChatWidget)
+    });
+  }
+
+  destroy() {
+    this.container.remove();
+    // Listener still attached to window! ChatWidget cannot be GC'd
+  }
+}</code></pre>
+        <pre><code class="language-javascript">// ✅ FIX: Store reference and remove on cleanup
+class ChatWidget {
+  constructor(container) {
+    this.container = container;
+    this.messages = [];
+    this.handleResize = () =&gt; this.relayout();
+    window.addEventListener('resize', this.handleResize);
+  }
+
+  destroy() {
+    window.removeEventListener('resize', this.handleResize);
+    this.container.remove();
+    this.messages = null;
+  }
+}
+
+// ✅ MODERN: Use AbortController for bulk cleanup
+class ChatWidget {
+  constructor(container) {
+    this.controller = new AbortController();
+    const { signal } = this.controller;
+
+    window.addEventListener('resize', () =&gt; this.relayout(), { signal });
+    window.addEventListener('online', () =&gt; this.reconnect(), { signal });
+    document.addEventListener('visibilitychange', () =&gt; this.pause(), { signal });
+  }
+
+  destroy() {
+    this.controller.abort(); // Removes ALL listeners at once
+  }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Closures Holding References</summary>
+        <p>JavaScript closures capture variables from their lexical scope. If a closure is long-lived (stored in a callback, timer, or cache), it retains everything in scope — even variables you don't use in the closure body.</p>
+        <pre><code class="language-javascript">// ❌ LEAK: Closure retains `hugeData` even though it only uses `id`
+function createHandler(hugeData) {
+  const id = hugeData.id;
+  // V8 may or may not optimize away hugeData —
+  // if debugger is attached or eval exists, it won't
+  return function handler() {
+    console.log('Processing', id);
+  };
+}
+
+// The returned handler keeps hugeData alive in its closure scope
+const handler = createHandler(fetchLargeDataset());
+element.addEventListener('click', handler);</code></pre>
+        <pre><code class="language-javascript">// ✅ FIX: Extract only what you need before creating the closure
+function createHandler(hugeData) {
+  const id = hugeData.id;
+  const name = hugeData.name;
+  // hugeData goes out of scope here — no closure captures it
+  return function handler() {
+    console.log('Processing', id, name);
+  };
+}</code></pre>
+        <div class="callout callout-warning">
+          <strong>V8 Context Specialization:</strong> V8's optimizer can sometimes eliminate unused captured variables, but this is not guaranteed — especially with <code>eval</code>, <code>with</code>, debugger breakpoints, or when the closure is passed across module boundaries.
+        </div>
+      </details>
+
+      <details>
+        <summary>Timers &amp; Intervals Not Cleared</summary>
+        <pre><code class="language-javascript">// ❌ LEAK: Interval holds reference to component forever
+function startPolling(component) {
+  setInterval(() =&gt; {
+    const data = fetchUpdates();
+    component.updateView(data); // `component` kept alive by closure
+  }, 5000);
+  // No handle stored — can never be cleared!
+}
+
+// Component is "destroyed" but interval keeps running and retaining it</code></pre>
+        <pre><code class="language-javascript">// ✅ FIX: Store handle, clear on cleanup
+function startPolling(component) {
+  const intervalId = setInterval(() =&gt; {
+    if (!component.isConnected) {
+      clearInterval(intervalId); // Self-cleaning
+      return;
+    }
+    const data = fetchUpdates();
+    component.updateView(data);
+  }, 5000);
+
+  return () =&gt; clearInterval(intervalId); // Return cleanup function
+}
+
+// In component lifecycle:
+const stopPolling = startPolling(this);
+// On destroy:
+stopPolling();</code></pre>
+      </details>
+
+      <details>
+        <summary>Global State Accumulation</summary>
+        <pre><code class="language-javascript">// ❌ LEAK: Cache grows without bound
+const responseCache = new Map();
+
+async function fetchWithCache(url) {
+  if (responseCache.has(url)) return responseCache.get(url);
+  const response = await fetch(url);
+  const data = await response.json();
+  responseCache.set(url, data); // Never evicted!
+  return data;
+}
+// After navigating 1000 pages, cache holds 1000 entries</code></pre>
+        <pre><code class="language-javascript">// ✅ FIX: Bounded LRU cache
+class LRUCache {
+  constructor(maxSize = 100) {
+    this.cache = new Map();
+    this.maxSize = maxSize;
+  }
+
+  get(key) {
+    if (!this.cache.has(key)) return undefined;
+    const value = this.cache.get(key);
+    this.cache.delete(key);
+    this.cache.set(key, value); // Move to end (most recent)
+    return value;
+  }
+
+  set(key, value) {
+    this.cache.delete(key);
+    this.cache.set(key, value);
+    if (this.cache.size &gt; this.maxSize) {
+      const oldest = this.cache.keys().next().value;
+      this.cache.delete(oldest);
+    }
+  }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Observers Not Disconnected</summary>
+        <pre><code class="language-javascript">// ❌ LEAK: Observers hold strong refs to callbacks and targets
+function trackVisibility(element, callback) {
+  const observer = new IntersectionObserver(callback);
+  observer.observe(element);
+  // If element is removed, observer still references it
+  // Observer itself is rooted by the browser's internal observer list
+}
+
+// Same pattern with MutationObserver and ResizeObserver</code></pre>
+        <pre><code class="language-javascript">// ✅ FIX: Disconnect observers on cleanup
+function trackVisibility(element, callback) {
+  const observer = new IntersectionObserver((entries) =&gt; {
+    callback(entries);
+  });
+  observer.observe(element);
+
+  return () =&gt; {
+    observer.unobserve(element);
+    observer.disconnect(); // Full cleanup
+  };
+}
+
+// Usage with cleanup
+const cleanup = trackVisibility(el, handleVisible);
+// On destroy:
+cleanup();</code></pre>
+      </details>
+
+      <details>
+        <summary>React-Specific Leaks</summary>
+        <pre><code class="language-javascript">// ❌ LEAK: Missing effect cleanup
+function useSubscription(channel) {
+  const [messages, setMessages] = useState([]);
+
+  useEffect(() =&gt; {
+    const ws = new WebSocket(channel);
+    ws.onmessage = (e) =&gt; {
+      setMessages(prev =&gt; [...prev, e.data]); // State update on unmounted
+    };
+    // No return cleanup! WebSocket stays open, setMessages called on dead component
+  }, [channel]);
+}
+
+// ❌ LEAK: Stale ref holding detached DOM
+function VideoPlayer() {
+  const containerRef = useRef(null);
+  const playerInstance = useRef(null);
+
+  useEffect(() =&gt; {
+    playerInstance.current = new HeavyVideoLib(containerRef.current);
+    // No cleanup — playerInstance retains internal DOM subtree
+  }, []);
+}</code></pre>
+        <pre><code class="language-javascript">// ✅ FIX: Proper effect cleanup
+function useSubscription(channel) {
+  const [messages, setMessages] = useState([]);
+
+  useEffect(() =&gt; {
+    let cancelled = false;
+    const ws = new WebSocket(channel);
+    ws.onmessage = (e) =&gt; {
+      if (!cancelled) setMessages(prev =&gt; [...prev, e.data]);
+    };
+    return () =&gt; {
+      cancelled = true;
+      ws.close();
+    };
+  }, [channel]);
+}
+
+// ✅ FIX: Cleanup refs
+function VideoPlayer() {
+  const containerRef = useRef(null);
+  const playerInstance = useRef(null);
+
+  useEffect(() =&gt; {
+    playerInstance.current = new HeavyVideoLib(containerRef.current);
+    return () =&gt; {
+      playerInstance.current?.destroy();
+      playerInstance.current = null;
+    };
+  }, []);
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 7: Chrome DevTools Memory Panel -->
+    <section id="devtools-memory">
+      <h2>Chrome DevTools Memory Panel</h2>
+      <details>
+        <summary>Profiling modes, snapshot interpretation, and analysis techniques</summary>
+        <h3>Three Profiling Modes</h3>
+        <table>
+          <thead>
+            <tr><th>Mode</th><th>Use Case</th><th>Overhead</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Heap Snapshot</strong></td><td>Point-in-time view of all objects</td><td>Pauses JS, medium</td></tr>
+            <tr><td><strong>Allocation Instrumentation on Timeline</strong></td><td>Track every allocation over time</td><td>High (records stacks)</td></tr>
+            <tr><td><strong>Allocation Sampling</strong></td><td>Statistical sampling of allocations</td><td>Low (production-viable)</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Heap Snapshot Interpretation</h3>
+        <p>A heap snapshot shows every reachable object on the V8 heap. Key columns:</p>
+        <ul>
+          <li><strong>Constructor:</strong> The function that created the object (or built-in type)</li>
+          <li><strong>Distance:</strong> Shortest path from GC root (lower = closer to root = harder to leak)</li>
+          <li><strong>Shallow Size:</strong> Memory directly held by the object itself</li>
+          <li><strong>Retained Size:</strong> Memory that would be freed if this object were collected</li>
+        </ul>
+
+        <h3>Shallow Size vs Retained Size</h3>
+        <pre class="diagram">
+  Object A (shallow: 32B)
+    ├── Object B (shallow: 64B)  ← only referenced by A
+    │     └── Object C (shallow: 1MB) ← only referenced by B
+    └── Object D (shallow: 128B) ← also referenced by Root
+
+  A's retained size = 32 + 64 + 1MB = ~1MB + 96B
+  (D is NOT included because it has another retainer)
+        </pre>
+        <div class="callout callout-tip">
+          <strong>Investigation tip:</strong> Sort by Retained Size descending to find the objects whose collection would free the most memory. These are your primary suspects.
+        </div>
+
+        <h3>Object Groups and Distances</h3>
+        <p>Objects at distance 1 are directly referenced by GC roots (window, active stack frames, native handles). Most leaked objects will be at distance 3+ — they're kept alive through a chain of intermediaries.</p>
+
+        <h3>Filtering and Searching</h3>
+        <ul>
+          <li>Filter by class name: type constructor names in the filter bar</li>
+          <li>Search for "Detached" to find detached DOM trees</li>
+          <li>Right-click → "Reveal in Summary view" to jump between views</li>
+          <li>Use "Containment" view to see the exact reference chain from GC root</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 8: Heap Snapshots Comparison -->
+    <section id="heap-snapshots">
+      <h2>Heap Snapshots Comparison</h2>
+      <details>
+        <summary>Three-snapshot technique, comparison view, finding leaks</summary>
+        <h3>Three-Snapshot Technique (Step by Step)</h3>
+        <ol>
+          <li><strong>Snapshot 1 (Baseline):</strong> Load app, navigate to the suspect page, force GC (trash icon), take snapshot</li>
+          <li><strong>Action:</strong> Perform the leaking operation (e.g., open/close modal, navigate away and back) 5-10 times</li>
+          <li><strong>Snapshot 2:</strong> Force GC again, take second snapshot</li>
+          <li><strong>Verify:</strong> Repeat the action 5-10 more times</li>
+          <li><strong>Snapshot 3:</strong> Force GC, take third snapshot</li>
+        </ol>
+        <div class="callout callout-tip">
+          <p><strong>DevTools tip:</strong> The "force GC" step uses the 🗑️ trash can icon in the top-left of the Memory panel (or Performance Monitor). This triggers a full garbage collection, ensuring objects retained only by weak references or pending finalization are cleaned up before you snapshot. Without forcing GC first, your snapshots will include noise from objects that are technically eligible for collection but haven't been swept yet.</p>
+        </div>
+        <div class="callout callout-info">
+          <strong>Why three?</strong> Snapshot 1 establishes baseline (includes lazy initialization). Snapshot 2 catches leaks from the first batch. Snapshot 3 confirms the pattern is consistent (not just one-time initialization).
+        </div>
+
+        <h3>Comparison View</h3>
+        <p>Select Snapshot 3, then choose "Comparison" and compare against Snapshot 1. This shows:</p>
+        <ul>
+          <li><strong># New:</strong> Objects allocated since Snapshot 1 that are still alive</li>
+          <li><strong># Deleted:</strong> Objects that existed in Snapshot 1 but are now gone</li>
+          <li><strong># Delta:</strong> Net change — positive means growing (potential leak)</li>
+          <li><strong>Size Delta:</strong> Net memory change per constructor</li>
+        </ul>
+
+        <h3>Containment View</h3>
+        <p>Shows the reference hierarchy from GC roots. Navigate: GC Root → Window → your object chain. This reveals <em>why</em> an object is alive — the retainer path.</p>
+
+        <h3>Statistics View</h3>
+        <p>Pie chart showing memory breakdown: Code, Strings, JS Arrays, Typed Arrays, System objects. Useful for identifying if the leak is DOM nodes, string accumulation, or object growth.</p>
+
+        <h3>Finding Detached DOM Elements</h3>
+        <pre><code class="language-javascript">// In the snapshot filter, search for "Detached"
+// You'll see entries like:
+//   Detached HTMLDivElement
+//   Detached InternalNode
+//   Detached HTMLInputElement
+
+// Click any entry → Retainers panel shows what's holding it:
+// element in handleClick() at app.js:142
+//   ↑ context in (closure) at app.js:140
+//     ↑ listener in EventListenerList</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 9: Allocation Instrumentation -->
+    <section id="allocation-instrumentation">
+      <h2>Allocation Instrumentation</h2>
+      <details>
+        <summary>Timeline tracking, sampling, and identifying allocation hot spots</summary>
+        <h3>Allocation Instrumentation on Timeline</h3>
+        <p>Records <em>every</em> allocation with a full stack trace. High overhead but provides the most detail:</p>
+        <ul>
+          <li>Start recording, perform the suspect action, stop recording</li>
+          <li>Blue bars: objects still alive at the end of recording</li>
+          <li>Gray bars: objects that were allocated then collected (healthy)</li>
+          <li>Select a time range to see only allocations in that window</li>
+        </ul>
+
+        <h3>Allocation Sampling</h3>
+        <p>Statistical approach — samples allocations at regular intervals (~512KB). Much lower overhead, suitable for longer recording sessions:</p>
+        <ul>
+          <li>Records allocation site (call stack) but not every individual object</li>
+          <li>Shows a flame chart of allocation frequency by code path</li>
+          <li>Best for identifying "which function allocates the most"</li>
+        </ul>
+
+        <h3>Blue vs Gray Bars Interpretation</h3>
+        <pre class="diagram">
+Timeline: ──────────────────────────────────────────▶ time
+           █ █ ░ █ ░ ░ █ █ █ █ ░ █ █ █ █ █ █ █ █ █
+           ▲               ▲
+           │               │
+      Healthy:         Suspicious:
+      Some blue,       Monotonically increasing
+      mostly gray      blue bars = leak
+        </pre>
+        <div class="callout callout-tip">
+          <strong>Key insight:</strong> If blue bars accumulate over time without corresponding gray bars, you have a leak. Click the blue bars to see the allocation stack trace — this tells you exactly what code created the leaked objects.
+        </div>
+
+        <h3>Tracking Allocations to Specific Code Paths</h3>
+        <pre><code class="language-javascript">// Use console.timeline markers for correlation
+console.time('route-change');
+await navigateTo('/inbox');
+console.timeEnd('route-change');
+
+// In the allocation timeline, you can correlate time markers
+// with allocation spikes to identify which user action causes leaks</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 10: Memory Measurement API -->
+    <section id="memory-api">
+      <h2>performance.measureUserAgentSpecificMemory()</h2>
+      <details>
+        <summary>Modern memory measurement, cross-origin isolation, and production RUM</summary>
+        <h3>The Modern Memory Measurement API</h3>
+        <pre><code class="language-javascript">// Requires cross-origin isolation
+async function measureMemory() {
+  if (!crossOriginIsolated) {
+    console.warn('Cross-origin isolation required');
+    return;
+  }
+
+  const result = await performance.measureUserAgentSpecificMemory();
+  console.log('Total bytes:', result.bytes);
+  console.log('Breakdown:', result.breakdown);
+  // breakdown: [{ bytes, attribution: [{ url, scope }], types }]
+}</code></pre>
+
+        <h3>Cross-Origin Isolation Requirements</h3>
+        <p>The API requires two response headers on your document:</p>
+        <pre><code class="language-javascript">// Required HTTP headers:
+// Cross-Origin-Opener-Policy: same-origin
+// Cross-Origin-Embedder-Policy: require-corp
+
+// Verify in code:
+if (self.crossOriginIsolated) {
+  // Safe to use measureUserAgentSpecificMemory()
+}</code></pre>
+
+        <h3>Breakdown by URL</h3>
+        <p>The API attributes memory to specific URLs (scripts, iframes), enabling you to identify which third-party script is consuming the most memory:</p>
+        <pre><code class="language-javascript">const result = await performance.measureUserAgentSpecificMemory();
+for (const entry of result.breakdown) {
+  if (entry.bytes &gt; 1_000_000) {
+    console.warn('High memory:', entry.attribution[0]?.url, entry.bytes);
+  }
+}</code></pre>
+
+        <h3>Using in Production RUM</h3>
+        <pre><code class="language-javascript">// Report memory metrics periodically
+function startMemoryMonitoring(intervalMs = 60_000) {
+  if (!crossOriginIsolated) return;
+
+  setInterval(async () =&gt; {
+    try {
+      const { bytes } = await performance.measureUserAgentSpecificMemory();
+      navigator.sendBeacon('/metrics', JSON.stringify({
+        type: 'memory',
+        bytes,
+        timestamp: Date.now(),
+        url: location.href,
+        sessionDuration: performance.now()
+      }));
+    } catch (e) {
+      // API may throw if GC is busy
+    }
+  }, intervalMs);
+}</code></pre>
+
+        <h3>Comparison with performance.memory (Legacy)</h3>
+        <table>
+          <thead>
+            <tr><th>Feature</th><th>performance.memory</th><th>measureUserAgentSpecificMemory()</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Browser support</td><td>Chrome only</td><td>Chrome 89+, Edge (Firefox not yet implemented as of 2024)</td></tr>
+            <tr><td>Cross-origin isolation</td><td>Not required</td><td>Required</td></tr>
+            <tr><td>Granularity</td><td>Total heap only</td><td>Per-URL breakdown</td></tr>
+            <tr><td>Accuracy</td><td>Bucketed (privacy)</td><td>Precise after GC</td></tr>
+            <tr><td>Async</td><td>No (synchronous)</td><td>Yes (waits for GC)</td></tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 11: Weak References -->
+    <section id="weak-references">
+      <h2>WeakMap, WeakSet, WeakRef Patterns</h2>
+      <details>
+        <summary>Leak prevention with weak references, FinalizationRegistry, and caveats</summary>
+        <h3>When to Use Each</h3>
+        <table>
+          <thead>
+            <tr><th>Construct</th><th>Use Case</th><th>Key/Value Types</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>WeakMap</code></td><td>Metadata for objects you don't own</td><td>Keys: objects only, Values: any</td></tr>
+            <tr><td><code>WeakSet</code></td><td>Tracking processed/seen objects</td><td>Values: objects only</td></tr>
+            <tr><td><code>WeakRef</code></td><td>Caches where re-creation is acceptable</td><td>Wraps any object</td></tr>
+            <tr><td><code>FinalizationRegistry</code></td><td>Cleanup side effects when objects die</td><td>Callback on GC</td></tr>
+          </tbody>
+        </table>
+
+        <h3>WeakMap for DOM Node Metadata</h3>
+        <pre><code class="language-javascript">// ✅ Metadata is automatically cleaned when DOM node is GC'd
+const nodeMetadata = new WeakMap();
+
+function annotateElement(el, data) {
+  nodeMetadata.set(el, {
+    createdAt: Date.now(),
+    analytics: data
+  });
+}
+
+// When `el` is removed from DOM and no other refs exist,
+// the WeakMap entry is automatically collected</code></pre>
+
+        <h3>WeakRef for Caches</h3>
+        <pre><code class="language-javascript">// ✅ Cache that lets GC reclaim memory under pressure
+class WeakCache {
+  #cache = new Map(); // key → WeakRef
+
+  get(key) {
+    const ref = this.#cache.get(key);
+    if (!ref) return undefined;
+    const value = ref.deref();
+    if (!value) {
+      this.#cache.delete(key); // Clean up dead reference
+      return undefined;
+    }
+    return value;
+  }
+
+  set(key, value) {
+    this.#cache.set(key, new WeakRef(value));
+  }
+}</code></pre>
+
+        <h3>FinalizationRegistry for Cleanup</h3>
+        <pre><code class="language-javascript">// ✅ Release external resources when JS object is collected
+const registry = new FinalizationRegistry((handle) =&gt; {
+  // Called after the registered object is GC'd
+  console.log(`Object collected, releasing handle: ${handle}`);
+  externalResource.release(handle);
+});
+
+function createManagedResource() {
+  const handle = externalResource.acquire();
+  const wrapper = { handle, data: new ArrayBuffer(1024) };
+  registry.register(wrapper, handle); // Track wrapper, hold handle as value
+  return wrapper;
+}
+// When wrapper is GC'd, registry callback fires with `handle`</code></pre>
+
+        <h3>Limitations and Caveats</h3>
+        <div class="callout callout-warning">
+          <ul>
+            <li><strong>Non-deterministic:</strong> WeakRef.deref() may return the object even after all strong refs are gone (GC hasn't run yet). Don't rely on timing.</li>
+            <li><strong>FinalizationRegistry is advisory:</strong> Callbacks may be delayed or never called (tab closed, process killed).</li>
+            <li><strong>No iteration:</strong> WeakMap/WeakSet cannot be iterated — you can't enumerate contents or get size.</li>
+            <li><strong>Keys must be objects or non-registered symbols:</strong> Strings, numbers, and registered symbols (<code>Symbol.for()</code>) cannot be WeakMap keys. Non-registered symbols (plain <code>Symbol()</code>) are valid keys since ES2023.</li>
+            <li><strong>Don't use for critical cleanup:</strong> Use explicit dispose patterns. The <code>using</code> keyword with <code>Symbol.dispose</code>/<code>Symbol.asyncDispose</code> (TC39 Explicit Resource Management, shipping in TypeScript 5.2+ and Chrome 134+) provides deterministic, non-GC-dependent cleanup — the modern replacement for try/finally boilerplate.</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 12: Production Incident -->
+    <section id="production-incident">
+      <h2>Production Incident: Email Client SPA</h2>
+      <details>
+        <summary>Full incident writeup — investigation, root cause, and resolution</summary>
+        <h3>Symptoms</h3>
+        <div class="callout callout-warning">
+          <strong>Ticket:</strong> "Application becomes increasingly sluggish after 4-6 hours of continuous use. Users who keep the tab open all day report unresponsive UI by afternoon. Tab eventually crashes with 'Aw, Snap!' (OOM)."
+        </div>
+        <p>Environment: React 18 SPA email client, virtualized inbox list (react-window), ~50k messages for power users, used 8+ hours/day by support staff.</p>
+
+        <h3>Investigation</h3>
+        <pre><code class="language-javascript">// Step 1: Confirm the leak with Performance Monitor
+// Opened DevTools → Performance Monitor → watched "JS Heap Size"
+// Observation: Heap grows ~5MB/hour with no plateau
+
+// Step 2: Reproduce in accelerated fashion
+// Automated rapid navigation: Inbox → Message → Back (100 cycles)
+// Heap grew from 45MB to 120MB in 100 cycles
+
+// Step 3: Three-snapshot technique
+// Snapshot 1: After initial load (45MB)
+// Action: Navigate to 20 messages and back
+// Snapshot 2: Force GC → 67MB (should be ~45MB)
+// Action: Navigate to 20 more messages and back
+// Snapshot 3: Force GC → 89MB
+
+// Step 4: Compare Snapshot 3 vs Snapshot 1
+// Found: +800 "Detached HTMLDivElement" (Delta view)
+// Each detached tree: ~24KB retained size</code></pre>
+
+        <h3>Root Cause</h3>
+        <p>The virtualized list component used <code>ResizeObserver</code> to measure row heights for variable-size virtualization. When scrolling caused rows to leave the viewport, the component unmounted the row DOM — but the <code>ResizeObserver</code> maintained a strong reference to the row element in its observation list.</p>
+        <pre><code class="language-javascript">// ❌ BEFORE: The leaking VirtualRow component
+function VirtualRow({ index, style, data }) {
+  const rowRef = useRef(null);
+  const { setRowHeight } = data;
+
+  useEffect(() =&gt; {
+    const observer = new ResizeObserver((entries) =&gt; {
+      setRowHeight(index, entries[0].contentRect.height);
+    });
+    observer.observe(rowRef.current);
+    // BUG: No cleanup! Observer keeps reference to unmounted DOM
+  }, [index, setRowHeight]);
+
+  return (
+    &lt;div ref={rowRef} style={style}&gt;
+      &lt;EmailPreview messageId={data.messages[index].id} /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+        <h3>Resolution</h3>
+        <pre><code class="language-javascript">// ✅ AFTER: Proper observer cleanup
+function VirtualRow({ index, style, data }) {
+  const rowRef = useRef(null);
+  const { setRowHeight } = data;
+
+  useEffect(() =&gt; {
+    const el = rowRef.current;
+    if (!el) return;
+
+    const observer = new ResizeObserver((entries) =&gt; {
+      if (entries[0]) {
+        setRowHeight(index, entries[0].contentRect.height);
+      }
+    });
+    observer.observe(el);
+
+    return () =&gt; {
+      observer.unobserve(el);
+      observer.disconnect(); // Full cleanup
+    };
+  }, [index, setRowHeight]);
+
+  return (
+    &lt;div ref={rowRef} style={style}&gt;
+      &lt;EmailPreview messageId={data.messages[index].id} /&gt;
+    &lt;/div&gt;
+  );
+}
+
+// ADDITIONAL FIX: Shared observer pattern (one observer for all rows)
+const sharedObserver = new ResizeObserver((entries) =&gt; {
+  for (const entry of entries) {
+    const index = entry.target.dataset.rowIndex;
+    rowHeightCache.set(Number(index), entry.contentRect.height);
+  }
+});
+
+// Observe/unobserve individual elements as they mount/unmount</code></pre>
+
+        <h3>Lessons Learned</h3>
+        <ul>
+          <li>Virtualized lists amplify leaks — hundreds of mount/unmount cycles per session</li>
+          <li>Always audit <code>useEffect</code> for missing cleanup returns, especially with Observers</li>
+          <li>Shared observers (one per list) are more efficient than per-row observers</li>
+          <li>Added automated memory regression test to CI (heap delta &lt; 1MB after 50 navigation cycles)</li>
+          <li>Added production RUM memory reporting for early detection</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 13: Debugging Workflow -->
+    <section id="debugging-workflow">
+      <h2>Debugging Workflow</h2>
+      <details>
+        <summary>Systematic approach, CI automation, and production monitoring</summary>
+        <h3>Step-by-Step Systematic Approach</h3>
+        <ol>
+          <li><strong>Confirm the leak:</strong> Use Performance Monitor to verify JS Heap grows monotonically (not just fluctuating)</li>
+          <li><strong>Identify the trigger:</strong> Which user action correlates with growth? Navigate, open modal, switch tabs?</li>
+          <li><strong>Isolate the component:</strong> Disable features one by one (feature flags) to narrow the source</li>
+          <li><strong>Three-snapshot technique:</strong> Baseline → Action × N → Snapshot → Action × N → Snapshot</li>
+          <li><strong>Analyze delta:</strong> In comparison view, find constructors with positive delta</li>
+          <li><strong>Trace retainers:</strong> For each leaked object, follow the retainer chain to find the root cause</li>
+          <li><strong>Fix and verify:</strong> Apply fix, repeat step 4 — delta should be near zero</li>
+        </ol>
+
+        <h3>Automated Leak Detection in CI</h3>
+        <pre><code class="language-javascript">// Using Meta's memlab for automated leak detection
+// memlab.config.js
+module.exports = {
+  url: () =&gt; 'http://localhost:3000',
+  action: async (page) =&gt; {
+    // Perform the action that might leak
+    await page.click('[data-testid="open-modal"]');
+    await page.waitForSelector('.modal');
+  },
+  back: async (page) =&gt; {
+    // Undo the action
+    await page.click('[data-testid="close-modal"]');
+    await page.waitForSelector('.modal', { hidden: true });
+  },
+};
+// Run: npx memlab run --scenario memlab.config.js</code></pre>
+
+        <h3>Memory Regression Testing</h3>
+        <pre><code class="language-javascript">// Custom Puppeteer test for CI
+async function memoryRegressionTest() {
+  const browser = await puppeteer.launch();
+  const page = await browser.newPage();
+  await page.goto('http://localhost:3000');
+
+  // Warm up
+  await performAction(page);
+  await undoAction(page);
+
+  // Baseline
+  await page.evaluate(() =&gt; window.gc?.());
+  const before = (await page.metrics()).JSHeapUsedSize;
+
+  // Stress test: 50 cycles
+  for (let i = 0; i &lt; 50; i++) {
+    await performAction(page);
+    await undoAction(page);
+  }
+
+  await page.evaluate(() =&gt; window.gc?.());
+  const after = (await page.metrics()).JSHeapUsedSize;
+
+  const delta = after - before;
+  const threshold = 2 * 1024 * 1024; // 2MB tolerance
+  assert(delta &lt; threshold, `Memory leak: grew ${delta} bytes`);
+  await browser.close();
+}</code></pre>
+
+        <h3>Production Monitoring Strategies</h3>
+        <ul>
+          <li>Report <code>performance.measureUserAgentSpecificMemory()</code> every 5 minutes via RUM</li>
+          <li>Track heap size vs session duration — plot P50/P95 curves</li>
+          <li>Alert when P95 memory at 1hr &gt; P95 at 5min by more than 3×</li>
+          <li>Segment by route — identify which pages leak</li>
+          <li>Use <code>PerformanceObserver</code> for long GC pauses as a proxy signal</li>
+        </ul>
+
+        <h3>Tools Ecosystem</h3>
+        <table>
+          <thead>
+            <tr><th>Tool</th><th>Purpose</th><th>Best For</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Chrome DevTools Memory</td><td>Interactive investigation</td><td>Manual debugging</td></tr>
+            <tr><td><code>memlab</code> (Meta)</td><td>Automated leak detection</td><td>CI integration</td></tr>
+            <tr><td><code>leakage</code> npm</td><td>Simple leak testing</td><td>Unit-level leak tests</td></tr>
+            <tr><td>Puppeteer + metrics</td><td>Custom automation</td><td>Regression testing</td></tr>
+            <tr><td>Performance Monitor</td><td>Real-time heap tracking</td><td>Quick confirmation</td></tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 14: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Production-ready patterns for memory safety</summary>
+        <h3>Memory-Safe Event Handler Pattern</h3>
+        <pre><code class="language-javascript">// Pattern: AbortController-based lifecycle management
+class Component {
+  #controller = new AbortController();
+
+  mount(element) {
+    const { signal } = this.#controller;
+
+    // All listeners auto-removed when controller aborts
+    element.addEventListener('click', this.#handleClick, { signal });
+    window.addEventListener('resize', this.#handleResize, { signal });
+    document.addEventListener('keydown', this.#handleKeydown, { signal });
+
+    // Also works with fetch
+    this.#loadData(signal);
+  }
+
+  async #loadData(signal) {
+    try {
+      const res = await fetch('/api/data', { signal });
+      if (!signal.aborted) {
+        this.data = await res.json();
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') throw e;
+    }
+  }
+
+  #handleClick = (e) =&gt; { /* ... */ };
+  #handleResize = () =&gt; { /* ... */ };
+  #handleKeydown = (e) =&gt; { /* ... */ };
+
+  unmount() {
+    this.#controller.abort(); // One call cleans everything
+  }
+}</code></pre>
+
+        <h3>Self-Cleaning Cache with TTL and Size Limit</h3>
+        <pre><code class="language-javascript">class BoundedCache {
+  #map = new Map();
+  #maxSize;
+  #ttlMs;
+  #cleanupInterval;
+
+  constructor({ maxSize = 200, ttlMs = 300_000 } = {}) {
+    this.#maxSize = maxSize;
+    this.#ttlMs = ttlMs;
+    this.#cleanupInterval = setInterval(() =&gt; this.#evictExpired(), ttlMs);
+  }
+
+  get(key) {
+    const entry = this.#map.get(key);
+    if (!entry) return undefined;
+    if (Date.now() - entry.timestamp &gt; this.#ttlMs) {
+      this.#map.delete(key);
+      return undefined;
+    }
+    // LRU: move to end
+    this.#map.delete(key);
+    this.#map.set(key, entry);
+    return entry.value;
+  }
+
+  set(key, value) {
+    this.#map.delete(key); // Remove if exists (for LRU ordering)
+    this.#map.set(key, { value, timestamp: Date.now() });
+    this.#enforceSize();
+  }
+
+  #enforceSize() {
+    while (this.#map.size &gt; this.#maxSize) {
+      const oldest = this.#map.keys().next().value;
+      this.#map.delete(oldest);
+    }
+  }
+
+  #evictExpired() {
+    const now = Date.now();
+    for (const [key, entry] of this.#map) {
+      if (now - entry.timestamp &gt; this.#ttlMs) {
+        this.#map.delete(key);
+      }
+    }
+  }
+
+  dispose() {
+    clearInterval(this.#cleanupInterval);
+    this.#map.clear();
+  }
+}</code></pre>
+
+        <h3>React Hook for Memory Leak Detection in Development</h3>
+        <pre><code class="language-javascript">// useLeakDetector.js — development-only hook
+import { useEffect, useRef } from 'react';
+
+const registry = new FinalizationRegistry((label) =&gt; {
+  console.log(`[LeakDetector] ✅ ${label} was collected`);
+});
+
+const tracked = new Set();
+
+export function useLeakDetector(label) {
+  const markerRef = useRef(null);
+
+  useEffect(() =&gt; {
+    if (process.env.NODE_ENV !== 'development') return;
+
+    // Create a marker object that should be collected on unmount
+    const marker = { label, mountedAt: Date.now() };
+    markerRef.current = marker;
+    tracked.add(label);
+
+    return () =&gt; {
+      markerRef.current = null;
+      // Give GC a chance, then check
+      setTimeout(() =&gt; {
+        // If FinalizationRegistry hasn't fired after 10s, warn
+        setTimeout(() =&gt; {
+          if (tracked.has(label)) {
+            console.warn(`[LeakDetector] ⚠️ ${label} may be leaked`);
+          }
+        }, 10_000);
+      }, 0);
+      registry.register(marker, label);
+      tracked.delete(label);
+    };
+  }, [label]);
+}
+
+// Usage:
+// function MyComponent() {
+//   useLeakDetector('MyComponent');
+//   return &lt;div&gt;...&lt;/div&gt;;
+// }</code></pre>
+
+        <h3>Automated Leak Test Using Puppeteer</h3>
+        <pre><code class="language-javascript">// leak-test.mjs — Run with: node --expose-gc leak-test.mjs
+import puppeteer from 'puppeteer';
+
+async function detectLeaks(url, action, undo, { cycles = 20, threshold = 1_048_576 } = {}) {
+  const browser = await puppeteer.launch({
+    args: ['--js-flags=--expose-gc']
+  });
+  const page = await browser.newPage();
+  await page.goto(url, { waitUntil: 'networkidle0' });
+
+  // Warm-up cycle (lazy init, caches)
+  await action(page);
+  await undo(page);
+  await page.evaluate('window.gc()');
+
+  const baseline = (await page.metrics()).JSHeapUsedSize;
+  const samples = [];
+
+  for (let i = 0; i &lt; cycles; i++) {
+    await action(page);
+    await undo(page);
+    if (i % 5 === 0) {
+      await page.evaluate('window.gc()');
+      samples.push((await page.metrics()).JSHeapUsedSize);
+    }
+  }
+
+  await page.evaluate('window.gc()');
+  const final = (await page.metrics()).JSHeapUsedSize;
+  const delta = final - baseline;
+
+  // Check for monotonic growth (not just noise)
+  const isMonotonic = samples.every((v, i) =&gt; i === 0 || v &gt;= samples[i - 1] * 0.95);
+
+  await browser.close();
+
+  return {
+    leaked: delta &gt; threshold &amp;&amp; isMonotonic,
+    baseline,
+    final,
+    delta,
+    samples
+  };
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 15: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Five mistakes senior developers make in interviews and production</summary>
+        <div class="callout callout-warning">
+          <h3>1. Assuming React Handles All Cleanup</h3>
+          <p>React's reconciler removes DOM nodes and unmounts components, but it does NOT automatically clean up: WebSocket connections, setInterval handles, event listeners on window/document, IntersectionObservers, Web Workers, or BroadcastChannels. You must return cleanup functions from <code>useEffect</code>.</p>
+        </div>
+
+        <div class="callout callout-warning">
+          <h3>2. Not Considering Third-Party Library Leaks</h3>
+          <p>Libraries like chart.js, video players, rich text editors, and map SDKs allocate internal state that requires explicit <code>.destroy()</code> calls. Wrapping them in React without calling their cleanup API leaks their internal DOM trees and canvas contexts.</p>
+          <pre><code class="language-javascript">// ❌ Chart instance leaks its internal canvas and data
+useEffect(() =&gt; {
+  const chart = new Chart(canvasRef.current, config);
+}, []);
+
+// ✅ Must call destroy
+useEffect(() =&gt; {
+  const chart = new Chart(canvasRef.current, config);
+  return () =&gt; chart.destroy();
+}, []);</code></pre>
+        </div>
+
+        <div class="callout callout-warning">
+          <h3>3. Using Map Where WeakMap Would Suffice</h3>
+          <p>If your Map keys are objects whose lifecycle is managed elsewhere (DOM nodes, component instances), use WeakMap. A Map holds strong references to keys and values — the entries persist even after the key object is logically "dead" elsewhere in your app.</p>
+        </div>
+
+        <div class="callout callout-warning">
+          <h3>4. Storing DOM References in Module Scope</h3>
+          <pre><code class="language-javascript">// ❌ Module-level reference survives across route navigations
+let formElement = null;
+
+export function initForm() {
+  formElement = document.getElementById('signup-form');
+}
+// When user navigates away, formElement holds a detached DOM tree</code></pre>
+          <p>Module scope is effectively global — it persists for the lifetime of the page. Store DOM references in component-scoped variables that are cleaned up on unmount.</p>
+        </div>
+
+        <div class="callout callout-warning">
+          <h3>5. Ignoring console.log Retention in DevTools</h3>
+          <p>When DevTools is open, <code>console.log(object)</code> creates a strong reference from the console to that object (so you can inspect it later). Logging large objects in tight loops with DevTools open creates artificial leaks that disappear in production. Use <code>console.log(object.id)</code> or structured logging that doesn't retain object references.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 16: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Engineering trade-offs in memory management strategies</summary>
+        <table>
+          <thead>
+            <tr><th>Strategy</th><th>Pros</th><th>Cons</th><th>When to Choose</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Aggressive cleanup</strong> (nullify refs, dispose patterns)</td>
+              <td>Deterministic, no surprise OOMs, predictable memory profile</td>
+              <td>More code, more bugs from use-after-dispose, developer overhead</td>
+              <td>Long-lived SPAs (email, dashboards), memory-constrained (mobile)</td>
+            </tr>
+            <tr>
+              <td><strong>Lazy GC reliance</strong> (let V8 handle it)</td>
+              <td>Less code, fewer bugs, simpler mental model</td>
+              <td>Unpredictable GC pauses, may hit memory limits under load</td>
+              <td>Short-lived pages, SSR/MPA, where memory isn't a constraint</td>
+            </tr>
+            <tr>
+              <td><strong>WeakRef + FinalizationRegistry</strong></td>
+              <td>Automatic cleanup, GC-friendly caches</td>
+              <td>Non-deterministic timing, more complexity, can't rely on callback execution</td>
+              <td>Caches where stale data is acceptable, metadata tracking</td>
+            </tr>
+            <tr>
+              <td><strong>Strong cache (Map/LRU)</strong></td>
+              <td>Deterministic, fast lookups, predictable eviction</td>
+              <td>Memory ceiling is your responsibility, risk of unbounded growth if forgotten</td>
+              <td>Hot data paths, when re-fetching is expensive</td>
+            </tr>
+            <tr>
+              <td><strong>Production memory monitoring</strong></td>
+              <td>Detect leaks early, data-driven optimization</td>
+              <td>Overhead (CPU + network), privacy concerns, cross-origin isolation requirement</td>
+              <td>Apps with long sessions, enterprise SaaS, when you can deploy with COOP/COEP</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 17: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Seven follow-up questions with senior-level answers</summary>
+
+        <h3>1. "How would you differentiate between high memory usage and an actual memory leak?"</h3>
+        <p>A leak is <strong>monotonically increasing</strong> memory that never plateaus, even after forcing GC. High usage may just be a large working set that stays constant. Plot heap size over time: a leak shows a positive slope; high usage shows a flat line at a high value. Additionally, after performing an undo action (close modal, navigate back), a leak shows memory doesn't return to baseline.</p>
+
+        <h3>2. "What are GC roots in the browser?"</h3>
+        <p>GC roots are entry points for reachability tracing. In Chrome:</p>
+        <ul>
+          <li>Global object (<code>window</code>)</li>
+          <li>Active execution stack (local variables in running functions)</li>
+          <li>V8 internal handles (compiled code, built-in objects)</li>
+          <li>Registered callbacks (timers, observers, event listeners on live DOM)</li>
+          <li>Active Promises in microtask queue</li>
+          <li>Console retained objects (when DevTools is open)</li>
+        </ul>
+
+        <h3>3. "Can a Web Worker leak memory that affects the main thread?"</h3>
+        <p>Indirectly, yes. If the main thread holds references to <code>MessagePort</code> or transferred objects, the Worker keeping its side alive prevents collection. Also, <code>SharedArrayBuffer</code> memory is reference-counted across threads — it's only freed when all threads release their reference. But a Worker's own heap is isolated; its internal leak won't grow the main thread's heap.</p>
+
+        <h3>4. "How do closures interact with V8's hidden class system to cause leaks?"</h3>
+        <p>V8 allocates a <code>Context</code> object for each closure scope. If multiple closures share the same scope, and only one is long-lived, the Context retains all variables — even those only used by short-lived closures that already ran. This is the "shared scope" problem: one long-lived callback keeps alive all sibling scope variables.</p>
+        <pre><code class="language-javascript">// Both closures share the same Context
+function setup() {
+  const hugeData = loadData(); // 10MB
+  const id = hugeData.id;
+
+  setTimeout(() =&gt; console.log(id), 1000);  // Short-lived
+  element.onclick = () =&gt; console.log(id);  // Long-lived
+  // hugeData is retained by the shared Context even though
+  // neither closure uses it directly (V8 may not optimize this away)
+}</code></pre>
+
+        <h3>5. "How would you set up memory leak monitoring for a production SPA?"</h3>
+        <p>Three-layer approach:</p>
+        <ol>
+          <li><strong>Client RUM:</strong> <code>measureUserAgentSpecificMemory()</code> reported every 5 min, correlated with session age and route</li>
+          <li><strong>Alerting:</strong> P95 memory at session-age-1hr exceeds threshold (e.g., 150MB) → alert engineering</li>
+          <li><strong>CI regression:</strong> memlab or Puppeteer-based test runs on every PR, fails if heap delta &gt; threshold after N action cycles</li>
+        </ol>
+
+        <h3>6. "What's the difference between a heap snapshot and allocation sampling?"</h3>
+        <p>A heap snapshot is a <strong>point-in-time census</strong> — it shows every object currently alive. Allocation sampling is a <strong>statistical record</strong> of where objects were created over a time window. Use snapshots to find "what's alive that shouldn't be" and sampling to find "what code path allocates the most." They answer different questions.</p>
+
+        <h3>7. "How does React 18's concurrent rendering affect memory leaks?"</h3>
+        <p>Concurrent rendering can <strong>start and abandon</strong> render work (via <code>startTransition</code>). If a component allocates during render (not in an effect), that allocation may be created multiple times if React restarts the render. This isn't a traditional leak (objects are short-lived), but it increases GC pressure. The real risk: if interrupted renders trigger subscription setups in effects that then get torn down rapidly, the subscription library may not handle rapid subscribe/unsubscribe cycles cleanly, leaving dangling callbacks.</p>
+      </details>
+    </section>
+
+    <!-- Section 18: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Mental models and what NOT to say in an interview</summary>
+        <h3>Mental Models</h3>
+        <ul>
+          <li><strong>The Water Tank:</strong> Memory flows in (allocations) and out (GC). A leak means the drain is partially blocked — water level rises monotonically until overflow (OOM).</li>
+          <li><strong>The Reference Chain:</strong> Every leak is a chain from a GC root to a useless object. Your job is to find and break one link in that chain.</li>
+          <li><strong>The Lifecycle Mismatch:</strong> Leaks occur when a reference's lifetime exceeds its usefulness. The fix is always to align reference lifetime with semantic lifetime.</li>
+        </ul>
+
+        <h3>What TO Say</h3>
+        <ul>
+          <li>"I'd first confirm it's a true leak by checking if heap grows monotonically after forced GC"</li>
+          <li>"The three-snapshot technique isolates objects that persist across action/undo cycles"</li>
+          <li>"Retained size in the retainer chain shows me the actual memory impact"</li>
+          <li>"In production, I'd use measureUserAgentSpecificMemory for continuous monitoring"</li>
+          <li>"The most common root causes are detached DOM, uncleaned listeners, and growing caches"</li>
+        </ul>
+
+        <h3>What NOT to Say</h3>
+        <div class="callout callout-warning">
+          <ul>
+            <li>❌ "JavaScript has garbage collection so memory leaks aren't really possible" — They absolutely are; GC only collects unreachable objects.</li>
+            <li>❌ "Just use Chrome DevTools" without explaining the specific methodology</li>
+            <li>❌ "React handles all memory management" — It handles unmounting, not resource cleanup.</li>
+            <li>❌ "WeakMap solves all leaks" — It only helps when you have object keys; most leaks are from closures and listeners.</li>
+            <li>❌ Confusing memory usage with memory leaks — high memory isn't a leak if it's stable.</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+</body>
+</html>

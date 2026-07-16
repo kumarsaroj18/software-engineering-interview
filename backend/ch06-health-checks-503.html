@@ -347,7 +347,7 @@ server:
       max: 200              # Only 200 worker threads
       min-spare: 10
     accept-count: 100       # TCP backlog queue size
-    connection-timeout: 20000  # 20s — way too long for a stuck downstream
+    connection-timeout: 60000  # 60s default — way too long for a stuck downstream
     max-connections: 8192   # Max simultaneous connections</code></pre>
 
         <h3>Cause 2: Ingress Controller / Load Balancer Connection Limits</h3>
@@ -868,9 +868,10 @@ spec:
 │  14:26:00  200/200 Tomcat threads blocked                                  │
 │            No threads available for ANY request                             │
 │            Health check: ✅ (still passes — dedicated management port!)     │
-│            NGINX ingress: 502 Bad Gateway (connection accepted but no       │
+│            NGINX ingress: 504 Gateway Timeout (connection accepted but no   │
 │            response within proxy_read_timeout)                              │
-│            Note: NGINX returns 502 when upstream times out/resets,          │
+│            Note: NGINX returns 504 when upstream exceeds read timeout,      │
+│            502 when upstream sends an invalid/broken response or resets,    │
 │            and 503 when NO upstreams are available at all.                  │
 │                                                                             │
 │  14:27:00  PagerDuty alert fires on 5xx rate > 10%                         │
@@ -1131,7 +1132,7 @@ sum(rate(nginx_ingress_controller_requests{status="503"}[5m]))
 kube_pod_status_ready{condition="true", pod=~"payment.*"} == 0
 
 # 3. Thread pool utilization (custom metric):
-tomcat_threads_busy_threads / tomcat_threads_config_max_threads > 0.9
+tomcat_threads_busy / tomcat_threads_config_max > 0.9
 
 # 4. CPU throttling:
 rate(container_cpu_cfs_throttled_periods_total{pod=~"payment.*"}[5m])

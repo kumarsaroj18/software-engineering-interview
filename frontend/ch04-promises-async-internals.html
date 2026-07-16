@@ -1,0 +1,1607 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 4: Promises &amp; Async Internals | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <a href="../index.html">
+        <span class="chapter-num">Ch 4</span>
+        <span class="chapter-title">Promises &amp; Async Internals</span>
+      </a>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#promise-state-machine">Promise State Machine</a></li>
+        <li><a href="#promise-resolution">Promise Resolution Procedure</a></li>
+        <li><a href="#thenable-assimilation">Thenable Assimilation</a></li>
+        <li><a href="#microtask-scheduling">Microtask Scheduling</a></li>
+        <li><a href="#async-await-desugaring">async/await Desugaring</a></li>
+        <li><a href="#error-propagation">Error Propagation</a></li>
+        <li><a href="#promise-combinators">Promise Combinators</a></li>
+        <li><a href="#cancellation-patterns">Cancellation Patterns</a></li>
+        <li><a href="#async-iterators">Async Iterators</a></li>
+        <li><a href="#structured-concurrency">Structured Concurrency</a></li>
+        <li><a href="#production-patterns">Production Patterns</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <a href="../index.html#part-1">Part I — JavaScript Engine Internals</a> &gt;
+      <span>Chapter 4</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge">Promises</span>
+        <span class="badge">Async/Await</span>
+        <span class="badge">Microtasks</span>
+        <span class="badge">Concurrency</span>
+      </div>
+      <h1>Promises &amp; Async Internals</h1>
+      <p class="chapter-question">"Walk through the internal mechanics of Promises. How does async/await desugar, and what are the scheduling implications?"</p>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> A Promise is a state machine (pending → fulfilled/rejected) whose .then() callbacks are scheduled as microtasks. async/await desugars to generator-like coroutines that suspend and resume via Promise resolution. Understanding this machinery explains why await doesn't yield to the browser, why error propagation differs from try/catch, and how to build cancellation, retry, and timeout patterns on top of the primitive.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="text" class="search-input" placeholder="Search this chapter..." aria-label="Search">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details open>
+        <summary>What the interviewer is really testing</summary>
+        <div class="callout callout-info">
+          <p>This question separates candidates who use Promises from those who understand how they work at the specification level. The interviewer wants to see:</p>
+        </div>
+        <ul>
+          <li><strong>Spec-level understanding:</strong> Can you describe [[PromiseState]], [[PromiseResult]], and the reaction queues? Do you know why <code>resolve(thenable)</code> costs an extra microtask tick?</li>
+          <li><strong>Microtask scheduling:</strong> Can you predict execution order in complex async scenarios? Do you understand the relationship between the microtask queue and the event loop?</li>
+          <li><strong>async/await desugaring:</strong> Can you rewrite an async function as its equivalent generator + Promise machinery? Do you know why consecutive awaits are sequential?</li>
+          <li><strong>Production patterns:</strong> Can you implement retry, timeout, cancellation, and concurrency control from primitives? Have you debugged real Promise-related failures?</li>
+        </ul>
+        <p>Senior candidates should be able to explain the <em>why</em> behind design decisions — not just describe behavior, but rationalize it from first principles.</p>
+      </details>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details open>
+        <summary>Concise answer for time-pressured interviews</summary>
+        <p>A <strong>Promise</strong> is a state machine with three states: <em>pending</em>, <em>fulfilled</em>, and <em>rejected</em>. Transitions are one-way and irreversible. When you call <code>.then()</code>, callbacks are never invoked synchronously — they're enqueued as <strong>microtasks</strong>, guaranteeing consistent async behavior regardless of whether the Promise is already settled.</p>
+        <p><strong>async/await</strong> is syntactic sugar over the coroutine pattern. An async function returns a Promise. Each <code>await</code> suspends the function's execution context, wraps the operand in <code>Promise.resolve()</code>, and attaches a continuation as a microtask. This desugars conceptually to a generator that yields Promises, with a runner that calls <code>.next()</code> on each resolution.</p>
+        <p><strong>Scheduling implication:</strong> Microtasks run to exhaustion before the browser can paint or process macrotasks. A long chain of awaits or recursive <code>.then()</code> calls blocks rendering. Error propagation via rejection flows through the chain until caught — unlike synchronous try/catch, an uncaught rejection in a <code>.then()</code> chain doesn't stop execution of the surrounding code.</p>
+        <p><strong>Production impact:</strong> This model enables patterns like <code>Promise.all</code> for concurrency, <code>AbortController</code> for cancellation, and exponential backoff for retry — but demands explicit error handling at every async boundary.</p>
+      </details>
+    </section>
+
+    <!-- Section 3: Promise State Machine -->
+    <section id="promise-state-machine">
+      <h2>Promise State Machine</h2>
+      <details>
+        <summary>Internal states, slots, and transitions</summary>
+        <h3>The Three States</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────┐
+│                   PROMISE STATES                         │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│   ┌─────────┐    resolve(value)    ┌───────────┐       │
+│   │         │ ──────────────────▶  │           │       │
+│   │ PENDING │                      │ FULFILLED │       │
+│   │         │                      │           │       │
+│   └────┬────┘                      └───────────┘       │
+│        │                                                │
+│        │  reject(reason)           ┌───────────┐       │
+│        └────────────────────────▶  │           │       │
+│                                    │ REJECTED  │       │
+│                                    │           │       │
+│                                    └───────────┘       │
+│                                                         │
+│   • Transitions are ONE-WAY and IRREVERSIBLE            │
+│   • Once settled, a Promise's value never changes       │
+│   • Multiple resolve/reject calls are silently ignored  │
+└─────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Internal Slots (ECMAScript Spec)</h3>
+        <table>
+          <thead>
+            <tr><th>Internal Slot</th><th>Description</th><th>Initial Value</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>[[PromiseState]]</code></td><td>Current state of the Promise</td><td><code>"pending"</code></td></tr>
+            <tr><td><code>[[PromiseResult]]</code></td><td>The fulfillment value or rejection reason</td><td><code>undefined</code></td></tr>
+            <tr><td><code>[[PromiseFulfillReactions]]</code></td><td>List of reactions to run on fulfillment</td><td>Empty list</td></tr>
+            <tr><td><code>[[PromiseRejectReactions]]</code></td><td>List of reactions to run on rejection</td><td>Empty list</td></tr>
+            <tr><td><code>[[PromiseIsHandled]]</code></td><td>Whether rejection has been observed</td><td><code>false</code></td></tr>
+          </tbody>
+        </table>
+
+        <h3>Eager Evaluation</h3>
+        <div class="callout callout-warning">
+          <p><strong>Critical distinction:</strong> The executor function runs <em>synchronously</em> during Promise construction. The Promise is eagerly evaluated — side effects happen immediately.</p>
+        </div>
+<pre><code class="language-javascript">console.log('1: before constructor');
+
+const p = new Promise((resolve, reject) =&gt; {
+  console.log('2: executor runs SYNCHRONOUSLY');
+  resolve('done');
+  console.log('3: still runs after resolve');
+});
+
+console.log('4: after constructor');
+
+p.then(val =&gt; console.log('5: microtask -', val));
+
+console.log('6: before microtask drains');
+
+// Output: 1, 2, 3, 4, 6, 5
+</code></pre>
+        <p>The executor runs in the same synchronous turn. Only the <code>.then()</code> callback is deferred as a microtask. This is why you see <code>console.log('3')</code> execute even after <code>resolve()</code> — calling resolve doesn't return or throw.</p>
+      </details>
+    </section>
+
+    <!-- Section 4: Promise Resolution Procedure -->
+    <section id="promise-resolution">
+      <h2>Promise Resolution Procedure</h2>
+      <details>
+        <summary>What happens internally when resolve() is called</summary>
+        <h3>Simple Value Resolution</h3>
+        <p>When <code>resolve(value)</code> is called with a non-thenable, non-Promise value:</p>
+        <ol>
+          <li>Set <code>[[PromiseState]]</code> to <code>"fulfilled"</code></li>
+          <li>Set <code>[[PromiseResult]]</code> to <code>value</code></li>
+          <li>Trigger all reactions in <code>[[PromiseFulfillReactions]]</code> as microtasks</li>
+          <li>Clear both reaction lists</li>
+        </ol>
+
+        <h3>resolve(thenable) — Recursive Unwrapping</h3>
+<pre><code class="language-javascript">// When resolve() receives a thenable, it unwraps it:
+const p = new Promise((resolve) =&gt; {
+  resolve({ then(onFulfill) { onFulfill(42); } });
+});
+// p eventually fulfills with 42, NOT the thenable object
+
+// This unwrapping costs an extra microtask tick
+</code></pre>
+
+        <h3>resolve(promise) — Adoption</h3>
+<pre><code class="language-javascript">const inner = new Promise(resolve =&gt; setTimeout(() =&gt; resolve('inner'), 100));
+const outer = new Promise(resolve =&gt; resolve(inner));
+
+// outer "adopts" inner's eventual state
+// outer won't settle until inner settles
+// This creates a "PromiseResolveThenableJob" — an extra microtask
+</code></pre>
+
+        <h3>The Extra Microtask Tick</h3>
+        <div class="callout callout-warning">
+          <p><strong>Performance implication:</strong> <code>resolve(promise)</code> creates one additional microtask compared to <code>resolve(value)</code>. This is because the spec requires calling the thenable's <code>.then()</code> method in a new microtask job (PromiseResolveThenableJob) to prevent synchronous recursion and ensure consistent ordering.</p>
+        </div>
+<pre><code class="language-javascript">Promise.resolve()
+  .then(() =&gt; console.log('A'))  // microtask 1
+
+new Promise(resolve =&gt; resolve(Promise.resolve()))
+  .then(() =&gt; console.log('B'))  // microtask 3 (extra tick!)
+
+Promise.resolve()
+  .then(() =&gt; console.log('C'))  // microtask 2
+
+// Output: A, C, B
+// B is delayed because resolve(Promise) creates PromiseResolveThenableJob
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Thenable Assimilation -->
+    <section id="thenable-assimilation">
+      <h2>Thenable Assimilation</h2>
+      <details>
+        <summary>Duck typing, cross-realm thenables, and microtask cost</summary>
+        <h3>Thenable vs Promise</h3>
+        <table>
+          <thead>
+            <tr><th>Concept</th><th>Definition</th><th>Example</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Thenable</td><td>Any object with a <code>.then</code> method</td><td><code>{ then(cb) { cb(1); } }</code></td></tr>
+            <tr><td>Promise</td><td>Object created by Promise constructor or <code>Promise.resolve</code></td><td><code>new Promise(r =&gt; r(1))</code></td></tr>
+          </tbody>
+        </table>
+
+        <h3>Duck Typing Check</h3>
+<pre><code class="language-javascript">// Spec algorithm (simplified):
+function isThenable(value) {
+  if (value === null || (typeof value !== 'object' &amp;&amp; typeof value !== 'function')) {
+    return false;
+  }
+  const then = value.then; // Property access — can trigger getters!
+  return typeof then === 'function';
+}
+</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Security concern:</strong> The <code>.then</code> property access can trigger a getter, which means a malicious thenable could run arbitrary code during resolution. The spec isolates this by running it in a separate microtask (PromiseResolveThenableJob).</p>
+        </div>
+
+        <h3>Cross-Realm Thenables</h3>
+        <p>Promises from different realms (iframes, workers, different V8 contexts) are not the same <code>Promise</code> constructor. The spec uses thenable assimilation (duck typing) rather than <code>instanceof</code> checks to ensure interoperability:</p>
+<pre><code class="language-javascript">// iframe's Promise !== window's Promise
+const iframePromise = iframe.contentWindow.eval('Promise.resolve(42)');
+
+// This works because of thenable assimilation:
+Promise.resolve(iframePromise).then(val =&gt; console.log(val)); // 42
+</code></pre>
+
+        <h3>Microtask Cost</h3>
+        <p>Every thenable assimilation creates one additional PromiseResolveThenableJob microtask. In deeply nested thenable chains, this adds up:</p>
+<pre><code class="language-javascript">// Each level adds a microtask tick:
+const t3 = { then(cb) { cb(1); } };               // +1 tick
+const t2 = { then(cb) { cb(t3); } };              // +2 ticks
+const t1 = { then(cb) { cb(t2); } };              // +3 ticks
+Promise.resolve(t1).then(v =&gt; console.log(v));    // 1 (after 3 extra ticks)
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 6: Microtask Scheduling -->
+    <section id="microtask-scheduling">
+      <h2>Microtask Scheduling of .then() Callbacks</h2>
+      <details>
+        <summary>Scheduling guarantees, ordering, and design rationale</summary>
+        <h3>Key Invariant: .then() Is Never Synchronous</h3>
+        <div class="callout callout-info">
+          <p>Even when a Promise is already fulfilled, <code>.then()</code> callbacks are always scheduled as microtasks — never called synchronously. This prevents Zalgo (unpredictable sync/async behavior).</p>
+        </div>
+
+        <h3>Two Cases</h3>
+        <table>
+          <thead>
+            <tr><th>Promise State</th><th>What .then() Does</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Already settled</td><td>Immediately enqueues callback as a microtask</td></tr>
+            <tr><td>Still pending</td><td>Stores callback in [[PromiseFulfillReactions]]; enqueued later when settled</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Order Guarantees</h3>
+<pre><code class="language-javascript">const p = Promise.resolve('value');
+
+p.then(() =&gt; console.log('A'));
+p.then(() =&gt; console.log('B'));
+p.then(() =&gt; console.log('C'));
+
+// Always: A, B, C — order of .then() attachment is preserved
+</code></pre>
+
+        <h3>Complete Timing Example</h3>
+<pre><code class="language-javascript">console.log('1: sync start');
+
+setTimeout(() =&gt; console.log('2: macrotask'), 0);
+
+Promise.resolve()
+  .then(() =&gt; {
+    console.log('3: microtask 1');
+    return Promise.resolve();
+  })
+  .then(() =&gt; console.log('4: microtask 2'));
+
+Promise.resolve().then(() =&gt; console.log('5: microtask 1b'));
+
+queueMicrotask(() =&gt; console.log('6: raw microtask'));
+
+console.log('7: sync end');
+
+// Output: 1, 7, 3, 5, 6, 4, 2
+// Explanation:
+// - Sync: 1, 7
+// - Microtask queue drains: 3, 5, 6 (all level-1 microtasks)
+// - 3's .then returns a Promise, so 4 is queued after current batch
+// - 4 runs in next microtask batch
+// - Macrotask: 2
+</code></pre>
+
+        <h3>Design Rationale</h3>
+        <p>The always-async guarantee exists to prevent "release Zalgo" — a term coined by Isaac Z. Schlueter describing APIs that sometimes call callbacks synchronously and sometimes asynchronously. This unpredictability causes subtle race conditions. By always deferring to microtask, Promise behavior is deterministic regardless of settlement timing.</p>
+      </details>
+    </section>
+
+    <!-- Section 7: async/await Desugaring -->
+    <section id="async-await-desugaring">
+      <h2>async/await Desugaring</h2>
+      <details>
+        <summary>Coroutine model, generator equivalence, and implicit microtasks</summary>
+        <h3>async Function Returns a Promise</h3>
+<pre><code class="language-javascript">async function fetchUser(id) {
+  const response = await fetch(`/api/users/${id}`);
+  const data = await response.json();
+  return data;
+}
+
+// Return value is ALWAYS a Promise, regardless of what you return
+// Throwing inside async rejects the returned Promise
+</code></pre>
+
+        <h3>await as Suspension Point — The Coroutine Model</h3>
+        <pre class="diagram">
+┌────────────────────────────────────────────────────────────┐
+│              async function execution                        │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│  ┌──────────┐   await   ┌──────────┐   await   ┌───────┐ │
+│  │ Run sync │ ────────▶ │ Suspend  │ ────────▶ │Resume │ │
+│  │  until   │           │ (yield   │           │ (next │ │
+│  │  await   │           │  control)│           │ value)│ │
+│  └──────────┘           └──────────┘           └───────┘ │
+│       │                      │                      │     │
+│       ▼                      ▼                      ▼     │
+│  [sync stack]          [microtask queue]      [microtask] │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Desugaring to Generator + Promise</h3>
+<pre><code class="language-javascript">// Original:
+async function example() {
+  const a = await fetchA();
+  const b = await fetchB(a);
+  return a + b;
+}
+
+// Desugared equivalent:
+function example() {
+  return new Promise((resolve, reject) =&gt; {
+    const gen = (function* () {
+      try {
+        const a = yield fetchA();
+        const b = yield fetchB(a);
+        return a + b;
+      } catch (e) {
+        throw e;
+      }
+    })();
+
+    function step(nextFn) {
+      let result;
+      try {
+        result = nextFn();
+      } catch (e) {
+        return reject(e);
+      }
+      if (result.done) {
+        return resolve(result.value);
+      }
+      Promise.resolve(result.value).then(
+        value =&gt; step(() =&gt; gen.next(value)),
+        err =&gt; step(() =&gt; gen.throw(err))
+      );
+    }
+
+    step(() =&gt; gen.next());
+  });
+}
+</code></pre>
+
+        <h3>V8 Optimization: Zero-Cost Async Stack Traces</h3>
+        <div class="callout callout-info">
+          <p>V8 (since 2019) captures async stack traces at near-zero cost by tracking the Promise chain at await points rather than capturing full stacks. The <code>--async-stack-traces</code> flag is enabled by default. This means <code>Error.stack</code> in async functions shows the full async call path.</p>
+        </div>
+
+        <h3>Implicit Microtask at Each await</h3>
+<pre><code class="language-javascript">async function three() {
+  console.log('A');           // sync
+  await Promise.resolve();   // suspend → 1 microtask
+  console.log('B');           // resumes in microtask
+  await Promise.resolve();   // suspend → 1 microtask
+  console.log('C');           // resumes in microtask
+}
+
+three();
+console.log('D');
+
+// Output: A, D, B, C
+// Each await adds at minimum one microtask boundary
+</code></pre>
+
+        <h3>Why Consecutive Awaits Are Sequential</h3>
+<pre><code class="language-javascript">// ❌ SEQUENTIAL — each await waits for the previous
+async function slow() {
+  const a = await fetchA(); // 200ms
+  const b = await fetchB(); // 200ms
+  return a + b;             // Total: 400ms
+}
+
+// ✅ CONCURRENT — start both, await together
+async function fast() {
+  const [a, b] = await Promise.all([fetchA(), fetchB()]);
+  return a + b;             // Total: 200ms
+}
+</code></pre>
+        <p>Each <code>await</code> suspends execution until the awaited Promise resolves. The next line doesn't execute (and therefore doesn't start the next async operation) until resumption. This is by design — it gives async code the readability of synchronous code.</p>
+      </details>
+    </section>
+
+    <!-- Section 8: Error Propagation & Unhandled Rejections -->
+    <section id="error-propagation">
+      <h2>Error Propagation &amp; Unhandled Rejections</h2>
+      <details>
+        <summary>.catch() semantics, unhandled rejections, and AggregateError</summary>
+        <h3>.catch() vs try/catch</h3>
+<pre><code class="language-javascript">// Promise chain — .catch() handles rejection
+fetchData()
+  .then(transform)
+  .then(save)
+  .catch(err =&gt; {
+    // Catches rejection from fetchData, transform, OR save
+    console.error('Pipeline failed:', err);
+  });
+
+// async/await — try/catch handles rejection
+async function pipeline() {
+  try {
+    const data = await fetchData();
+    const transformed = await transform(data);
+    await save(transformed);
+  } catch (err) {
+    // Same behavior — catches any rejection in the chain
+    console.error('Pipeline failed:', err);
+  }
+}
+</code></pre>
+
+        <h3>Error Propagation Through .then Chains</h3>
+<pre><code class="language-javascript">Promise.resolve(1)
+  .then(v =&gt; { throw new Error('oops'); })
+  .then(v =&gt; console.log('skipped'))  // skipped!
+  .then(v =&gt; console.log('also skipped'))  // skipped!
+  .catch(err =&gt; {
+    console.log('caught:', err.message); // 'oops'
+    return 'recovered';
+  })
+  .then(v =&gt; console.log(v)); // 'recovered'
+</code></pre>
+
+        <h3>Unhandled Rejection Detection</h3>
+<pre><code class="language-javascript">// Browser:
+window.addEventListener('unhandledrejection', event =&gt; {
+  console.error('Unhandled rejection:', event.reason);
+  event.preventDefault(); // Prevents default logging
+});
+
+// Node.js:
+process.on('unhandledRejection', (reason, promise) =&gt; {
+  console.error('Unhandled rejection at:', promise, 'reason:', reason);
+});
+
+// Detection timing: the engine checks at end of microtask checkpoint
+// A Promise is "handled" if .catch() is attached before the check
+</code></pre>
+
+        <h3>Why Forgotten .catch() Is Dangerous</h3>
+        <div class="callout callout-warning">
+          <p>An unhandled rejection doesn't throw — it fails <em>silently</em> unless you listen for the event. In Node.js 15+, unhandled rejections terminate the process. In browsers, they log a console error but the app continues in a potentially corrupt state.</p>
+        </div>
+
+        <h3>Promise.prototype.finally</h3>
+<pre><code class="language-javascript">fetchData()
+  .then(process)
+  .catch(handleError)
+  .finally(() =&gt; {
+    // Runs regardless of fulfillment or rejection
+    // Does NOT receive the value/reason
+    // Return value is ignored (passes through previous result)
+    // UNLESS it throws or returns a rejected Promise
+    hideLoadingSpinner();
+  });
+</code></pre>
+
+        <h3>AggregateError with Promise.any</h3>
+<pre><code class="language-javascript">const results = await Promise.any([
+  fetch('/api/primary'),
+  fetch('/api/secondary'),
+  fetch('/api/tertiary'),
+]).catch(err =&gt; {
+  // Only rejects if ALL promises reject
+  console.log(err instanceof AggregateError); // true
+  console.log(err.errors); // Array of all rejection reasons
+  console.log(err.errors.length); // 3
+});
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 9: Promise Combinators -->
+    <section id="promise-combinators">
+      <h2>Promise Combinators</h2>
+      <details>
+        <summary>all, allSettled, race, any — semantics and comparison</summary>
+        <h3>Comparison Table</h3>
+        <table>
+          <thead>
+            <tr><th>Combinator</th><th>Resolves When</th><th>Rejects When</th><th>Result Type</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>Promise.all</code></td><td>All fulfill</td><td>First rejection (fail-fast)</td><td>Array of values</td></tr>
+            <tr><td><code>Promise.allSettled</code></td><td>All settle</td><td>Never rejects</td><td>Array of {status, value/reason}</td></tr>
+            <tr><td><code>Promise.race</code></td><td>First to settle (fulfill or reject)</td><td>First to settle (if rejected)</td><td>Single value/reason</td></tr>
+            <tr><td><code>Promise.any</code></td><td>First to fulfill</td><td>All reject (AggregateError)</td><td>Single value</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Promise.all — Fail-Fast</h3>
+<pre><code class="language-javascript">// All must succeed; first failure rejects immediately
+const [users, posts, comments] = await Promise.all([
+  fetchUsers(),
+  fetchPosts(),
+  fetchComments()
+]);
+// If fetchPosts() rejects, the whole thing rejects immediately
+// But fetchUsers() and fetchComments() continue running (not cancelled!)
+</code></pre>
+
+        <h3>Promise.allSettled — Never Rejects</h3>
+<pre><code class="language-javascript">const results = await Promise.allSettled([
+  fetchCritical(),
+  fetchOptional(),
+  fetchNiceToHave()
+]);
+
+const succeeded = results.filter(r =&gt; r.status === 'fulfilled');
+const failed = results.filter(r =&gt; r.status === 'rejected');
+// Use when you want all results regardless of individual failures
+</code></pre>
+
+        <h3>Promise.race — First Settles Wins</h3>
+<pre><code class="language-javascript">// Classic timeout pattern:
+function withTimeout(promise, ms) {
+  const timeout = new Promise((_, reject) =&gt;
+    setTimeout(() =&gt; reject(new Error(`Timeout after ${ms}ms`)), ms)
+  );
+  return Promise.race([promise, timeout]);
+}
+</code></pre>
+
+        <h3>Promise.any — First Fulfills Wins</h3>
+<pre><code class="language-javascript">// Hedged request — try multiple sources, use first success
+const data = await Promise.any([
+  fetchFromCache(),
+  fetchFromCDN(),
+  fetchFromOrigin()
+]);
+// Only rejects if ALL three fail
+</code></pre>
+
+        <h3>Custom Combinator: Promise.some(n)</h3>
+<pre><code class="language-javascript">// Resolve when at least n promises fulfill
+function promiseSome(promises, n) {
+  return new Promise((resolve, reject) =&gt; {
+    const results = [];
+    let rejections = 0;
+    const total = promises.length;
+
+    if (n &gt; total) {
+      return reject(new RangeError(`Cannot fulfill ${n} from ${total} promises`));
+    }
+
+    promises.forEach((p, i) =&gt; {
+      Promise.resolve(p).then(
+        value =&gt; {
+          results.push(value);
+          if (results.length === n) resolve(results);
+        },
+        () =&gt; {
+          rejections++;
+          if (rejections &gt; total - n) {
+            reject(new AggregateError([], `Only ${total - rejections} fulfilled, needed ${n}`));
+          }
+        }
+      );
+    });
+  });
+}
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 10: Cancellation Patterns -->
+    <section id="cancellation-patterns">
+      <h2>AbortController &amp; Cancellation Patterns</h2>
+      <details>
+        <summary>Why Promises aren't cancellable, and how to work around it</summary>
+        <h3>Why Promises Aren't Natively Cancellable</h3>
+        <div class="callout callout-info">
+          <p>A Promise represents an <em>eventual value</em> — it's a read handle. Cancellation is a write operation (stopping computation). The spec intentionally separates these concerns. Multiple consumers can observe the same Promise; cancellation by one would break others.</p>
+        </div>
+
+        <h3>AbortController + AbortSignal Pattern</h3>
+<pre><code class="language-javascript">const controller = new AbortController();
+const { signal } = controller;
+
+// Pass signal to fetch
+const response = await fetch('/api/data', { signal });
+
+// Cancel from outside:
+controller.abort();
+// fetch rejects with AbortError: "The user aborted a request."
+</code></pre>
+
+        <h3>Custom Async Operations with AbortSignal</h3>
+<pre><code class="language-javascript">async function pollUntilReady(url, { signal } = {}) {
+  while (true) {
+    signal?.throwIfAborted(); // Check before each iteration
+
+    const res = await fetch(url, { signal });
+    const data = await res.json();
+
+    if (data.status === 'ready') return data;
+
+    await new Promise((resolve, reject) =&gt; {
+      const timer = setTimeout(resolve, 1000);
+      signal?.addEventListener('abort', () =&gt; {
+        clearTimeout(timer);
+        reject(signal.reason);
+      }, { once: true });
+    });
+  }
+}
+</code></pre>
+
+        <h3>Timeout with AbortSignal.timeout()</h3>
+<pre><code class="language-javascript">// Modern approach (supported in Node 17.3+, modern browsers):
+const response = await fetch('/api/slow', {
+  signal: AbortSignal.timeout(5000) // Auto-aborts after 5s
+});
+
+// Composing signals:
+const controller = new AbortController();
+const timeoutSignal = AbortSignal.timeout(5000);
+
+// Abort on either user action OR timeout:
+const combined = AbortSignal.any([controller.signal, timeoutSignal]);
+const response = await fetch('/api/data', { signal: combined });
+</code></pre>
+
+        <h3>Production Example: Cancellable Search</h3>
+<pre><code class="language-javascript">class SearchService {
+  #controller = null;
+
+  async search(query) {
+    // Cancel previous in-flight request
+    this.#controller?.abort();
+    this.#controller = new AbortController();
+
+    try {
+      const response = await fetch(
+        `/api/search?q=${encodeURIComponent(query)}`,
+        { signal: this.#controller.signal }
+      );
+      return await response.json();
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        return null; // Silently ignore cancelled requests
+      }
+      throw err; // Re-throw real errors
+    }
+  }
+}
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 11: Async Iterators -->
+    <section id="async-iterators">
+      <h2>Async Iterators &amp; for-await-of</h2>
+      <details>
+        <summary>Symbol.asyncIterator, generators, and streaming patterns</summary>
+        <h3>Symbol.asyncIterator Protocol</h3>
+<pre><code class="language-javascript">const asyncIterable = {
+  [Symbol.asyncIterator]() {
+    let i = 0;
+    return {
+      async next() {
+        if (i &gt;= 3) return { done: true, value: undefined };
+        await new Promise(r =&gt; setTimeout(r, 100));
+        return { done: false, value: i++ };
+      }
+    };
+  }
+};
+
+for await (const val of asyncIterable) {
+  console.log(val); // 0, 1, 2 — each after 100ms
+}
+</code></pre>
+
+        <h3>AsyncGenerator Functions</h3>
+<pre><code class="language-javascript">async function* paginate(url) {
+  let nextPage = url;
+  while (nextPage) {
+    const response = await fetch(nextPage);
+    const data = await response.json();
+    yield data.items;
+    nextPage = data.nextPageUrl;
+  }
+}
+
+// Consume:
+for await (const page of paginate('/api/items?page=1')) {
+  renderItems(page);
+}
+</code></pre>
+
+        <h3>Streaming Data Consumption</h3>
+<pre><code class="language-javascript">async function* readStream(stream) {
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      yield value;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+// Process a Response body as chunks:
+const response = await fetch('/api/large-file');
+for await (const chunk of readStream(response.body)) {
+  processChunk(chunk);
+}
+</code></pre>
+
+        <h3>Backpressure Considerations</h3>
+        <div class="callout callout-warning">
+          <p><strong>Backpressure:</strong> <code>for-await-of</code> naturally applies backpressure — it won't call <code>.next()</code> until the current iteration completes. This means slow consumers automatically slow down fast producers. However, if you buffer items (e.g., in an array), you lose this guarantee and risk unbounded memory growth.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 12: Structured Concurrency -->
+    <section id="structured-concurrency">
+      <h2>Structured Concurrency Patterns</h2>
+      <details>
+        <summary>Sequential vs concurrent, semaphores, and task queues</summary>
+        <h3>Sequential vs Concurrent</h3>
+<pre><code class="language-javascript">// Sequential: 3 seconds total
+async function sequential() {
+  const a = await taskA(); // 1s
+  const b = await taskB(); // 1s
+  const c = await taskC(); // 1s
+  return [a, b, c];
+}
+
+// Concurrent: 1 second total (all run in parallel)
+async function concurrent() {
+  return Promise.all([taskA(), taskB(), taskC()]);
+}
+
+// Mixed: some dependent, some independent
+async function mixed() {
+  const [a, b] = await Promise.all([taskA(), taskB()]);
+  const c = await taskC(a, b); // depends on a and b
+  return c;
+}
+</code></pre>
+
+        <h3>Semaphore Pattern (Limiting Concurrency)</h3>
+<pre><code class="language-javascript">class Semaphore {
+  #queue = [];
+  #active = 0;
+
+  constructor(limit) {
+    this.limit = limit;
+  }
+
+  async acquire() {
+    if (this.#active &lt; this.limit) {
+      this.#active++;
+      return;
+    }
+    await new Promise(resolve =&gt; this.#queue.push(resolve));
+  }
+
+  release() {
+    this.#active--;
+    if (this.#queue.length &gt; 0) {
+      this.#active++;
+      const next = this.#queue.shift();
+      next();
+    }
+  }
+
+  async run(fn) {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+}
+
+// Usage: limit to 3 concurrent requests
+const sem = new Semaphore(3);
+const results = await Promise.all(
+  urls.map(url =&gt; sem.run(() =&gt; fetch(url)))
+);
+</code></pre>
+
+        <h3>Task Queue with Concurrency Control</h3>
+<pre><code class="language-javascript">async function mapWithConcurrency(items, fn, concurrency) {
+  const results = new Array(items.length);
+  let index = 0;
+
+  async function worker() {
+    while (index &lt; items.length) {
+      const i = index++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    () =&gt; worker()
+  );
+
+  await Promise.all(workers);
+  return results;
+}
+
+// Process 100 items with max 5 concurrent operations
+const results = await mapWithConcurrency(items, processItem, 5);
+</code></pre>
+
+        <h3>Error Handling in Concurrent Operations</h3>
+<pre><code class="language-javascript">// Strategy 1: Fail-fast (Promise.all behavior)
+// First error aborts — but other operations keep running!
+
+// Strategy 2: Collect all errors (Promise.allSettled)
+const results = await Promise.allSettled(tasks.map(execute));
+const errors = results
+  .filter(r =&gt; r.status === 'rejected')
+  .map(r =&gt; r.reason);
+if (errors.length) throw new AggregateError(errors);
+
+// Strategy 3: Fail-fast with cleanup
+async function allWithCleanup(tasks, cleanup) {
+  const controller = new AbortController();
+  try {
+    return await Promise.all(
+      tasks.map(t =&gt; t(controller.signal))
+    );
+  } catch (err) {
+    controller.abort();
+    await cleanup?.();
+    throw err;
+  }
+}
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 13: Production Patterns -->
+    <section id="production-patterns">
+      <h2>Production Patterns</h2>
+      <details>
+        <summary>Retry, timeout, debounce, circuit breaker, and resource pools</summary>
+        <h3>Retry with Exponential Backoff</h3>
+<pre><code class="language-javascript">async function retry(fn, {
+  maxAttempts = 3,
+  baseDelay = 1000,
+  maxDelay = 30000,
+  backoffFactor = 2,
+  retryOn = () =&gt; true,
+  signal
+} = {}) {
+  let lastError;
+
+  for (let attempt = 0; attempt &lt; maxAttempts; attempt++) {
+    try {
+      signal?.throwIfAborted();
+      return await fn(attempt);
+    } catch (err) {
+      lastError = err;
+
+      if (attempt === maxAttempts - 1) break;
+      if (!retryOn(err, attempt)) break;
+
+      const delay = Math.min(
+        baseDelay * Math.pow(backoffFactor, attempt) + Math.random() * 1000,
+        maxDelay
+      );
+
+      await new Promise((resolve, reject) =&gt; {
+        const timer = setTimeout(resolve, delay);
+        signal?.addEventListener('abort', () =&gt; {
+          clearTimeout(timer);
+          reject(signal.reason);
+        }, { once: true });
+      });
+    }
+  }
+
+  throw lastError;
+}
+</code></pre>
+
+        <h3>Timeout Wrapper</h3>
+<pre><code class="language-javascript">function withTimeout(fn, ms, message = `Operation timed out after ${ms}ms`) {
+  return async (...args) =&gt; {
+    const controller = new AbortController();
+    const timer = setTimeout(() =&gt; controller.abort(), ms);
+
+    try {
+      return await fn(...args, { signal: controller.signal });
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        throw new Error(message);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+</code></pre>
+
+        <h3>Debounced Async (Latest-Wins)</h3>
+<pre><code class="language-javascript">function debouncedAsync(fn, delay) {
+  let timer = null;
+  let activeController = null;
+
+  return function (...args) {
+    // Cancel previous timer
+    clearTimeout(timer);
+    // Abort previous in-flight request
+    activeController?.abort();
+
+    return new Promise((resolve, reject) =&gt; {
+      timer = setTimeout(async () =&gt; {
+        activeController = new AbortController();
+        try {
+          const result = await fn(...args, {
+            signal: activeController.signal
+          });
+          resolve(result);
+        } catch (err) {
+          if (err.name !== 'AbortError') reject(err);
+        }
+      }, delay);
+    });
+  };
+}
+</code></pre>
+
+        <h3>Circuit Breaker Pattern</h3>
+<pre><code class="language-javascript">class CircuitBreaker {
+  #state = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+  #failures = 0;
+  #lastFailure = 0;
+
+  constructor({ threshold = 5, resetTimeout = 30000 } = {}) {
+    this.threshold = threshold;
+    this.resetTimeout = resetTimeout;
+  }
+
+  async execute(fn) {
+    if (this.#state === 'OPEN') {
+      if (Date.now() - this.#lastFailure &gt; this.resetTimeout) {
+        this.#state = 'HALF_OPEN';
+      } else {
+        throw new Error('Circuit is OPEN — request blocked');
+      }
+    }
+
+    try {
+      const result = await fn();
+      this.#onSuccess();
+      return result;
+    } catch (err) {
+      this.#onFailure();
+      throw err;
+    }
+  }
+
+  #onSuccess() {
+    this.#failures = 0;
+    this.#state = 'CLOSED';
+  }
+
+  #onFailure() {
+    this.#failures++;
+    this.#lastFailure = Date.now();
+    if (this.#failures &gt;= this.threshold) {
+      this.#state = 'OPEN';
+    }
+  }
+
+  get state() { return this.#state; }
+}
+</code></pre>
+
+        <h3>Resource Pool Pattern</h3>
+<pre><code class="language-javascript">class Pool {
+  #available = [];
+  #waiting = [];
+
+  constructor(factory, size) {
+    for (let i = 0; i &lt; size; i++) {
+      this.#available.push(factory());
+    }
+  }
+
+  async acquire() {
+    if (this.#available.length &gt; 0) {
+      return this.#available.pop();
+    }
+    return new Promise(resolve =&gt; this.#waiting.push(resolve));
+  }
+
+  release(resource) {
+    if (this.#waiting.length &gt; 0) {
+      const next = this.#waiting.shift();
+      next(resource);
+    } else {
+      this.#available.push(resource);
+    }
+  }
+
+  async use(fn) {
+    const resource = await this.acquire();
+    try {
+      return await fn(resource);
+    } finally {
+      this.release(resource);
+    }
+  }
+}
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 14: Production Incident -->
+    <section id="production-incident">
+      <h2>Production Incident</h2>
+      <details>
+        <summary>Silent payment failures from unhandled Promise rejections</summary>
+        <div class="callout callout-warning">
+          <p><strong>Incident Report:</strong> Unhandled Promise Rejections in Payment Flow</p>
+        </div>
+
+        <h3>Symptoms</h3>
+        <ul>
+          <li>Customer payments were being charged but order confirmations weren't sent</li>
+          <li>No errors in application logs</li>
+          <li>Monitoring dashboards showed normal error rates</li>
+          <li>Customer complaints started after a deployment 3 days earlier</li>
+        </ul>
+
+        <h3>Root Cause</h3>
+<pre><code class="language-javascript">// The problematic code:
+async function processPayment(order) {
+  const charge = await paymentGateway.charge(order.amount);
+
+  // This Promise was NOT awaited — fire-and-forget
+  notificationService.sendConfirmation(order, charge)
+    .then(() =&gt; analytics.track('confirmation_sent', order.id));
+  // ↑ No .catch() — rejection is silent!
+
+  return charge;
+}
+
+// The bug: notificationService.sendConfirmation() started rejecting
+// after a config change, but since the Promise wasn't awaited or caught,
+// the error was completely invisible.
+</code></pre>
+
+        <h3>Why It Was Silent</h3>
+        <ul>
+          <li>The function returned <code>charge</code> successfully — the payment worked</li>
+          <li>The unhandled rejection happened in a detached Promise chain</li>
+          <li>Node.js was running with <code>--unhandled-rejections=warn</code> (not <code>throw</code>)</li>
+          <li>Warning logs were being filtered by the log aggregator's severity level</li>
+        </ul>
+
+        <h3>Fix</h3>
+<pre><code class="language-javascript">async function processPayment(order) {
+  const charge = await paymentGateway.charge(order.amount);
+
+  // Fix 1: await the notification (makes it part of the chain)
+  try {
+    await notificationService.sendConfirmation(order, charge);
+    await analytics.track('confirmation_sent', order.id);
+  } catch (err) {
+    // Fix 2: explicit error handling for non-critical operations
+    logger.error('Notification failed', { orderId: order.id, error: err });
+    await deadLetterQueue.push({ type: 'confirmation', order, charge });
+  }
+
+  return charge;
+}
+</code></pre>
+
+        <h3>Prevention</h3>
+        <ul>
+          <li>ESLint rule: <code>no-floating-promises</code> (from @typescript-eslint)</li>
+          <li>Node.js flag: <code>--unhandled-rejections=throw</code></li>
+          <li>Global handler: <code>process.on('unhandledRejection', ...)</code> with alerting</li>
+          <li>Code review checklist: every async call must be awaited or explicitly fire-and-forget with <code>.catch()</code></li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 15: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Promise.all implementation, retry, task queue, and interview puzzles</summary>
+        <h3>Implement Promise.all from Scratch</h3>
+<pre><code class="language-javascript">function promiseAll(promises) {
+  return new Promise((resolve, reject) =&gt; {
+    const results = [];
+    let settled = 0;
+    const iterable = Array.from(promises);
+
+    if (iterable.length === 0) {
+      return resolve([]);
+    }
+
+    iterable.forEach((promise, index) =&gt; {
+      Promise.resolve(promise).then(
+        value =&gt; {
+          results[index] = value; // Preserve order
+          settled++;
+          if (settled === iterable.length) {
+            resolve(results);
+          }
+        },
+        reason =&gt; {
+          reject(reason); // Fail-fast on first rejection
+        }
+      );
+    });
+  });
+}
+
+// Edge cases handled:
+// ✓ Empty array → resolve([])
+// ✓ Non-Promise values → wrapped with Promise.resolve()
+// ✓ Order preserved (not first-resolved order)
+// ✓ Fail-fast on first rejection
+</code></pre>
+
+        <h3>Async Retry with Backoff</h3>
+<pre><code class="language-javascript">async function fetchWithRetry(url, options = {}) {
+  const { maxRetries = 3, baseDelay = 500, signal } = options;
+
+  for (let attempt = 0; attempt &lt;= maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, { signal });
+      if (!response.ok &amp;&amp; response.status &gt;= 500) {
+        throw new Error(`Server error: ${response.status}`);
+      }
+      return response;
+    } catch (err) {
+      if (err.name === 'AbortError') throw err; // Don't retry aborts
+      if (attempt === maxRetries) throw err;
+
+      const jitter = Math.random() * 200;
+      const delay = baseDelay * Math.pow(2, attempt) + jitter;
+      await new Promise(r =&gt; setTimeout(r, delay));
+    }
+  }
+}
+</code></pre>
+
+        <h3>Task Queue with Concurrency Limit</h3>
+<pre><code class="language-javascript">class TaskQueue {
+  #concurrency;
+  #running = 0;
+  #queue = [];
+
+  constructor(concurrency = 4) {
+    this.#concurrency = concurrency;
+  }
+
+  add(task) {
+    return new Promise((resolve, reject) =&gt; {
+      this.#queue.push({ task, resolve, reject });
+      this.#drain();
+    });
+  }
+
+  #drain() {
+    while (this.#running &lt; this.#concurrency &amp;&amp; this.#queue.length &gt; 0) {
+      const { task, resolve, reject } = this.#queue.shift();
+      this.#running++;
+
+      task()
+        .then(resolve, reject)
+        .finally(() =&gt; {
+          this.#running--;
+          this.#drain();
+        });
+    }
+  }
+
+  get pending() { return this.#queue.length; }
+  get active() { return this.#running; }
+}
+
+// Usage:
+const queue = new TaskQueue(3);
+const urls = [/* 100 URLs */];
+const results = await Promise.all(
+  urls.map(url =&gt; queue.add(() =&gt; fetch(url).then(r =&gt; r.json())))
+);
+</code></pre>
+
+        <h3>Interview Puzzle: Predict the Output</h3>
+<pre><code class="language-javascript">async function puzzle() {
+  console.log('1');
+
+  const p1 = new Promise(resolve =&gt; {
+    console.log('2');
+    resolve('3');
+    console.log('4');
+  });
+
+  console.log('5');
+
+  const p2 = p1.then(v =&gt; {
+    console.log(v);
+    return '6';
+  });
+
+  console.log('7');
+
+  await p2;
+
+  console.log('8');
+
+  await Promise.resolve();
+
+  console.log('9');
+}
+
+puzzle();
+console.log('10');
+
+// Output: 1, 2, 4, 5, 7, 10, 3, 8, 9
+// Explanation:
+// - 1: sync in async function
+// - 2: executor runs sync
+// - 4: executor continues after resolve()
+// - 5: sync after constructor
+// - 7: sync after .then() (which just registers callback)
+// - 10: sync in outer scope (puzzle() returns at first await)
+// - 3: p1.then callback runs (microtask)
+// - 8: await p2 resumes (microtask)
+// - 9: second await resumes (microtask)
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 16: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>5 critical errors senior engineers still make</summary>
+
+        <h3>1. Forgetting to Return in .then() Chains</h3>
+<pre><code class="language-javascript">// ❌ BUG: the chain gets undefined instead of the fetch result
+fetchUser(id)
+  .then(user =&gt; {
+    fetchPosts(user.id); // Missing return!
+  })
+  .then(posts =&gt; {
+    console.log(posts); // undefined!
+  });
+
+// ✅ CORRECT: return the Promise
+fetchUser(id)
+  .then(user =&gt; {
+    return fetchPosts(user.id);
+  })
+  .then(posts =&gt; {
+    console.log(posts); // actual posts
+  });
+</code></pre>
+
+        <h3>2. await in Sequential Loop (Should Use Promise.all)</h3>
+<pre><code class="language-javascript">// ❌ SLOW: sequential — N * latency
+async function fetchAll(ids) {
+  const results = [];
+  for (const id of ids) {
+    results.push(await fetchItem(id)); // Waits for each!
+  }
+  return results;
+}
+
+// ✅ FAST: concurrent — max(latencies)
+async function fetchAll(ids) {
+  return Promise.all(ids.map(id =&gt; fetchItem(id)));
+}
+
+// ✅ CONTROLLED: limited concurrency
+async function fetchAll(ids) {
+  return mapWithConcurrency(ids, fetchItem, 5);
+}
+</code></pre>
+
+        <h3>3. Swallowing Errors with Empty .catch()</h3>
+<pre><code class="language-javascript">// ❌ DANGEROUS: error disappears completely
+fetchData()
+  .then(process)
+  .catch(() =&gt; {}); // "It stopped crashing!" — but it's silently broken
+
+// ✅ CORRECT: at minimum, log the error
+fetchData()
+  .then(process)
+  .catch(err =&gt; {
+    logger.error('Pipeline failed', { error: err });
+    return fallbackValue; // Explicit recovery
+  });
+</code></pre>
+
+        <h3>4. Promise Constructor Anti-pattern</h3>
+<pre><code class="language-javascript">// ❌ UNNECESSARY: wrapping an existing Promise in new Promise
+function fetchUser(id) {
+  return new Promise((resolve, reject) =&gt; {
+    fetch(`/api/users/${id}`)
+      .then(res =&gt; res.json())
+      .then(resolve)
+      .catch(reject);
+  });
+}
+
+// ✅ CORRECT: just return the Promise chain
+function fetchUser(id) {
+  return fetch(`/api/users/${id}`).then(res =&gt; res.json());
+}
+
+// The ONLY reason to use new Promise():
+// - Wrapping callback-based APIs (setTimeout, events)
+// - Creating deferred Promises (see Promise.withResolvers below)
+</code></pre>
+        <div class="callout callout-info">
+          <p><strong>ES2024: <code>Promise.withResolvers()</code></strong> — eliminates the "deferred" pattern boilerplate. Instead of wrapping code in <code>new Promise((resolve, reject) =&gt; ...)</code> just to externalize resolve/reject, you can now write:</p>
+        </div>
+<pre><code class="language-javascript">// ES2024 — cleaner deferred pattern
+const { promise, resolve, reject } = Promise.withResolvers();
+
+// Use resolve/reject externally (event handlers, callbacks, etc.)
+button.addEventListener('click', () => resolve('clicked'));
+setTimeout(() => reject(new Error('Timeout')), 5000);
+
+const result = await promise;
+</code></pre>
+
+        <h3>5. Not Handling Cleanup on Rejection</h3>
+<pre><code class="language-javascript">// ❌ BUG: resource leak on error
+async function processFile(path) {
+  const handle = await fs.open(path);
+  const data = await handle.read(); // If this throws...
+  await handle.close();              // ...this never runs!
+  return data;
+}
+
+// ✅ CORRECT: use try/finally
+async function processFile(path) {
+  const handle = await fs.open(path);
+  try {
+    return await handle.read();
+  } finally {
+    await handle.close(); // Always runs
+  }
+}
+
+// ✅ FUTURE: using keyword (TC39 Explicit Resource Management, TS 5.2+)
+// Deterministic cleanup without try/finally boilerplate
+async function processFile(path) {
+  await using handle = await fs.open(path);
+  return await handle.read();
+  // handle[Symbol.asyncDispose]() called automatically at block exit
+}
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 17: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Callbacks vs Promises vs async/await vs Observables</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Criterion</th>
+              <th>Callbacks</th>
+              <th>Promises</th>
+              <th>async/await</th>
+              <th>Observables (RxJS)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Values</strong></td>
+              <td>Single</td>
+              <td>Single</td>
+              <td>Single</td>
+              <td>Multiple over time</td>
+            </tr>
+            <tr>
+              <td><strong>Eager/Lazy</strong></td>
+              <td>Depends</td>
+              <td>Eager</td>
+              <td>Eager</td>
+              <td>Lazy (cold)</td>
+            </tr>
+            <tr>
+              <td><strong>Cancellation</strong></td>
+              <td>Manual</td>
+              <td>AbortController</td>
+              <td>AbortController</td>
+              <td>Built-in (unsubscribe)</td>
+            </tr>
+            <tr>
+              <td><strong>Error handling</strong></td>
+              <td>Error-first convention</td>
+              <td>.catch() chains</td>
+              <td>try/catch</td>
+              <td>catchError operator</td>
+            </tr>
+            <tr>
+              <td><strong>Composition</strong></td>
+              <td>Callback hell</td>
+              <td>.then() chains</td>
+              <td>Sequential reads</td>
+              <td>Rich operator library</td>
+            </tr>
+            <tr>
+              <td><strong>Backpressure</strong></td>
+              <td>Manual</td>
+              <td>None</td>
+              <td>Via async iterators</td>
+              <td>Operators (buffer, throttle)</td>
+            </tr>
+            <tr>
+              <td><strong>Debugging</strong></td>
+              <td>Difficult (lost stacks)</td>
+              <td>Moderate</td>
+              <td>Good (async stack traces)</td>
+              <td>Difficult (operator chains)</td>
+            </tr>
+            <tr>
+              <td><strong>Bundle size</strong></td>
+              <td>Zero</td>
+              <td>Zero (native)</td>
+              <td>Zero (native)</td>
+              <td>~30KB (tree-shaken)</td>
+            </tr>
+            <tr>
+              <td><strong>Best for</strong></td>
+              <td>Legacy APIs, events</td>
+              <td>Single async operations</td>
+              <td>Sequential async flows</td>
+              <td>Event streams, real-time</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-tip">
+          <p><strong>Rule of thumb:</strong> Use async/await for request/response patterns. Use Observables when you need to compose multiple events over time (WebSocket messages, UI events, polling). Use raw Promises when building utility functions that other code consumes.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 18: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>7 deep follow-ups with strong answers</summary>
+
+        <h3>Q1: Why does resolve(Promise.resolve(x)) take more microtask ticks than resolve(x)?</h3>
+        <p><strong>Strong answer:</strong> When resolve() receives a thenable, the spec mandates creating a PromiseResolveThenableJob — a microtask that calls the thenable's .then() method. This indirection exists for two reasons: (1) it prevents synchronous recursion if the thenable's .then() immediately calls back, and (2) it ensures consistent ordering by always deferring thenable unwrapping. The result is one extra microtask tick per level of thenable wrapping. <code>Promise.resolve(x)</code> when x is already a native Promise with the same constructor returns x unchanged (fast path), but <code>new Promise(r =&gt; r(otherPromise))</code> always pays the extra tick.</p>
+
+        <h3>Q2: How do microtasks interact with rendering in the browser?</h3>
+        <p><strong>Strong answer:</strong> The browser event loop processes all microtasks to exhaustion before performing a rendering update. This means a Promise chain of 10,000 .then() callbacks will block painting for the entire duration. The rendering pipeline (style → layout → paint → composite) only runs between macrotasks if the browser determines a visual update is needed (~60fps = every 16.7ms). To yield to the browser mid-computation, you must schedule work as a macrotask (setTimeout), use requestAnimationFrame, or use scheduler.yield() (the upcoming Scheduling API). This is why long await chains can cause jank.</p>
+
+        <h3>Q3: Can you implement a Promise that is truly cancellable?</h3>
+        <p><strong>Strong answer:</strong> You can't cancel a Promise itself, but you can cancel the work it represents. The pattern is to use AbortController: pass an AbortSignal to the async operation, check it at suspension points, and listen for the abort event. For cleanup, you combine this with a wrapper that suppresses the resolved value if the signal is aborted. TC39 considered a <code>Promise.cancel()</code> proposal but withdrew it because cancellation semantics conflict with Promise's role as a shared read handle. The community settled on AbortController as the external cancellation mechanism.</p>
+
+        <h3>Q4: What's the difference between queueMicrotask() and Promise.resolve().then()?</h3>
+        <p><strong>Strong answer:</strong> Both schedule microtasks, but <code>queueMicrotask(fn)</code> is the direct, minimal API — it enqueues fn without creating a Promise object. <code>Promise.resolve().then(fn)</code> creates a resolved Promise, allocates a PromiseReaction record, and then schedules the callback. queueMicrotask is more efficient for fire-and-forget microtask scheduling. However, <code>Promise.resolve().then()</code> is preferable when you need the return value wrapped in a Promise or want to chain further operations. In terms of ordering, they interleave in the same queue — a microtask is a microtask regardless of source.</p>
+
+        <h3>Q5: How does V8 optimize async/await compared to the spec's desugaring?</h3>
+        <p><strong>Strong answer:</strong> V8 (since 2018) optimizes await by reducing the number of microtask ticks. The spec originally required 3 microtask ticks per await (create throwaway Promise, create PromiseResolveThenableJob, schedule reaction). V8 optimizes this: if the awaited value is a native Promise (same realm, unmodified prototype), it shortcuts to 1 tick by directly scheduling the resumption without creating intermediate Promises. This was formalized in the spec as the "await optimization" in ES2020. V8 also tracks async call frames cheaply for DevTools async stack traces by storing metadata on the Promise object rather than capturing full stacks.</p>
+
+        <h3>Q6: How would you implement a deadline-aware Promise.all that cancels remaining work?</h3>
+        <p><strong>Strong answer:</strong> Combine AbortController with Promise.race against a timeout. Create a shared AbortController, pass its signal to all tasks, race the Promise.all against a setTimeout rejection. When the timeout fires, abort the controller to signal all tasks to stop. Each task should check the signal at suspension points and clean up on abort. This gives you structured cancellation — unlike raw Promise.all which leaves orphaned operations running after a failure.</p>
+<pre><code class="language-javascript">async function allWithDeadline(tasks, ms) {
+  const controller = new AbortController();
+  const { signal } = controller;
+
+  const timer = setTimeout(() =&gt; controller.abort(), ms);
+
+  try {
+    return await Promise.all(tasks.map(t =&gt; t(signal)));
+  } finally {
+    clearTimeout(timer);
+    controller.abort(); // Clean up any stragglers
+  }
+}
+</code></pre>
+
+        <h3>Q7: What problems does structured concurrency (like TC39 proposal) solve that Promise.all doesn't?</h3>
+        <p><strong>Strong answer:</strong> Promise.all has two structural problems: (1) if one task rejects, the others continue running with no way to stop them — you've lost structured ownership. (2) Errors in "background" promises (fire-and-forget) are unobservable. Structured concurrency (modeled after Trio in Python or Kotlin coroutines) ensures: all child tasks complete before the parent scope exits, failure in any child cancels siblings, and no task leaks beyond its scope. The TC39 proposal aims to bring this to JavaScript with constructs that guarantee all async work is "joined" before a scope exits, eliminating orphaned promises entirely.</p>
+      </details>
+    </section>
+
+    <!-- Section 19: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details open>
+        <summary>Mental models and what NOT to say</summary>
+        <h3>Mental Models to Internalize</h3>
+        <ul>
+          <li><strong>Promise = state machine:</strong> pending → fulfilled | rejected. One-way, irreversible. Reactions are queued, never synchronous.</li>
+          <li><strong>Microtask queue = flush-to-empty:</strong> All microtasks drain before any rendering or macrotask. Long chains block the browser.</li>
+          <li><strong>await = suspend + schedule resumption as microtask:</strong> It's a coroutine yield point, not a sleep.</li>
+          <li><strong>Thenable assimilation = duck typing + extra tick:</strong> resolve(thenable) always costs a PromiseResolveThenableJob.</li>
+          <li><strong>Cancellation is external:</strong> Promises are read handles. Use AbortController for write (cancel) semantics.</li>
+        </ul>
+
+        <h3>What NOT to Say in an Interview</h3>
+        <div class="callout callout-warning">
+          <ul>
+            <li>❌ "Promises are like callbacks but cleaner" — this undersells the semantic difference (state machine vs fire-and-forget)</li>
+            <li>❌ "await pauses execution" — imprecise. It suspends the async function's execution context and returns control to the caller. The event loop continues.</li>
+            <li>❌ "async/await is just syntax sugar for .then()" — it desugars to generators/coroutines, which have different error and stack trace semantics</li>
+            <li>❌ ".then() runs the callback immediately if the Promise is resolved" — no, it always schedules a microtask</li>
+            <li>❌ "You can cancel a Promise with AbortController" — you cancel the operation, not the Promise. The Promise still settles (rejects with AbortError).</li>
+          </ul>
+        </div>
+
+        <h3>One-Sentence Summary</h3>
+        <p>A Promise is an eagerly-evaluated state machine whose reactions execute as microtasks; async/await builds coroutine suspension on top of this, and mastering the scheduling semantics is what enables building robust production patterns for concurrency, cancellation, and error recovery.</p>
+      </details>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+</body>
+</html>

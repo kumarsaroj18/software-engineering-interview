@@ -1,0 +1,2675 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 3: Prototypes &amp; Inheritance | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <!-- Sidebar Navigation -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 3</span>
+      <span class="chapter-title">Prototypes &amp; Inheritance</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#prototype-chain">[[Prototype]] Chain Internals</a></li>
+        <li><a href="#creation-patterns">Object.create vs Constructors vs class</a></li>
+        <li><a href="#property-lookup">Property Lookup Algorithm</a></li>
+        <li><a href="#hidden-classes">Hidden Classes &amp; Shape Transitions</a></li>
+        <li><a href="#prototype-mutations">Prototype Mutations</a></li>
+        <li><a href="#well-known-symbols">Well-Known Symbols</a></li>
+        <li><a href="#proxy-reflect">Proxy &amp; Reflect</a></li>
+        <li><a href="#mixin-patterns">Mixin Patterns at Scale</a></li>
+        <li><a href="#object-immutability">Object.freeze &amp; Object.seal</a></li>
+        <li><a href="#production-architecture">Production Architecture</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-i">Part I — JavaScript Engine Internals</a> &rsaquo;
+      <span>Chapter 3</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">Prototypes</span>
+        <span class="badge badge-topic">Inheritance</span>
+        <span class="badge badge-topic">V8</span>
+        <span class="badge badge-topic">Metaprogramming</span>
+      </div>
+      <h1>How does prototypal inheritance differ from classical inheritance, and why does it matter for large-scale applications?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> JavaScript uses a prototype chain — a linked list of objects — for property lookup. Understanding how V8 represents this as Hidden Classes (Maps) and how prototype mutations destroy inline cache optimizations is what separates senior engineers from those who just know "objects inherit from other objects."
+      </p>
+    </header>
+
+    <!-- Search -->
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter... (Ctrl+K or /)" aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <div class="callout callout-info">
+        <p><strong>What they're really testing:</strong></p>
+        <ul>
+          <li>Do you understand the prototype chain at the engine level — not just "objects inherit from other objects"?</li>
+          <li>Can you explain how V8's Hidden Classes (Maps) and Inline Caches interact with prototype-based inheritance?</li>
+          <li>Do you know the performance cost of prototype mutations after object creation?</li>
+          <li>Can you make informed architectural decisions — composition vs inheritance, factory functions vs classes — with engine-level reasoning?</li>
+          <li>Have you dealt with prototype pollution vulnerabilities or mixin-related bugs in production?</li>
+        </ul>
+      </div>
+      <p>This question separates engineers who memorized "JavaScript uses prototypal inheritance" from those who understand <em>how</em> the engine implements it, <em>why</em> certain patterns destroy performance, and <em>when</em> to choose which object creation strategy in large codebases.</p>
+      <p>At FAANG-level interviews, the interviewer expects you to connect prototypal inheritance to V8's internal object representation, explain why <code>Object.setPrototypeOf</code> is a performance cliff, and articulate production-grade decisions about class hierarchies vs composition — with specific reasoning about Hidden Class stability, inline cache monomorphism, and memory layout.</p>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <div class="callout callout-tip">
+        <p><strong>Use this in the interview:</strong></p>
+        <p>JavaScript doesn't have classical inheritance with copying semantics. Instead, every object has an internal <code>[[Prototype]]</code> slot pointing to another object, forming a linked list. Property lookup walks this chain until it finds the property or hits <code>null</code>.</p>
+        <p>There are three main creation patterns: <code>Object.create(proto)</code> for direct prototype linkage, constructor functions with <code>new</code> for the classical pattern, and <code>class</code> syntax which desugars to the constructor pattern but with stricter semantics.</p>
+        <p>At the engine level, V8 uses Hidden Classes (called "Maps" internally) to optimize property access. Objects sharing the same shape get the same Hidden Class, enabling inline caching. When you mutate a prototype — via <code>Object.setPrototypeOf</code> or monkey-patching — you invalidate inline caches globally, forcing the engine into slow-path dictionary lookups.</p>
+        <p>For large-scale applications: prefer composition over deep inheritance chains (chain length directly impacts lookup performance), establish object shapes at construction time (don't add properties conditionally), never mutate prototypes after initialization, and use <code>Object.create(null)</code> for dictionary objects that shouldn't inherit <code>Object.prototype</code> methods.</p>
+      </div>
+    </section>
+
+    <!-- Section 3: [[Prototype]] Chain Internals -->
+    <section id="prototype-chain">
+      <h2>[[Prototype]] Chain Internals</h2>
+
+      <details>
+        <summary>How property lookup traverses the chain</summary>
+        <p>When you access <code>obj.prop</code>, the engine executes a well-defined algorithm:</p>
+        <ol>
+          <li>Check <code>obj</code>'s own properties (stored on the object itself or, in V8, as in-object properties or backing store properties).</li>
+          <li>If not found, follow <code>obj.[[Prototype]]</code> to the next object in the chain.</li>
+          <li>Repeat step 1-2 on each prototype object.</li>
+          <li>If the chain terminates at <code>null</code> without finding the property, return <code>undefined</code>.</li>
+        </ol>
+        <pre class="diagram">
+┌─────────────┐     [[Prototype]]     ┌──────────────────┐     [[Prototype]]     ┌───────────────────┐     [[Prototype]]
+│   myObj     │ ──────────────────────▶│  MyClass.proto   │ ──────────────────────▶│ Object.prototype  │ ──────────────────▶ null
+│             │                        │                  │                        │                   │
+│ ownProp: 1  │                        │ sharedMethod()   │                        │ toString()        │
+│ data: [...]  │                        │ getValue()       │                        │ hasOwnProperty()  │
+└─────────────┘                        └──────────────────┘                        │ valueOf()         │
+                                                                                   └───────────────────┘
+        </pre>
+        <p>In V8, this lookup is heavily optimized via <strong>Inline Caches (ICs)</strong>. On first access, V8 records the object's Hidden Class and the property's offset. On subsequent accesses with the same Hidden Class, V8 directly reads from the cached offset — <em>O(1)</em> instead of walking the chain. This is why prototype stability matters enormously.</p>
+      </details>
+
+      <details>
+        <summary>Object.getPrototypeOf vs __proto__ vs .prototype property</summary>
+        <p>These three are commonly confused. They serve fundamentally different purposes:</p>
+        <pre><code class="language-javascript">// 1. Object.getPrototypeOf(obj) — the CORRECT way to read [[Prototype]]
+const proto = Object.getPrototypeOf(myObj);
+
+// 2. obj.__proto__ — legacy accessor property on Object.prototype
+// It's a getter/setter defined on Object.prototype that accesses [[Prototype]]
+// Deprecated in spec, but universally supported. Avoid in production.
+const proto2 = myObj.__proto__; // same as Object.getPrototypeOf(myObj)
+
+// 3. Constructor.prototype — the object that BECOMES [[Prototype]]
+// when you use `new Constructor()`
+function Dog(name) { this.name = name; }
+Dog.prototype.bark = function() { return 'Woof!'; };
+
+const rex = new Dog('Rex');
+// rex.[[Prototype]] === Dog.prototype  ✓
+// rex.prototype === undefined          ✓ (only functions have .prototype)
+Object.getPrototypeOf(rex) === Dog.prototype; // true</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Critical distinction:</strong> <code>.prototype</code> is a property on <em>functions</em> (the object that will become the prototype of instances). <code>[[Prototype]]</code> is an internal slot on <em>every object</em> (the link to its parent in the chain). <code>__proto__</code> is a deprecated accessor that reads/writes <code>[[Prototype]]</code>.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Prototype chain termination: Object.prototype → null</summary>
+        <p>Every standard prototype chain terminates at <code>Object.prototype</code>, whose own <code>[[Prototype]]</code> is <code>null</code>:</p>
+        <pre><code class="language-javascript">Object.getPrototypeOf(Object.prototype) === null; // true
+
+// This is WHY property lookup eventually stops:
+// When the engine reaches an object whose [[Prototype]] is null,
+// the search terminates and returns undefined.
+
+// Exception: Object.create(null) creates a prototype-less object
+const dict = Object.create(null);
+Object.getPrototypeOf(dict); // null — NO prototype chain at all
+dict.toString; // undefined — no inherited methods
+'toString' in dict; // false</code></pre>
+        <p>This termination is also why <code>Object.prototype</code> pollution is so dangerous — every normal object in the runtime inherits from it. Adding a property to <code>Object.prototype</code> makes it visible on <em>every</em> object via the chain.</p>
+      </details>
+
+      <details>
+        <summary>Performance: chain length impact on property access</summary>
+        <p>In theory, longer chains mean more hops. In practice, V8's Inline Caches eliminate this cost for <strong>monomorphic</strong> access patterns (same Hidden Class every time). However:</p>
+        <ul>
+          <li><strong>Monomorphic IC hit:</strong> Chain length is irrelevant — cached offset gives O(1) access.</li>
+          <li><strong>Polymorphic IC (2-4 shapes):</strong> V8 maintains a small dispatch table. Chain length matters during IC miss/compilation.</li>
+          <li><strong>Megamorphic IC (5+ shapes):</strong> Falls back to hash-table lookup. Chain length now directly impacts performance.</li>
+          <li><strong>Missing properties:</strong> Always walk the full chain to null — this is the worst case. V8 can cache "not found" results, but prototype mutations invalidate these caches.</li>
+        </ul>
+        <pre><code class="language-javascript">// Benchmark: chain depth vs property access
+// Deeper chains only hurt when ICs can't cache the result
+
+// Shallow chain (fast — IC caches after first access)
+const shallow = Object.create({ value: 42 });
+shallow.value; // IC caches: Hidden Class → offset
+
+// Deep chain (same speed with monomorphic IC)
+const deep = Object.create(
+  Object.create(
+    Object.create(
+      Object.create({ value: 42 })
+    )
+  )
+);
+deep.value; // IC still caches — O(1) after first access
+
+// WHERE depth hurts: missing properties
+deep.nonExistent; // Must walk 5 levels to null EVERY time (until IC caches "absent")</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 4: Object.create vs Constructor Functions vs class -->
+    <section id="creation-patterns">
+      <h2>Object.create vs Constructor Functions vs class</h2>
+
+      <details>
+        <summary>Object.create(proto) — direct prototype linkage</summary>
+        <p><code>Object.create</code> is the most direct way to establish a prototype link. It creates a new object with the specified prototype without invoking any constructor function:</p>
+        <pre><code class="language-javascript">// Object.create — pure prototype delegation
+const animal = {
+  breathe() { return 'inhale...exhale'; },
+  describe() { return `I am a ${this.type}`; }
+};
+
+const dog = Object.create(animal);
+dog.type = 'dog';
+dog.bark = function() { return 'Woof!'; };
+
+// dog.[[Prototype]] === animal
+// dog.breathe() → found on animal via chain
+// dog.bark() → found on dog itself (own property)
+
+// Object.create with property descriptors (second argument)
+const cat = Object.create(animal, {
+  type: { value: 'cat', writable: true, enumerable: true, configurable: true },
+  purr: { value() { return 'Prrr'; }, enumerable: true, configurable: true }
+});
+
+// Object.create(null) — no prototype at all
+const safeDict = Object.create(null);
+// No toString, no hasOwnProperty, no constructor — truly empty
+// Immune to prototype pollution attacks</code></pre>
+        <p><strong>V8 implication:</strong> Objects created via <code>Object.create</code> with subsequent property additions create a new Hidden Class transition for each property. V8 cannot predict the shape at creation time, which may result in slower initial shape transitions compared to constructors where the shape is predictable from the constructor body.</p>
+      </details>
+
+      <details>
+        <summary>Constructor functions + new keyword (what new actually does)</summary>
+        <p>The <code>new</code> keyword performs exactly 4 steps (per ECMAScript spec §13.2.2):</p>
+        <pre><code class="language-javascript">// What `new Foo(args)` actually does:
+function simulateNew(Constructor, ...args) {
+  // Step 1: Create a new empty object
+  const obj = {};
+  
+  // Step 2: Link [[Prototype]] to Constructor.prototype
+  Object.setPrototypeOf(obj, Constructor.prototype);
+  
+  // Step 3: Execute constructor with `this` bound to new object
+  const result = Constructor.apply(obj, args);
+  
+  // Step 4: If constructor returns an object, use it; otherwise return obj
+  return (result !== null &amp;&amp; typeof result === 'object') ? result : obj;
+}
+
+// Example constructor
+function Person(name, age) {
+  // `this` is the newly created object (from Step 1-2)
+  this.name = name;  // Creates own property on the instance
+  this.age = age;    // Creates own property on the instance
+}
+// Methods go on the prototype — shared across all instances
+Person.prototype.greet = function() {
+  return `Hi, I'm ${this.name}`;
+};
+
+const alice = new Person('Alice', 30);
+// alice has own properties: { name: 'Alice', age: 30 }
+// alice.[[Prototype]] === Person.prototype (has greet)</code></pre>
+        <div class="callout callout-info">
+          <p><strong>V8 optimization:</strong> V8 pre-analyzes constructor functions to predict the object shape. It creates an "initial map" (Hidden Class) for the constructor and pre-allocates in-object property slots. This is why constructors that always assign the same properties in the same order produce optimally-shaped objects. Adding properties conditionally inside constructors forces V8 to create branching shape transitions.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>ES6 class — syntactic sugar with stricter semantics</summary>
+        <p>Classes desugar to constructor functions + prototype assignment, but with important behavioral differences:</p>
+        <pre><code class="language-javascript">// ES6 class
+class Animal {
+  constructor(type) {
+    this.type = type;          // Instance property
+  }
+  breathe() {                  // Goes on Animal.prototype
+    return 'inhale...exhale';
+  }
+  static create(type) {        // Goes on Animal itself (not prototype)
+    return new Animal(type);
+  }
+}
+
+// Desugars roughly to:
+function Animal(type) {
+  if (!new.target) throw new TypeError("Class constructor cannot be invoked without 'new'");
+  this.type = type;
+}
+Animal.prototype.breathe = function() { return 'inhale...exhale'; };
+Animal.prototype.constructor = Animal;
+Object.defineProperty(Animal, 'create', {
+  value: function(type) { return new Animal(type); },
+  writable: true, configurable: true
+});
+
+// Key differences from plain constructors:
+// 1. Classes MUST be called with `new` (TDZ + new.target check)
+// 2. Class methods are non-enumerable (defined with defineProperty)
+// 3. Class body is always in strict mode
+// 4. Class declarations are NOT hoisted (temporal dead zone)
+// 5. extends/super provide proper subclassing (including built-ins)</code></pre>
+        <pre><code class="language-javascript">// Subclassing with extends — what happens internally
+class Dog extends Animal {
+  constructor(name) {
+    super('dog');              // MUST call super before using `this`
+    this.name = name;
+  }
+  bark() { return 'Woof!'; }
+}
+
+// What extends sets up:
+// Dog.prototype.[[Prototype]] === Animal.prototype  (instance method chain)
+// Dog.[[Prototype]] === Animal                      (static method chain)
+// super() calls Animal.constructor with new.target = Dog</code></pre>
+      </details>
+
+      <details>
+        <summary>Comparison table: memory, performance, readability</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>Object.create</th>
+              <th>Constructor + new</th>
+              <th>class</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Prototype setup</td>
+              <td>Explicit, direct</td>
+              <td>Via .prototype property</td>
+              <td>Via extends keyword</td>
+            </tr>
+            <tr>
+              <td>V8 shape prediction</td>
+              <td>⚠️ Poor (ad-hoc properties)</td>
+              <td>✅ Good (predictable body)</td>
+              <td>✅ Good (predictable body)</td>
+            </tr>
+            <tr>
+              <td>Memory per instance</td>
+              <td>Only own props</td>
+              <td>Own props + hidden class</td>
+              <td>Own props + hidden class</td>
+            </tr>
+            <tr>
+              <td>Method sharing</td>
+              <td>Via prototype object</td>
+              <td>Via Constructor.prototype</td>
+              <td>Via class prototype</td>
+            </tr>
+            <tr>
+              <td>Subclassing built-ins</td>
+              <td>❌ Manual, fragile</td>
+              <td>❌ Doesn't work (Array, Map)</td>
+              <td>✅ Proper support</td>
+            </tr>
+            <tr>
+              <td>Strict mode</td>
+              <td>Depends on context</td>
+              <td>Depends on context</td>
+              <td>Always strict</td>
+            </tr>
+            <tr>
+              <td>Team readability</td>
+              <td>⚠️ Unfamiliar to many</td>
+              <td>⚠️ Verbose, error-prone</td>
+              <td>✅ Familiar OOP syntax</td>
+            </tr>
+            <tr>
+              <td>Use case</td>
+              <td>Dictionaries, delegation</td>
+              <td>Legacy code, polyfills</td>
+              <td>Application code, libraries</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 5: Property Lookup Algorithm -->
+    <section id="property-lookup">
+      <h2>Property Lookup Algorithm</h2>
+
+      <details>
+        <summary>Own property check (hasOwnProperty)</summary>
+        <p>The first step in any property access is checking the object's own properties. In V8, "own properties" are stored in two possible locations:</p>
+        <ul>
+          <li><strong>In-object properties:</strong> Stored directly on the object's memory (fast, limited slots pre-allocated based on constructor analysis).</li>
+          <li><strong>Backing store (properties array):</strong> Overflow properties stored in a separate array when in-object slots are exhausted.</li>
+        </ul>
+        <pre><code class="language-javascript">const obj = { a: 1, b: 2 };
+obj.c = 3;
+
+// Checking own properties:
+obj.hasOwnProperty('a');           // true — own property
+obj.hasOwnProperty('toString');    // false — inherited from Object.prototype
+
+// SAFER alternative (immune to prototype override):
+Object.prototype.hasOwnProperty.call(obj, 'a');     // true
+Object.hasOwn(obj, 'a');                             // true (ES2022)
+
+// Why "safer"? Because someone could do:
+const malicious = { hasOwnProperty: () =&gt; true };
+malicious.hasOwnProperty('anything'); // always true — WRONG
+Object.hasOwn(malicious, 'anything'); // correct answer</code></pre>
+      </details>
+
+      <details>
+        <summary>Walking up the [[Prototype]] chain</summary>
+        <p>If the property isn't found as an own property, the engine follows the <code>[[Prototype]]</code> link and repeats the own-property check on the next object:</p>
+        <pre><code class="language-javascript">// Pseudocode for property lookup (simplified from spec §13.4.12)
+function getProperty(obj, key) {
+  let current = obj;
+  while (current !== null) {
+    // Check own properties (data properties + accessors)
+    const desc = Object.getOwnPropertyDescriptor(current, key);
+    if (desc !== undefined) {
+      // Found! Return value (or call getter for accessor)
+      if ('value' in desc) return desc.value;
+      if (desc.get) return desc.get.call(obj); // `this` is original obj
+      return undefined;
+    }
+    // Not found — move up the chain
+    current = Object.getPrototypeOf(current);
+  }
+  return undefined; // Chain exhausted
+}
+
+// Key insight: even when the property is found on a prototype,
+// `this` inside methods refers to the ORIGINAL object (receiver),
+// not the prototype where the method was found.</code></pre>
+      </details>
+
+      <details>
+        <summary>Property shadowing</summary>
+        <p>When you assign a property that exists on the prototype, the behavior depends on the property descriptor on the prototype:</p>
+        <pre><code class="language-javascript">const proto = { x: 10 };
+const child = Object.create(proto);
+
+// Case 1: Normal data property on prototype — creates shadow
+child.x = 20;
+// child now has OWN property x: 20
+// proto.x is still 10 — not modified
+child.x;                    // 20 (own property)
+Object.getPrototypeOf(child).x; // 10 (prototype property, untouched)
+
+// Case 2: Read-only property on prototype — SILENTLY FAILS (or throws in strict)
+const proto2 = {};
+Object.defineProperty(proto2, 'y', { value: 5, writable: false });
+const child2 = Object.create(proto2);
+child2.y = 99;             // Silent failure in sloppy mode!
+child2.y;                  // 5 — no own property created!
+// In strict mode: TypeError: Cannot assign to read only property 'y'
+
+// Case 3: Setter on prototype — calls the setter, no shadow
+const proto3 = {
+  _z: 0,
+  set z(val) { this._z = val; },  // `this` = child3 (receiver)
+  get z() { return this._z; }
+};
+const child3 = Object.create(proto3);
+child3.z = 42;            // Calls setter with this = child3
+child3._z;                // 42 — own property _z on child3
+child3.hasOwnProperty('z'); // false! No shadow — setter intercepted</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Gotcha for senior engineers:</strong> Property shadowing rules mean that prototype setters can create own properties with <em>different names</em> on the receiver. This is used intentionally in Vue 2's reactivity system (defineProperty on the object to intercept sets) and can cause subtle bugs when you expect assignment to create a simple own property.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Getters/setters on the prototype chain</summary>
+        <p>Accessor properties (get/set) on the prototype chain behave differently from data properties during both read and write operations:</p>
+        <pre><code class="language-javascript">const base = {
+  _value: 0,
+  get value() {
+    // `this` is the receiver (the object on which .value was accessed)
+    console.log(`Getting value from: ${this === base ? 'base' : 'child'}`);
+    return this._value;
+  },
+  set value(v) {
+    // `this` is the receiver — creates _value on the receiver, not base
+    console.log(`Setting value on: ${this === base ? 'base' : 'child'}`);
+    this._value = v;
+  }
+};
+
+const child = Object.create(base);
+child.value = 42;
+// Logs: "Setting value on: child"
+// child._value === 42 (own property on child)
+// base._value === 0 (unchanged)
+
+child.value;
+// Logs: "Getting value from: child"
+// Returns 42 (reads child._value)
+
+// This is the foundation of Vue 2's reactivity:
+// Define getters/setters on the prototype or the object itself
+// to intercept property access and trigger dependency tracking.</code></pre>
+      </details>
+
+      <details>
+        <summary>Performance implications of deep chains</summary>
+        <p>While V8's IC system often eliminates chain-walk cost, there are scenarios where depth matters:</p>
+        <ul>
+          <li><strong>IC misses during warmup:</strong> First access to a property on a deep chain requires walking the full depth. In hot loops during JIT compilation, this warmup cost can add up.</li>
+          <li><strong>Prototype changes invalidate IC caches globally:</strong> If any object in the chain has its prototype mutated, all ICs that cached properties through that chain are invalidated.</li>
+          <li><strong>Missing property lookups:</strong> Accessing a property that doesn't exist anywhere in the chain always requires walking to <code>null</code>. V8 can cache "absent" results, but these caches are fragile.</li>
+          <li><strong>Polymorphic sites:</strong> If a function receives objects with different prototype chain lengths for the same property, the IC becomes polymorphic, reducing optimization potential.</li>
+        </ul>
+        <pre><code class="language-javascript">// Anti-pattern: deep inheritance hierarchies
+class Entity {}
+class LivingEntity extends Entity {}
+class Animal extends LivingEntity {}
+class Mammal extends Animal {}
+class Dog extends Mammal {}
+class GoldenRetriever extends Dog {}
+// 6 levels deep — accessing Entity methods requires 6 hops on IC miss
+
+// Preferred: shallow chain + composition
+class Dog {
+  constructor() {
+    this.movement = new MovementBehavior();
+    this.sound = new SoundBehavior('bark');
+  }
+}
+// Only 1-2 levels deep, behaviors are own properties (fastest access)</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 6: Hidden Classes & Shape Transitions -->
+    <section id="hidden-classes">
+      <h2>Hidden Classes &amp; Shape Transitions</h2>
+
+      <details>
+        <summary>What Hidden Classes (Maps) are in V8</summary>
+        <p>V8 doesn't store objects as hash maps (despite <code>{}</code> syntax). Instead, every object has a pointer to a <strong>Hidden Class</strong> (internally called a "Map" in V8, "Shape" in SpiderMonkey, "Structure" in JavaScriptCore). The Hidden Class describes:</p>
+        <ul>
+          <li>Which properties exist on the object</li>
+          <li>The order they were added</li>
+          <li>Each property's offset in the object's memory layout</li>
+          <li>Each property's attributes (writable, enumerable, configurable)</li>
+          <li>The object's <code>[[Prototype]]</code> reference</li>
+        </ul>
+        <pre class="diagram">
+Hidden Class (Map) for objects with shape { x, y }:
+
+┌──────────────────────────────────┐
+│  Hidden Class (Map) #3           │
+│  ─────────────────────           │
+│  Property: "x"                   │
+│    Offset: 0, Writable: true     │
+│  Property: "y"                   │
+│    Offset: 1, Writable: true     │
+│  Prototype: Point.prototype      │
+│  Back pointer: Map #2            │
+│  Transitions: (none)             │
+└──────────────────────────────────┘
+        ▲                ▲
+        │                │
+   ┌────┴────┐     ┌────┴────┐
+   │ point1  │     │ point2  │      ← Same Hidden Class = same shape
+   │ x: 1    │     │ x: 5    │         V8 uses same IC cache for both
+   │ y: 2    │     │ y: 10   │
+   └─────────┘     └─────────┘
+        </pre>
+        <p>When two objects share the same Hidden Class, V8's Inline Caches can optimize property access to a single memory offset read — as fast as a C struct field access.</p>
+      </details>
+
+      <details>
+        <summary>How adding properties creates shape transitions</summary>
+        <p>Each property addition creates a <strong>transition</strong> from one Hidden Class to another, forming a transition tree:</p>
+        <pre><code class="language-javascript">function Point(x, y) {
+  this.x = x;  // Transition: Map_0 (empty) → Map_1 (has x)
+  this.y = y;  // Transition: Map_1 (has x) → Map_2 (has x, y)
+}
+
+// V8's transition tree:
+// Map_0 (empty) --[add "x"]--> Map_1 --[add "y"]--> Map_2
+//
+// All `new Point(...)` instances end up at Map_2</code></pre>
+        <pre><code class="language-javascript">// PROBLEM: Conditional property addition creates BRANCHING transitions
+function BadPoint(x, y, z) {
+  this.x = x;
+  this.y = y;
+  if (z !== undefined) {
+    this.z = z;    // Some instances get Map_3a (x,y,z)
+  }
+  // Others stay at Map_2 (x,y)
+}
+
+// Now objects from BadPoint have DIFFERENT Hidden Classes
+// ICs that receive both shapes become polymorphic → slower
+
+// WORSE: Adding properties in different orders
+const a = {}; a.x = 1; a.y = 2;  // Map: empty → x → x,y
+const b = {}; b.y = 2; b.x = 1;  // Map: empty → y → y,x
+// a and b have DIFFERENT Hidden Classes despite same properties!
+// V8 treats property ORDER as part of the shape.</code></pre>
+        <div class="callout callout-tip">
+          <p><strong>Rule of thumb:</strong> Always add properties in the same order, always add all properties (use <code>undefined</code> as default), and do it in the constructor. This ensures all instances share one Hidden Class — maximizing IC effectiveness.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Why prototype mutation is catastrophic for performance</summary>
+        <p>The Hidden Class stores a reference to the object's prototype. When you call <code>Object.setPrototypeOf(obj, newProto)</code>, V8 must:</p>
+        <ol>
+          <li>Create a new Hidden Class (the prototype is part of the shape)</li>
+          <li>Invalidate ALL Inline Caches that cached property lookups through this object's prototype chain</li>
+          <li>Invalidate Inline Caches on ALL objects that shared the old Hidden Class</li>
+          <li>Force re-compilation of optimized (TurboFan) code that inlined prototype assumptions</li>
+        </ol>
+        <pre><code class="language-javascript">// This is a global performance nuke:
+const obj = new MyClass();
+Object.setPrototypeOf(obj, newProto);
+// Every IC that ever cached a property on obj or any object with
+// the same Hidden Class is now invalid.
+// V8 may deoptimize entire functions back to interpreted mode.
+
+// Chrome DevTools will literally warn you:
+// ⚠️ "Optimization disabled for [function] — prototype change"</code></pre>
+      </details>
+
+      <details>
+        <summary>Inline Caches becoming megamorphic after prototype changes</summary>
+        <p>V8's Inline Cache (IC) states and what triggers transitions:</p>
+        <pre class="diagram">
+IC States:
+┌──────────────────┐     miss      ┌──────────────────┐     miss      ┌──────────────────┐     miss      ┌──────────────────┐
+│  Uninitialized   │ ────────────▶ │   Monomorphic    │ ────────────▶ │   Polymorphic    │ ────────────▶ │   Megamorphic    │
+│  (no cache)      │               │  (1 Hidden Class) │               │  (2-4 classes)   │               │  (generic lookup)│
+└──────────────────┘               └──────────────────┘               └──────────────────┘               └──────────────────┘
+                                         ⚡ FAST                           ⚡ Fast-ish                          🐌 SLOW
+                                   Single check + offset              Linear scan of cache             Hash-table lookup
+                                                                                                       No inlining possible
+        </pre>
+        <p>Prototype mutations force ICs into megamorphic state because the Hidden Class changes, introducing a new shape that wasn't in the IC's cache. Once megamorphic, an IC never recovers — it stays slow for the lifetime of that code location.</p>
+        <pre><code class="language-javascript">// Demonstration of IC degradation
+function getName(obj) {
+  return obj.name; // IC site
+}
+
+class User { constructor(n) { this.name = n; } }
+const users = Array.from({ length: 1000 }, (_, i) =&gt; new User(`User${i}`));
+
+// Phase 1: Monomorphic — all objects have same Hidden Class
+users.forEach(u =&gt; getName(u)); // IC: monomorphic, blazing fast
+
+// Phase 2: Mutate ONE object's prototype
+Object.setPrototypeOf(users[0], { greet() {} });
+// users[0] now has a DIFFERENT Hidden Class
+
+// Phase 3: IC for getName is now POLYMORPHIC
+users.forEach(u =&gt; getName(u)); // IC must check 2 shapes
+
+// If you mutate more objects with different prototypes:
+// IC becomes MEGAMORPHIC → permanent slow path</code></pre>
+      </details>
+
+      <details>
+        <summary>Code examples: slow vs fast patterns</summary>
+        <pre><code class="language-javascript">// ❌ SLOW: Dynamic property addition (shape transitions at runtime)
+function createUser(data) {
+  const user = {};
+  if (data.name) user.name = data.name;
+  if (data.email) user.email = data.email;
+  if (data.age) user.age = data.age;
+  return user;
+}
+// Each combination of present/absent fields creates a DIFFERENT Hidden Class
+// 2^3 = 8 possible shapes!
+
+// ✅ FAST: Predictable shape — always the same properties
+function createUser(data) {
+  return {
+    name: data.name ?? null,
+    email: data.email ?? null,
+    age: data.age ?? null
+  };
+}
+// ONE Hidden Class for all users — monomorphic ICs everywhere</code></pre>
+        <pre><code class="language-javascript">// ❌ SLOW: Modifying prototype after object creation
+class Component {}
+// Later in code...
+Component.prototype.newMethod = function() { /* ... */ };
+// Invalidates ALL ICs that accessed Component instances
+
+// ✅ FAST: Define everything before creating instances
+class Component {
+  newMethod() { /* ... */ }
+}
+// Or at least — add prototype methods BEFORE any instance is created</code></pre>
+        <pre><code class="language-javascript">// ❌ SLOW: delete operator (forces Hidden Class transition to "slow mode")
+const obj = { x: 1, y: 2, z: 3 };
+delete obj.y;
+// V8 transitions obj to "dictionary mode" — no more fast IC access
+
+// ✅ FAST: Set to undefined instead of delete
+const obj = { x: 1, y: 2, z: 3 };
+obj.y = undefined;
+// Keeps the same Hidden Class — IC still works</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 7: Performance Implications of Prototype Mutations -->
+    <section id="prototype-mutations">
+      <h2>Performance Implications of Prototype Mutations</h2>
+
+      <details>
+        <summary>Why Object.setPrototypeOf is slow (invalidates ICs across the engine)</summary>
+        <p><code>Object.setPrototypeOf</code> is one of the most expensive operations in JavaScript. The MDN documentation literally warns: "changing the [[Prototype]] of an object is a very slow operation." Here's why at the engine level:</p>
+        <ol>
+          <li><strong>Hidden Class invalidation:</strong> The prototype is part of the Hidden Class. Changing it creates a new Hidden Class and invalidates all objects that shared the old one.</li>
+          <li><strong>Global IC invalidation:</strong> V8 maintains a "prototype chain validity cell" for each prototype. Mutating a prototype flips this cell, causing ALL ICs that depend on that prototype chain to miss.</li>
+          <li><strong>Deoptimization cascade:</strong> TurboFan (V8's optimizing compiler) inlines prototype assumptions. Prototype changes trigger deoptimization — compiled machine code is discarded and execution falls back to the interpreter.</li>
+          <li><strong>No recovery:</strong> Once an IC becomes megamorphic due to prototype changes, it stays megamorphic. The optimization is permanently lost for that code site.</li>
+        </ol>
+        <pre><code class="language-javascript">// V8's internal prototype validity mechanism:
+// Each prototype object has a "validity cell"
+// ICs cache: [HiddenClass, offset, validityCell]
+// Before using cached offset, check validityCell.isValid()
+// Object.setPrototypeOf invalidates the cell → ALL ICs miss
+
+// Even changing a DIFFERENT object's prototype can affect you:
+const proto = { shared: 42 };
+const a = Object.create(proto);
+const b = Object.create(proto);
+
+function getShared(obj) { return obj.shared; } // IC caches proto lookup
+
+getShared(a); // IC: monomorphic, caches validity cell of proto
+getShared(b); // IC hit — same chain
+
+Object.setPrototypeOf(a, {}); // Invalidates proto's validity cell!
+getShared(b); // IC MISS — validity cell invalidated even for b!</code></pre>
+      </details>
+
+      <details>
+        <summary>Monkey-patching prototypes in production</summary>
+        <p>Monkey-patching (adding/modifying methods on built-in or library prototypes) is common in polyfills and some frameworks. The performance implications vary by timing:</p>
+        <pre><code class="language-javascript">// TIMING MATTERS:
+
+// ✅ OK: Patching BEFORE any instances are created (app startup)
+// No existing ICs to invalidate
+if (!Array.prototype.at) {
+  // Polyfill — added before any arrays are used in hot paths
+  Array.prototype.at = function(index) {
+    return this[index &lt; 0 ? this.length + index : index];
+  };
+}
+
+// ❌ TERRIBLE: Patching AFTER instances exist and code is JIT-compiled
+// In a route handler, after the app has been running:
+Array.prototype.customFilter = function(fn) { /* ... */ };
+// This invalidates ICs for ALL array property accesses across the entire app
+// Every function that touches array methods may deoptimize
+
+// ❌ WORST: Patching in a hot loop or frequently-called function
+function processData(items) {
+  // Someone thought this was clever:
+  items.__proto__.transform = function() { /* ... */ };
+  // CATASTROPHIC — invalidates on EVERY call
+}</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Production rule:</strong> All prototype modifications must happen at application bootstrap, before any hot code paths execute. Never modify prototypes in response to runtime events, user actions, or within request handlers.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>V8 deoptimization when prototype shapes change</summary>
+        <p>V8's TurboFan optimizing compiler makes aggressive assumptions about prototype stability. When these assumptions break, <strong>deoptimization</strong> occurs — the optimized machine code is thrown away:</p>
+        <pre><code class="language-javascript">// What TurboFan assumes (after profiling):
+function processUser(user) {
+  // TurboFan sees: user always has Hidden Class X
+  // TurboFan sees: user.getName is always at prototype offset Y
+  // TurboFan INLINES the method call — no lookup at all!
+  return user.getName().toUpperCase();
+}
+
+// After 10,000 calls, TurboFan has compiled this to machine code:
+// 1. Check user's Hidden Class === X (guard)
+// 2. Read name from offset Y directly (no chain walk)
+// 3. Call toUpperCase inline
+
+// NOW: someone adds a method to User.prototype
+User.prototype.serialize = function() { /* ... */ };
+// TurboFan's prototype stability assumption is VIOLATED
+// → Deoptimize processUser back to INTERPRETER
+// → Must re-profile and re-compile (if it's still hot)
+// → The re-compiled version may be LESS optimized (less confident)</code></pre>
+        <p>You can observe this in Chrome DevTools: Performance panel → "Deopt" events. Or run Node.js with <code>--trace-deopt</code> to see deoptimization reasons in the console.</p>
+        <pre><code class="language-javascript">// Run with: node --trace-deopt app.js
+// Output: [deoptimizing (DEOPT eager): begin ... reason: prototype change]</code></pre>
+      </details>
+
+      <details>
+        <summary>Benchmarks showing the impact</summary>
+        <pre><code class="language-javascript">// Benchmark: property access before and after prototype mutation
+// (Representative numbers — actual times vary by machine and V8 version)
+
+const proto = { getValue() { return this._val; } };
+
+function createObj(val) {
+  const obj = Object.create(proto);
+  obj._val = val;
+  return obj;
+}
+
+const objects = Array.from({ length: 100000 }, (_, i) =&gt; createObj(i));
+
+// --- Benchmark 1: Monomorphic access (before mutation) ---
+console.time('before-mutation');
+let sum = 0;
+for (let i = 0; i &lt; objects.length; i++) {
+  sum += objects[i].getValue(); // Monomorphic IC — ~2ns per call
+}
+console.timeEnd('before-mutation');
+// Typical: 2-5ms for 100K calls
+
+// --- Mutate prototype ---
+proto.newMethod = function() {};  // Invalidates ALL ICs
+
+// --- Benchmark 2: After mutation ---
+console.time('after-mutation');
+sum = 0;
+for (let i = 0; i &lt; objects.length; i++) {
+  sum += objects[i].getValue(); // IC must re-learn — ~10-50ns per call initially
+}
+console.timeEnd('after-mutation');
+// Typical: 10-50ms for 100K calls (5-25x slower on first pass)
+
+// After re-warming: performance recovers partially
+// But may never reach original speed if IC became megamorphic</code></pre>
+        <div class="callout callout-info">
+          <p><strong>Real-world impact:</strong> In a React application with 10,000 component instances, mutating a base component's prototype mid-session (e.g., hot-module-reload adding a method) can cause 50-100ms jank as V8 deoptimizes and re-compiles affected code paths. This is why HMR systems need careful prototype patching strategies.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 8: Well-Known Symbols -->
+    <section id="well-known-symbols">
+      <h2>Symbol.hasInstance, Symbol.toPrimitive, and Well-Known Symbols</h2>
+
+      <details>
+        <summary>Customizing instanceof via Symbol.hasInstance</summary>
+        <p><code>instanceof</code> doesn't just walk the prototype chain. It first checks if the right-hand side has <code>[Symbol.hasInstance]</code>, and if so, delegates entirely to that method:</p>
+        <pre><code class="language-javascript">// Default instanceof behavior:
+// obj instanceof Constructor
+// → walks obj's [[Prototype]] chain looking for Constructor.prototype
+
+// Custom instanceof with Symbol.hasInstance:
+class ValidString {
+  static [Symbol.hasInstance](instance) {
+    return typeof instance === 'string' &amp;&amp; instance.length &gt; 0;
+  }
+}
+
+'' instanceof ValidString;      // false
+'hello' instanceof ValidString; // true
+42 instanceof ValidString;      // false
+
+// Practical use: duck-typing check
+class Iterable {
+  static [Symbol.hasInstance](instance) {
+    return instance != null &amp;&amp; typeof instance[Symbol.iterator] === 'function';
+  }
+}
+
+[1, 2, 3] instanceof Iterable;     // true
+'hello' instanceof Iterable;        // true (strings are iterable)
+new Map() instanceof Iterable;      // true
+42 instanceof Iterable;             // false
+
+// ⚠️ Symbol.hasInstance is checked FIRST — it completely overrides
+// the normal prototype-chain walk. This can break assumptions.</code></pre>
+      </details>
+
+      <details>
+        <summary>Controlling type coercion with Symbol.toPrimitive</summary>
+        <p><code>Symbol.toPrimitive</code> gives objects control over how they convert to primitive values. It receives a "hint" indicating what type is preferred:</p>
+        <pre><code class="language-javascript">class Temperature {
+  constructor(celsius) {
+    this.celsius = celsius;
+  }
+  
+  [Symbol.toPrimitive](hint) {
+    switch (hint) {
+      case 'number':
+        return this.celsius;           // Numeric context
+      case 'string':
+        return `${this.celsius}°C`;    // String context
+      case 'default':
+        return this.celsius;           // == comparison, + operator
+      default:
+        throw new TypeError('Invalid hint');
+    }
+  }
+}
+
+const temp = new Temperature(100);
++temp;              // 100 (hint: 'number')
+`${temp}`;          // "100°C" (hint: 'string')
+temp + 10;          // 110 (hint: 'default')
+temp == 100;        // true (hint: 'default')
+temp &gt; 50;          // true (hint: 'number')
+
+// Without Symbol.toPrimitive, the engine uses:
+// 1. valueOf() for numeric hint
+// 2. toString() for string hint
+// 3. valueOf() then toString() for default hint
+// Symbol.toPrimitive OVERRIDES both valueOf and toString</code></pre>
+      </details>
+
+      <details>
+        <summary>Symbol.iterator for custom iteration</summary>
+        <p><code>Symbol.iterator</code> defines the iteration protocol — making any object work with <code>for...of</code>, spread, and destructuring:</p>
+        <pre><code class="language-javascript">// Custom range iterator
+class Range {
+  constructor(start, end, step = 1) {
+    this.start = start;
+    this.end = end;
+    this.step = step;
+  }
+  
+  [Symbol.iterator]() {
+    let current = this.start;
+    const { end, step } = this;
+    
+    return {
+      next() {
+        if (current &lt;= end) {
+          const value = current;
+          current += step;
+          return { value, done: false };
+        }
+        return { done: true };
+      },
+      // Make the iterator itself iterable (for nested iteration)
+      [Symbol.iterator]() { return this; }
+    };
+  }
+}
+
+const range = new Range(1, 10, 2);
+[...range];                    // [1, 3, 5, 7, 9]
+for (const n of range) {}     // Works
+const [first, second] = range; // Destructuring works
+
+// Async iteration with Symbol.asyncIterator
+class AsyncStream {
+  async *[Symbol.asyncIterator]() {
+    for (let i = 0; i &lt; 5; i++) {
+      await new Promise(r =&gt; setTimeout(r, 100));
+      yield i;
+    }
+  }
+}
+
+for await (const chunk of new AsyncStream()) {
+  console.log(chunk); // 0, 1, 2, 3, 4 (100ms apart)
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Symbol.species for subclass factory control</summary>
+        <p><code>Symbol.species</code> controls which constructor is used when built-in methods need to create derived instances. This is critical for proper Array/Promise/RegExp subclassing:</p>
+        <pre><code class="language-javascript">// Problem: Array methods create new instances — which constructor?
+class PowerArray extends Array {
+  // Without Symbol.species, .map() returns a PowerArray
+  // That might be unexpected or cause issues
+  
+  static get [Symbol.species]() {
+    return Array; // Tell map/filter/slice to create plain Arrays
+  }
+  
+  isEmpty() {
+    return this.length === 0;
+  }
+}
+
+const arr = new PowerArray(1, 2, 3);
+arr.isEmpty(); // false — PowerArray method works
+
+const mapped = arr.map(x =&gt; x * 2);
+mapped instanceof PowerArray; // false — Symbol.species says use Array
+mapped instanceof Array;      // true
+// mapped.isEmpty();           // TypeError — it's a plain Array
+
+// Real-world use case: Promise subclassing
+class TrackedPromise extends Promise {
+  static get [Symbol.species]() {
+    return Promise; // .then() returns plain Promise, not TrackedPromise
+  }
+}
+
+// Why this matters: without Symbol.species, every .then() call on a
+// TrackedPromise would create another TrackedPromise, potentially
+// triggering constructor side effects on every chain link.</code></pre>
+        <div class="callout callout-info">
+          <p><strong>Note:</strong> <code>Symbol.species</code> is being reconsidered for removal from future specs due to complexity. TC39 has discussed deprecation. In modern code, prefer composition over subclassing built-ins.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 9: Proxy & Reflect Metaprogramming -->
+    <section id="proxy-reflect">
+      <h2>Proxy &amp; Reflect Metaprogramming</h2>
+
+      <details>
+        <summary>Proxy traps for property access, assignment, deletion</summary>
+        <p>Proxies intercept fundamental object operations via "traps." There are 13 traps total, corresponding to internal methods in the ECMAScript spec:</p>
+        <pre><code class="language-javascript">const handler = {
+  // Property access: obj.prop or obj['prop']
+  get(target, property, receiver) {
+    console.log(`GET ${String(property)}`);
+    return Reflect.get(target, property, receiver);
+  },
+  
+  // Property assignment: obj.prop = value
+  set(target, property, value, receiver) {
+    console.log(`SET ${String(property)} = ${value}`);
+    // Validate before allowing write
+    if (property === 'age' &amp;&amp; (typeof value !== 'number' || value &lt; 0)) {
+      throw new TypeError('age must be a non-negative number');
+    }
+    return Reflect.set(target, property, value, receiver);
+  },
+  
+  // Property deletion: delete obj.prop
+  deleteProperty(target, property) {
+    if (property.startsWith('_')) {
+      throw new Error('Cannot delete private properties');
+    }
+    return Reflect.deleteProperty(target, property);
+  },
+  
+  // Property existence: 'prop' in obj
+  has(target, property) {
+    if (property.startsWith('_')) return false; // Hide "private" props
+    return Reflect.has(target, property);
+  },
+  
+  // Object.keys, for...in
+  ownKeys(target) {
+    // Filter out "private" properties from enumeration
+    return Reflect.ownKeys(target).filter(k =&gt; !String(k).startsWith('_'));
+  },
+  
+  // Property definition: Object.defineProperty
+  defineProperty(target, property, descriptor) {
+    console.log(`DEFINE ${String(property)}`);
+    return Reflect.defineProperty(target, property, descriptor);
+  },
+  
+  // Prototype access: Object.getPrototypeOf
+  getPrototypeOf(target) {
+    return Reflect.getPrototypeOf(target);
+  }
+};
+
+const user = new Proxy({ name: 'Alice', _secret: 'xyz', age: 30 }, handler);
+user.name;          // Logs: GET name → "Alice"
+user.age = 25;      // Logs: SET age = 25
+user.age = -1;      // Throws: TypeError
+'_secret' in user;  // false (hidden by has trap)
+Object.keys(user);  // ['name', 'age'] (_secret filtered)</code></pre>
+      </details>
+
+      <details>
+        <summary>Reflect API — forwarding operations</summary>
+        <p><code>Reflect</code> provides the default behavior for every Proxy trap. It's the correct way to forward operations from within a trap:</p>
+        <pre><code class="language-javascript">// Why Reflect over direct property access?
+
+// 1. Reflect.get handles receiver correctly for getters
+const parent = {
+  get value() { return this._value; }
+};
+const child = Object.create(parent);
+child._value = 42;
+
+// Direct access doesn't forward the receiver:
+// target[property] → `this` inside getter would be `target`, not `receiver`
+
+// Reflect.get(target, prop, receiver) passes the correct `this`:
+Reflect.get(parent, 'value', child); // 42 — getter's `this` is child
+
+// 2. Reflect returns booleans for success/failure (instead of throwing)
+Reflect.defineProperty(obj, 'x', { value: 1 }); // returns true/false
+// vs Object.defineProperty(obj, 'x', { value: 1 }); // throws on failure
+
+// 3. Reflect methods map 1:1 to Proxy traps
+// Makes it trivial to forward the default behavior:
+const loggingHandler = {
+  get(target, prop, receiver) {
+    const value = Reflect.get(target, prop, receiver); // Forward correctly
+    console.log(`Accessed ${String(prop)}: ${value}`);
+    return value;
+  }
+};</code></pre>
+      </details>
+
+      <details>
+        <summary>Use cases: validation, logging, reactive systems (Vue 3)</summary>
+        <pre><code class="language-javascript">// USE CASE 1: Schema validation (runtime type checking)
+function createValidated(schema, data = {}) {
+  return new Proxy(data, {
+    set(target, prop, value) {
+      if (prop in schema) {
+        const validator = schema[prop];
+        if (!validator(value)) {
+          throw new TypeError(
+            `Invalid value for ${prop}: ${JSON.stringify(value)}`
+          );
+        }
+      }
+      return Reflect.set(target, prop, value);
+    }
+  });
+}
+
+const user = createValidated({
+  name: v =&gt; typeof v === 'string' &amp;&amp; v.length &gt; 0,
+  age: v =&gt; Number.isInteger(v) &amp;&amp; v &gt;= 0 &amp;&amp; v &lt;= 150,
+  email: v =&gt; /^[^@]+@[^@]+\.[^@]+$/.test(v)
+});
+
+user.name = 'Alice';        // ✓
+user.age = -5;              // TypeError!</code></pre>
+        <pre><code class="language-javascript">// USE CASE 2: Vue 3's reactivity system (simplified)
+// Vue 3 replaced Object.defineProperty (Vue 2) with Proxy
+
+const targetMap = new WeakMap(); // target → depsMap
+
+function reactive(target) {
+  return new Proxy(target, {
+    get(target, key, receiver) {
+      track(target, key);  // Record dependency
+      const result = Reflect.get(target, key, receiver);
+      // Deep reactivity: wrap nested objects
+      if (typeof result === 'object' &amp;&amp; result !== null) {
+        return reactive(result);
+      }
+      return result;
+    },
+    set(target, key, value, receiver) {
+      const oldValue = target[key];
+      const result = Reflect.set(target, key, value, receiver);
+      if (oldValue !== value) {
+        trigger(target, key); // Notify watchers
+      }
+      return result;
+    },
+    deleteProperty(target, key) {
+      const result = Reflect.deleteProperty(target, key);
+      trigger(target, key);
+      return result;
+    }
+  });
+}
+
+// Why Proxy over defineProperty?
+// 1. Catches NEW property additions (Vue 2 couldn't)
+// 2. Catches deletions
+// 3. Works with arrays (index assignment, length changes)
+// 4. No need to walk every property at init time (lazy)</code></pre>
+      </details>
+
+      <details>
+        <summary>Performance cost of Proxy</summary>
+        <p>Proxies have significant overhead compared to regular objects. Understanding when this matters:</p>
+        <ul>
+          <li><strong>~5-10x slower property access</strong> compared to regular objects (varies by engine and trap complexity).</li>
+          <li><strong>Cannot be optimized by JIT:</strong> V8 cannot inline or cache Proxy trap calls — every access goes through the trap handler.</li>
+          <li><strong>Allocation overhead:</strong> Each Proxy allocates a separate internal handler object.</li>
+          <li><strong>GC pressure:</strong> Proxy targets and handlers create additional GC roots.</li>
+        </ul>
+        <pre><code class="language-javascript">// Benchmark comparison (approximate, V8 v12+):
+const plain = { x: 1 };
+const proxied = new Proxy({ x: 1 }, { get: Reflect.get });
+
+// Reading plain.x:  ~2ns  (IC optimized, single memory read)
+// Reading proxied.x: ~15-25ns (trap invocation, no IC possible)
+
+// WHEN THIS MATTERS:
+// - Hot loops accessing proxy properties millions of times
+// - Large reactive state trees with frequent reads (Vue/MobX)
+// - Property access in animation frames (16ms budget)
+
+// WHEN IT DOESN'T MATTER:
+// - API boundaries (request validation)
+// - Configuration objects (accessed once at startup)
+// - Test mocks and spies
+// - Sparse access patterns (UI event handlers)
+
+// Vue 3's mitigation: only wrap the top-level object,
+// lazily wrap nested objects on first access,
+// use raw access (toRaw()) in performance-critical code</code></pre>
+        <div class="callout callout-tip">
+          <p><strong>Interview tip:</strong> When discussing Proxy performance, mention that <code>Reflect.get</code> in a get trap is faster than <code>target[prop]</code> because it avoids creating additional IC sites. Also note that revocable proxies (via <code>Proxy.revocable</code>) add another indirection layer on top. V8 has been steadily improving Proxy performance since 2020 (notably in V8 v9.1+), reducing the overhead gap — but Proxies still cannot be JIT-optimized like regular property accesses, so the ~5-10x difference persists for hot paths.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: Mixin Patterns at Scale -->
+    <section id="mixin-patterns">
+      <h2>Mixin Patterns at Scale</h2>
+
+      <details>
+        <summary>Object.assign for flat mixins</summary>
+        <p>The simplest mixin pattern — copy properties from source objects onto a target:</p>
+        <pre><code class="language-javascript">// Flat mixin via Object.assign
+const Serializable = {
+  serialize() {
+    return JSON.stringify(this);
+  },
+  deserialize(json) {
+    return Object.assign(this, JSON.parse(json));
+  }
+};
+
+const EventEmitter = {
+  _listeners: null,
+  on(event, fn) {
+    (this._listeners ??= {})[event] ??= [];
+    this._listeners[event].push(fn);
+    return this;
+  },
+  emit(event, ...args) {
+    (this._listeners?.[event] ?? []).forEach(fn =&gt; fn.apply(this, args));
+  }
+};
+
+class User {
+  constructor(name) { this.name = name; }
+}
+Object.assign(User.prototype, Serializable, EventEmitter);
+
+const user = new User('Alice');
+user.on('change', () =&gt; console.log('changed!'));
+user.serialize(); // Works — mixed in
+
+// ⚠️ PROBLEMS with Object.assign mixins:
+// 1. Shared mutable state: _listeners is on the PROTOTYPE
+//    All instances share the SAME _listeners object!
+// 2. No super — mixins can't call methods on the class they're mixed into
+// 3. Name collisions silently overwrite (last one wins)
+// 4. Getters/setters are CALLED during assign, not copied</code></pre>
+      </details>
+
+      <details>
+        <summary>Mixin functions (functional mixins)</summary>
+        <p>Functional mixins are factory functions that take an object and return an enhanced version. They solve the shared state problem:</p>
+        <pre><code class="language-javascript">// Functional mixin pattern
+const withEventEmitter = (Base) =&gt; {
+  const listeners = new WeakMap(); // Per-instance state via WeakMap
+  
+  return class extends Base {
+    on(event, fn) {
+      if (!listeners.has(this)) listeners.set(this, {});
+      const map = listeners.get(this);
+      (map[event] ??= []).push(fn);
+      return this;
+    }
+    off(event, fn) {
+      const map = listeners.get(this);
+      if (map?.[event]) {
+        map[event] = map[event].filter(f =&gt; f !== fn);
+      }
+      return this;
+    }
+    emit(event, ...args) {
+      const map = listeners.get(this);
+      (map?.[event] ?? []).forEach(fn =&gt; fn.apply(this, args));
+    }
+  };
+};
+
+const withValidation = (Base) =&gt; class extends Base {
+  validate() {
+    const errors = [];
+    for (const [key, validator] of Object.entries(this.constructor.schema ?? {})) {
+      if (!validator(this[key])) {
+        errors.push(`Invalid ${key}: ${this[key]}`);
+      }
+    }
+    return errors;
+  }
+  get isValid() { return this.validate().length === 0; }
+};
+
+// Compose mixins via function composition
+class User extends withValidation(withEventEmitter(class {})) {
+  static schema = {
+    name: v =&gt; typeof v === 'string' &amp;&amp; v.length &gt; 0,
+    age: v =&gt; Number.isInteger(v) &amp;&amp; v &gt; 0
+  };
+  constructor(name, age) {
+    super();
+    this.name = name;
+    this.age = age;
+  }
+}
+
+const user = new User('Alice', 30);
+user.on('save', () =&gt; console.log('saved!'));
+user.isValid; // true</code></pre>
+      </details>
+
+      <details>
+        <summary>Class mixin pattern (subclass factories)</summary>
+        <p>The "subclass factory" pattern is the most robust mixin approach for classes. It creates a chain of anonymous classes:</p>
+        <pre><code class="language-javascript">// Subclass factory mixin — the industry standard pattern
+const Timestamped = (superclass) =&gt; class extends superclass {
+  constructor(...args) {
+    super(...args);
+    this.createdAt = new Date();
+  }
+  touch() { this.updatedAt = new Date(); }
+};
+
+const SoftDeletable = (superclass) =&gt; class extends superclass {
+  #deleted = false;
+  delete() { this.#deleted = true; this.deletedAt = new Date(); }
+  restore() { this.#deleted = false; this.deletedAt = null; }
+  get isDeleted() { return this.#deleted; }
+};
+
+const Cacheable = (superclass) =&gt; class extends superclass {
+  static #cache = new Map();
+  static get(id) { return this.#cache.get(id); }
+  save() {
+    this.constructor.#cache.set(this.id, this);
+    return this;
+  }
+};
+
+// Compose: reads naturally as "Model with Timestamped, SoftDeletable, Cacheable"
+class Model extends Cacheable(SoftDeletable(Timestamped(class {
+  constructor(id) { this.id = id; }
+}))) {}
+
+const m = new Model('abc');
+m.createdAt;   // Date (from Timestamped)
+m.delete();    // (from SoftDeletable)
+m.isDeleted;   // true
+m.save();      // (from Cacheable)
+Model.get('abc') === m; // true
+
+// Prototype chain: m → Model.proto → Cacheable.proto → SoftDeletable.proto
+//                    → Timestamped.proto → anonymous.proto → Object.prototype</code></pre>
+      </details>
+
+      <details>
+        <summary>Comparison with composition</summary>
+        <pre><code class="language-javascript">// COMPOSITION alternative — no prototype chain manipulation
+class User {
+  constructor(name) {
+    this.name = name;
+    this.events = new EventEmitter();  // HAS-A, not IS-A
+    this.validator = new Validator(User.schema);
+    this.timestamps = new Timestamps();
+  }
+  
+  // Delegate explicitly
+  on(event, fn) { return this.events.on(event, fn); }
+  emit(event, ...args) { return this.events.emit(event, ...args); }
+  get isValid() { return this.validator.validate(this); }
+}
+
+// Trade-offs:
+// Mixins:
+//   ✅ this-aware (methods can access instance properties naturally)
+//   ✅ instanceof works (user instanceof Timestamped === true)
+//   ❌ Name collisions, fragile ordering, deep prototype chains
+//   ❌ Hard to tree-shake, hard to type (TypeScript intersection hell)
+//
+// Composition:
+//   ✅ Explicit dependencies, no name collisions
+//   ✅ Easy to test in isolation, easy to tree-shake
+//   ✅ TypeScript-friendly (interfaces + delegation)
+//   ❌ Boilerplate delegation code
+//   ❌ instanceof doesn't work without Symbol.hasInstance</code></pre>
+      </details>
+
+      <details>
+        <summary>When mixins cause problems at scale</summary>
+        <ul>
+          <li><strong>Diamond problem:</strong> Two mixins depend on the same base mixin → it appears twice in the chain. C3 linearization (like Python MRO) doesn't exist in JS — you get whatever order you compose.</li>
+          <li><strong>Name collisions:</strong> As the codebase grows, independently-developed mixins start shadowing each other's methods. No compile-time detection.</li>
+          <li><strong>Initialization order bugs:</strong> Mixin constructors run in chain order. If MixinA's constructor depends on a property set by MixinB, ordering matters and isn't obvious from the class declaration.</li>
+          <li><strong>TypeScript pain:</strong> Typing mixin compositions requires complex intersection types and generic constraints. IDE support degrades with deep mixin stacks.</li>
+          <li><strong>Testing difficulty:</strong> You can't test a mixin in isolation — it requires a host class. Mock hosts may not exercise the same code paths as production hosts.</li>
+        </ul>
+        <div class="callout callout-warning">
+          <p><strong>Production advice:</strong> Limit mixin depth to 2-3 levels. Prefer composition for new code. Reserve mixins for cross-cutting concerns that genuinely need <code>this</code> access (event emission, serialization). Use naming conventions (e.g., prefix mixin methods) to reduce collision risk.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 11: Object.freeze, Object.seal — Deep vs Shallow -->
+    <section id="object-immutability">
+      <h2>Object.freeze, Object.seal — Deep vs Shallow</h2>
+
+      <details>
+        <summary>What freeze/seal actually do at the engine level</summary>
+        <p>These methods modify property descriptors and object extensibility flags at the engine level:</p>
+        <pre><code class="language-javascript">// Object.freeze(obj):
+// 1. Object.preventExtensions(obj) — no new properties
+// 2. For each own property:
+//    - Set configurable: false
+//    - Set writable: false (for data properties)
+// Result: no add, no delete, no modify — completely immutable (shallow)
+
+// Object.seal(obj):
+// 1. Object.preventExtensions(obj) — no new properties
+// 2. For each own property:
+//    - Set configurable: false
+//    - writable stays unchanged (can still modify existing values!)
+// Result: no add, no delete, no reconfigure — but can modify values
+
+// Object.preventExtensions(obj):
+// 1. Only prevents adding new properties
+// Result: existing properties can be modified, deleted, reconfigured
+
+const obj = { x: 1, y: { z: 2 } };
+
+Object.freeze(obj);
+obj.x = 99;           // Silently fails (throws in strict mode)
+obj.newProp = 'hi';   // Silently fails
+delete obj.x;         // Silently fails
+obj.y.z = 99;         // ✅ SUCCEEDS — freeze is SHALLOW
+
+// Checking state:
+Object.isFrozen(obj);       // true
+Object.isSealed(obj);       // true (frozen implies sealed)
+Object.isExtensible(obj);   // false</code></pre>
+        <div class="callout callout-info">
+          <p><strong>V8 internal representation:</strong> When an object is frozen, V8 transitions its Hidden Class to a "frozen" variant. This is a one-way transition — the object can never be unfrozen. V8 can then mark the Hidden Class as "constant" which enables additional optimizations: the JIT compiler can inline frozen property values as constants.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Why they're shallow</summary>
+        <p>The ECMAScript spec defines freeze/seal as operating only on the object's own property descriptors. Nested objects are separate heap objects with their own descriptors — freeze doesn't traverse references:</p>
+        <pre><code class="language-javascript">const config = Object.freeze({
+  api: {
+    baseUrl: 'https://api.example.com',
+    timeout: 5000
+  },
+  features: ['auth', 'logging']
+});
+
+// The top-level object is frozen:
+config.api = {};          // ❌ Fails — can't reassign own property
+config.newKey = 'x';      // ❌ Fails — can't add new property
+
+// But nested objects are NOT frozen:
+config.api.baseUrl = 'https://evil.com';  // ✅ Succeeds!
+config.features.push('exploit');           // ✅ Succeeds!
+
+// This is because:
+// config.api is a REFERENCE (pointer) that is frozen
+// The OBJECT it points to has its own descriptors — not frozen
+// Freezing the reference prevents reassigning config.api
+// but doesn't affect the target object's properties</code></pre>
+      </details>
+
+      <details>
+        <summary>Deep freeze patterns</summary>
+        <pre><code class="language-javascript">// Simple recursive deep freeze
+function deepFreeze(obj) {
+  // Freeze the object itself
+  Object.freeze(obj);
+  
+  // Recursively freeze all own properties that are objects
+  for (const key of Object.getOwnPropertyNames(obj)) {
+    const value = obj[key];
+    if (value !== null &amp;&amp; typeof value === 'object' &amp;&amp; !Object.isFrozen(value)) {
+      deepFreeze(value);
+    }
+  }
+  return obj;
+}
+
+// Production-grade deep freeze (handles edge cases)
+function deepFreezeProduction(obj, seen = new WeakSet()) {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (seen.has(obj)) return obj; // Handle circular references
+  seen.add(obj);
+  
+  // Handle special types
+  if (obj instanceof Map || obj instanceof Set) {
+    // Maps and Sets can't be meaningfully frozen
+    // (their methods mutate internal slots, not properties)
+    console.warn('Cannot deep-freeze Map/Set');
+    return obj;
+  }
+  
+  Object.freeze(obj);
+  
+  // Freeze all own properties (including symbols and non-enumerable)
+  const allKeys = [
+    ...Object.getOwnPropertyNames(obj),
+    ...Object.getOwnPropertySymbols(obj)
+  ];
+  
+  for (const key of allKeys) {
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (desc &amp;&amp; 'value' in desc) {
+      deepFreezeProduction(desc.value, seen);
+    }
+  }
+  return obj;
+}
+
+// Usage
+const config = deepFreezeProduction({
+  database: { host: 'localhost', port: 5432 },
+  cache: { ttl: 3600, maxSize: 1000 }
+});
+config.database.host = 'evil.com'; // ❌ Throws in strict mode</code></pre>
+      </details>
+
+      <details>
+        <summary>Performance implications (V8 can optimize frozen objects)</summary>
+        <p>Counterintuitively, frozen objects can be <em>faster</em> than mutable ones in certain scenarios:</p>
+        <ul>
+          <li><strong>Constant folding:</strong> V8 can treat frozen object properties as compile-time constants. If TurboFan sees <code>config.MAX_RETRIES</code> on a frozen object, it can inline the literal value <code>3</code> directly into machine code.</li>
+          <li><strong>No write barriers:</strong> The GC doesn't need to track writes to frozen objects (they can't change), reducing garbage collector overhead.</li>
+          <li><strong>Stable Hidden Class:</strong> Frozen objects will never transition to a new shape, making IC predictions 100% reliable.</li>
+          <li><strong>Shared between Isolates:</strong> In Node.js worker threads, frozen objects can potentially be shared without copying (implementation-dependent).</li>
+        </ul>
+        <pre><code class="language-javascript">// V8 optimization: frozen object as constant
+const FROZEN_CONFIG = Object.freeze({
+  MAX_RETRIES: 3,
+  TIMEOUT_MS: 5000,
+  BASE_URL: 'https://api.example.com'
+});
+
+function fetchWithRetry(url) {
+  // V8 can inline FROZEN_CONFIG.MAX_RETRIES as literal 3
+  // because it knows the object is frozen and will never change
+  for (let i = 0; i &lt; FROZEN_CONFIG.MAX_RETRIES; i++) {
+    // TurboFan may unroll this loop entirely!
+  }
+}
+
+// However: freezing AFTER objects are in use provides less benefit
+// because ICs are already established. Freeze at creation time.</code></pre>
+      </details>
+
+      <details>
+        <summary>Immutability libraries comparison</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Library</th>
+              <th>Approach</th>
+              <th>Performance</th>
+              <th>API Style</th>
+              <th>Bundle Size</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Object.freeze</td>
+              <td>Native, shallow</td>
+              <td>✅ Zero overhead (engine optimizes)</td>
+              <td>Imperative</td>
+              <td>0 KB</td>
+            </tr>
+            <tr>
+              <td>Immer</td>
+              <td>Proxy-based copy-on-write</td>
+              <td>⚠️ Proxy overhead on writes</td>
+              <td>Mutable-looking draft API</td>
+              <td>~6 KB</td>
+            </tr>
+            <tr>
+              <td>Immutable.js</td>
+              <td>Persistent data structures (tries)</td>
+              <td>✅ Structural sharing for large collections</td>
+              <td>Custom API (get/set/update)</td>
+              <td>~18 KB</td>
+            </tr>
+            <tr>
+              <td>Structura.js</td>
+              <td>Proxy-based (Immer alternative)</td>
+              <td>✅ Faster than Immer</td>
+              <td>Similar to Immer</td>
+              <td>~2 KB</td>
+            </tr>
+            <tr>
+              <td>Native structuredClone</td>
+              <td>Deep copy (no immutability guarantee)</td>
+              <td>⚠️ Full copy cost</td>
+              <td>One function call</td>
+              <td>0 KB</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout-tip">
+          <p><strong>Recommendation for 2024+:</strong> Use <code>Object.freeze</code> for configuration objects, Immer for Redux-style state management (developer ergonomics outweigh Proxy cost for UI state updates), and plain spread operators for simple shallow updates. Reserve Immutable.js for very large collections where structural sharing provides measurable memory benefits. For deep cloning (without immutability), prefer native <code>structuredClone()</code> — it handles circular references, typed arrays, and most built-in types with zero dependencies.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 12: Production Architecture Decisions -->
+    <section id="production-architecture">
+      <h2>Production Architecture Decisions</h2>
+
+      <details>
+        <summary>When to prefer composition over inheritance</summary>
+        <p>The "favor composition over inheritance" principle is well-known, but knowing <em>when</em> inheritance is still appropriate requires senior-level judgment:</p>
+        <ul>
+          <li><strong>Use inheritance when:</strong>
+            <ul>
+              <li>There's a genuine "is-a" relationship (a <code>TypeError</code> IS an <code>Error</code>)</li>
+              <li>You need polymorphism via <code>instanceof</code> checks</li>
+              <li>The framework mandates it (React class components, Angular services)</li>
+              <li>Subclassing built-ins (Error, Array, HTMLElement for Web Components)</li>
+            </ul>
+          </li>
+          <li><strong>Use composition when:</strong>
+            <ul>
+              <li>You're combining behaviors from multiple sources</li>
+              <li>The relationship is "has-a" or "uses-a"</li>
+              <li>Behaviors change at runtime (strategy pattern)</li>
+              <li>You want to avoid coupling to a base class implementation</li>
+              <li>You need independent testability</li>
+            </ul>
+          </li>
+        </ul>
+        <pre><code class="language-javascript">// ❌ Inheritance misuse: "is-a" that's actually "has-behaviors"
+class Animal extends MovingEntity {
+  // What if we need a Plant that also moves? (Venus flytrap)
+  // What about a Robot that moves but isn't an animal?
+}
+
+// ✅ Composition: behaviors are independent, combinable
+class Animal {
+  constructor(config) {
+    this.movement = new MovementSystem(config.speed, config.type);
+    this.health = new HealthSystem(config.maxHP);
+    this.ai = config.ai ? new AIController(config.ai) : null;
+  }
+  
+  update(dt) {
+    this.ai?.think(this);
+    this.movement.update(dt);
+    this.health.tick(dt);
+  }
+}
+
+// Now a Robot can use MovementSystem without being an Animal
+// A Plant can have HealthSystem without MovementSystem
+// Behaviors are independently testable</code></pre>
+      </details>
+
+      <details>
+        <summary>Factory functions vs classes in team codebases</summary>
+        <pre><code class="language-javascript">// FACTORY FUNCTIONS
+// Advantages in large teams:
+// 1. Encapsulation via closure (true privacy, not # sugar)
+// 2. No `this` binding issues
+// 3. No `new` keyword confusion
+// 4. Easier to compose and mock
+
+function createUserService(db, cache, logger) {
+  // Private state via closure — truly inaccessible from outside
+  let requestCount = 0;
+  
+  // Private helper — no accidental exposure
+  function sanitize(input) {
+    return input.replace(/[&lt;&gt;]/g, '');
+  }
+  
+  // Public API — the returned object
+  return Object.freeze({
+    async getUser(id) {
+      requestCount++;
+      logger.debug(`getUser called (${requestCount} total)`);
+      
+      const cached = await cache.get(`user:${id}`);
+      if (cached) return cached;
+      
+      const user = await db.query('SELECT * FROM users WHERE id = $1', [id]);
+      await cache.set(`user:${id}`, user);
+      return user;
+    },
+    
+    async createUser(data) {
+      const clean = sanitize(data.name);
+      return db.query('INSERT INTO users (name) VALUES ($1)', [clean]);
+    },
+    
+    getStats() { return { requestCount }; }
+  });
+}
+
+// CLASSES — same functionality
+class UserService {
+  #requestCount = 0;
+  #db; #cache; #logger;
+  
+  constructor(db, cache, logger) {
+    this.#db = db;
+    this.#cache = cache;
+    this.#logger = logger;
+  }
+  
+  #sanitize(input) { return input.replace(/[&lt;&gt;]/g, ''); }
+  
+  async getUser(id) { /* ... */ }
+  async createUser(data) { /* ... */ }
+}
+
+// Trade-offs:
+// Factory: +closure privacy, +no this, +frozen API, -memory (each instance has own functions)
+// Class: +memory efficient (shared prototype), +instanceof, +standard pattern, -this binding
+// Rule of thumb: Classes for many instances, factories for singletons/services</code></pre>
+      </details>
+
+      <details>
+        <summary>Prototype-based plugin systems</summary>
+        <pre><code class="language-javascript">// Plugin system using prototype chain delegation
+// (Used by Express.js, jQuery, many frameworks)
+
+class PluginHost {
+  #plugins = new Map();
+  
+  use(name, plugin) {
+    // Validate plugin interface
+    if (typeof plugin.install !== 'function') {
+      throw new Error(`Plugin ${name} must have an install() method`);
+    }
+    
+    // Install plugin — it can add methods to the prototype
+    plugin.install(this.constructor.prototype, this);
+    this.#plugins.set(name, plugin);
+    return this; // Chainable
+  }
+  
+  hasPlugin(name) {
+    return this.#plugins.has(name);
+  }
+}
+
+// Plugin definition
+const LoggingPlugin = {
+  install(proto, host) {
+    // Add method to prototype — available on all instances
+    proto.log = function(level, msg) {
+      console.log(`[${level.toUpperCase()}] ${msg}`);
+    };
+    proto.debug = function(msg) { this.log('debug', msg); };
+    proto.error = function(msg) { this.log('error', msg); };
+  }
+};
+
+const CachePlugin = {
+  install(proto, host) {
+    const cache = new Map();
+    proto.cacheGet = function(key) { return cache.get(key); };
+    proto.cacheSet = function(key, val, ttl) {
+      cache.set(key, val);
+      if (ttl) setTimeout(() =&gt; cache.delete(key), ttl);
+    };
+  }
+};
+
+// Usage
+const app = new PluginHost();
+app.use('logging', LoggingPlugin).use('cache', CachePlugin);
+app.log('info', 'Server starting'); // Works — added by plugin
+
+// ⚠️ Risk: plugins modifying prototypes can conflict
+// Mitigation: namespace plugin methods, validate no collisions</code></pre>
+      </details>
+
+      <details>
+        <summary>Production incident: prototype pollution vulnerability</summary>
+        <div class="callout callout-warning">
+          <p><strong>Real-world incident:</strong> Prototype pollution is a critical vulnerability class that has affected lodash, jQuery, Express, and many Node.js applications. It occurs when untrusted input modifies <code>Object.prototype</code>.</p>
+        </div>
+        <pre><code class="language-javascript">// THE VULNERABILITY: Recursive merge without prototype check
+function deepMerge(target, source) {
+  for (const key in source) {
+    if (typeof source[key] === 'object' &amp;&amp; source[key] !== null) {
+      if (!target[key]) target[key] = {};
+      deepMerge(target[key], source[key]);
+    } else {
+      target[key] = source[key];
+    }
+  }
+  return target;
+}
+
+// ATTACK: User sends this JSON payload:
+const maliciousPayload = JSON.parse(
+  '{"__proto__": {"isAdmin": true, "role": "superuser"}}'
+);
+
+const config = {};
+deepMerge(config, maliciousPayload);
+// Now Object.prototype.isAdmin === true
+// EVERY object in the application now has isAdmin: true!
+
+const user = {};
+user.isAdmin; // true — exploited!
+
+// DEFENSES:
+// 1. Block __proto__, constructor, prototype keys
+function safeMerge(target, source) {
+  for (const key of Object.keys(source)) {  // Object.keys, not for...in
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+      continue; // Skip dangerous keys
+    }
+    if (typeof source[key] === 'object' &amp;&amp; source[key] !== null) {
+      target[key] = safeMerge(target[key] ?? {}, source[key]);
+    } else {
+      target[key] = source[key];
+    }
+  }
+  return target;
+}
+
+// 2. Use Object.create(null) for untrusted data containers
+const untrustedData = Object.create(null);
+// No __proto__ accessor — immune to pollution
+
+// 3. Use Map instead of plain objects for dynamic keys
+const userPermissions = new Map();
+// Maps don't have prototype chain issues
+
+// 4. Object.freeze(Object.prototype) — nuclear option
+// Prevents ALL modifications but may break third-party code</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 13: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+
+      <details>
+        <summary>Custom implementation of the new keyword</summary>
+        <pre><code class="language-javascript">/**
+ * Full implementation of the `new` operator
+ * Per ECMAScript spec §13.2.2 [[Construct]]
+ */
+function myNew(Constructor, ...args) {
+  // Step 1: Validate — Constructor must be a function with [[Construct]]
+  if (typeof Constructor !== 'function') {
+    throw new TypeError(`${Constructor} is not a constructor`);
+  }
+  
+  // Step 2: Create new object with [[Prototype]] linked to Constructor.prototype
+  // If Constructor.prototype is not an object, fall back to Object.prototype
+  const proto = (typeof Constructor.prototype === 'object' &amp;&amp; Constructor.prototype !== null)
+    ? Constructor.prototype
+    : Object.prototype;
+  
+  const instance = Object.create(proto);
+  
+  // Step 3: Execute constructor with `this` = new instance
+  // Set new.target for detection inside constructor
+  const result = Constructor.apply(instance, args);
+  
+  // Step 4: If constructor returns an object (or function), use it
+  // Otherwise return the instance we created
+  if (result !== null &amp;&amp; (typeof result === 'object' || typeof result === 'function')) {
+    return result;
+  }
+  
+  return instance;
+}
+
+// Test it
+function Person(name, age) {
+  this.name = name;
+  this.age = age;
+}
+Person.prototype.greet = function() {
+  return `Hi, I'm ${this.name}, ${this.age}`;
+};
+
+const alice = myNew(Person, 'Alice', 30);
+alice.greet();                            // "Hi, I'm Alice, 30"
+alice instanceof Person;                   // true
+Object.getPrototypeOf(alice) === Person.prototype; // true
+
+// Edge case: constructor that returns an object
+function Singleton() {
+  if (Singleton._instance) return Singleton._instance;
+  this.id = Math.random();
+  Singleton._instance = this;
+}
+
+const a = myNew(Singleton);
+const b = myNew(Singleton);
+a === b; // true — constructor returned existing instance</code></pre>
+      </details>
+
+      <details>
+        <summary>Inheritance chain visualization</summary>
+        <pre><code class="language-javascript">/**
+ * Visualize the complete prototype chain of any object
+ * Useful for debugging inheritance issues
+ */
+function visualizePrototypeChain(obj, label = 'object') {
+  const chain = [];
+  let current = obj;
+  let depth = 0;
+  const seen = new WeakSet();
+  
+  while (current !== null) {
+    if (seen.has(current)) {
+      chain.push({ depth, type: '[Circular]', properties: [] });
+      break;
+    }
+    seen.add(current);
+    
+    const entry = {
+      depth,
+      type: getObjectLabel(current),
+      properties: Object.getOwnPropertyNames(current).slice(0, 10),
+      symbols: Object.getOwnPropertySymbols(current).map(s =&gt; s.toString()),
+      isFrozen: Object.isFrozen(current),
+      isSealed: Object.isSealed(current)
+    };
+    chain.push(entry);
+    
+    current = Object.getPrototypeOf(current);
+    depth++;
+  }
+  chain.push({ depth, type: 'null (chain end)', properties: [] });
+  
+  // Pretty print
+  console.log(`\n=== Prototype Chain: ${label} ===`);
+  chain.forEach((entry, i) =&gt; {
+    const indent = '  '.repeat(entry.depth);
+    const arrow = i &gt; 0 ? `${indent}↑ [[Prototype]]\n` : '';
+    console.log(
+      `${arrow}${indent}[${entry.depth}] ${entry.type}` +
+      (entry.properties.length ? `\n${indent}    props: ${entry.properties.join(', ')}` : '') +
+      (entry.symbols?.length ? `\n${indent}    symbols: ${entry.symbols.join(', ')}` : '')
+    );
+  });
+}
+
+function getObjectLabel(obj) {
+  if (obj === Object.prototype) return 'Object.prototype';
+  if (obj === Function.prototype) return 'Function.prototype';
+  if (obj === Array.prototype) return 'Array.prototype';
+  const ctor = obj.constructor;
+  if (ctor &amp;&amp; ctor.name) return `${ctor.name}.prototype`;
+  return Object.prototype.toString.call(obj);
+}
+
+// Usage:
+class Animal { speak() {} }
+class Dog extends Animal { bark() {} }
+const rex = new Dog();
+visualizePrototypeChain(rex, 'rex');
+// Output:
+// === Prototype Chain: rex ===
+// [0] Dog.prototype
+//     props: (none — instance properties would show here)
+//   ↑ [[Prototype]]
+//   [1] Dog.prototype
+//     props: constructor, bark
+//     ↑ [[Prototype]]
+//     [2] Animal.prototype
+//       props: constructor, speak
+//       ↑ [[Prototype]]
+//       [3] Object.prototype
+//         props: constructor, hasOwnProperty, toString, ...
+//         ↑ [[Prototype]]
+//         [4] null (chain end)</code></pre>
+      </details>
+
+      <details>
+        <summary>Prototype-based state machine</summary>
+        <pre><code class="language-javascript">/**
+ * State machine using prototype chain for state behavior inheritance.
+ * Each state is a prototype object. Transitioning swaps the prototype.
+ * 
+ * ⚠️ Note: This is educational. In production, prefer explicit state
+ * objects or libraries (XState) over prototype swapping due to IC costs.
+ */
+const StateMachine = {
+  create(config) {
+    const { states, initial } = config;
+    
+    // Build prototype objects for each state
+    const stateProtos = Object.create(null);
+    for (const [name, behavior] of Object.entries(states)) {
+      stateProtos[name] = {
+        ...behavior,
+        _stateName: name,
+        transition(event) {
+          const nextState = behavior.transitions?.[event];
+          if (!nextState) {
+            console.warn(`No transition for event "${event}" in state "${name}"`);
+            return this;
+          }
+          if (!stateProtos[nextState]) {
+            throw new Error(`Unknown state: ${nextState}`);
+          }
+          // Swap prototype — changes available methods
+          Object.setPrototypeOf(this, stateProtos[nextState]);
+          this.onEnter?.();
+          return this;
+        },
+        get state() { return this._stateName; }
+      };
+    }
+    
+    // Create machine instance with initial state as prototype
+    const machine = Object.create(stateProtos[initial]);
+    machine._history = [initial];
+    machine.onEnter?.();
+    return machine;
+  }
+};
+
+// Usage: Traffic light
+const light = StateMachine.create({
+  initial: 'green',
+  states: {
+    green: {
+      color: '🟢',
+      onEnter() { console.log('GO!'); },
+      transitions: { timer: 'yellow' }
+    },
+    yellow: {
+      color: '🟡',
+      onEnter() { console.log('CAUTION!'); },
+      transitions: { timer: 'red' }
+    },
+    red: {
+      color: '🔴',
+      onEnter() { console.log('STOP!'); },
+      transitions: { timer: 'green' }
+    }
+  }
+});
+
+light.color;               // "🟢"
+light.state;               // "green"
+light.transition('timer'); // Logs: "CAUTION!"
+light.color;               // "🟡"
+light.state;               // "yellow"</code></pre>
+      </details>
+
+      <details>
+        <summary>Safe property access across prototype chain</summary>
+        <pre><code class="language-javascript">/**
+ * Utilities for safe property access that respects the prototype chain
+ * while avoiding prototype pollution and unexpected inherited values.
+ */
+
+// 1. Safe own-property access (ignores prototype)
+function getOwn(obj, key) {
+  return Object.hasOwn(obj, key) ? obj[key] : undefined;
+}
+
+// 2. Safe deep property access with prototype awareness
+function getDeep(obj, path, { inherited = false } = {}) {
+  const keys = path.split('.');
+  let current = obj;
+  
+  for (const key of keys) {
+    if (current == null) return undefined;
+    
+    // Block prototype pollution vectors
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+      return undefined;
+    }
+    
+    if (inherited) {
+      // Allow inherited properties
+      current = current[key];
+    } else {
+      // Own properties only
+      current = Object.hasOwn(current, key) ? current[key] : undefined;
+    }
+  }
+  
+  return current;
+}
+
+// 3. Find where in the prototype chain a property lives
+function findPropertyOrigin(obj, key) {
+  let current = obj;
+  let depth = 0;
+  
+  while (current !== null) {
+    if (Object.hasOwn(current, key)) {
+      return {
+        found: true,
+        depth,
+        owner: current,
+        descriptor: Object.getOwnPropertyDescriptor(current, key),
+        isOwn: depth === 0
+      };
+    }
+    current = Object.getPrototypeOf(current);
+    depth++;
+  }
+  
+  return { found: false, depth: -1, owner: null };
+}
+
+// 4. Create a "safe" object that throws on prototype property access
+function createStrictObject(data) {
+  return new Proxy(Object.create(null, 
+    Object.fromEntries(
+      Object.entries(data).map(([k, v]) =&gt; [k, { value: v, enumerable: true, writable: true, configurable: true }])
+    )
+  ), {
+    get(target, prop) {
+      if (!(prop in target) &amp;&amp; typeof prop === 'string') {
+        throw new ReferenceError(`Property "${prop}" does not exist`);
+      }
+      return target[prop];
+    }
+  });
+}
+
+// Usage
+const obj = createStrictObject({ name: 'Alice', age: 30 });
+obj.name;     // "Alice"
+obj.toString; // ReferenceError: Property "toString" does not exist</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 14: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Mistake 1: Modifying Object.prototype</summary>
+        <p><strong>The mistake:</strong> Adding utility methods to <code>Object.prototype</code> for "convenience."</p>
+        <pre><code class="language-javascript">// ❌ BEFORE — pollutes ALL objects in the runtime
+Object.prototype.isEmpty = function() {
+  return Object.keys(this).length === 0;
+};
+
+// Now EVERY object has isEmpty:
+const user = { name: 'Alice' };
+user.isEmpty(); // false — "works" but...
+
+// Problem 1: Breaks for...in loops across the entire codebase
+for (const key in user) {
+  console.log(key); // "name", "isEmpty" ← unexpected!
+}
+
+// Problem 2: Breaks Object.keys behavior expectations
+// Problem 3: Third-party libraries break
+// Problem 4: If two libraries both add different isEmpty → collision
+
+// ✅ AFTER — utility function (no prototype modification)
+function isEmpty(obj) {
+  return Object.keys(obj).length === 0;
+}
+// Or: use a utility library (lodash.isEmpty)</code></pre>
+      </details>
+
+      <details>
+        <summary>Mistake 2: Forgetting Object.create(null) for dictionary objects</summary>
+        <p><strong>The mistake:</strong> Using <code>{}</code> as a dictionary/map when keys come from user input.</p>
+        <pre><code class="language-javascript">// ❌ BEFORE — plain object as dictionary
+function countWords(text) {
+  const counts = {};
+  for (const word of text.split(/\s+/)) {
+    counts[word] = (counts[word] || 0) + 1;
+  }
+  return counts;
+}
+
+// Attack vector: user submits text containing "__proto__" or "constructor"
+const result = countWords('hello __proto__ constructor toString');
+// result.__proto__ → [Object: null prototype] {} (NOT a count!)
+// result.constructor → [Function: Object] (inherited, not a count!)
+// result.toString → 1? Or [Function: toString]? Depends on order!
+
+// Also: 'toString' in result → true EVEN IF toString wasn't in text
+// Because it's inherited from Object.prototype
+
+// ✅ AFTER — null prototype dictionary
+function countWords(text) {
+  const counts = Object.create(null); // No inherited properties!
+  for (const word of text.split(/\s+/)) {
+    counts[word] = (counts[word] || 0) + 1;
+  }
+  return counts;
+}
+// 'toString' in counts → false (unless actually in text)
+// counts.__proto__ → undefined (it's a regular key now, not special)
+
+// ✅ EVEN BETTER — use Map for dynamic keys
+function countWords(text) {
+  const counts = new Map();
+  for (const word of text.split(/\s+/)) {
+    counts.set(word, (counts.get(word) || 0) + 1);
+  }
+  return counts;
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Mistake 3: Arrow functions and prototype methods</summary>
+        <p><strong>The mistake:</strong> Using arrow functions for methods that need dynamic <code>this</code> binding.</p>
+        <pre><code class="language-javascript">// ❌ BEFORE — arrow function on prototype
+class Timer {
+  constructor() {
+    this.seconds = 0;
+  }
+}
+
+// Arrow function captures `this` from DEFINITION context (the module/global)
+// NOT from the instance
+Timer.prototype.start = () =&gt; {
+  setInterval(() =&gt; {
+    this.seconds++; // `this` is NOT the Timer instance!
+    // In strict mode: TypeError. In sloppy mode: modifies window.seconds
+  }, 1000);
+};
+
+// Also bad: arrow function in class body as a "method"
+class Button {
+  // This creates a NEW function on EVERY instance (not on prototype!)
+  handleClick = () =&gt; {
+    console.log(this); // Works for `this`, but...
+  };
+  // Memory: 1000 Button instances = 1000 handleClick function objects
+}
+
+// ✅ AFTER — regular function on prototype + bind where needed
+class Timer {
+  constructor() {
+    this.seconds = 0;
+  }
+  start() {
+    // Regular method on prototype — shared across instances
+    setInterval(() =&gt; {
+      this.seconds++; // Arrow in callback captures `this` from start()
+    }, 1000);
+  }
+}
+
+class Button {
+  constructor() {
+    // Bind once in constructor if you need to pass as callback
+    this.handleClick = this.handleClick.bind(this);
+  }
+  handleClick() {
+    // On prototype — shared. Bound copy on instance for callbacks.
+    console.log(this);
+  }
+}</code></pre>
+        <div class="callout callout-info">
+          <p><strong>When arrow properties ARE appropriate:</strong> Event handlers in React class components (pre-hooks era), callbacks that are always passed by reference and need stable <code>this</code>. The memory cost is acceptable for UI components with limited instance counts. For data models with thousands of instances, always use prototype methods.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Mistake 4: hasOwnProperty vs in operator</summary>
+        <p><strong>The mistake:</strong> Using the wrong property check for the situation.</p>
+        <pre><code class="language-javascript">// The `in` operator checks the ENTIRE prototype chain
+// hasOwnProperty (or Object.hasOwn) checks ONLY own properties
+
+const user = { name: 'Alice', age: 30 };
+
+// ❌ WRONG: Using `in` to check if user has a specific data field
+if ('toString' in user) {
+  // Always true! toString is inherited from Object.prototype
+  // This is almost NEVER what you want for data checks
+}
+
+// ❌ WRONG: Using hasOwnProperty when you NEED inherited checks
+class Animal { constructor() { this.alive = true; } }
+class Dog extends Animal { constructor() { super(); this.breed = 'Lab'; } }
+const dog = new Dog();
+
+if (dog.hasOwnProperty('alive')) {
+  // true — alive IS an own property (set in constructor)
+}
+// But what about methods?
+if (dog.hasOwnProperty('toString')) {
+  // false — but the method IS available via prototype
+}
+
+// ✅ CORRECT: Match the check to the intent
+// "Does this object directly contain this data?" → Object.hasOwn()
+if (Object.hasOwn(user, 'name')) { /* data exists on object */ }
+
+// "Can I call this method/access this property?" → in operator or optional chain
+if ('speak' in dog) { dog.speak(); }
+// Or: dog.speak?.();
+
+// "Is this key safe to use as a dictionary key?" → Object.hasOwn + null proto
+const dict = Object.create(null);
+dict[userInput] = value;
+if (Object.hasOwn(dict, someKey)) { /* safe */ }</code></pre>
+      </details>
+
+      <details>
+        <summary>Mistake 5: Forgetting that delete triggers slow mode</summary>
+        <p><strong>The mistake:</strong> Using <code>delete</code> to "clean up" object properties in hot paths.</p>
+        <pre><code class="language-javascript">// ❌ BEFORE — delete forces V8 into dictionary mode
+function processResponse(response) {
+  const data = { ...response };
+  
+  // "Clean up" internal fields before sending to client
+  delete data._internalId;
+  delete data._timestamp;
+  delete data._rawBuffer;
+  
+  return data;
+  // V8 transitions data to "slow properties" (dictionary mode)
+  // All subsequent property accesses on this object are hash-table lookups
+  // If this runs in a loop, the IC for this pattern goes megamorphic
+}
+
+// ✅ AFTER — destructure to exclude (no delete, shape stays fast)
+function processResponse(response) {
+  const { _internalId, _timestamp, _rawBuffer, ...data } = response;
+  return data;
+  // `data` has a clean, predictable Hidden Class from the start
+  // No dictionary-mode transition
+}
+
+// ✅ ALTERNATIVE — set to undefined (preserves Hidden Class)
+function processResponse(response) {
+  const data = { ...response };
+  data._internalId = undefined;
+  data._timestamp = undefined;
+  data._rawBuffer = undefined;
+  return data;
+  // Same Hidden Class — IC stays monomorphic
+  // Trade-off: properties still enumerable (filter in serialization)
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 15: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+
+      <details>
+        <summary>Object creation and inheritance pattern comparison</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>Prototypal Inheritance</th>
+              <th>Class Syntax</th>
+              <th>Composition</th>
+              <th>Factory Functions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Memory efficiency</td>
+              <td>✅ Shared methods on prototype</td>
+              <td>✅ Shared methods on prototype</td>
+              <td>⚠️ Each instance owns behavior objects</td>
+              <td>❌ Each instance has own closures</td>
+            </tr>
+            <tr>
+              <td>V8 optimization</td>
+              <td>✅ Stable Hidden Classes</td>
+              <td>✅ Predictable shape from constructor</td>
+              <td>✅ Flat, predictable shapes</td>
+              <td>⚠️ Varies (frozen objects help)</td>
+            </tr>
+            <tr>
+              <td>Encapsulation</td>
+              <td>❌ No true privacy</td>
+              <td>⚠️ #private fields (recent)</td>
+              <td>⚠️ Depends on implementation</td>
+              <td>✅ Closures provide true privacy</td>
+            </tr>
+            <tr>
+              <td>instanceof support</td>
+              <td>✅ Works via chain</td>
+              <td>✅ Native support</td>
+              <td>❌ Requires Symbol.hasInstance</td>
+              <td>❌ Requires Symbol.hasInstance</td>
+            </tr>
+            <tr>
+              <td>Multiple inheritance</td>
+              <td>⚠️ Mixins (fragile)</td>
+              <td>⚠️ Mixin pattern (class factories)</td>
+              <td>✅ Natural (compose behaviors)</td>
+              <td>✅ Natural (combine closures)</td>
+            </tr>
+            <tr>
+              <td>Testability</td>
+              <td>⚠️ Must mock prototype chain</td>
+              <td>⚠️ Must mock or extend</td>
+              <td>✅ Inject dependencies directly</td>
+              <td>✅ Inject via arguments</td>
+            </tr>
+            <tr>
+              <td>TypeScript support</td>
+              <td>⚠️ Complex types needed</td>
+              <td>✅ First-class support</td>
+              <td>✅ Interface-based</td>
+              <td>✅ Return type inference</td>
+            </tr>
+            <tr>
+              <td>Tree-shaking</td>
+              <td>❌ Prototype methods always included</td>
+              <td>❌ All methods in bundle</td>
+              <td>✅ Import only what's used</td>
+              <td>⚠️ Depends on structure</td>
+            </tr>
+            <tr>
+              <td>Refactoring safety</td>
+              <td>❌ Fragile base class problem</td>
+              <td>❌ Fragile base class problem</td>
+              <td>✅ Changes are local</td>
+              <td>✅ Changes are local</td>
+            </tr>
+            <tr>
+              <td>Team onboarding</td>
+              <td>❌ Confusing for many devs</td>
+              <td>✅ Familiar OOP pattern</td>
+              <td>⚠️ Requires functional thinking</td>
+              <td>⚠️ Less conventional</td>
+            </tr>
+            <tr>
+              <td>Best for</td>
+              <td>Polyfills, delegation patterns</td>
+              <td>Application code, frameworks</td>
+              <td>Game engines, behavior systems</td>
+              <td>Services, singletons, DI</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>When to use each pattern — decision framework</summary>
+        <ul>
+          <li><strong>Use classes</strong> when: you're writing application code that will be maintained by a team, you need instanceof checks, you're extending built-ins, or your framework requires it (Angular, Ember).</li>
+          <li><strong>Use Object.create</strong> when: you need a pure dictionary (Object.create(null)), you want explicit delegation without constructor overhead, or you're implementing polyfills.</li>
+          <li><strong>Use composition</strong> when: you need to combine behaviors from multiple sources, behaviors change at runtime, you want maximum testability, or your inheritance hierarchy is deeper than 2 levels.</li>
+          <li><strong>Use factory functions</strong> when: you need true encapsulation, you're creating singleton services, you want to avoid <code>this</code> binding issues, or you're writing functional-style code.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 16: Follow-up Interview Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Q1: How does instanceof work internally?</summary>
+        <p><strong>Strong answer:</strong> <code>obj instanceof Constructor</code> first checks if <code>Constructor[Symbol.hasInstance]</code> exists — if so, it calls that method and returns the result. If not, it walks <code>obj</code>'s prototype chain looking for <code>Constructor.prototype</code>. Specifically: it reads <code>Object.getPrototypeOf(obj)</code> repeatedly until it finds an object that is <code>===</code> to <code>Constructor.prototype</code>, or reaches <code>null</code> (returning false).</p>
+        <pre><code class="language-javascript">// Simplified instanceof implementation
+function myInstanceof(obj, Constructor) {
+  // Check Symbol.hasInstance first
+  if (typeof Constructor[Symbol.hasInstance] === 'function') {
+    return Constructor[Symbol.hasInstance](obj);
+  }
+  
+  // Walk the prototype chain
+  const target = Constructor.prototype;
+  if (target === null || typeof target !== 'object') {
+    throw new TypeError('Right-hand side of instanceof is not callable');
+  }
+  
+  let current = Object.getPrototypeOf(obj);
+  while (current !== null) {
+    if (current === target) return true;
+    current = Object.getPrototypeOf(current);
+  }
+  return false;
+}
+
+// Key implication: instanceof breaks if you reassign Constructor.prototype
+function Dog() {}
+const rex = new Dog();
+rex instanceof Dog; // true
+
+Dog.prototype = {}; // Reassign!
+rex instanceof Dog; // false — rex's chain still points to OLD prototype</code></pre>
+      </details>
+
+      <details>
+        <summary>Q2: What happens to performance when you modify a prototype after object creation?</summary>
+        <p><strong>Strong answer:</strong> Modifying a prototype after objects are created triggers a cascade of V8 deoptimizations. Every prototype has a "validity cell" that Inline Caches reference. When you modify a prototype (add/remove/change properties, or change its [[Prototype]]), V8 invalidates this cell, which causes:</p>
+        <ol>
+          <li>All ICs that cached property lookups through this prototype immediately miss</li>
+          <li>TurboFan-compiled code that inlined prototype assumptions gets deoptimized (machine code discarded)</li>
+          <li>Affected functions fall back to the interpreter and must be re-profiled</li>
+          <li>If modifications happen repeatedly, ICs become megamorphic (permanently slow)</li>
+        </ol>
+        <p>The impact is <em>global</em> — it affects ALL objects whose prototype chain includes the modified prototype, even objects in completely unrelated code paths. This is why the V8 team describes <code>Object.setPrototypeOf</code> as "one of the slowest operations in JavaScript."</p>
+        <p>Mitigation: Define all prototype methods before creating instances. If you must add methods dynamically (plugin systems), do it at startup before hot code paths execute.</p>
+      </details>
+
+      <details>
+        <summary>Q3: How does Object.create(null) differ from {} and when would you use it?</summary>
+        <p><strong>Strong answer:</strong> <code>{}</code> creates an object whose <code>[[Prototype]]</code> is <code>Object.prototype</code>, inheriting methods like <code>toString</code>, <code>hasOwnProperty</code>, <code>valueOf</code>, and critically, the <code>__proto__</code> accessor property. <code>Object.create(null)</code> creates an object with <code>[[Prototype]]</code> set to <code>null</code> — truly empty with zero inherited properties.</p>
+        <p><strong>Use cases for Object.create(null):</strong></p>
+        <ul>
+          <li><strong>Dictionaries with untrusted keys:</strong> User-supplied keys like "__proto__" or "constructor" become harmless regular string keys instead of triggering prototype pollution.</li>
+          <li><strong>Lookup tables:</strong> No collision between data keys and inherited method names (e.g., a key named "toString" won't shadow the method because there is no method).</li>
+          <li><strong>Cache objects:</strong> When using <code>in</code> operator to check existence, inherited properties won't give false positives.</li>
+          <li><strong>Security-sensitive data stores:</strong> Immune to prototype pollution attacks since there's no prototype to pollute through.</li>
+        </ul>
+        <pre><code class="language-javascript">const dict = Object.create(null);
+dict['__proto__'] = 'not special'; // Just a regular key
+dict['toString'] = 'also just a key'; // No shadowing
+'hasOwnProperty' in dict; // false — truly doesn't exist</code></pre>
+      </details>
+
+      <details>
+        <summary>Q4: Explain prototype pollution and how to prevent it</summary>
+        <p><strong>Strong answer:</strong> Prototype pollution occurs when an attacker can write to <code>Object.prototype</code> (or any shared prototype) through application logic — typically via unsafe recursive merge, deep clone, or property-path-setting functions that don't guard against <code>__proto__</code>, <code>constructor.prototype</code>, or <code>prototype</code> as keys.</p>
+        <p><strong>Impact:</strong> Any property added to <code>Object.prototype</code> appears on every object in the runtime. This enables:</p>
+        <ul>
+          <li>Authentication bypass (e.g., polluting <code>isAdmin: true</code>)</li>
+          <li>Denial of service (overwriting methods like <code>toString</code>)</li>
+          <li>Remote code execution in Node.js (via environment variable injection in child_process)</li>
+        </ul>
+        <p><strong>Prevention layers:</strong></p>
+        <pre><code class="language-javascript">// 1. Input validation — reject dangerous keys
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+function isSafeKey(key) { return !DANGEROUS_KEYS.has(key); }
+
+// 2. Use Map for dynamic keys (immune to pollution)
+const userSettings = new Map();
+
+// 3. Object.create(null) for data containers
+const config = Object.create(null);
+
+// 4. Object.freeze(Object.prototype) — defense in depth
+// ⚠️ May break poorly-written third-party code
+Object.freeze(Object.prototype);
+
+// 5. Use schema validation (zod, joi) before merge operations
+const schema = z.object({ name: z.string(), age: z.number() });
+const safe = schema.parse(untrustedInput); // Strips unknown keys</code></pre>
+      </details>
+
+      <details>
+        <summary>Q5: How do Proxy objects interact with the prototype chain?</summary>
+        <p><strong>Strong answer:</strong> Proxies can intercept prototype-related operations via specific traps:</p>
+        <ul>
+          <li><code>getPrototypeOf</code> trap — intercepts <code>Object.getPrototypeOf(proxy)</code>, <code>proxy.__proto__</code>, and <code>instanceof</code></li>
+          <li><code>setPrototypeOf</code> trap — intercepts <code>Object.setPrototypeOf(proxy, newProto)</code></li>
+          <li><code>get</code> trap — fires for ALL property access, including inherited properties found via the chain</li>
+        </ul>
+        <p>Key nuances:</p>
+        <pre><code class="language-javascript">// A Proxy can appear in a prototype chain
+const handler = {
+  get(target, prop, receiver) {
+    console.log(`Intercepted: ${String(prop)} on ${receiver === child ? 'child' : 'proxy'}`);
+    return Reflect.get(target, prop, receiver);
+  }
+};
+
+const base = { value: 42 };
+const proxy = new Proxy(base, handler);
+const child = Object.create(proxy);
+
+child.value;
+// Logs: "Intercepted: value on child"
+// The proxy's get trap fires because child's [[Prototype]] IS the proxy
+// `receiver` is child (the original object the property was accessed on)
+// `target` is base (the proxy's target)
+
+// Invariant enforcement:
+// If target has a non-configurable, non-writable property,
+// the get trap MUST return that property's value (or throws TypeError)
+// This prevents proxies from lying about frozen/sealed targets</code></pre>
+      </details>
+
+      <details>
+        <summary>Q6: Why are class methods on the prototype while arrow function properties are on the instance?</summary>
+        <p><strong>Strong answer:</strong> This is a consequence of how each is compiled by the JavaScript engine:</p>
+        <pre><code class="language-javascript">class Component {
+  // Regular method → defined on Component.prototype via Object.defineProperty
+  // Shared across ALL instances (one function object in memory)
+  handleClick() { console.log(this); }
+  
+  // Arrow property → compiled into constructor body
+  // Creates a NEW function for EVERY instance (captures `this` via closure)
+  handleHover = () =&gt; { console.log(this); };
+}
+
+// Desugars to:
+function Component() {
+  // Arrow property is created HERE — per instance
+  this.handleHover = () =&gt; { console.log(this); };
+}
+// Regular method is created HERE — once, shared
+Component.prototype.handleClick = function() { console.log(this); };
+
+// Memory implication:
+// 1000 instances = 1 handleClick + 1000 handleHover function objects
+// Arrow properties use ~50-80 bytes per instance per method</code></pre>
+        <p><strong>Why this exists:</strong> Arrow properties solve the <code>this</code>-binding problem when passing methods as callbacks (e.g., React event handlers). The trade-off is memory. For data-heavy models with many instances, always use prototype methods. For UI components (typically &lt;100 instances), the memory cost is negligible and the ergonomic benefit is worth it.</p>
+      </details>
+
+      <details>
+        <summary>Q7: How does V8 decide between in-object properties and dictionary mode?</summary>
+        <p><strong>Strong answer:</strong> V8 maintains two storage strategies for object properties:</p>
+        <ul>
+          <li><strong>Fast mode (in-object + backing store):</strong> Properties are stored at fixed offsets determined by the Hidden Class. Access is a single memory read at a known offset. V8 pre-allocates in-object slots based on constructor analysis (typically 2-10 slots). Overflow goes to a "properties" backing store array.</li>
+          <li><strong>Dictionary mode (slow properties):</strong> Properties are stored in a hash table. Access requires hash computation + possible collision resolution. Used when the object's shape becomes too unpredictable for fast mode.</li>
+        </ul>
+        <p><strong>Triggers for dictionary mode transition:</strong></p>
+        <ul>
+          <li>Using <code>delete</code> on a property (shape becomes unpredictable)</li>
+          <li>Adding too many properties dynamically (>~30 transition tree branches)</li>
+          <li>Using computed property names in patterns V8 can't predict</li>
+          <li>Calling <code>Object.defineProperty</code> with unusual descriptors repeatedly</li>
+        </ul>
+        <p>Once in dictionary mode, an object generally stays there — it's a one-way transition. This is why avoiding <code>delete</code> and establishing shapes at construction time matters for performance.</p>
+      </details>
+    </section>
+
+    <!-- Section 17: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Key mental models for the interview:</strong></p>
+        <ul>
+          <li><strong>Prototype chain = linked list for property lookup.</strong> Every object has [[Prototype]] → walk until found or null.</li>
+          <li><strong>Hidden Classes = shapes.</strong> Objects with the same properties in the same order share a Hidden Class. Same Hidden Class = fast IC access.</li>
+          <li><strong>Prototype stability = performance.</strong> Mutating prototypes after initialization destroys Inline Caches globally. It's not "a little slow" — it's catastrophic.</li>
+          <li><strong>Object.create(null) = safe dictionary.</strong> No inherited properties, immune to prototype pollution, ideal for untrusted key storage.</li>
+          <li><strong>class is syntactic sugar with teeth.</strong> It desugars to constructors + prototypes but adds strict mode, TDZ, non-enumerable methods, proper subclassing of built-ins, and super semantics.</li>
+          <li><strong>Composition beats deep inheritance.</strong> Keep chains shallow (≤2 levels), compose behaviors via delegation, use classes for framework integration and explicit IS-A relationships.</li>
+          <li><strong>delete kills performance.</strong> Set to undefined instead. Destructure to exclude properties.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout-warning">
+        <p><strong>What NOT to say in an interview:</strong></p>
+        <ul>
+          <li>❌ "JavaScript uses prototypal inheritance where objects inherit from other objects" — too surface-level. Explain the chain mechanics, IC implications, and when to choose alternatives.</li>
+          <li>❌ "class is just syntactic sugar" — it IS syntactic sugar, but with meaningful behavioral differences (strict mode, TDZ, non-enumerable, super, built-in subclassing). Don't dismiss these.</li>
+          <li>❌ "__proto__ is the prototype" — it's a deprecated accessor on Object.prototype. The actual prototype is the internal [[Prototype]] slot, accessed via Object.getPrototypeOf.</li>
+          <li>❌ "Prototype chain performance doesn't matter" — it matters enormously at scale. IC monomorphism, chain depth, and prototype stability directly impact V8's ability to optimize.</li>
+          <li>❌ "I always use classes" / "I never use classes" — show that you can reason about trade-offs: memory, encapsulation, testability, team familiarity. The right choice depends on context.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+</body>
+</html>

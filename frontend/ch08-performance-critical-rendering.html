@@ -1,0 +1,2475 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 8: Performance &amp; Critical Rendering Path | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <a href="../index.html" class="sidebar-brand">
+      <span class="chapter-num">Ch 8</span>
+      <span class="chapter-title">Performance &amp; TTI</span>
+    </a>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#performance-budget">Performance Budget</a></li>
+        <li><a href="#bundle-analysis">Bundle Analysis</a></li>
+        <li><a href="#code-splitting">Code Splitting</a></li>
+        <li><a href="#lazy-loading">Lazy Loading</a></li>
+        <li><a href="#resource-hints">Resource Hints</a></li>
+        <li><a href="#font-loading">Font Loading</a></li>
+        <li><a href="#image-optimization">Image Optimization</a></li>
+        <li><a href="#service-workers">Service Workers</a></li>
+        <li><a href="#ssr-vs-ssg">SSR vs SSG</a></li>
+        <li><a href="#streaming-html">Streaming HTML</a></li>
+        <li><a href="#progressive-enhancement">Progressive Enhancement</a></li>
+        <li><a href="#core-web-vitals">Core Web Vitals</a></li>
+        <li><a href="#rum">Real User Monitoring</a></li>
+        <li><a href="#testing-tools">Lighthouse &amp; WebPageTest</a></li>
+        <li><a href="#production-incident">Production Case Study</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <a href="../index.html#part-1">Part I — JavaScript Engine Internals</a> &gt;
+      <span>Chapter 8</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Performance</span>
+        <span class="badge badge-topic">TTI</span>
+        <span class="badge badge-topic">Bundle</span>
+        <span class="badge badge-topic">Optimization</span>
+      </div>
+      <h1>Chapter 8: Performance &amp; Critical Rendering Path</h1>
+      <blockquote class="chapter-takeaway">
+        TTI is dominated by JavaScript parse/compile/execute time on mobile. The path to &lt;2s is: reduce JS shipped (code splitting, tree-shaking), defer non-critical JS (dynamic import, prefetch), optimize delivery (compression, CDN, preconnect), and eliminate render-blocking resources. Every kilobyte of JS costs ~3-4x more on mobile than equivalent HTML/CSS.
+      </blockquote>
+      <div class="callout callout-info">
+        <p><strong>Metric evolution (2024):</strong> Lighthouse v10+ deprecated TTI in favor of <strong>TBT</strong> (Total Blocking Time) as the lab metric. In the field, <strong>INP</strong> (Interaction to Next Paint) replaced both TTI and FID. This chapter uses "TTI" as the interview framing question, but the optimization strategies target TBT/INP improvement — the underlying techniques are identical.</p>
+        <p><strong>Scope note:</strong> This chapter focuses on <em>loading performance strategy and delivery optimization</em>. For browser rendering mechanics (pipeline, compositor, GPU layers), see <a href="ch07-web-apis-browser-internals.html">Chapter 7</a>.</p>
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="text" class="search-input" placeholder="Search this chapter..." aria-label="Search">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details>
+        <summary>What the interviewer is really evaluating</summary>
+        <div class="callout callout-info">
+          <strong>The Question:</strong> "A production SPA takes 6 seconds to become interactive on mobile. How would you reduce Time-to-Interactive to under 2 seconds?"
+        </div>
+        <p>The interviewer wants to assess:</p>
+        <ul>
+          <li><strong>Systems thinking:</strong> Can you identify the full pipeline from server to pixels — DNS, TCP, TLS, TTFB, download, parse, compile, execute, layout, paint, composite?</li>
+          <li><strong>Prioritization under constraints:</strong> Which optimizations yield the biggest impact for the least effort? (Pareto principle in performance)</li>
+          <li><strong>Measurement mindset:</strong> Do you measure before optimizing? Do you understand lab vs field data?</li>
+          <li><strong>Mobile-first awareness:</strong> Do you understand that a mid-range Android phone has 4-6x slower CPU than your MacBook Pro?</li>
+          <li><strong>Production experience:</strong> Have you actually shipped performance improvements, not just read about them?</li>
+        </ul>
+        <p>This question separates seniors who have optimized real production apps from those who only know the theory. The interviewer expects a structured approach: measure → identify bottlenecks → apply targeted fixes → verify improvement.</p>
+      </details>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details>
+        <summary>Concise answer for time-pressured interviews</summary>
+        <p><strong>Framework for reducing TTI from 6s to &lt;2s:</strong></p>
+        <ol>
+          <li><strong>Measure first:</strong> Lighthouse on throttled 4G + real device testing. Identify: is it network-bound or CPU-bound?</li>
+          <li><strong>Reduce JavaScript:</strong> Code-split routes (React.lazy), tree-shake dead code, replace heavy libraries (moment→date-fns, lodash→lodash-es individual imports).</li>
+          <li><strong>Defer non-critical JS:</strong> Dynamic imports for below-fold, defer third-party scripts, use requestIdleCallback for analytics.</li>
+          <li><strong>Optimize delivery:</strong> Brotli compression (20-25% smaller than gzip), HTTP/2 multiplexing, CDN edge caching, preconnect to origins.</li>
+          <li><strong>Eliminate render-blocking:</strong> Inline critical CSS, async/defer scripts, font-display: optional for web fonts.</li>
+          <li><strong>Consider SSR/SSG:</strong> Server-render the critical path so users see content before JS hydrates.</li>
+        </ol>
+        <pre class="diagram">
+┌─────────────────── TTI Breakdown (6s → 1.8s) ───────────────────┐
+│                                                                    │
+│  Before: DNS─TCP─TLS─TTFB─Download─Parse─Compile─Execute─Layout  │
+│          50ms  80ms 200ms 800ms  1200ms 1500ms  1800ms   370ms   │
+│                                                    Total: ~6000ms  │
+│                                                                    │
+│  After:  DNS─TCP─TLS─TTFB─Download─Parse─Compile─Execute─Layout  │
+│          0*   0*  50ms 200ms  300ms  400ms   500ms   200ms  150ms │
+│          (*preconnect/H2 reuse)            Total: ~1800ms          │
+│                                                                    │
+│  Key reductions:                                                   │
+│  • JS bundle: 1.2MB → 180KB (code splitting + tree shaking)       │
+│  • Delivery: HTTP/2 + Brotli + CDN                                │
+│  • Parsing: Less JS = less parse time                              │
+│  • SSR: Content visible at TTFB, JS hydrates after                │
+└────────────────────────────────────────────────────────────────────┘
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 3: Performance Budget -->
+    <section id="performance-budget">
+      <h2>Performance Budget</h2>
+      <details>
+        <summary>Setting and enforcing budgets that guarantee fast TTI</summary>
+        <h3>What Is a Performance Budget?</h3>
+        <p>A performance budget is a set of limits on metrics that affect user experience. It's not aspirational — it's a hard constraint enforced in CI, like a failing test.</p>
+
+        <div class="callout callout-warning">
+          <strong>The 170KB Rule:</strong> To achieve &lt;5s TTI on a mid-range phone over 3G (~400kbps effective throughput after TCP slow-start), your critical-path JavaScript budget is ~170KB compressed. This accounts for ~1.5s download + ~3.5s parse/compile/execute on a Moto G4-class device. <em>This figure originates from Addy Osmani's research (~2018) using a Moto G4 baseline. Modern mid-range phones (2024) are ~2-3x faster, supporting 200-250KB budgets — but 170KB remains a safe aggressive target for global audiences.</em>
+        </div>
+
+        <h3>How to Set a Budget</h3>
+        <pre><code class="language-javascript">// performance-budget.json — used by bundlesize or Lighthouse CI
+{
+  "budgets": [
+    {
+      "resourceType": "script",
+      "budget": 170,  // KB, compressed
+      "comment": "Critical path JS for 3G mobile TTI < 5s"
+    },
+    {
+      "resourceType": "total",
+      "budget": 500,  // KB total page weight
+      "comment": "Entire page including images, fonts, CSS"
+    },
+    {
+      "metric": "interactive",
+      "budget": 3800, // ms on simulated 4G
+      "comment": "Lighthouse TTI threshold"
+    },
+    {
+      "metric": "first-contentful-paint",
+      "budget": 1500
+    }
+  ]
+}</code></pre>
+
+        <h3>Example Budgets by App Type</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>App Type</th>
+              <th>JS Budget (compressed)</th>
+              <th>Total Weight</th>
+              <th>Target TTI (4G)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Landing page / Marketing</td>
+              <td>50KB</td>
+              <td>200KB</td>
+              <td>&lt;2s</td>
+            </tr>
+            <tr>
+              <td>E-commerce PDP</td>
+              <td>150KB</td>
+              <td>400KB</td>
+              <td>&lt;3s</td>
+            </tr>
+            <tr>
+              <td>SaaS Dashboard</td>
+              <td>300KB (initial route)</td>
+              <td>600KB</td>
+              <td>&lt;4s</td>
+            </tr>
+            <tr>
+              <td>Rich Editor / IDE</td>
+              <td>500KB (with lazy-loaded chunks)</td>
+              <td>1MB</td>
+              <td>&lt;5s</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Enforcing in CI</h3>
+        <pre><code class="language-javascript">// webpack.config.js — built-in performance hints
+module.exports = {
+  performance: {
+    maxAssetSize: 170 * 1024,       // 170KB per asset
+    maxEntrypointSize: 250 * 1024,  // 250KB for entry
+    hints: 'error'                   // Fail the build
+  }
+};
+
+// Or use bundlesize in package.json
+// "bundlesize": [
+//   { "path": "dist/main.*.js", "maxSize": "170kB" },
+//   { "path": "dist/vendor.*.js", "maxSize": "120kB" }
+// ]</code></pre>
+
+        <div class="callout callout-tip">
+          <strong>Senior insight:</strong> Budget the <em>initial route bundle</em>, not total app size. A 2MB app is fine if the first route loads 150KB and the rest loads on demand. Frame budgets around user-perceived milestones, not total payload.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: Bundle Analysis -->
+    <section id="bundle-analysis">
+      <h2>Bundle Analysis</h2>
+      <details>
+        <summary>Identifying and eliminating bundle bloat</summary>
+        <h3>Tools for Bundle Analysis</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Tool</th>
+              <th>Purpose</th>
+              <th>When to Use</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>webpack-bundle-analyzer</td>
+              <td>Interactive treemap of bundle contents</td>
+              <td>Visual exploration, finding large modules</td>
+            </tr>
+            <tr>
+              <td>source-map-explorer</td>
+              <td>Treemap from source maps (framework-agnostic)</td>
+              <td>CRA, Vite, any bundler with source maps</td>
+            </tr>
+            <tr>
+              <td>bundlephobia.com</td>
+              <td>Package size before installing</td>
+              <td>Evaluating dependencies before adding</td>
+            </tr>
+            <tr>
+              <td>Import Cost (VS Code extension)</td>
+              <td>Inline size display in editor</td>
+              <td>Awareness during development</td>
+            </tr>
+            <tr>
+              <td>Lighthouse treemap</td>
+              <td>Coverage map showing unused bytes</td>
+              <td>Finding dead code in production</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Actionable Analysis Workflow</h3>
+        <pre><code class="language-javascript">// Step 1: Generate stats file
+// webpack --profile --json > stats.json
+
+// Step 2: Analyze with webpack-bundle-analyzer
+const { BundleAnalyzerPlugin } = require('webpack-bundle-analyzer');
+
+module.exports = {
+  plugins: [
+    new BundleAnalyzerPlugin({
+      analyzerMode: 'static',       // Generate HTML report
+      reportFilename: 'bundle-report.html',
+      openAnalyzer: false,
+      generateStatsFile: true,
+      statsFilename: 'bundle-stats.json'
+    })
+  ]
+};</code></pre>
+
+        <h3>Common Bloat Patterns</h3>
+        <pre><code class="language-javascript">// ❌ BAD: Imports entire lodash (71KB minified)
+import _ from 'lodash';
+const result = _.get(obj, 'a.b.c');
+
+// ✅ GOOD: Import individual function (2KB)
+import get from 'lodash/get';
+const result = get(obj, 'a.b.c');
+
+// ❌ BAD: Moment.js with all locales (232KB minified)
+import moment from 'moment';
+
+// ✅ GOOD: date-fns with tree-shaking (per-function imports)
+import { format, parseISO } from 'date-fns';
+
+// ❌ BAD: Entire icon library
+import { Icons } from 'react-icons';
+
+// ✅ GOOD: Individual icon imports
+import { FiSearch } from 'react-icons/fi';</code></pre>
+
+        <h3>Identifying Duplicates</h3>
+        <pre><code class="language-javascript">// webpack.config.js — deduplicate packages
+const { DuplicatesPlugin } = require('inspectpack/plugin');
+
+module.exports = {
+  plugins: [
+    new DuplicatesPlugin({
+      emitErrors: true,  // Fail build on duplicates
+      verbose: true
+    })
+  ],
+  resolve: {
+    // Force single version of React
+    alias: {
+      'react': path.resolve('./node_modules/react'),
+      'react-dom': path.resolve('./node_modules/react-dom')
+    }
+  }
+};</code></pre>
+
+        <div class="callout callout-info">
+          <strong>Real-world impact:</strong> In a typical enterprise React app, bundle analysis reveals 30-50% of shipped JS is unused on the initial route. The biggest wins usually come from: removing duplicate packages, replacing heavy utilities, and code-splitting routes that aren't needed on first load.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 5: Code Splitting & Route-Based Chunking -->
+    <section id="code-splitting">
+      <h2>Code Splitting &amp; Route-Based Chunking</h2>
+      <details>
+        <summary>Shipping only the JavaScript needed for the current view</summary>
+        <h3>React.lazy + Suspense</h3>
+        <pre><code class="language-javascript">import React, { Suspense, lazy } from 'react';
+import { Routes, Route } from 'react-router-dom';
+
+// Each route becomes its own chunk
+const Home = lazy(() => import('./pages/Home'));
+const Product = lazy(() => import('./pages/Product'));
+const Checkout = lazy(() => import('./pages/Checkout'));
+const Admin = lazy(() => import(
+  /* webpackChunkName: "admin" */
+  /* webpackPrefetch: true */
+  './pages/Admin'
+));
+
+function App() {
+  return (
+    &lt;Suspense fallback={&lt;PageSkeleton /&gt;}&gt;
+      &lt;Routes&gt;
+        &lt;Route path="/" element={&lt;Home /&gt;} /&gt;
+        &lt;Route path="/product/:id" element={&lt;Product /&gt;} /&gt;
+        &lt;Route path="/checkout" element={&lt;Checkout /&gt;} /&gt;
+        &lt;Route path="/admin/*" element={&lt;Admin /&gt;} /&gt;
+      &lt;/Routes&gt;
+    &lt;/Suspense&gt;
+  );
+}</code></pre>
+
+        <h3>Next.js Automatic Splitting</h3>
+        <pre><code class="language-javascript">// Next.js splits by page automatically
+// pages/index.js → chunk for home
+// pages/product/[id].js → chunk for product
+
+// Dynamic imports for components within a page
+import dynamic from 'next/dynamic';
+
+const HeavyChart = dynamic(() => import('../components/Chart'), {
+  loading: () => &lt;ChartSkeleton /&gt;,
+  ssr: false  // Skip server-render for client-only components
+});
+
+// With named exports
+const Modal = dynamic(() =>
+  import('../components/Modal').then(mod => mod.Modal)
+);</code></pre>
+
+        <h3>Manual splitChunks Configuration</h3>
+        <pre><code class="language-javascript">// webpack.config.js — granular chunk strategy
+module.exports = {
+  optimization: {
+    splitChunks: {
+      chunks: 'all',
+      maxInitialRequests: 25,
+      minSize: 20000,        // 20KB minimum chunk
+      cacheGroups: {
+        // Framework code (changes rarely → long cache)
+        framework: {
+          test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+          name: 'framework',
+          priority: 40,
+          enforce: true
+        },
+        // Large libraries get their own chunks
+        lib: {
+          test: /[\\/]node_modules[\\/]/,
+          minSize: 50000,    // Only if > 50KB
+          name(module) {
+            const match = module.context.match(
+              /[\\/]node_modules[\\/](.*?)([\\/]|$)/
+            );
+            return `lib.${match[1].replace('@', '')}`;
+          },
+          priority: 30
+        },
+        // Shared code used by 2+ routes
+        shared: {
+          minChunks: 2,
+          priority: 20,
+          reuseExistingChunk: true
+        }
+      }
+    }
+  }
+};</code></pre>
+
+        <h3>Granular vs Monolithic Chunks</h3>
+        <pre class="diagram">
+┌─── Monolithic (Bad for Caching) ───┐    ┌─── Granular (Good for Caching) ────┐
+│                                     │    │                                     │
+│  vendor.js (500KB)                  │    │  framework.js (45KB)  ← rarely      │
+│  ├── react (45KB)                   │    │  lib.lodash.js (25KB)   changes     │
+│  ├── lodash (70KB)                  │    │  lib.chart.js (180KB)               │
+│  ├── chart.js (180KB)              │    │  shared.js (30KB)                   │
+│  └── ...200 more packages           │    │  vendor-misc.js (50KB)              │
+│                                     │    │                                     │
+│  One package update → entire        │    │  One update → only that chunk       │
+│  500KB vendor cache invalidated     │    │  invalidated. Others stay cached.   │
+└─────────────────────────────────────┘    └─────────────────────────────────────┘
+        </pre>
+
+        <div class="callout callout-tip">
+          <strong>Senior insight:</strong> The optimal number of initial chunks is 6-10 for HTTP/2. Too few = poor caching; too many = request overhead and compression inefficiency. Profile your specific app — there's no universal magic number.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 6: Lazy Loading Below-the-Fold -->
+    <section id="lazy-loading">
+      <h2>Lazy Loading Below-the-Fold</h2>
+      <details>
+        <summary>Deferring off-screen content until needed</summary>
+        <h3>IntersectionObserver for Components</h3>
+        <pre><code class="language-javascript">// Generic lazy-load wrapper using IntersectionObserver
+function useLazyLoad(options = {}) {
+  const [isVisible, setIsVisible] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setIsVisible(true);
+          observer.disconnect(); // Load once only
+        }
+      },
+      {
+        rootMargin: '200px', // Start loading 200px before viewport
+        threshold: 0,
+        ...options
+      }
+    );
+
+    if (ref.current) observer.observe(ref.current);
+    return () => observer.disconnect();
+  }, []);
+
+  return { ref, isVisible };
+}
+
+// Usage in a component
+function ProductPage() {
+  const { ref: reviewsRef, isVisible: showReviews } = useLazyLoad();
+  const { ref: relatedRef, isVisible: showRelated } = useLazyLoad();
+
+  return (
+    &lt;main&gt;
+      {/* Above the fold — loads immediately */}
+      &lt;ProductHero /&gt;
+      &lt;ProductDetails /&gt;
+
+      {/* Below the fold — lazy loaded */}
+      &lt;div ref={reviewsRef}&gt;
+        {showReviews &amp;&amp; &lt;Reviews productId={id} /&gt;}
+      &lt;/div&gt;
+
+      &lt;div ref={relatedRef}&gt;
+        {showRelated &amp;&amp; &lt;RelatedProducts /&gt;}
+      &lt;/div&gt;
+    &lt;/main&gt;
+  );
+}</code></pre>
+
+        <h3>Dynamic Import Patterns</h3>
+        <pre><code class="language-javascript">// Pattern 1: Import on interaction
+async function handleOpenEditor() {
+  const { CodeEditor } = await import(
+    /* webpackChunkName: "editor" */
+    './components/CodeEditor'
+  );
+  setEditor(() => CodeEditor);
+}
+
+// Pattern 2: Import on visibility (with React.lazy)
+const LazyComponent = lazy(() => import('./HeavyComponent'));
+
+function Section() {
+  const { ref, isVisible } = useLazyLoad();
+  return (
+    &lt;div ref={ref}&gt;
+      {isVisible &amp;&amp; (
+        &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+          &lt;LazyComponent /&gt;
+        &lt;/Suspense&gt;
+      )}
+    &lt;/div&gt;
+  );
+}
+
+// Pattern 3: Import on idle
+function loadAnalytics() {
+  if ('requestIdleCallback' in window) {
+    requestIdleCallback(() => {
+      import('./analytics').then(m => m.init());
+    });
+  } else {
+    setTimeout(() => {
+      import('./analytics').then(m => m.init());
+    }, 2000);
+  }
+}</code></pre>
+
+        <h3>Native Image Lazy Loading</h3>
+        <pre><code class="language-html">&lt;!-- Native browser lazy loading --&gt;
+&lt;img
+  src="product-large.jpg"
+  loading="lazy"
+  decoding="async"
+  width="800"
+  height="600"
+  alt="Product image"
+&gt;
+
+&lt;!-- Don't lazy-load LCP image! --&gt;
+&lt;img
+  src="hero-banner.jpg"
+  loading="eager"
+  fetchpriority="high"
+  width="1200"
+  height="400"
+  alt="Hero banner"
+&gt;
+
+&lt;!-- Lazy load iframes --&gt;
+&lt;iframe
+  src="https://www.youtube.com/embed/..."
+  loading="lazy"
+  title="Product video"
+&gt;&lt;/iframe&gt;</code></pre>
+
+        <div class="callout callout-warning">
+          <strong>Don't lazy-load above-the-fold content.</strong> The LCP element (hero image, main heading) must load eagerly with <code>fetchpriority="high"</code>. Lazy-loading LCP hurts your largest Contentful Paint score significantly.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 7: Preload, Prefetch, Preconnect -->
+    <section id="resource-hints">
+      <h2>Preload, Prefetch, Preconnect</h2>
+      <details>
+        <summary>Telling the browser what to fetch and when</summary>
+        <h3>Resource Hints Comparison</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Hint</th>
+              <th>Purpose</th>
+              <th>Priority</th>
+              <th>When</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>preconnect</code></td>
+              <td>DNS + TCP + TLS handshake</td>
+              <td>High</td>
+              <td>Third-party origins you'll fetch from soon</td>
+            </tr>
+            <tr>
+              <td><code>dns-prefetch</code></td>
+              <td>DNS lookup only</td>
+              <td>Low</td>
+              <td>Origins used later; fallback for preconnect</td>
+            </tr>
+            <tr>
+              <td><code>preload</code></td>
+              <td>Fetch resource for current page</td>
+              <td>High</td>
+              <td>Critical fonts, hero images, key scripts</td>
+            </tr>
+            <tr>
+              <td><code>prefetch</code></td>
+              <td>Fetch resource for next navigation</td>
+              <td>Low (idle)</td>
+              <td>Next page's JS chunks, data</td>
+            </tr>
+            <tr>
+              <td><code>modulepreload</code></td>
+              <td>Preload + parse ES module</td>
+              <td>High</td>
+              <td>Critical JS modules (Vite/ESM apps)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Implementation</h3>
+        <pre><code class="language-html">&lt;head&gt;
+  &lt;!-- Preconnect to critical third-party origins --&gt;
+  &lt;link rel="preconnect" href="https://cdn.example.com" crossorigin&gt;
+  &lt;link rel="preconnect" href="https://fonts.googleapis.com"&gt;
+  &lt;link rel="preconnect" href="https://fonts.gstatic.com" crossorigin&gt;
+
+  &lt;!-- DNS-prefetch as fallback (broader browser support) --&gt;
+  &lt;link rel="dns-prefetch" href="https://analytics.example.com"&gt;
+
+  &lt;!-- Preload critical resources --&gt;
+  &lt;link rel="preload" href="/fonts/inter-var.woff2" as="font"
+        type="font/woff2" crossorigin&gt;
+  &lt;link rel="preload" href="/api/critical-data" as="fetch"
+        crossorigin&gt;
+  &lt;link rel="preload" href="/hero-image.webp" as="image"
+        fetchpriority="high"&gt;
+
+  &lt;!-- Prefetch next page's chunk --&gt;
+  &lt;link rel="prefetch" href="/chunks/checkout.abc123.js"&gt;
+
+  &lt;!-- Module preload for ESM --&gt;
+  &lt;link rel="modulepreload" href="/src/app.js"&gt;
+&lt;/head&gt;</code></pre>
+
+        <h3>fetchpriority Attribute</h3>
+        <pre><code class="language-html">&lt;!-- High priority: LCP image --&gt;
+&lt;img src="hero.webp" fetchpriority="high" alt="Hero"&gt;
+
+&lt;!-- Low priority: below-fold images --&gt;
+&lt;img src="footer-bg.webp" fetchpriority="low" loading="lazy" alt=""&gt;
+
+&lt;!-- High priority: critical async script --&gt;
+&lt;script src="critical.js" async fetchpriority="high"&gt;&lt;/script&gt;
+
+&lt;!-- Low priority: analytics --&gt;
+&lt;script src="analytics.js" async fetchpriority="low"&gt;&lt;/script&gt;</code></pre>
+
+        <div class="callout callout-tip">
+          <strong>Senior insight:</strong> Limit preconnects to 4-6 origins max. Each preconnect consumes CPU and network resources. Preloading too many resources can actually hurt performance by competing with truly critical resources for bandwidth.
+        </div>
+
+        <h3>Speculation Rules API (Chrome 121+)</h3>
+        <p>The modern replacement for <code>&lt;link rel="prefetch"&gt;</code> with much better developer ergonomics and prerendering support:</p>
+        <pre><code class="language-html">&lt;!-- Declarative speculation rules (in &lt;head&gt; or injected dynamically) --&gt;
+&lt;script type="speculationrules"&gt;
+{
+  "prerender": [
+    { "where": { "href_matches": "/product/*" },
+      "eagerness": "moderate" }
+  ],
+  "prefetch": [
+    { "where": { "selector_matches": ".nav-link" },
+      "eagerness": "conservative" }
+  ]
+}
+&lt;/script&gt;
+
+&lt;!-- Eagerness levels:
+     - "immediate": start now
+     - "eager": start on slight signal (link visible)
+     - "moderate": start on hover (200ms)
+     - "conservative": start on mousedown/touchstart
+--&gt;</code></pre>
+        <p><strong>Advantages over <code>&lt;link rel="prefetch"&gt;</code>:</strong> supports full prerendering (instant navigation), rule-based matching (no manual link management), respects Save-Data header, and is cancellable. Can be feature-detected via <code>HTMLScriptElement.supports('speculationrules')</code>.</p>
+      </details>
+    </section>
+
+    <!-- Section 8: Font Loading Strategies -->
+    <section id="font-loading">
+      <h2>Font Loading Strategies</h2>
+      <details>
+        <summary>Eliminating layout shift and render blocking from web fonts</summary>
+        <h3>font-display Values</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Value</th>
+              <th>Block Period</th>
+              <th>Swap Period</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>swap</code></td>
+              <td>~100ms</td>
+              <td>Infinite</td>
+              <td>Body text (always show text)</td>
+            </tr>
+            <tr>
+              <td><code>optional</code></td>
+              <td>~100ms</td>
+              <td>None</td>
+              <td>Performance-critical pages (use system font if slow)</td>
+            </tr>
+            <tr>
+              <td><code>fallback</code></td>
+              <td>~100ms</td>
+              <td>~3s</td>
+              <td>Balance between swap and optional</td>
+            </tr>
+            <tr>
+              <td><code>block</code></td>
+              <td>~3s</td>
+              <td>Infinite</td>
+              <td>Icon fonts only (text invisible without them)</td>
+            </tr>
+            <tr>
+              <td><code>auto</code></td>
+              <td>Browser-defined</td>
+              <td>Browser-defined</td>
+              <td>Never (unpredictable behavior)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Optimal Font Loading Pattern</h3>
+        <pre><code class="language-html">&lt;!-- 1. Preconnect to Google Fonts (or preload self-hosted) --&gt;
+&lt;link rel="preconnect" href="https://fonts.gstatic.com" crossorigin&gt;
+
+&lt;!-- 2. Preload critical font files --&gt;
+&lt;link rel="preload" href="/fonts/inter-var-latin.woff2"
+      as="font" type="font/woff2" crossorigin&gt;
+
+&lt;!-- 3. CSS with font-display and size-adjust --&gt;
+&lt;style&gt;
+  @font-face {
+    font-family: 'Inter';
+    src: url('/fonts/inter-var-latin.woff2') format('woff2');
+    font-weight: 100 900;
+    font-display: optional; /* Best for performance */
+    unicode-range: U+0000-00FF; /* Latin subset only */
+  }
+
+  /* Fallback with size-adjust to prevent CLS */
+  @font-face {
+    font-family: 'Inter-fallback';
+    src: local('Arial');
+    size-adjust: 107%;
+    ascent-override: 90%;
+    descent-override: 22%;
+    line-gap-override: 0%;
+  }
+
+  body {
+    font-family: 'Inter', 'Inter-fallback', system-ui, sans-serif;
+  }
+&lt;/style&gt;</code></pre>
+
+        <h3>FOUT / FOIT / FOFT Explained</h3>
+        <pre class="diagram">
+┌─── FOIT (Flash of Invisible Text) ──────────────────────────────┐
+│  [blank]──────────────────────────────[web font appears]         │
+│  Problem: Users see nothing for up to 3 seconds                  │
+│  Cause: font-display: block (or browser default)                 │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─── FOUT (Flash of Unstyled Text) ────────────────────────────────┐
+│  [system font]─────────────────────────[swap to web font]        │
+│  Problem: Layout shift when fonts swap                           │
+│  Cause: font-display: swap without size-adjust                   │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─── FOFT (Flash of Faux Text) ────────────────────────────────────┐
+│  [system font]──[roman loaded]──────[bold/italic loaded]         │
+│  Strategy: Load roman first, synthesize bold, then swap          │
+│  Benefit: Fastest text display with minimal reflows              │
+└──────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Font Subsetting</h3>
+        <pre><code class="language-javascript">// Using fonttools (Python) to subset fonts
+// pip install fonttools brotli
+
+// Subset to Latin characters only:
+// pyftsubset Inter-Regular.ttf \
+//   --output-file=Inter-Regular-latin.woff2 \
+//   --flavor=woff2 \
+//   --layout-features="kern,liga" \
+//   --unicodes="U+0000-00FF,U+0131,U+0152-0153"
+
+// Result: 90KB → 18KB per weight/style
+
+// Variable font advantage:
+// Instead of loading Regular (18KB) + Bold (18KB) + Italic (18KB) = 54KB
+// Load Inter-var.woff2 (32KB) — all weights in one file</code></pre>
+
+        <div class="callout callout-info">
+          <strong>CLS Prevention:</strong> Use <code>size-adjust</code>, <code>ascent-override</code>, and <code>descent-override</code> on your fallback @font-face to match the metrics of your web font. This eliminates layout shift when fonts swap. Tools like <a href="https://screenspan.net/fallback">Fallback Font Generator</a> calculate these values automatically.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 9: Image Optimization -->
+    <section id="image-optimization">
+      <h2>Image Optimization</h2>
+      <details>
+        <summary>Serving the right image at the right size in the right format</summary>
+        <h3>Format Selection</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Format</th>
+              <th>Compression</th>
+              <th>Browser Support</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>AVIF</td>
+              <td>50% smaller than JPEG</td>
+              <td>Chrome, Firefox, Safari 16+</td>
+              <td>Photos, complex images</td>
+            </tr>
+            <tr>
+              <td>WebP</td>
+              <td>25-35% smaller than JPEG</td>
+              <td>All modern browsers</td>
+              <td>Universal fallback for AVIF</td>
+            </tr>
+            <tr>
+              <td>JPEG</td>
+              <td>Baseline</td>
+              <td>Universal</td>
+              <td>Legacy fallback</td>
+            </tr>
+            <tr>
+              <td>PNG</td>
+              <td>Lossless</td>
+              <td>Universal</td>
+              <td>Transparency, screenshots</td>
+            </tr>
+            <tr>
+              <td>SVG</td>
+              <td>Vector (tiny at any size)</td>
+              <td>Universal</td>
+              <td>Icons, illustrations, logos</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Responsive Images with srcset</h3>
+        <pre><code class="language-html">&lt;!-- Art direction with &lt;picture&gt; --&gt;
+&lt;picture&gt;
+  &lt;!-- AVIF for supporting browsers --&gt;
+  &lt;source
+    type="image/avif"
+    srcset="hero-400.avif 400w,
+            hero-800.avif 800w,
+            hero-1200.avif 1200w"
+    sizes="(max-width: 768px) 100vw, 50vw"&gt;
+
+  &lt;!-- WebP fallback --&gt;
+  &lt;source
+    type="image/webp"
+    srcset="hero-400.webp 400w,
+            hero-800.webp 800w,
+            hero-1200.webp 1200w"
+    sizes="(max-width: 768px) 100vw, 50vw"&gt;
+
+  &lt;!-- JPEG fallback --&gt;
+  &lt;img
+    src="hero-800.jpg"
+    srcset="hero-400.jpg 400w,
+            hero-800.jpg 800w,
+            hero-1200.jpg 1200w"
+    sizes="(max-width: 768px) 100vw, 50vw"
+    alt="Product hero image"
+    width="1200"
+    height="600"
+    loading="eager"
+    fetchpriority="high"
+    decoding="async"&gt;
+&lt;/picture&gt;</code></pre>
+
+        <h3>Blur-Up Placeholder Pattern</h3>
+        <pre><code class="language-javascript">// Tiny 20px base64 placeholder → full image
+function BlurUpImage({ src, placeholder, alt, ...props }) {
+  const [loaded, setLoaded] = useState(false);
+  const imgRef = useRef(null);
+
+  useEffect(() => {
+    const img = new Image();
+    img.src = src;
+    img.onload = () => setLoaded(true);
+  }, [src]);
+
+  return (
+    &lt;div className="blur-up-container" style={{ position: 'relative' }}&gt;
+      {/* Tiny blurred placeholder (inline base64, ~200 bytes) */}
+      &lt;img
+        src={placeholder}
+        alt=""
+        aria-hidden="true"
+        className={`placeholder ${loaded ? 'fade-out' : ''}`}
+        style={{
+          filter: 'blur(20px)',
+          transform: 'scale(1.1)',
+          position: 'absolute',
+          inset: 0
+        }}
+      /&gt;
+      {/* Full image */}
+      &lt;img
+        ref={imgRef}
+        src={src}
+        alt={alt}
+        className={`full-image ${loaded ? 'fade-in' : 'hidden'}`}
+        {...props}
+      /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+        <h3>CDN Image Transforms</h3>
+        <pre><code class="language-javascript">// Cloudinary / Imgix / Cloudflare Images URL-based transforms
+function getOptimizedImageUrl(src, { width, format = 'auto', quality = 80 }) {
+  // Cloudflare Image Resizing
+  return `/cdn-cgi/image/width=${width},format=${format},quality=${quality}/${src}`;
+
+  // Cloudinary
+  // return `https://res.cloudinary.com/demo/image/upload/w_${width},f_${format},q_${quality}/${src}`;
+
+  // Imgix
+  // return `${src}?w=${width}&fm=${format}&q=${quality}&auto=format`;
+}</code></pre>
+
+        <div class="callout callout-tip">
+          <strong>LCP Image Priority:</strong> Your LCP image should have <code>fetchpriority="high"</code>, <code>loading="eager"</code>, and ideally be preloaded with <code>&lt;link rel="preload" as="image"&gt;</code>. Never lazy-load the LCP element.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: Service Workers & Cache Strategies -->
+    <section id="service-workers">
+      <h2>Service Workers &amp; Cache Strategies</h2>
+      <details>
+        <summary>Offline-first architecture and intelligent caching</summary>
+        <h3>Cache Strategies</h3>
+        <pre class="diagram">
+┌─── Cache-First (Cache Falling Back to Network) ──────────────────┐
+│  Request → Cache hit? → Return cached                            │
+│                    ↓ miss                                         │
+│              Network → Cache response → Return                   │
+│  Best for: Static assets, fonts, images (versioned URLs)         │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─── Network-First (Network Falling Back to Cache) ────────────────┐
+│  Request → Network OK? → Cache response → Return                 │
+│                    ↓ fail/timeout                                 │
+│              Cache → Return stale                                 │
+│  Best for: API responses, HTML pages (freshness matters)         │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─── Stale-While-Revalidate ───────────────────────────────────────┐
+│  Request → Cache hit? → Return cached immediately                │
+│                    ↓ (in parallel)                                │
+│              Network → Update cache for next time                 │
+│  Best for: Avatars, non-critical API data, semi-static content   │
+└──────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Workbox Implementation</h3>
+        <pre><code class="language-javascript">// service-worker.js using Workbox
+import { precacheAndRoute } from 'workbox-precaching';
+import { registerRoute } from 'workbox-routing';
+import {
+  CacheFirst,
+  NetworkFirst,
+  StaleWhileRevalidate
+} from 'workbox-strategies';
+import { ExpirationPlugin } from 'workbox-expiration';
+import { CacheableResponsePlugin } from 'workbox-cacheable-response';
+
+// Precache app shell (injected by build tool)
+precacheAndRoute(self.__WB_MANIFEST);
+
+// Cache-first for static assets (hashed filenames)
+registerRoute(
+  ({ request }) =&gt;
+    request.destination === 'style' ||
+    request.destination === 'script' ||
+    request.destination === 'font',
+  new CacheFirst({
+    cacheName: 'static-assets',
+    plugins: [
+      new ExpirationPlugin({ maxEntries: 100, maxAgeSeconds: 365 * 24 * 60 * 60 }),
+      new CacheableResponsePlugin({ statuses: [0, 200] })
+    ]
+  })
+);
+
+// Stale-while-revalidate for images
+registerRoute(
+  ({ request }) =&gt; request.destination === 'image',
+  new StaleWhileRevalidate({
+    cacheName: 'images',
+    plugins: [
+      new ExpirationPlugin({ maxEntries: 200, maxAgeSeconds: 30 * 24 * 60 * 60 })
+    ]
+  })
+);
+
+// Network-first for API calls
+registerRoute(
+  ({ url }) =&gt; url.pathname.startsWith('/api/'),
+  new NetworkFirst({
+    cacheName: 'api-responses',
+    networkTimeoutSeconds: 3,
+    plugins: [
+      new ExpirationPlugin({ maxEntries: 50, maxAgeSeconds: 24 * 60 * 60 }),
+      new CacheableResponsePlugin({ statuses: [0, 200] })
+    ]
+  })
+);
+
+// Network-first for HTML navigation (offline support)
+registerRoute(
+  ({ request }) =&gt; request.mode === 'navigate',
+  new NetworkFirst({
+    cacheName: 'pages',
+    plugins: [
+      new CacheableResponsePlugin({ statuses: [0, 200] })
+    ]
+  })
+);</code></pre>
+
+        <div class="callout callout-warning">
+          <strong>Service Worker Gotchas:</strong> SWs don't help first visit (they install on first load). They primarily improve repeat visits and offline. Don't rely on SW for TTI improvement on first load — focus on server-side delivery and code splitting instead.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 11: SSR vs Static Generation -->
+    <section id="ssr-vs-ssg">
+      <h2>SSR vs Static Generation</h2>
+      <details>
+        <summary>Choosing the right rendering strategy for performance</summary>
+        <h3>Rendering Strategies Comparison</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>TTFB</th>
+              <th>FCP</th>
+              <th>TTI</th>
+              <th>Cacheability</th>
+              <th>Personalization</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>SSG (Static)</td>
+              <td>⚡ Fast (CDN)</td>
+              <td>⚡ Fast</td>
+              <td>Depends on JS</td>
+              <td>Perfect</td>
+              <td>❌ None</td>
+            </tr>
+            <tr>
+              <td>ISR (Incremental)</td>
+              <td>⚡ Fast (CDN)</td>
+              <td>⚡ Fast</td>
+              <td>Depends on JS</td>
+              <td>Good (timed)</td>
+              <td>❌ None</td>
+            </tr>
+            <tr>
+              <td>SSR (Server)</td>
+              <td>🐢 Slower</td>
+              <td>Fast</td>
+              <td>Better (less client JS)</td>
+              <td>Harder</td>
+              <td>✅ Full</td>
+            </tr>
+            <tr>
+              <td>Streaming SSR</td>
+              <td>⚡ Fast (early flush)</td>
+              <td>⚡ Fast</td>
+              <td>Progressive</td>
+              <td>Harder</td>
+              <td>✅ Full</td>
+            </tr>
+            <tr>
+              <td>CSR (Client)</td>
+              <td>⚡ Fast (static shell)</td>
+              <td>🐢 Slow</td>
+              <td>🐢 Slow</td>
+              <td>Shell only</td>
+              <td>✅ Full</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Next.js ISR (Incremental Static Regeneration)</h3>
+        <pre><code class="language-javascript">// pages/product/[id].js — static generation with revalidation
+export async function getStaticProps({ params }) {
+  const product = await fetchProduct(params.id);
+
+  return {
+    props: { product },
+    revalidate: 60, // Regenerate at most every 60 seconds
+    // First request after 60s serves stale, triggers background rebuild
+  };
+}
+
+export async function getStaticPaths() {
+  // Pre-generate top 100 products at build time
+  const topProducts = await fetchTopProducts(100);
+
+  return {
+    paths: topProducts.map(p =&gt; ({ params: { id: p.id } })),
+    fallback: 'blocking' // SSR on-demand for non-pre-generated pages
+  };
+}
+
+// App Router equivalent (Next.js 13+)
+// app/product/[id]/page.js
+export const revalidate = 60;
+
+export async function generateStaticParams() {
+  const products = await fetchTopProducts(100);
+  return products.map(p =&gt; ({ id: p.id }));
+}</code></pre>
+
+        <h3>When to Use Each Strategy</h3>
+        <pre class="diagram">
+┌─── Decision Tree ─────────────────────────────────────────────────┐
+│                                                                    │
+│  Is the page the same for all users?                              │
+│  ├── YES → Does it change frequently?                             │
+│  │         ├── Rarely (docs, blog) → SSG                         │
+│  │         ├── Every few minutes → ISR (revalidate: 60-300)      │
+│  │         └── Real-time (stock prices) → SSR + short cache      │
+│  │                                                                │
+│  └── NO (personalized) → Does it need SEO?                       │
+│           ├── YES → SSR (or SSR shell + client personalization)  │
+│           └── NO → CSR (behind auth = no SEO needed)             │
+│                                                                    │
+│  Edge cases:                                                       │
+│  • Hybrid: SSG shell + client-side personalization (e-commerce)  │
+│  • Edge SSR: Personalized at CDN edge (Vercel Edge, CF Workers)  │
+│  • Streaming: Best of both — fast TTFB + personalization         │
+└────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <div class="callout callout-info">
+          <strong>Edge Rendering:</strong> Edge functions (Cloudflare Workers, Vercel Edge) run SSR at CDN nodes close to users, combining SSR's personalization with CDN-like TTFB (~50ms globally vs 200-500ms for origin SSR). Trade-off: limited runtime (no Node.js APIs, execution time limits).
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 12: Streaming HTML -->
+    <section id="streaming-html">
+      <h2>Streaming HTML</h2>
+      <details>
+        <summary>Progressive rendering with React 18 streaming SSR</summary>
+        <h3>renderToPipeableStream</h3>
+        <pre><code class="language-javascript">// server.js — React 18 streaming SSR
+import { renderToPipeableStream } from 'react-dom/server';
+import { createServer } from 'http';
+import App from './App';
+
+createServer((req, res) =&gt; {
+  const { pipe, abort } = renderToPipeableStream(
+    &lt;App url={req.url} /&gt;,
+    {
+      // Shell is ready — flush the &lt;head&gt; and initial content
+      onShellReady() {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/html');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        pipe(res);
+      },
+      onShellError(error) {
+        res.statusCode = 500;
+        res.send('&lt;!doctype html&gt;&lt;h1&gt;Server Error&lt;/h1&gt;');
+      },
+      onAllReady() {
+        // Full page ready (for crawlers, set in bootstrapScriptContent)
+      },
+      onError(error) {
+        console.error(error);
+      }
+    }
+  );
+
+  // Abort after timeout
+  setTimeout(abort, 10000);
+}).listen(3000);</code></pre>
+
+        <h3>Out-of-Order Streaming with Suspense</h3>
+        <pre><code class="language-javascript">// App.js — Suspense boundaries define streaming chunks
+function ProductPage({ id }) {
+  return (
+    &lt;Layout&gt;
+      {/* Shell streams immediately */}
+      &lt;Header /&gt;
+      &lt;ProductHero id={id} /&gt;
+
+      {/* These stream out-of-order as data resolves */}
+      &lt;Suspense fallback={&lt;ReviewsSkeleton /&gt;}&gt;
+        &lt;Reviews id={id} /&gt;  {/* May resolve second */}
+      &lt;/Suspense&gt;
+
+      &lt;Suspense fallback={&lt;RecommendationsSkeleton /&gt;}&gt;
+        &lt;Recommendations id={id} /&gt;  {/* May resolve first */}
+      &lt;/Suspense&gt;
+
+      &lt;Footer /&gt;
+    &lt;/Layout&gt;
+  );
+}
+
+// The HTML streams progressively:
+// 1. Shell (&lt;head&gt;, header, hero) → Browser starts rendering
+// 2. &lt;template&gt; tags with completed Suspense content
+// 3. Inline &lt;script&gt; to swap templates into fallback positions
+// Result: Users see content progressively, not all-or-nothing</code></pre>
+
+        <h3>Early Flush Pattern</h3>
+        <pre><code class="language-javascript">// Express middleware — flush &lt;head&gt; early
+app.get('*', (req, res) =&gt; {
+  // Flush the head immediately so browser can start
+  // downloading CSS, fonts, preloaded resources
+  res.write(`
+    &lt;!doctype html&gt;
+    &lt;html&gt;
+    &lt;head&gt;
+      &lt;link rel="stylesheet" href="/styles.css"&gt;
+      &lt;link rel="preload" href="/fonts/inter.woff2" as="font" crossorigin&gt;
+      &lt;link rel="preconnect" href="https://api.example.com"&gt;
+    &lt;/head&gt;
+    &lt;body&gt;
+  `);
+  res.flush(); // Force TCP packet send
+
+  // Now do the expensive work (DB queries, rendering)
+  const html = await renderApp(req);
+  res.write(html);
+  res.end('&lt;/body&gt;&lt;/html&gt;');
+});</code></pre>
+
+        <div class="callout callout-tip">
+          <strong>Why streaming matters:</strong> Traditional SSR blocks until the entire page is rendered. A slow DB query delays <em>everything</em>. Streaming sends the shell immediately (fast TTFB/FCP) and fills in data-dependent sections as they resolve. Users see the page building progressively — perceived performance is dramatically better.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 13: Progressive Enhancement -->
+    <section id="progressive-enhancement">
+      <h2>Progressive Enhancement</h2>
+      <details>
+        <summary>Building resilient experiences that work without JavaScript</summary>
+        <h3>HTML-First Approach</h3>
+        <pre><code class="language-html">&lt;!-- Form works without JS (native form submission) --&gt;
+&lt;form action="/api/search" method="GET"&gt;
+  &lt;input type="search" name="q" required&gt;
+  &lt;button type="submit"&gt;Search&lt;/button&gt;
+&lt;/form&gt;
+
+&lt;!-- Enhanced with JS: intercept submit, fetch results --&gt;
+&lt;script type="module"&gt;
+  const form = document.querySelector('form');
+  form.addEventListener('submit', async (e) =&gt; {
+    e.preventDefault();
+    const q = new FormData(form).get('q');
+    const results = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+    renderResults(await results.json());
+  });
+&lt;/script&gt;
+
+&lt;!-- Navigation works without JS --&gt;
+&lt;details&gt;
+  &lt;summary&gt;Menu&lt;/summary&gt;
+  &lt;nav&gt;
+    &lt;a href="/products"&gt;Products&lt;/a&gt;
+    &lt;a href="/about"&gt;About&lt;/a&gt;
+  &lt;/nav&gt;
+&lt;/details&gt;</code></pre>
+
+        <h3>Resilient Loading Patterns</h3>
+        <pre><code class="language-javascript">// Pattern: Load JS enhancement only if supported and needed
+if ('IntersectionObserver' in window &amp;&amp; 'fetch' in window) {
+  import('./enhancements/infinite-scroll.js');
+}
+
+// Pattern: CSS-only interactivity as baseline
+// The :target pseudo-class creates navigation without JS
+// The :checked pseudo-class creates toggles without JS
+
+// Pattern: Serve HTML with inline critical data
+// &lt;script type="application/json" id="initial-data"&gt;
+//   {"products": [...]}
+// &lt;/script&gt;
+// JS reads this instead of making another network request
+
+// Pattern: Module/nomodule for modern/legacy split
+// &lt;script type="module" src="app.modern.js"&gt;&lt;/script&gt;
+// &lt;script nomodule src="app.legacy.js"&gt;&lt;/script&gt;</code></pre>
+
+        <div class="callout callout-info">
+          <strong>Performance connection:</strong> Progressive enhancement directly improves TTI because the page is <em>already interactive</em> via native HTML before JavaScript loads. Links work, forms submit, content is readable. JS then <em>enhances</em> rather than <em>enables</em>.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 14: Core Web Vitals Optimization -->
+    <section id="core-web-vitals">
+      <h2>Core Web Vitals Optimization</h2>
+      <details>
+        <summary>Metric-specific optimization checklists for LCP, INP, and CLS</summary>
+        <h3>LCP (Largest Contentful Paint) Optimization</h3>
+        <p><strong>Target:</strong> &lt;2.5s (P75)</p>
+        <pre><code class="language-javascript">// LCP Optimization Checklist:
+// 1. Identify the LCP element (usually hero image or h1)
+// 2. Ensure it's in the initial HTML (not injected by JS)
+// 3. Preload LCP image
+// 4. Set fetchpriority="high" on LCP image
+// 5. Use optimal image format (WebP/AVIF)
+// 6. Inline critical CSS (above-fold styles)
+// 7. Eliminate render-blocking resources
+// 8. Reduce server response time (TTFB)
+
+// Detecting LCP element programmatically
+new PerformanceObserver((list) =&gt; {
+  const entries = list.getEntries();
+  const lastEntry = entries[entries.length - 1];
+  console.log('LCP element:', lastEntry.element);
+  console.log('LCP time:', lastEntry.startTime);
+  console.log('LCP URL:', lastEntry.url); // If image
+}).observe({ type: 'largest-contentful-paint', buffered: true });</code></pre>
+
+        <h3>INP (Interaction to Next Paint) Optimization</h3>
+        <p><strong>Target:</strong> &lt;200ms (P75)</p>
+        <pre><code class="language-javascript">// INP measures responsiveness of ALL interactions, not just first
+// Optimization strategies:
+
+// 1. Break up long tasks (>50ms blocks the main thread)
+function processLargeList(items) {
+  const CHUNK_SIZE = 50;
+  let index = 0;
+
+  function processChunk() {
+    const end = Math.min(index + CHUNK_SIZE, items.length);
+    for (; index &lt; end; index++) {
+      processItem(items[index]);
+    }
+    if (index &lt; items.length) {
+      // Yield to main thread between chunks
+      setTimeout(processChunk, 0);
+      // Or better: scheduler.yield() when available
+    }
+  }
+  processChunk();
+}
+
+// 2. Use startTransition for non-urgent updates
+import { startTransition } from 'react';
+
+function handleInput(e) {
+  // Urgent: update input field immediately
+  setInputValue(e.target.value);
+
+  // Non-urgent: filter results can wait
+  startTransition(() =&gt; {
+    setFilteredResults(filterItems(e.target.value));
+  });
+}
+
+// 3. Debounce expensive handlers
+function handleScroll() {
+  if (!ticking) {
+    requestAnimationFrame(() =&gt; {
+      updateScrollPosition();
+      ticking = false;
+    });
+    ticking = true;
+  }
+}</code></pre>
+
+        <h3>CLS (Cumulative Layout Shift) Optimization</h3>
+        <p><strong>Target:</strong> &lt;0.1 (P75)</p>
+        <pre><code class="language-html">&lt;!-- CLS Prevention Checklist --&gt;
+
+&lt;!-- 1. Always set dimensions on images/video --&gt;
+&lt;img src="photo.jpg" width="800" height="600" alt="..."&gt;
+
+&lt;!-- 2. Or use aspect-ratio CSS --&gt;
+&lt;style&gt;
+  .responsive-img {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+  }
+&lt;/style&gt;
+
+&lt;!-- 3. Reserve space for dynamic content --&gt;
+&lt;style&gt;
+  .ad-slot {
+    min-height: 250px; /* Reserve space for ad */
+    contain: layout;   /* Contain layout shifts */
+  }
+&lt;/style&gt;
+
+&lt;!-- 4. Avoid inserting content above existing content --&gt;
+&lt;!-- BAD: Banner injected at top pushes everything down --&gt;
+&lt;!-- GOOD: Use transform animations instead of layout-triggering properties --&gt;
+
+&lt;!-- 5. Use contain-intrinsic-size for content-visibility --&gt;
+&lt;style&gt;
+  .below-fold-section {
+    content-visibility: auto;
+    contain-intrinsic-size: 0 500px;
+  }
+&lt;/style&gt;</code></pre>
+
+        <div class="callout callout-warning">
+          <strong>INP replaced FID in March 2024.</strong> INP measures the worst interaction latency across the entire page lifecycle, not just the first click. This means long tasks during scrolling, typing, or navigation all count. You need consistent responsiveness, not just a fast first click.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 15: Real User Monitoring -->
+    <section id="rum">
+      <h2>Real User Monitoring</h2>
+      <details>
+        <summary>Measuring performance where it matters: real users on real devices</summary>
+        <h3>web-vitals Library</h3>
+        <pre><code class="language-javascript">// Using Google's web-vitals library
+import { onLCP, onINP, onCLS, onFCP, onTTFB } from 'web-vitals';
+
+function sendToAnalytics(metric) {
+  const body = JSON.stringify({
+    name: metric.name,
+    value: metric.value,
+    rating: metric.rating,  // 'good', 'needs-improvement', 'poor'
+    delta: metric.delta,
+    id: metric.id,
+    navigationType: metric.navigationType,
+    // Custom dimensions
+    page: window.location.pathname,
+    deviceType: getDeviceType(),
+    connectionType: navigator.connection?.effectiveType,
+    timestamp: Date.now()
+  });
+
+  // Use sendBeacon for reliability (survives page unload)
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon('/api/vitals', body);
+  } else {
+    fetch('/api/vitals', { body, method: 'POST', keepalive: true });
+  }
+}
+
+// Collect all Core Web Vitals
+onLCP(sendToAnalytics);
+onINP(sendToAnalytics);
+onCLS(sendToAnalytics);
+onFCP(sendToAnalytics);
+onTTFB(sendToAnalytics);</code></pre>
+
+        <h3>PerformanceObserver for Custom Metrics</h3>
+        <pre><code class="language-javascript">// Custom timing for business-critical interactions
+performance.mark('product-list-start');
+
+// ... render product list ...
+
+performance.mark('product-list-end');
+performance.measure('product-list-render', 'product-list-start', 'product-list-end');
+
+// Observe long tasks (>50ms)
+new PerformanceObserver((list) =&gt; {
+  for (const entry of list.getEntries()) {
+    console.warn('Long task detected:', {
+      duration: entry.duration,
+      startTime: entry.startTime,
+      name: entry.name
+    });
+  }
+}).observe({ type: 'longtask', buffered: true });
+
+// Observe resource loading times
+new PerformanceObserver((list) =&gt; {
+  for (const entry of list.getEntries()) {
+    if (entry.transferSize === 0) continue; // Skip cached
+    if (entry.duration &gt; 1000) {
+      console.warn('Slow resource:', entry.name, entry.duration + 'ms');
+    }
+  }
+}).observe({ type: 'resource', buffered: true });</code></pre>
+
+        <h3>P75 vs P95 — Which to Track?</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Percentile</th>
+              <th>Purpose</th>
+              <th>When to Use</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>P50 (median)</td>
+              <td>Typical experience</td>
+              <td>General health monitoring</td>
+            </tr>
+            <tr>
+              <td>P75</td>
+              <td>Google's CWV threshold</td>
+              <td>SEO impact, most users' experience</td>
+            </tr>
+            <tr>
+              <td>P90</td>
+              <td>Bad experience boundary</td>
+              <td>Identifying underserved segments</td>
+            </tr>
+            <tr>
+              <td>P95/P99</td>
+              <td>Worst experiences</td>
+              <td>Finding outliers, mobile on slow networks</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-tip">
+          <strong>Segment your data:</strong> Aggregate metrics hide problems. Always segment by: device type (mobile/desktop), connection speed (4G/3G/2G), geography, page type, and whether it's a new vs returning visitor. A "good" P75 LCP might hide a terrible mobile-on-3G experience.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 16: Lighthouse & WebPageTest -->
+    <section id="testing-tools">
+      <h2>Lighthouse &amp; WebPageTest</h2>
+      <details>
+        <summary>Lab testing, CI integration, and regression detection</summary>
+        <h3>Lab vs Field Data</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>Lab (Synthetic)</th>
+              <th>Field (RUM)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Source</td>
+              <td>Lighthouse, WebPageTest</td>
+              <td>CrUX, web-vitals, Analytics</td>
+            </tr>
+            <tr>
+              <td>Environment</td>
+              <td>Controlled, simulated throttling</td>
+              <td>Real devices, real networks</td>
+            </tr>
+            <tr>
+              <td>Reproducibility</td>
+              <td>High (same conditions)</td>
+              <td>Low (varies per user)</td>
+            </tr>
+            <tr>
+              <td>Coverage</td>
+              <td>Specific pages you test</td>
+              <td>All pages real users visit</td>
+            </tr>
+            <tr>
+              <td>Best for</td>
+              <td>Debugging, CI gates, development</td>
+              <td>Understanding real impact</td>
+            </tr>
+            <tr>
+              <td>Limitation</td>
+              <td>Doesn't reflect real-world variance</td>
+              <td>Hard to isolate specific changes</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Lighthouse CI Integration</h3>
+        <pre><code class="language-javascript">// lighthouserc.js — Lighthouse CI configuration
+module.exports = {
+  ci: {
+    collect: {
+      url: [
+        'http://localhost:3000/',
+        'http://localhost:3000/product/1',
+        'http://localhost:3000/checkout'
+      ],
+      numberOfRuns: 3,  // Run 3 times, take median
+      settings: {
+        preset: 'desktop',
+        // Or simulate mobile:
+        // throttling: { cpuSlowdownMultiplier: 4 },
+        // emulatedFormFactor: 'mobile'
+      }
+    },
+    assert: {
+      assertions: {
+        'categories:performance': ['error', { minScore: 0.9 }],
+        'first-contentful-paint': ['error', { maxNumericValue: 1500 }],
+        'interactive': ['error', { maxNumericValue: 3800 }],
+        'largest-contentful-paint': ['error', { maxNumericValue: 2500 }],
+        'cumulative-layout-shift': ['error', { maxNumericValue: 0.1 }],
+        'total-byte-weight': ['warning', { maxNumericValue: 500000 }]
+      }
+    },
+    upload: {
+      target: 'lhci',
+      serverBaseUrl: 'https://lhci.example.com'
+    }
+  }
+};</code></pre>
+
+        <h3>CI Pipeline Integration</h3>
+        <pre><code class="language-javascript">// .github/workflows/performance.yml (conceptual)
+// name: Performance CI
+// on: [pull_request]
+// jobs:
+//   lighthouse:
+//     runs-on: ubuntu-latest
+//     steps:
+//       - uses: actions/checkout@v4
+//       - run: npm ci && npm run build
+//       - run: npm run start &
+//       - run: npx @lhci/cli autorun
+//       - uses: actions/upload-artifact@v4
+//         with:
+//           name: lighthouse-results
+//           path: .lighthouseci/
+
+// WebPageTest API for deeper analysis
+const WebPageTest = require('webpagetest');
+const wpt = new WebPageTest('www.webpagetest.org', process.env.WPT_API_KEY);
+
+const testConfig = {
+  location: 'Dulles:Chrome.4G',
+  connectivity: '4G',
+  runs: 3,
+  firstViewOnly: true,
+  lighthouse: true
+};
+
+wpt.runTest('https://example.com', testConfig, (err, result) =&gt; {
+  const { TTFB, firstContentfulPaint, TTI } = result.data.median.firstView;
+  console.log(`TTFB: ${TTFB}ms, FCP: ${firstContentfulPaint}ms, TTI: ${TTI}ms`);
+});</code></pre>
+
+        <div class="callout callout-info">
+          <strong>Regression detection:</strong> Track metrics over time, not just pass/fail. A PR might pass the budget (TTI &lt; 3800ms) but still regress from 2800ms → 3700ms. Use Lighthouse CI's trend comparison to catch regressions before they accumulate into a real problem.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 17: Production Case Study -->
+    <section id="production-incident">
+      <h2>Production Case Study</h2>
+      <details>
+        <summary>E-commerce site TTI reduction from 6s to 1.8s</summary>
+        <h3>Initial State: 6s TTI on Mobile</h3>
+        <pre class="diagram">
+┌─── Performance Audit Results ─────────────────────────────────────┐
+│                                                                    │
+│  Device: Moto G4 on throttled 4G (1.6Mbps, 150ms RTT)           │
+│  Page: Product Detail Page (PDP)                                  │
+│                                                                    │
+│  Metrics:                                                          │
+│  • TTFB: 800ms (origin server, no CDN)                           │
+│  • FCP: 3.2s (render-blocking CSS + fonts)                       │
+│  • LCP: 4.5s (unoptimized hero image, 2.4MB JPEG)               │
+│  • TTI: 6.0s (1.8MB JS bundle, single chunk)                    │
+│  • CLS: 0.35 (no image dimensions, font swap)                   │
+│                                                                    │
+│  Bundle Breakdown:                                                 │
+│  • main.js: 1.2MB (min+gzip: 380KB)                             │
+│  • vendor.js: 600KB (min+gzip: 180KB)                            │
+│  • Total JS: 1.8MB (min+gzip: 560KB)                            │
+│                                                                    │
+│  Top offenders:                                                    │
+│  • moment.js + locales: 232KB (only using format())              │
+│  • lodash (full): 71KB (using 3 functions)                       │
+│  • react-icons (all): 165KB (using 12 icons)                     │
+│  • unused routes: ~400KB (admin, settings, reports)              │
+└────────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Changes Made (in priority order)</h3>
+        <pre><code class="language-javascript">// Phase 1: Quick wins (6.0s → 3.8s) — 1 day of work
+// ─────────────────────────────────────────────────
+// 1. Replace moment.js with date-fns (232KB → 8KB)
+// 2. Individual lodash imports (71KB → 6KB)
+// 3. Individual icon imports (165KB → 4KB)
+// 4. Route-based code splitting (400KB deferred)
+// Result: 560KB → 210KB compressed JS
+
+// Phase 2: Delivery optimization (3.8s → 2.4s) — 2 days
+// ─────────────────────────────────────────────────
+// 1. CDN deployment (TTFB: 800ms → 80ms)
+// 2. Brotli compression (210KB → 170KB)
+// 3. 103 Early Hints for critical CSS (HTTP/2 Server Push deprecated in Chrome 106)
+// 4. Preconnect to API and image CDN
+// 5. Image optimization (2.4MB hero → 45KB WebP + srcset)
+
+// Phase 3: Rendering strategy (2.4s → 1.8s) — 3 days
+// ─────────────────────────────────────────────────
+// 1. SSR for product page (content visible at FCP)
+// 2. Critical CSS inlining (eliminate render-blocking)
+// 3. font-display: optional (eliminate FOIT)
+// 4. Image dimensions + aspect-ratio (CLS: 0.35 → 0.02)
+// 5. Priority hints: fetchpriority="high" on LCP image</code></pre>
+
+        <h3>Results</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Before</th>
+              <th>After</th>
+              <th>Improvement</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>TTFB</td>
+              <td>800ms</td>
+              <td>80ms</td>
+              <td>-90%</td>
+            </tr>
+            <tr>
+              <td>FCP</td>
+              <td>3.2s</td>
+              <td>0.9s</td>
+              <td>-72%</td>
+            </tr>
+            <tr>
+              <td>LCP</td>
+              <td>4.5s</td>
+              <td>1.4s</td>
+              <td>-69%</td>
+            </tr>
+            <tr>
+              <td>TTI</td>
+              <td>6.0s</td>
+              <td>1.8s</td>
+              <td>-70%</td>
+            </tr>
+            <tr>
+              <td>CLS</td>
+              <td>0.35</td>
+              <td>0.02</td>
+              <td>-94%</td>
+            </tr>
+            <tr>
+              <td>JS Bundle</td>
+              <td>560KB</td>
+              <td>170KB</td>
+              <td>-70%</td>
+            </tr>
+            <tr>
+              <td>Bounce Rate</td>
+              <td>58%</td>
+              <td>34%</td>
+              <td>-41%</td>
+            </tr>
+            <tr>
+              <td>Conversion Rate</td>
+              <td>1.8%</td>
+              <td>2.9%</td>
+              <td>+61%</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-tip">
+          <strong>Business impact:</strong> The 61% conversion rate improvement translated to ~$2.3M additional annual revenue for this e-commerce site. Performance is not just a technical metric — it directly impacts business outcomes. Every 100ms of improvement in LCP correlates with ~1% increase in conversions.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 18: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Production-ready performance patterns</summary>
+        <h3>Performance Budget CI Check</h3>
+        <pre><code class="language-javascript">// scripts/check-bundle-size.js — Run in CI pipeline
+const fs = require('fs');
+const path = require('path');
+const zlib = require('zlib');
+
+const BUDGETS = {
+  'main': 170 * 1024,      // 170KB gzipped
+  'vendor': 120 * 1024,    // 120KB gzipped
+  'total': 350 * 1024      // 350KB total gzipped JS
+};
+
+function getGzipSize(filePath) {
+  const content = fs.readFileSync(filePath);
+  return zlib.gzipSync(content).length;
+}
+
+function checkBudgets(distDir) {
+  const jsFiles = fs.readdirSync(distDir)
+    .filter(f =&gt; f.endsWith('.js'))
+    .map(f =&gt; ({
+      name: f,
+      path: path.join(distDir, f),
+      size: getGzipSize(path.join(distDir, f))
+    }));
+
+  let totalSize = 0;
+  let violations = [];
+
+  for (const file of jsFiles) {
+    totalSize += file.size;
+
+    // Check individual chunk budgets
+    for (const [pattern, budget] of Object.entries(BUDGETS)) {
+      if (pattern === 'total') continue;
+      if (file.name.includes(pattern) &amp;&amp; file.size &gt; budget) {
+        violations.push(
+          `❌ ${file.name}: ${(file.size / 1024).toFixed(1)}KB &gt; ` +
+          `budget ${(budget / 1024).toFixed(1)}KB`
+        );
+      }
+    }
+  }
+
+  // Check total budget
+  if (totalSize &gt; BUDGETS.total) {
+    violations.push(
+      `❌ Total JS: ${(totalSize / 1024).toFixed(1)}KB &gt; ` +
+      `budget ${(BUDGETS.total / 1024).toFixed(1)}KB`
+    );
+  }
+
+  if (violations.length &gt; 0) {
+    console.error('⚠️  Performance budget violations:\n');
+    violations.forEach(v =&gt; console.error(v));
+    console.error('\nBundle breakdown:');
+    jsFiles.forEach(f =&gt;
+      console.log(`  ${f.name}: ${(f.size / 1024).toFixed(1)}KB gzipped`)
+    );
+    process.exit(1);
+  }
+
+  console.log('✅ All budgets passed');
+  console.log(`   Total JS: ${(totalSize / 1024).toFixed(1)}KB / ${(BUDGETS.total / 1024).toFixed(1)}KB`);
+}
+
+checkBudgets('./dist/assets');</code></pre>
+
+        <h3>Dynamic Import Patterns</h3>
+        <pre><code class="language-javascript">// Pattern 1: Route-based splitting with loading states
+const routes = [
+  {
+    path: '/',
+    component: lazy(() =&gt; import('./pages/Home')),
+    preload: () =&gt; import('./pages/Home') // For prefetching
+  },
+  {
+    path: '/product/:id',
+    component: lazy(() =&gt; import('./pages/Product')),
+    preload: () =&gt; import('./pages/Product')
+  }
+];
+
+// Prefetch on hover/focus (likely next navigation)
+function PrefetchLink({ to, children }) {
+  const route = routes.find(r =&gt; r.path === to);
+
+  const handleInteraction = () =&gt; {
+    if (route?.preload) route.preload();
+  };
+
+  return (
+    &lt;Link
+      to={to}
+      onMouseEnter={handleInteraction}
+      onFocus={handleInteraction}
+    &gt;
+      {children}
+    &lt;/Link&gt;
+  );
+}
+
+// Pattern 2: Feature-flag based loading
+async function loadFeature(featureName) {
+  const features = {
+    'rich-editor': () =&gt; import('./features/RichEditor'),
+    'video-player': () =&gt; import('./features/VideoPlayer'),
+    'analytics-dashboard': () =&gt; import('./features/Dashboard')
+  };
+
+  if (features[featureName]) {
+    const module = await features[featureName]();
+    return module.default;
+  }
+  return null;
+}</code></pre>
+
+        <h3>Critical CSS Extraction</h3>
+        <pre><code class="language-javascript">// Using critters (Webpack/Vite plugin) for critical CSS
+// vite.config.js
+import critters from 'critters-webpack-plugin';
+
+export default {
+  plugins: [
+    critters({
+      // Inline critical CSS, async-load the rest
+      preload: 'swap',         // &lt;link rel="preload" as="style"&gt;
+      inlineFonts: false,      // Don't inline font URLs
+      pruneSource: true,       // Remove inlined CSS from external sheet
+      minimumExternalSize: 0,  // Inline all critical CSS
+      mergeStylesheets: true   // Combine &lt;style&gt; tags
+    })
+  ]
+};
+
+// Manual critical CSS approach for simple cases:
+// 1. Identify above-fold CSS (~14KB uncompressed max)
+// 2. Inline it in &lt;head&gt;
+// 3. Async-load the full stylesheet</code></pre>
+
+        <pre><code class="language-html">&lt;head&gt;
+  &lt;!-- Critical CSS inlined --&gt;
+  &lt;style&gt;
+    /* Only above-fold styles */
+    :root { --primary: #3b82f6; }
+    body { margin: 0; font-family: system-ui; }
+    .header { display: flex; height: 64px; }
+    .hero { min-height: 400px; }
+  &lt;/style&gt;
+
+  &lt;!-- Full stylesheet loaded async --&gt;
+  &lt;link rel="preload" href="/styles.css" as="style"
+        onload="this.onload=null;this.rel='stylesheet'"&gt;
+  &lt;noscript&gt;&lt;link rel="stylesheet" href="/styles.css"&gt;&lt;/noscript&gt;
+&lt;/head&gt;</code></pre>
+
+        <h3>Image Component with Blur-Up</h3>
+        <pre><code class="language-javascript">// components/OptimizedImage.jsx
+import { useState, useRef, useEffect } from 'react';
+
+export function OptimizedImage({
+  src,
+  alt,
+  width,
+  height,
+  placeholder,  // Tiny base64 ~20px wide
+  sizes = '100vw',
+  priority = false,
+  className = ''
+}) {
+  const [isLoaded, setIsLoaded] = useState(false);
+  const imgRef = useRef(null);
+
+  useEffect(() => {
+    // Handle already-cached images
+    if (imgRef.current?.complete) setIsLoaded(true);
+  }, []);
+
+  // Generate srcset for responsive breakpoints
+  const widths = [400, 800, 1200, 1600];
+  const srcSet = widths
+    .filter(w =&gt; w &lt;= width * 2) // Don't upscale beyond 2x
+    .map(w =&gt; `${getImageUrl(src, w)} ${w}w`)
+    .join(', ');
+
+  return (
+    &lt;div
+      className={`image-container ${className}`}
+      style={{ aspectRatio: `${width} / ${height}`, position: 'relative' }}
+    &gt;
+      {/* Blur placeholder */}
+      {placeholder &amp;&amp; !isLoaded &amp;&amp; (
+        &lt;img
+          src={placeholder}
+          alt=""
+          aria-hidden="true"
+          style={{
+            position: 'absolute', inset: 0,
+            width: '100%', height: '100%',
+            objectFit: 'cover', filter: 'blur(20px)',
+            transform: 'scale(1.1)'
+          }}
+        /&gt;
+      )}
+
+      {/* Full image */}
+      &lt;img
+        ref={imgRef}
+        src={getImageUrl(src, 800)}
+        srcSet={srcSet}
+        sizes={sizes}
+        alt={alt}
+        width={width}
+        height={height}
+        loading={priority ? 'eager' : 'lazy'}
+        fetchpriority={priority ? 'high' : undefined}
+        decoding="async"
+        onLoad={() =&gt; setIsLoaded(true)}
+        style={{
+          opacity: isLoaded ? 1 : 0,
+          transition: 'opacity 0.3s ease'
+        }}
+      /&gt;
+    &lt;/div&gt;
+  );
+}
+
+function getImageUrl(src, width) {
+  // Adapt to your image CDN
+  return `/cdn-cgi/image/width=${width},format=auto,quality=80/${src}`;
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 19: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Performance anti-patterns that hurt TTI</summary>
+        <h3>Mistake 1: Importing Entire Libraries</h3>
+        <pre><code class="language-javascript">// ❌ WRONG: Entire library imported
+import _ from 'lodash';              // +71KB
+import moment from 'moment';         // +232KB
+import * as Icons from 'react-icons'; // +165KB
+
+// ✅ CORRECT: Cherry-pick imports
+import debounce from 'lodash/debounce';     // +1KB
+import { format } from 'date-fns';          // +2KB
+import { FiSearch } from 'react-icons/fi';  // +0.5KB
+
+// Why it matters: Tree-shaking can't eliminate unused exports
+// from CommonJS modules or barrel files that import everything.</code></pre>
+
+        <h3>Mistake 2: Not Code Splitting Routes</h3>
+        <pre><code class="language-javascript">// ❌ WRONG: All routes in one bundle
+import Home from './pages/Home';
+import Product from './pages/Product';
+import Admin from './pages/Admin';      // Admin users = 2%
+import Settings from './pages/Settings'; // Rarely visited
+import Reports from './pages/Reports';   // Visited monthly
+
+// Every user downloads Admin, Settings, Reports on first load!
+
+// ✅ CORRECT: Only load what's needed for current route
+const Home = lazy(() =&gt; import('./pages/Home'));
+const Product = lazy(() =&gt; import('./pages/Product'));
+const Admin = lazy(() =&gt; import('./pages/Admin'));
+const Settings = lazy(() =&gt; import('./pages/Settings'));
+const Reports = lazy(() =&gt; import('./pages/Reports'));</code></pre>
+
+        <h3>Mistake 3: Render-Blocking Third-Party Scripts</h3>
+        <pre><code class="language-html">&lt;!-- ❌ WRONG: Synchronous third-party scripts in &lt;head&gt; --&gt;
+&lt;head&gt;
+  &lt;script src="https://analytics.example.com/tracker.js"&gt;&lt;/script&gt;
+  &lt;script src="https://chat.example.com/widget.js"&gt;&lt;/script&gt;
+  &lt;script src="https://ads.example.com/prebid.js"&gt;&lt;/script&gt;
+  &lt;!-- Browser STOPS parsing HTML until each downloads + executes --&gt;
+&lt;/head&gt;
+
+&lt;!-- ✅ CORRECT: Async/defer with priority management --&gt;
+&lt;head&gt;
+  &lt;!-- Preconnect to origins we'll need --&gt;
+  &lt;link rel="preconnect" href="https://analytics.example.com"&gt;
+&lt;/head&gt;
+&lt;body&gt;
+  &lt;!-- App content first --&gt;
+
+  &lt;!-- Load third-party after main content --&gt;
+  &lt;script async src="https://analytics.example.com/tracker.js"&gt;&lt;/script&gt;
+  &lt;script&gt;
+    // Defer chat widget until user idle
+    requestIdleCallback(() =&gt; {
+      const s = document.createElement('script');
+      s.src = 'https://chat.example.com/widget.js';
+      document.body.appendChild(s);
+    });
+  &lt;/script&gt;
+&lt;/body&gt;</code></pre>
+
+        <h3>Mistake 4: Unoptimized Images as LCP</h3>
+        <pre><code class="language-html">&lt;!-- ❌ WRONG: Unoptimized LCP image --&gt;
+&lt;img src="hero-original.png"&gt;
+&lt;!-- Problems: No dimensions (CLS), PNG format (3x WebP size),
+     no srcset (4K image on mobile), no priority hint,
+     no alt text, no fetchpriority="high" for LCP element --&gt;
+
+&lt;!-- ✅ CORRECT: Fully optimized LCP image --&gt;
+&lt;link rel="preload" as="image" href="hero-800.webp"
+      imagesrcset="hero-400.webp 400w, hero-800.webp 800w, hero-1200.webp 1200w"
+      imagesizes="100vw"&gt;
+&lt;picture&gt;
+  &lt;source type="image/avif" srcset="hero-400.avif 400w, hero-800.avif 800w, hero-1200.avif 1200w" sizes="100vw"&gt;
+  &lt;source type="image/webp" srcset="hero-400.webp 400w, hero-800.webp 800w, hero-1200.webp 1200w" sizes="100vw"&gt;
+  &lt;img src="hero-800.jpg" srcset="hero-400.jpg 400w, hero-800.jpg 800w" sizes="100vw"
+       width="1200" height="600" alt="Product showcase"
+       loading="eager" fetchpriority="high" decoding="async"&gt;
+&lt;/picture&gt;</code></pre>
+
+        <h3>Mistake 5: Client-Rendering When SSR Would Help</h3>
+        <pre><code class="language-javascript">// ❌ WRONG: Client-rendering a content-heavy page
+// User sees blank screen for 3-4 seconds while:
+// 1. HTML shell downloads
+// 2. JS bundle downloads + parses
+// 3. React mounts
+// 4. useEffect fires API call
+// 5. Data fetches
+// 6. Re-render with data
+
+function ProductPage({ id }) {
+  const [product, setProduct] = useState(null);
+  useEffect(() =&gt; {
+    fetch(`/api/products/${id}`).then(r =&gt; r.json()).then(setProduct);
+  }, [id]);
+  if (!product) return &lt;Spinner /&gt;; // User sees this for 3-4s
+  return &lt;ProductDetails product={product} /&gt;;
+}
+
+// ✅ CORRECT: Server-render with data
+// User sees full content at FCP (~1s), JS hydrates in background
+export async function getServerSideProps({ params }) {
+  const product = await fetchProduct(params.id);
+  return { props: { product } };
+}
+
+function ProductPage({ product }) {
+  // Already has data — no loading state needed on initial render
+  return &lt;ProductDetails product={product} /&gt;;
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <strong>The waterfall trap:</strong> Client-rendering creates a request waterfall: HTML → JS → API → Render. Each step waits for the previous one. SSR/SSG collapses this to: HTML (with data) → Render → JS hydrates. The perceived performance difference is massive on slow connections.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 20: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Understanding the cost of every performance decision</summary>
+        <h3>Rendering Strategy Trade-offs</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>TTFB</th>
+              <th>FCP</th>
+              <th>TTI</th>
+              <th>Cacheability</th>
+              <th>DX Complexity</th>
+              <th>Infrastructure Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>CSR (SPA)</td>
+              <td>⚡ Fast</td>
+              <td>🐢 Slow</td>
+              <td>🐢 Slow</td>
+              <td>Shell only</td>
+              <td>Low</td>
+              <td>Low (static hosting)</td>
+            </tr>
+            <tr>
+              <td>SSR</td>
+              <td>🐢 Variable</td>
+              <td>⚡ Fast</td>
+              <td>Medium</td>
+              <td>Hard</td>
+              <td>High</td>
+              <td>High (servers)</td>
+            </tr>
+            <tr>
+              <td>SSG</td>
+              <td>⚡ Fast</td>
+              <td>⚡ Fast</td>
+              <td>Medium</td>
+              <td>⚡ Perfect</td>
+              <td>Low</td>
+              <td>Low (CDN)</td>
+            </tr>
+            <tr>
+              <td>ISR</td>
+              <td>⚡ Fast</td>
+              <td>⚡ Fast</td>
+              <td>Medium</td>
+              <td>Good</td>
+              <td>Medium</td>
+              <td>Medium</td>
+            </tr>
+            <tr>
+              <td>Streaming SSR</td>
+              <td>⚡ Fast</td>
+              <td>⚡ Fast</td>
+              <td>Progressive</td>
+              <td>Hard</td>
+              <td>High</td>
+              <td>High</td>
+            </tr>
+            <tr>
+              <td>Edge SSR</td>
+              <td>⚡ Fast</td>
+              <td>⚡ Fast</td>
+              <td>Fast</td>
+              <td>Medium</td>
+              <td>High</td>
+              <td>High</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Bundle Size vs Developer Experience</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Decision</th>
+              <th>Bundle Impact</th>
+              <th>DX Impact</th>
+              <th>Recommendation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Component library (MUI, Chakra)</td>
+              <td>+50-150KB</td>
+              <td>Faster development</td>
+              <td>Tree-shake; use only in dashboards</td>
+            </tr>
+            <tr>
+              <td>State management (Redux)</td>
+              <td>+10-30KB</td>
+              <td>Predictable patterns</td>
+              <td>Consider Zustand (2KB) for simpler apps</td>
+            </tr>
+            <tr>
+              <td>Date library</td>
+              <td>2KB - 232KB</td>
+              <td>Varies</td>
+              <td>date-fns or Temporal API (native)</td>
+            </tr>
+            <tr>
+              <td>Animation library (Framer Motion)</td>
+              <td>+30-50KB</td>
+              <td>Rich animations easy</td>
+              <td>CSS animations first; lazy-load library</td>
+            </tr>
+            <tr>
+              <td>Form library (React Hook Form)</td>
+              <td>+9KB</td>
+              <td>Much less boilerplate</td>
+              <td>Worth it for complex forms</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Caching Complexity Trade-offs</h3>
+        <pre class="diagram">
+┌─── Simple Caching (Easy to reason about) ────────────────────────┐
+│                                                                    │
+│  Strategy: Content-hashed filenames + immutable cache             │
+│  • app.a1b2c3.js → Cache-Control: immutable, max-age=31536000   │
+│  • index.html → Cache-Control: no-cache (always revalidate)      │
+│                                                                    │
+│  Pros: Simple mental model, safe, great hit rate                  │
+│  Cons: Full page reload needed for HTML changes                   │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─── Complex Caching (Better performance, harder to manage) ───────┐
+│                                                                    │
+│  Strategy: Layered caching + stale-while-revalidate              │
+│  • CDN edge cache (5 min TTL)                                    │
+│  • Service worker (stale-while-revalidate)                       │
+│  • Browser cache (content-hashed assets)                         │
+│  • Vary headers for personalization                              │
+│                                                                    │
+│  Pros: Near-instant repeat loads, offline support                 │
+│  Cons: Cache invalidation bugs, stale content risks,             │
+│         harder debugging, potential consistency issues             │
+└──────────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <div class="callout callout-info">
+          <strong>The golden rule of performance trade-offs:</strong> Optimize for the P75 user, not the developer's MacBook Pro. If you must choose between DX and performance, choose performance for user-facing pages and DX for internal tools.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 21: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Deep-dive questions interviewers ask after the main answer</summary>
+        <h3>Q1: How do you measure TTI vs TBT, and which matters more?</h3>
+        <p><strong>Answer:</strong> TTI (Time to Interactive) marks when the page is reliably interactive — main thread idle for 5s with no long tasks. TBT (Total Blocking Time) sums all long task time between FCP and TTI. In lab testing, TBT is more reliable (less variance) and correlates well with field INP. Lighthouse uses TBT as a proxy because TTI is noisy. In the field, use INP (actual interaction latency) rather than TTI.</p>
+
+        <h3>Q2: Your app has 30 third-party scripts. How do you manage them?</h3>
+        <p><strong>Answer:</strong> Audit with <code>requestMap</code> (shows third-party dependency graph). Categorize: critical (payment SDK), important (analytics), nice-to-have (chat widget). Strategy: (1) Load critical synchronously, (2) defer important to after TTI with <code>requestIdleCallback</code>, (3) lazy-load nice-to-have on user interaction, (4) Use a tag manager with trigger rules, (5) Consider Partytown to run third-party scripts in a Web Worker off the main thread.</p>
+
+        <h3>Q3: How does HTTP/2 change your bundling strategy?</h3>
+        <p><strong>Answer:</strong> HTTP/1.1 penalized many requests (6 connections/origin limit), favoring large concatenated bundles. HTTP/2 multiplexes unlimited requests over one connection, making granular chunks viable. Optimal strategy shifts from "fewer, larger bundles" to "many small, cacheable chunks." However, there's still overhead per request (headers, stream management) and compression is less efficient on small files. Sweet spot: 6-25 initial chunks of 20-100KB each.</p>
+
+        <h3>Q4: What's the cost of hydration, and how do you reduce it?</h3>
+        <p><strong>Answer:</strong> Hydration re-executes component logic to attach event listeners to server-rendered HTML. Cost: (1) Download component JS, (2) parse/compile, (3) execute to build virtual DOM, (4) reconcile with real DOM. For a complex page, this can be 1-3s on mobile. Mitigation strategies: (1) Partial hydration (only hydrate interactive islands), (2) Progressive hydration (hydrate on visibility/interaction), (3) React Server Components (zero client JS for static parts), (4) Resumability (Qwik — serialize state instead of replaying).</p>
+
+        <h3>Q5: How do you handle performance for users on 2G/3G networks?</h3>
+        <p><strong>Answer:</strong> Use Network Information API (<code>navigator.connection.effectiveType</code>) for adaptive loading: (1) Reduce image quality on slow connections, (2) Skip non-essential features (animations, auto-play video), (3) Increase prefetch aggressiveness on fast connections, (4) Show data-saver mode with reduced imagery, (5) Use <code>Save-Data</code> header respect. The key insight: serve different experiences based on connection quality rather than one-size-fits-all.</p>
+        <pre><code class="language-javascript">// Adaptive loading based on network conditions
+function useAdaptiveLoading() {
+  const connection = navigator.connection || {};
+  const { effectiveType, saveData } = connection;
+
+  return {
+    shouldLoadImages: !saveData &amp;&amp; effectiveType !== '2g',
+    imageQuality: effectiveType === '4g' ? 'high' : 'low',
+    shouldAutoplay: effectiveType === '4g' &amp;&amp; !saveData,
+    shouldPrefetch: effectiveType === '4g',
+    shouldLoadFonts: effectiveType !== '2g' &amp;&amp; !saveData
+  };
+}
+
+// Usage
+function HeroSection() {
+  const { shouldLoadImages, imageQuality } = useAdaptiveLoading();
+
+  return (
+    &lt;section&gt;
+      {shouldLoadImages ? (
+        &lt;OptimizedImage quality={imageQuality} src="hero.jpg" /&gt;
+      ) : (
+        &lt;div className="hero-placeholder" aria-label="Hero image"&gt;
+          &lt;p&gt;Image hidden to save data&lt;/p&gt;
+        &lt;/div&gt;
+      )}
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+        <h3>Q6: How do you prevent performance regressions in a large team?</h3>
+        <p><strong>Answer:</strong> Multi-layered approach: (1) Performance budgets enforced in CI — PRs that exceed budgets are blocked, (2) Lighthouse CI with trend tracking — detect gradual regressions even within budget, (3) RUM dashboards with alerting — P75 LCP exceeds threshold → alert, (4) Bundle size bot on PRs (shows size diff), (5) Performance review in code review checklist, (6) Regular performance audits (monthly), (7) Education — team-wide understanding of why <code>import moment from 'moment'</code> is a problem.</p>
+
+        <h3>Q7: Explain the Critical Rendering Path and how to optimize it.</h3>
+        <p><strong>Answer:</strong> The Critical Rendering Path is the sequence of steps browser takes to convert HTML/CSS/JS into pixels:</p>
+        <pre class="diagram">
+┌─── Critical Rendering Path ───────────────────────────────────────┐
+│                                                                    │
+│  HTML → DOM                                                        │
+│           ↘                                                        │
+│            → Render Tree → Layout → Paint → Composite             │
+│           ↗                                                        │
+│  CSS → CSSOM                                                       │
+│                                                                    │
+│  Optimization targets:                                             │
+│  1. Minimize critical resources (inline CSS, defer JS)            │
+│  2. Minimize critical path length (reduce round trips)            │
+│  3. Minimize critical bytes (compress, tree-shake)                │
+│                                                                    │
+│  CSS is render-blocking (CSSOM needed for Render Tree)            │
+│  JS is parser-blocking (can modify DOM/CSSOM)                     │
+│  → Inline critical CSS, async everything else                     │
+│  → async/defer all scripts                                         │
+└────────────────────────────────────────────────────────────────────┘
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 22: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Mental models, key principles, and what NOT to say</summary>
+        <h3>Mental Models</h3>
+        <ul>
+          <li><strong>The Cost of JavaScript:</strong> 1KB of JS ≠ 1KB of CSS. JS must download + parse + compile + execute. On mobile, every KB of JS costs 3-4x more processing time than equivalent content in HTML/CSS.</li>
+          <li><strong>Performance Budget as Constraint:</strong> Treat your JS budget like a financial budget. Every library you add has ongoing "maintenance cost" in bytes. Ask: "Is this worth N KB to my users?"</li>
+          <li><strong>Measure → Identify → Fix → Verify:</strong> Never optimize without measuring first. The bottleneck is rarely where you think. Profile on real devices with real network conditions.</li>
+          <li><strong>Progressive Disclosure:</strong> Load only what the user needs NOW. Everything else loads on demand — routes, components, images, data.</li>
+          <li><strong>The Network is Unreliable:</strong> Design for the worst case first, then enhance. Mobile users on flaky 3G should still have a usable experience.</li>
+        </ul>
+
+        <h3>Key Principles to Demonstrate</h3>
+        <ol>
+          <li>You measure before optimizing (data-driven, not gut-driven)</li>
+          <li>You think about mobile-first performance (not your dev MacBook)</li>
+          <li>You understand the full stack (network, server, browser, rendering)</li>
+          <li>You prioritize by impact (Pareto: 20% of changes → 80% of improvement)</li>
+          <li>You've shipped performance improvements in production</li>
+        </ol>
+
+        <h3>What NOT to Say in an Interview</h3>
+        <div class="callout callout-warning">
+          <ul>
+            <li>❌ "Just add a CDN" — Shows surface-level thinking. CDN helps TTFB but doesn't fix a 1.8MB JS bundle.</li>
+            <li>❌ "Lazy load everything" — Shows you don't understand above-fold priority. LCP elements must load eagerly.</li>
+            <li>❌ "We should rewrite in [framework X]" — Framework choice rarely determines performance. Architecture and loading strategy do.</li>
+            <li>❌ "I'd minify the code" — Minification is table stakes (already done by default). Interviewers want architectural solutions, not build tool defaults.</li>
+            <li>❌ "Caching solves it" — Only helps repeat visits. First visit TTI is the primary concern. Also doesn't address the root cause of too much JS.</li>
+            <li>❌ "Lighthouse says 95, so we're fine" — Lab scores don't reflect real user experience. P75 field data from CrUX or RUM is what matters.</li>
+          </ul>
+        </div>
+
+        <h3>The Senior-Level Answer Structure</h3>
+        <pre class="diagram">
+┌─── How to Structure Your Answer ──────────────────────────────────┐
+│                                                                    │
+│  1. MEASURE (30 seconds)                                          │
+│     "First, I'd profile with Lighthouse + real device testing     │
+│      to identify whether it's network-bound or CPU-bound."        │
+│                                                                    │
+│  2. ANALYZE (30 seconds)                                          │
+│     "Bundle analysis would reveal the top contributors.            │
+│      Common culprits: unused code, heavy libraries, no splitting." │
+│                                                                    │
+│  3. PRIORITIZE (60 seconds)                                       │
+│     "Highest impact changes first:                                 │
+│      - Code split routes (immediate 40-60% reduction)             │
+│      - Replace heavy libraries (moment, lodash full)              │
+│      - CDN + compression for delivery"                            │
+│                                                                    │
+│  4. ARCHITECTURAL (60 seconds)                                    │
+│     "For sustained performance:                                    │
+│      - SSR/streaming for content-heavy pages                      │
+│      - Performance budgets enforced in CI                         │
+│      - RUM monitoring with alerting"                              │
+│                                                                    │
+│  5. VERIFY (15 seconds)                                           │
+│     "Measure again. Compare P75 in field data.                    │
+│      Performance regression testing in CI going forward."          │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+        </pre>
+      </details>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+</body>
+</html>

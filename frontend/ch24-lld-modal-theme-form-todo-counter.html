@@ -1,0 +1,1293 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 24: LLD — Modal, Theme Switcher, Form, Todo &amp; Counter | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <a href="../index.html">
+        <span class="chapter-num">Ch 24</span>
+        <span class="chapter-title">LLD — Modal, Theme, Form, Todo, Counter</span>
+      </a>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#component-modal">Component 4: Modal / Dialog</a></li>
+        <li><a href="#component-theme">Component 5: Theme Switcher</a></li>
+        <li><a href="#component-form">Component 6: Form Validation</a></li>
+        <li><a href="#component-todo">Component 7: Todo List</a></li>
+        <li><a href="#component-counter">Component 8: Counter Optimization</a></li>
+        <li><a href="#common-mistakes">Common LLD Mistakes</a></li>
+        <li><a href="#the-pattern">The Pattern</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-iv">Part IV — React Low-Level Design</a> &rsaquo;
+      <span>Chapter 24</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">LLD</span>
+        <span class="badge badge-topic">React Patterns</span>
+        <span class="badge badge-topic">Accessibility</span>
+        <span class="badge badge-topic">State Design</span>
+      </div>
+      <h1>LLD — Modal, Theme Switcher, Form, Todo &amp; Counter</h1>
+      <blockquote class="chapter-question">
+        "Build a Modal, a Theme Switcher, a Form with real-time validation, a Todo list with persistence, and a Counter with re-render optimization."
+      </blockquote>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> These five components look simple but each one hides a senior-level trap: modals need portals and focus management, not just conditional rendering; theme switchers need to avoid FOUC and work under SSR; forms need to isolate re-renders per field; todo lists need a reducer-shaped mental model plus resilient persistence; counters are a vehicle for demonstrating <code>memo</code>/<code>useCallback</code> discipline, not React knowledge itself. Interviewers are grading your instinct for edge cases and API design, not whether you can render a <code>&lt;button&gt;</code>.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="text" class="search-input" placeholder="Search this chapter..." aria-label="Search">
+    </div>
+
+    <!-- Section: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details open>
+        <summary>Why these five specifically, and what "good" looks like</summary>
+        <p>Chapter 23 covered the LLD round's general strategy (clarify → design → implement → optimize). This chapter applies that strategy to five components that show up constantly in 45-60 minute frontend rounds because each has a "hidden requirement" that separates a mid-level solution from a senior one:</p>
+        <table>
+          <thead>
+            <tr><th>Component</th><th>What a junior builds</th><th>What a senior builds</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Modal</td><td><code>{open &amp;&amp; &lt;div&gt;...&lt;/div&gt;}</code> inline</td><td>Portal + focus trap + scroll lock + stacking-safe z-index + Escape/outside-click</td></tr>
+            <tr><td>Theme Switcher</td><td>Toggle a class with <code>useState</code></td><td>CSS variables + system-preference sync + no-flash inline script + SSR-safe hydration</td></tr>
+            <tr><td>Form</td><td>One <code>useState</code> per field, validate on submit</td><td>Reducer-shaped field state, schema validation, per-field re-render isolation</td></tr>
+            <tr><td>Todo List</td><td>Array in <code>useState</code>, mutate with <code>filter</code>/<code>map</code></td><td><code>useReducer</code> for transitions, debounced persistence, optimistic updates that survive storage failures</td></tr>
+            <tr><td>Counter</td><td>"It's just a number, why would this be hard?"</td><td>Demonstrates when <em>not</em> to optimize, then how to when a parent re-renders 60 times a second</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout-info">
+          <strong>Scoring rubric an interviewer actually uses:</strong> Did you ask about scale/constraints before coding? Did you build the primitive (portal, reducer, hook) rather than reach for a library? Did you handle at least 2 edge cases unprompted? Did you explain a trade-off without being asked "why not X instead"?
+        </div>
+      </details>
+    </section>
+
+    <!-- Component 4: Modal / Dialog -->
+    <section id="component-modal">
+      <h2>Component 4: Modal / Dialog</h2>
+
+      <details>
+        <summary>Requirements &amp; Constraints</summary>
+        <p><strong>Clarifying questions to ask before coding:</strong></p>
+        <ul>
+          <li>Can modals be nested (a confirm dialog opened from within another modal)?</li>
+          <li>Does content need to animate in/out, or is a hard show/hide acceptable?</li>
+          <li>Should closing be blockable (e.g., "unsaved changes" confirm)?</li>
+          <li>Is this rendered inside a scrollable ancestor with <code>overflow: hidden</code> or <code>transform</code> (which breaks <code>position: fixed</code>)?</li>
+        </ul>
+        <p><strong>Core requirements:</strong> render above all other content regardless of DOM position, trap keyboard focus inside while open, restore focus to the trigger element on close, close on <kbd>Escape</kbd> and outside click, lock body scroll, and be screen-reader accessible as a dialog.</p>
+      </details>
+
+      <details>
+        <summary>Native &lt;dialog&gt; element — know when to use it</summary>
+        <p>The HTML <code>&lt;dialog&gt;</code> element with <code>.showModal()</code> provides many modal features <em>for free</em>:</p>
+        <pre><code class="language-jsx">function NativeModal({ isOpen, onClose, title, children }) {
+  const dialogRef = useRef(null);
+
+  useEffect(() =&gt; {
+    const dialog = dialogRef.current;
+    if (isOpen) {
+      dialog.showModal(); // Puts in top layer (no z-index issues), traps focus, adds backdrop
+    } else {
+      dialog.close();
+    }
+  }, [isOpen]);
+
+  return (
+    &lt;dialog
+      ref={dialogRef}
+      onClose={onClose}  // Fires on Escape automatically
+      onClick={(e) =&gt; { if (e.target === dialogRef.current) onClose(); }} // backdrop click
+      aria-labelledby="dialog-title"
+    &gt;
+      &lt;h2 id="dialog-title"&gt;{title}&lt;/h2&gt;
+      {children}
+      &lt;button onClick={onClose}&gt;Close&lt;/button&gt;
+    &lt;/dialog&gt;
+  );
+}
+
+/* CSS: dialog::backdrop { background: rgba(0,0,0,0.5); } */</code></pre>
+        <p><strong>Built-in behaviors:</strong> top-layer rendering (no z-index wars), focus trapping, Escape dismissal, <code>::backdrop</code> pseudo-element, <code>inert</code> on background content.</p>
+        <p><strong>When to use native <code>&lt;dialog&gt;</code>:</strong> Simpler cases, no animation needs, all modern browsers (Chrome 37+, Firefox 98+, Safari 15.4+). <strong>When to use a custom portal:</strong> Complex enter/exit animations, nested modal stacks with custom transitions, or when you need fine-grained control over focus restoration behavior.</p>
+        <div class="callout callout-tip">
+          <p><strong>Interview tip:</strong> Always mention you know <code>&lt;dialog&gt;</code> exists. Then explain why you might <em>still</em> build a custom solution: "Native dialog handles the simple case well, but for our design system we needed animated transitions, nested stacks, and imperative control — so we built a portal-based solution on top."</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>React Portal — Why It's Required</summary>
+        <p>A modal rendered in-place inside a deeply nested component tree inherits every ancestor's <code>overflow</code>, <code>z-index</code>, and <code>transform</code> context. A single ancestor with <code>transform: translateX(0)</code> (common for animation) creates a new containing block, silently breaking <code>position: fixed</code> centering. <code>createPortal</code> renders the modal's DOM subtree into a different DOM node — typically <code>document.body</code> — while keeping it in the same React tree for event bubbling, context, and state.</p>
+        <pre><code class="language-jsx">import { createPortal } from 'react-dom';
+
+function ModalPortal({ children }) {
+  const elRef = useRef(null);
+  if (!elRef.current) {
+    elRef.current = document.createElement('div');
+    elRef.current.setAttribute('data-modal-root', '');
+  }
+
+  useEffect(() =&gt; {
+    const root = document.getElementById('modal-root') ?? document.body;
+    root.appendChild(elRef.current);
+    return () =&gt; {
+      elRef.current.remove();
+    };
+  }, []);
+
+  return createPortal(children, elRef.current);
+}</code></pre>
+        <div class="callout callout-tip">
+          <strong>Interview follow-up bait:</strong> "Why not just render the modal at the bottom of your JSX tree instead of using a portal?" Answer: because React events still bubble through the <em>React tree</em>, not the DOM tree, when using a portal — so <code>onClick</code> handlers on ancestors still fire correctly. But CSS cascade and DOM-based layout (stacking context, clipping) follow the actual DOM position, which is why the portal is necessary specifically for those.
+        </div>
+      </details>
+
+      <details>
+        <summary>Focus Trap Implementation</summary>
+        <p>WCAG requires that keyboard focus cannot leave an open modal via <kbd>Tab</kbd>/<kbd>Shift+Tab</kbd>. The trap must: capture the previously focused element, move focus into the modal on open, cycle focus between the first and last focusable elements, and restore focus to the trigger on close.</p>
+        <pre><code class="language-jsx">const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])';
+
+function useFocusTrap(containerRef, isActive) {
+  useEffect(() =&gt; {
+    if (!isActive) return;
+
+    const previouslyFocused = document.activeElement;
+    const container = containerRef.current;
+    const focusables = () =&gt; Array.from(container.querySelectorAll(FOCUSABLE_SELECTOR));
+
+    // Move focus into the modal — prefer an explicit autofocus target
+    const initial = container.querySelector('[data-autofocus]') || focusables()[0];
+    initial?.focus();
+
+    function handleKeydown(e) {
+      if (e.key !== 'Tab') return;
+      const nodes = focusables();
+      if (nodes.length === 0) return;
+      const first = nodes[0];
+      const last = nodes[nodes.length - 1];
+
+      if (e.shiftKey &amp;&amp; document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey &amp;&amp; document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+
+    container.addEventListener('keydown', handleKeydown);
+    return () =&gt; {
+      container.removeEventListener('keydown', handleKeydown);
+      previouslyFocused?.focus?.(); // Restore focus on close/unmount
+    };
+  }, [isActive, containerRef]);
+}</code></pre>
+        <div class="callout callout-warning">
+          <strong>Common bug:</strong> Computing <code>focusables()</code> once outside the keydown handler. If the modal's content changes (an accordion expands, revealing new focusable elements), a stale list breaks the trap. Recompute it on every keydown.
+        </div>
+      </details>
+
+      <details>
+        <summary>Escape Key, Outside Click &amp; Scroll Lock</summary>
+        <pre><code class="language-jsx">function useDismiss(isOpen, onClose, containerRef) {
+  useEffect(() =&gt; {
+    if (!isOpen) return;
+
+    function handleKey(e) {
+      if (e.key === 'Escape') onClose();
+    }
+    function handlePointerDown(e) {
+      if (containerRef.current &amp;&amp; !containerRef.current.contains(e.target)) {
+        onClose();
+      }
+    }
+
+    document.addEventListener('keydown', handleKey);
+    // pointerdown (not click) avoids closing when a drag/selection ends outside
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () =&gt; {
+      document.removeEventListener('keydown', handleKey);
+      document.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [isOpen, onClose, containerRef]);
+}
+
+function useScrollLock(isActive) {
+  useEffect(() =&gt; {
+    if (!isActive) return;
+    const { overflow, paddingRight } = document.body.style;
+    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+
+    document.body.style.overflow = 'hidden';
+    // Prevent layout shift from the disappearing scrollbar
+    if (scrollbarWidth &gt; 0) {
+      document.body.style.paddingRight = `${scrollbarWidth}px`;
+    }
+    return () =&gt; {
+      document.body.style.overflow = overflow;
+      document.body.style.paddingRight = paddingRight;
+    };
+  }, [isActive]);
+}</code></pre>
+        <p><strong>Nested modals &amp; stacking:</strong> maintain a module-level counter (or a context-provided stack) of currently-open modals. Only the topmost modal should respond to Escape, and scroll-lock should only be released when the <em>last</em> modal in the stack closes — a naive per-modal cleanup would unlock scrolling while an outer modal is still open.</p>
+      </details>
+
+      <details>
+        <summary>Complete Implementation</summary>
+        <pre><code class="language-jsx">import { createContext, useContext, useEffect, useId, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+
+const ModalStackContext = createContext(null);
+
+export function ModalStackProvider({ children }) {
+  const [stack, setStack] = useState([]); // array of modal ids, top = last
+
+  const push = (id) =&gt; setStack((s) =&gt; [...s, id]);
+  const pop = (id) =&gt; setStack((s) =&gt; s.filter((x) =&gt; x !== id));
+  const isTop = (id) =&gt; stack[stack.length - 1] === id;
+
+  return (
+    &lt;ModalStackContext.Provider value={{ push, pop, isTop, depth: stack.length }}&gt;
+      {children}
+    &lt;/ModalStackContext.Provider&gt;
+  );
+}
+
+export function Modal({ isOpen, onClose, title, children, initialFocusRef }) {
+  const id = useId();
+  const dialogRef = useRef(null);
+  const stack = useContext(ModalStackContext);
+
+  useEffect(() =&gt; {
+    if (!isOpen) return;
+    stack?.push(id);
+    return () =&gt; stack?.pop(id);
+  }, [isOpen, id, stack]);
+
+  const isTopMost = stack ? stack.isTop(id) : true;
+
+  useFocusTrap(dialogRef, isOpen);
+  useDismiss(isOpen &amp;&amp; isTopMost, onClose, dialogRef);
+  useScrollLock(isOpen &amp;&amp; (stack ? stack.depth === 1 : true));
+
+  if (!isOpen) return null;
+
+  return createPortal(
+    &lt;div className="modal-overlay" data-testid="modal-overlay"&gt;
+      &lt;div
+        ref={dialogRef}
+        className="modal-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={`${id}-title`}
+      &gt;
+        &lt;header className="modal-header"&gt;
+          &lt;h2 id={`${id}-title`}&gt;{title}&lt;/h2&gt;
+          &lt;button
+            aria-label="Close dialog"
+            onClick={onClose}
+            className="modal-close"
+          &gt;
+            ×
+          &lt;/button&gt;
+        &lt;/header&gt;
+        &lt;div className="modal-body"&gt;{children}&lt;/div&gt;
+      &lt;/div&gt;
+    &lt;/div&gt;,
+    document.body
+  );
+}
+
+// Usage
+function ConfirmDeleteExample() {
+  const [open, setOpen] = useState(false);
+  return (
+    &lt;ModalStackProvider&gt;
+      &lt;button onClick={() =&gt; setOpen(true)}&gt;Delete account&lt;/button&gt;
+      &lt;Modal isOpen={open} onClose={() =&gt; setOpen(false)} title="Confirm deletion"&gt;
+        &lt;p&gt;This cannot be undone.&lt;/p&gt;
+        &lt;button data-autofocus onClick={() =&gt; setOpen(false)}&gt;Cancel&lt;/button&gt;
+        &lt;button onClick={() =&gt; { /* delete */ setOpen(false); }}&gt;Delete&lt;/button&gt;
+      &lt;/Modal&gt;
+    &lt;/ModalStackProvider&gt;
+  );
+}</code></pre>
+        <p><strong>Enter/exit animation note:</strong> to animate exit, you cannot unmount immediately on close — you need a brief "closing" state that unmounts only after the CSS transition's <code>transitionend</code> fires (or use a library like Framer Motion's <code>AnimatePresence</code> which handles this exit-before-unmount timing for you).</p>
+      </details>
+
+      <details>
+        <summary>Edge Cases</summary>
+        <ul>
+          <li><strong>Modal opened with no focusable children:</strong> the trap must fall back to focusing the dialog container itself (give it <code>tabIndex={-1}</code>) rather than throwing when <code>focusables()</code> is empty.</li>
+          <li><strong>Trigger element removed from DOM while modal is open</strong> (e.g., it was a row in a list that got deleted): guard the focus-restore call with optional chaining and verify the element is still connected (<code>el.isConnected</code>).</li>
+          <li><strong>Modal contains an <code>&lt;iframe&gt;</code> or third-party widget</strong> that manages its own focus — the trap can fight with it. Document this as a known limitation rather than trying to solve it generically.</li>
+          <li><strong>Server-side rendering:</strong> <code>document.body</code> doesn't exist during SSR. Guard the portal target lookup and render <code>null</code> until mounted (<code>useEffect</code>-gated <code>mounted</code> flag), matching the hydration-safety pattern from the theme switcher below.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Component 5: Theme Switcher -->
+    <section id="component-theme">
+      <h2>Component 5: Theme Switcher (Dark / Light)</h2>
+
+      <details>
+        <summary>Requirements &amp; Architecture Decision</summary>
+        <p><strong>Requirements:</strong> instant, flash-free theme on load; respects <code>prefers-color-scheme</code> when the user hasn't chosen explicitly; persists an explicit choice across reloads; works correctly with SSR (no hydration mismatch); doesn't force every themed component to re-render on toggle.</p>
+        <div class="callout callout-info">
+          <strong>Key architectural decision:</strong> theming is a <em>CSS problem</em>, not a React state problem. React should only own <em>which</em> theme name is active — the actual visual change should happen via CSS custom properties scoped to a <code>data-theme</code> attribute on <code>&lt;html&gt;</code>, so toggling doesn't re-render your component tree at all.
+        </div>
+      </details>
+
+      <details>
+        <summary>CSS Custom Properties Strategy</summary>
+        <pre><code class="language-css">:root[data-theme="light"] {
+  --bg: #ffffff;
+  --text: #111111;
+  --accent: #2563eb;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0f1115;
+  --text: #e6e6e6;
+  --accent: #60a5fa;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  transition: background 0.15s ease, color 0.15s ease;
+}</code></pre>
+        <p>Every component reads colors via <code>var(--bg)</code> etc. Switching themes is one attribute mutation (<code>documentElement.dataset.theme = 'dark'</code>) — the browser repaints affected properties without React re-rendering a single component.</p>
+      </details>
+
+      <details>
+        <summary>Flash of Unstyled/Wrong Content (FOUC) Prevention</summary>
+        <p>If the theme is applied inside a <code>useEffect</code>, there's a visible flash: the page paints with the default theme, then <code>useEffect</code> runs (after paint) and flips it. The fix is a tiny inline, render-blocking script placed in <code>&lt;head&gt;</code> — before React even loads — that reads storage/media query and sets the attribute synchronously.</p>
+        <pre><code class="language-html">&lt;script&gt;
+  (function () {
+    try {
+      var stored = localStorage.getItem('theme');
+      var theme = stored || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.setAttribute('data-theme', theme);
+    } catch (e) {
+      document.documentElement.setAttribute('data-theme', 'light');
+    }
+  })();
+&lt;/script&gt;</code></pre>
+        <div class="callout callout-warning">
+          <strong>Why this must be inline and synchronous:</strong> an external script file is fetched asynchronously and would still allow a flash. It must be a blocking inline <code>&lt;script&gt;</code> executed before the first paint, placed as early as possible in <code>&lt;head&gt;</code>.
+        </div>
+      </details>
+
+      <details>
+        <summary>System Preference Sync &amp; Context API</summary>
+        <pre><code class="language-jsx">const ThemeContext = createContext(null);
+
+function getSystemTheme() {
+  return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+export function ThemeProvider({ children }) {
+  // Read the value the inline script already applied — avoids a mismatch re-render
+  // SSR-safe: guard against 'document' being undefined during server rendering
+  const [theme, setTheme] = useState(
+    () =&gt; typeof document !== 'undefined'
+      ? document.documentElement.getAttribute('data-theme') || 'light'
+      : 'light'
+  );
+  const [isExplicit, setIsExplicit] = useState(
+    () =&gt; typeof localStorage !== 'undefined' ? localStorage.getItem('theme') != null : false
+  );
+
+  useEffect(() =&gt; {
+    document.documentElement.setAttribute('data-theme', theme);
+  }, [theme]);
+
+  // Follow system changes ONLY if the user hasn't made an explicit choice
+  useEffect(() =&gt; {
+    if (isExplicit) return;
+    const mql = matchMedia('(prefers-color-scheme: dark)');
+    const handler = (e) =&gt; setTheme(e.matches ? 'dark' : 'light');
+    mql.addEventListener('change', handler);
+    return () =&gt; mql.removeEventListener('change', handler);
+  }, [isExplicit]);
+
+  const setExplicitTheme = (next) =&gt; {
+    setTheme(next);
+    setIsExplicit(true);
+    localStorage.setItem('theme', next);
+  };
+
+  const resetToSystem = () =&gt; {
+    setIsExplicit(false);
+    localStorage.removeItem('theme');
+    setTheme(getSystemTheme());
+  };
+
+  return (
+    &lt;ThemeContext.Provider value={{ theme, setExplicitTheme, resetToSystem, isExplicit }}&gt;
+      {children}
+    &lt;/ThemeContext.Provider&gt;
+  );
+}
+
+export const useTheme = () =&gt; useContext(ThemeContext);</code></pre>
+      </details>
+
+      <details>
+        <summary>SSR Considerations &amp; Hydration Safety</summary>
+        <p>On the server, <code>localStorage</code> and <code>matchMedia</code> don't exist, so the server-rendered HTML has no way to know the user's real preference — it must render a neutral default (or the inline script's job, which only runs client-side, handles it post-load). Two rules keep hydration mismatch-free:</p>
+        <ul>
+          <li>The server always renders <code>data-theme="light"</code> (or omits the attribute) as a fixed default — never try to guess the client's preference server-side from a cookie unless you actually read a theme cookie on every request.</li>
+          <li>The initial React state must read from the DOM attribute the inline script already set (<code>document.documentElement.getAttribute('data-theme')</code>), <em>not</em> recompute from <code>matchMedia</code> — otherwise React's first client render can disagree with what's already painted, causing an actual (if brief) re-flash even without a hydration warning.</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>Complete Implementation</summary>
+        <pre><code class="language-jsx">function ThemeToggle() {
+  const { theme, setExplicitTheme } = useTheme();
+  return (
+    &lt;button
+      role="switch"
+      aria-checked={theme === 'dark'}
+      aria-label="Toggle color theme"
+      onClick={() =&gt; setExplicitTheme(theme === 'dark' ? 'light' : 'dark')}
+    &gt;
+      {theme === 'dark' ? '🌙' : '☀️'}
+    &lt;/button&gt;
+  );
+}
+
+// app entry (index.html &lt;head&gt;) must include the inline script from above,
+// then:
+function App() {
+  return (
+    &lt;ThemeProvider&gt;
+      &lt;ThemeToggle /&gt;
+      &lt;Page /&gt;
+    &lt;/ThemeProvider&gt;
+  );
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Edge Cases</summary>
+        <ul>
+          <li><strong><code>localStorage</code> throws</strong> (Safari private mode, disabled storage): wrap every access in try/catch and fall back to in-memory-only theming for that session.</li>
+          <li><strong>Multiple tabs open:</strong> listen to the <code>storage</code> event to sync a theme change made in one tab to all others in the same origin.</li>
+          <li><strong>Third-party embedded widgets</strong> (iframes) don't inherit <code>:root</code> CSS variables — you must <code>postMessage</code> the theme into the iframe if it needs to match.</li>
+          <li><strong>Print stylesheets:</strong> dark theme should not apply when printing — add a <code>@media print</code> override that forces light variables regardless of <code>data-theme</code>.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Component 6: Form with Real-Time Validation -->
+    <section id="component-form">
+      <h2>Component 6: Form with Real-Time Validation</h2>
+
+      <details>
+        <summary>Requirements &amp; Controlled vs Uncontrolled Trade-off</summary>
+        <p><strong>Requirements:</strong> validate on blur (not on every keystroke — too noisy) after first blur, then re-validate live on change; support field-level and form-level errors; support async validation (e.g., username availability) without racing stale responses; keep typing latency imperceptible even in large forms (no full-form re-render per keystroke).</p>
+        <table>
+          <thead>
+            <tr><th></th><th>Controlled</th><th>Uncontrolled</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Value ownership</td><td>React state is source of truth</td><td>DOM is source of truth, read via ref/FormData</td></tr>
+            <tr><td>Re-renders per keystroke</td><td>Yes (unless isolated) </td><td>No</td></tr>
+            <tr><td>Real-time validation/formatting</td><td>Easy (React sees every change)</td><td>Requires manual event listeners</td></tr>
+            <tr><td>Best for</td><td>Rich validation, conditional fields</td><td>Large simple forms, file inputs</td></tr>
+          </tbody>
+        </table>
+        <p>The pattern below is controlled per-field but isolates re-renders so that typing in one field never re-renders sibling fields or the parent form.</p>
+      </details>
+
+      <details>
+        <summary>Custom useForm Hook &amp; Per-Field Re-Render Isolation</summary>
+        <p>The trick to avoiding a full-form re-render on every keystroke: the form's state lives in a single <code>useReducer</code>, but each <code>&lt;Field&gt;</code> subscribes to only its own slice via a context selector pattern, so a change to <code>email</code> doesn't re-render the <code>password</code> field.</p>
+        <pre><code class="language-jsx">function formReducer(state, action) {
+  switch (action.type) {
+    case 'CHANGE':
+      return {
+        ...state,
+        values: { ...state.values, [action.name]: action.value },
+        touched: state.touched[action.name] ? state.touched : { ...state.touched, [action.name]: false },
+      };
+    case 'BLUR':
+      return {
+        ...state,
+        touched: { ...state.touched, [action.name]: true },
+        errors: { ...state.errors, [action.name]: action.validate(state.values[action.name]) },
+      };
+    case 'SET_ERROR':
+      return { ...state, errors: { ...state.errors, [action.name]: action.error } };
+    case 'SUBMIT_START':
+      return { ...state, isSubmitting: true };
+    case 'SUBMIT_END':
+      return { ...state, isSubmitting: false, errors: action.errors ?? state.errors };
+    default:
+      return state;
+  }
+}
+
+function useForm({ initialValues, validators = {}, onSubmit }) {
+  const [state, dispatch] = useReducer(formReducer, {
+    values: initialValues,
+    errors: {},
+    touched: {},
+    isSubmitting: false,
+  });
+
+  const handleChange = (name, value) =&gt; dispatch({ type: 'CHANGE', name, value });
+
+  const handleBlur = (name) =&gt;
+    dispatch({ type: 'BLUR', name, validate: validators[name] ?? (() =&gt; undefined) });
+
+  const handleSubmit = async (e) =&gt; {
+    e.preventDefault();
+    const errors = {};
+    for (const name of Object.keys(validators)) {
+      const err = validators[name](state.values[name]);
+      if (err) errors[name] = err;
+    }
+    if (Object.keys(errors).length &gt; 0) {
+      dispatch({ type: 'SUBMIT_END', errors });
+      return;
+    }
+    dispatch({ type: 'SUBMIT_START' });
+    try {
+      await onSubmit(state.values);
+      dispatch({ type: 'SUBMIT_END', errors: {} });
+    } catch (err) {
+      dispatch({ type: 'SUBMIT_END', errors: { form: err.message } });
+    }
+  };
+
+  return { state, handleChange, handleBlur, handleSubmit };
+}</code></pre>
+        <div class="callout callout-tip">
+          <strong>Isolating re-renders further:</strong> for very large forms (50+ fields), a single <code>useReducer</code> at the top still re-renders every field on every keystroke because they all read from the same <code>state</code>. The industry-standard fix (used by React Hook Form) is to keep field values in an <em>uncontrolled ref map</em> and only trigger re-renders for the specific field whose error/touched status changed, using a subscription model rather than context broadcast.
+        </div>
+      </details>
+
+      <details>
+        <summary>Schema-Based Validation (Zod) &amp; Async Validation</summary>
+        <pre><code class="language-typescript">import { z } from 'zod';
+
+const signupSchema = z.object({
+  email: z.string().email('Enter a valid email'),
+  password: z.string().min(8, 'At least 8 characters'),
+  username: z.string().min(3),
+});
+
+function zodFieldValidator(schema, field) {
+  return (value) =&gt; {
+    const result = schema.shape[field].safeParse(value);
+    return result.success ? undefined : result.error.issues[0].message;
+  };
+}
+
+// Async validation with race-condition prevention
+function useAsyncFieldValidation(checkFn, delay = 400) {
+  const [status, setStatus] = useState('idle'); // idle | checking | valid | invalid
+  const requestId = useRef(0);
+
+  const check = useDebouncedCallback(async (value) =&gt; {
+    const id = ++requestId.current;
+    setStatus('checking');
+    const ok = await checkFn(value);
+    if (id !== requestId.current) return; // A newer request superseded this one
+    setStatus(ok ? 'valid' : 'invalid');
+  }, delay);
+
+  return { status, check };
+}
+
+// Usage: check username availability without racing
+function UsernameField() {
+  const { status, check } = useAsyncFieldValidation(
+    (value) =&gt; fetch(`/api/username-available?u=${value}`).then((r) =&gt; r.json()).then((d) =&gt; d.available)
+  );
+  return (
+    &lt;div&gt;
+      &lt;input onChange={(e) =&gt; check(e.target.value)} aria-describedby="username-status" /&gt;
+      &lt;span id="username-status" aria-live="polite"&gt;
+        {status === 'checking' &amp;&amp; 'Checking…'}
+        {status === 'invalid' &amp;&amp; 'Username taken'}
+        {status === 'valid' &amp;&amp; 'Available'}
+      &lt;/span&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+        <p><strong>Field-level vs form-level errors:</strong> field errors block only that field's submission-readiness and render inline via <code>aria-describedby</code>; form-level errors (e.g., "network error, try again") render once at the top and don't block individual fields from showing their own valid state.</p>
+      </details>
+
+      <details>
+        <summary>Accessibility</summary>
+        <pre><code class="language-jsx">function Field({ name, label, value, error, touched, onChange, onBlur }) {
+  const errorId = `${name}-error`;
+  return (
+    &lt;div className="field"&gt;
+      &lt;label htmlFor={name}&gt;{label}&lt;/label&gt;
+      &lt;input
+        id={name}
+        name={name}
+        value={value}
+        aria-invalid={touched &amp;&amp; !!error}
+        aria-describedby={touched &amp;&amp; error ? errorId : undefined}
+        onChange={(e) =&gt; onChange(name, e.target.value)}
+        onBlur={() =&gt; onBlur(name)}
+      /&gt;
+      {touched &amp;&amp; error &amp;&amp; (
+        &lt;p id={errorId} role="alert" className="field-error"&gt;
+          {error}
+        &lt;/p&gt;
+      )}
+    &lt;/div&gt;
+  );
+}</code></pre>
+        <p><code>role="alert"</code> on the error message causes screen readers to announce it immediately when it appears, without the field needing to be re-focused. <code>aria-invalid</code> and <code>aria-describedby</code> associate the error text with the input for assistive tech.</p>
+      </details>
+
+      <details>
+        <summary>Complete Implementation</summary>
+        <pre><code class="language-jsx">function SignupForm() {
+  const { state, handleChange, handleBlur, handleSubmit } = useForm({
+    initialValues: { email: '', password: '', username: '' },
+    validators: {
+      email: zodFieldValidator(signupSchema, 'email'),
+      password: zodFieldValidator(signupSchema, 'password'),
+      username: zodFieldValidator(signupSchema, 'username'),
+    },
+    onSubmit: async (values) =&gt; {
+      await fetch('/api/signup', { method: 'POST', body: JSON.stringify(values) });
+    },
+  });
+
+  return (
+    &lt;form onSubmit={handleSubmit} noValidate&gt;
+      {state.errors.form &amp;&amp; &lt;p role="alert"&gt;{state.errors.form}&lt;/p&gt;}
+      &lt;Field
+        name="email"
+        label="Email"
+        value={state.values.email}
+        error={state.errors.email}
+        touched={state.touched.email}
+        onChange={handleChange}
+        onBlur={handleBlur}
+      /&gt;
+      &lt;Field
+        name="password"
+        label="Password"
+        value={state.values.password}
+        error={state.errors.password}
+        touched={state.touched.password}
+        onChange={handleChange}
+        onBlur={handleBlur}
+      /&gt;
+      &lt;button type="submit" disabled={state.isSubmitting}&gt;
+        {state.isSubmitting ? 'Creating account…' : 'Sign up'}
+      &lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Edge Cases</summary>
+        <ul>
+          <li><strong>Validate-on-first-blur, then live:</strong> before a field is touched, don't show errors even if the value is already invalid (avoids showing "Required" on an empty field the instant the form mounts).</li>
+          <li><strong>Paste events</strong> bypass individual keystrokes — validation triggered on <code>onChange</code> still fires correctly since <code>onChange</code> fires once with the full pasted value, but debounced async checks should still debounce it rather than firing once per pasted character (which doesn't happen, but is a common wrong assumption).</li>
+          <li><strong>Submitting while an async check is pending:</strong> disable submit while <code>status === 'checking'</code> for any field with async validation, not just while the form's own <code>isSubmitting</code> flag is true.</li>
+          <li><strong>Browser autofill</strong> sets input values without firing React's synthetic <code>onChange</code> in some browsers — validate current DOM values on submit as a fallback, not only state that was populated via <code>onChange</code>.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Component 7: Todo List with LocalStorage -->
+    <section id="component-todo">
+      <h2>Component 7: Todo List with LocalStorage</h2>
+
+      <details>
+        <summary>Requirements &amp; Why useReducer</summary>
+        <p><strong>Requirements:</strong> add/toggle/delete/edit todos, filter (all/active/completed), bulk operations (clear completed, toggle all), persist across reloads, remain usable if storage is unavailable, and support drag-to-reorder.</p>
+        <p>A todo list has more state <em>transitions</em> than state <em>values</em> — "toggle this one, then re-derive the filtered view, then persist" is a sequence of related updates. <code>useReducer</code> makes each transition an explicit, testable, named action instead of scattered <code>setTodos(todos.map(...))</code> calls repeated across handlers.</p>
+      </details>
+
+      <details>
+        <summary>Reducer Design &amp; usePersist Hook</summary>
+        <pre><code class="language-jsx">function todosReducer(state, action) {
+  switch (action.type) {
+    case 'ADD':
+      return [...state, { id: crypto.randomUUID(), text: action.text, completed: false, createdAt: Date.now() }];
+    case 'TOGGLE':
+      return state.map((t) =&gt; (t.id === action.id ? { ...t, completed: !t.completed } : t));
+    case 'EDIT':
+      return state.map((t) =&gt; (t.id === action.id ? { ...t, text: action.text } : t));
+    case 'DELETE':
+      return state.filter((t) =&gt; t.id !== action.id);
+    case 'TOGGLE_ALL':
+      return state.map((t) =&gt; ({ ...t, completed: action.value }));
+    case 'CLEAR_COMPLETED':
+      return state.filter((t) =&gt; !t.completed);
+    case 'REORDER':
+      return action.reordered;
+    case 'HYDRATE':
+      return action.todos;
+    default:
+      return state;
+  }
+}
+
+// Sync reducer state to localStorage without blocking every dispatch on I/O
+function usePersistedReducer(reducer, initialState, storageKey) {
+  const [state, dispatch] = useReducer(reducer, initialState, (init) =&gt; {
+    try {
+      const raw = localStorage.getItem(storageKey);
+      return raw ? JSON.parse(raw) : init;
+    } catch {
+      return init; // Corrupt JSON or storage disabled — fall back silently
+    }
+  });
+
+  const writeTimeout = useRef(null);
+  useEffect(() =&gt; {
+    clearTimeout(writeTimeout.current);
+    writeTimeout.current = setTimeout(() =&gt; {
+      try {
+        localStorage.setItem(storageKey, JSON.stringify(state));
+      } catch {
+        // Storage full or disabled — the UI already reflects the change,
+        // it just won't survive a reload. Surface a non-blocking warning.
+      }
+    }, 300); // Debounce writes during rapid interactions (e.g., toggling many items)
+    return () =&gt; clearTimeout(writeTimeout.current);
+  }, [state, storageKey]);
+
+  return [state, dispatch];
+}</code></pre>
+        <div class="callout callout-info">
+          <strong>Why debounce the write, not the state update:</strong> the UI must reflect every dispatch immediately (state updates are synchronous via the reducer), but persisting to <code>localStorage</code> — a synchronous, blocking API — on every single keystroke-driven edit would jank rapid interactions. Debouncing only the write, not the render, keeps both fast.
+        </div>
+      </details>
+
+      <details>
+        <summary>Optimistic Updates &amp; Graceful Degradation</summary>
+        <p>If todos are also synced to a server, apply the change to local state immediately (optimistic), then reconcile with the server response. On failure, roll back and surface an error — don't leave the UI in a state the server never confirmed.</p>
+        <pre><code class="language-jsx">async function toggleWithSync(dispatch, todo) {
+  dispatch({ type: 'TOGGLE', id: todo.id }); // Optimistic — instant feedback
+  try {
+    await api.updateTodo(todo.id, { completed: !todo.completed });
+  } catch {
+    dispatch({ type: 'TOGGLE', id: todo.id }); // Roll back on failure
+    showToast('Could not save change — reverted');
+  }
+}</code></pre>
+        <p><strong>Graceful degradation when storage is disabled</strong> (private browsing, quota exceeded, corporate policy): detect it once at startup, keep the app fully functional in-memory for the session, and show a persistent but dismissible banner rather than silently failing every write.</p>
+        <pre><code class="language-jsx">function isStorageAvailable() {
+  try {
+    const testKey = '__storage_test__';
+    localStorage.setItem(testKey, '1');
+    localStorage.removeItem(testKey);
+    return true;
+  } catch {
+    return false;
+  }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Drag &amp; Drop Reordering</summary>
+        <pre><code class="language-jsx">function useDragReorder(items, onReorder) {
+  const dragIndex = useRef(null);
+
+  const onDragStart = (index) =&gt; (e) =&gt; {
+    dragIndex.current = index;
+    e.dataTransfer.effectAllowed = 'move';
+  };
+
+  const onDragOver = (index) =&gt; (e) =&gt; {
+    e.preventDefault(); // Required to allow dropping
+  };
+
+  const onDrop = (index) =&gt; (e) =&gt; {
+    e.preventDefault();
+    const from = dragIndex.current;
+    if (from === null || from === index) return;
+    const next = [...items];
+    const [moved] = next.splice(from, 1);
+    next.splice(index, 0, moved);
+    onReorder(next);
+    dragIndex.current = null;
+  };
+
+  return { onDragStart, onDragOver, onDrop };
+}</code></pre>
+        <div class="callout callout-warning">
+          <strong>Accessibility gap:</strong> native drag-and-drop is mouse/touch-only. A complete implementation adds keyboard reordering (e.g., <kbd>Alt+ArrowUp</kbd>/<kbd>Alt+ArrowDown</kbd> on a focused item) and announces the new position via an <code>aria-live</code> region — interviewers who ask "is this accessible?" are checking for exactly this gap.
+        </div>
+      </details>
+
+      <details>
+        <summary>Complete Implementation (Filtering, Search &amp; Bulk Ops)</summary>
+        <pre><code class="language-jsx">function TodoApp() {
+  const [todos, dispatch] = usePersistedReducer(todosReducer, [], 'todos-v1');
+  const [filter, setFilter] = useState('all'); // all | active | completed
+  const [query, setQuery] = useState('');
+
+  const visible = useMemo(() =&gt; {
+    return todos
+      .filter((t) =&gt; (filter === 'active' ? !t.completed : filter === 'completed' ? t.completed : true))
+      .filter((t) =&gt; t.text.toLowerCase().includes(query.toLowerCase()));
+  }, [todos, filter, query]);
+
+  const remaining = useMemo(() =&gt; todos.filter((t) =&gt; !t.completed).length, [todos]);
+
+  return (
+    &lt;div&gt;
+      &lt;input
+        placeholder="Search todos…"
+        value={query}
+        onChange={(e) =&gt; setQuery(e.target.value)}
+        aria-label="Search todos"
+      /&gt;
+      &lt;TodoInput onAdd={(text) =&gt; dispatch({ type: 'ADD', text })} /&gt;
+
+      &lt;ul&gt;
+        {visible.map((todo) =&gt; (
+          &lt;TodoItem key={todo.id} todo={todo} dispatch={dispatch} /&gt;
+        ))}
+      &lt;/ul&gt;
+
+      &lt;footer&gt;
+        &lt;span&gt;{remaining} items left&lt;/span&gt;
+        &lt;button onClick={() =&gt; setFilter('all')}&gt;All&lt;/button&gt;
+        &lt;button onClick={() =&gt; setFilter('active')}&gt;Active&lt;/button&gt;
+        &lt;button onClick={() =&gt; setFilter('completed')}&gt;Completed&lt;/button&gt;
+        &lt;button onClick={() =&gt; dispatch({ type: 'CLEAR_COMPLETED' })}&gt;Clear completed&lt;/button&gt;
+      &lt;/footer&gt;
+    &lt;/div&gt;
+  );
+}
+
+const TodoItem = memo(function TodoItem({ todo, dispatch }) {
+  return (
+    &lt;li&gt;
+      &lt;input
+        type="checkbox"
+        checked={todo.completed}
+        onChange={() =&gt; dispatch({ type: 'TOGGLE', id: todo.id })}
+      /&gt;
+      &lt;span style={{ textDecoration: todo.completed ? 'line-through' : 'none' }}&gt;{todo.text}&lt;/span&gt;
+      &lt;button onClick={() =&gt; dispatch({ type: 'DELETE', id: todo.id })} aria-label={`Delete ${todo.text}`}&gt;
+        ×
+      &lt;/button&gt;
+    &lt;/li&gt;
+  );
+});</code></pre>
+        <p><code>dispatch</code> from <code>useReducer</code> is referentially stable across renders, so passing it directly to <code>memo(TodoItem)</code> doesn't break memoization the way passing a fresh inline callback would — this is one of the practical reasons to prefer <code>useReducer</code> over several <code>useState</code>+ inline handlers when list items are memoized.</p>
+      </details>
+
+      <details>
+        <summary>Edge Cases</summary>
+        <ul>
+          <li><strong>Empty text submission:</strong> trim and reject whitespace-only todos at the input level, not the reducer, so the reducer stays a pure trusted-input transform.</li>
+          <li><strong>Multi-tab editing:</strong> listen for the <code>storage</code> event and dispatch a <code>HYDRATE</code> action so a todo added in one tab appears in others without requiring a manual refresh.</li>
+          <li><strong>Very large lists (1000+ todos):</strong> the search/filter <code>useMemo</code> is O(n) per keystroke — fine at this scale, but pair with virtualization (Component 3, Ch. 23) once the visible list itself gets long, not the filtering logic.</li>
+          <li><strong>Reordering while filtered:</strong> dragging within a filtered view must splice the reorder into the <em>underlying unfiltered array</em>, not the filtered one, or completed/hidden items will jump position when the filter is cleared.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Component 8: Counter with Re-Render Optimization -->
+    <section id="component-counter">
+      <h2>Component 8: Counter with Re-Render Optimization</h2>
+
+      <details>
+        <summary>Requirements &amp; Interview Extension Points</summary>
+        <p>The base ask — "build a counter" — takes 30 seconds. The interview happens entirely in the extensions the interviewer layers on: "now render 500 of these in a grid," "now the parent re-renders every 16ms from a WebSocket tick — the counters shouldn't visibly lag," "now add an <code>onCountChange</code> callback prop." Each extension is designed to tempt a premature-optimization mistake or expose a missing one.</p>
+      </details>
+
+      <details>
+        <summary>The Un-Optimized Baseline (Correct Starting Point)</summary>
+        <pre><code class="language-jsx">function Counter({ initial = 0 }) {
+  const [count, setCount] = useState(initial);
+  return (
+    &lt;div&gt;
+      &lt;button onClick={() =&gt; setCount((c) =&gt; c - 1)}&gt;-&lt;/button&gt;
+      &lt;span&gt;{count}&lt;/span&gt;
+      &lt;button onClick={() =&gt; setCount((c) =&gt; c + 1)}&gt;+&lt;/button&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+        <div class="callout callout-tip">
+          <strong>Say this out loud in the interview:</strong> "I'll start unoptimized — <code>memo</code>/<code>useCallback</code> have their own cost (extra comparisons, memory for cached closures) and are only worth it once I've established there's an actual re-render problem, which the interviewer will usually introduce as the next constraint." This single sentence signals seniority more than the optimized code itself.
+        </div>
+      </details>
+
+      <details>
+        <summary>The Re-Render Problem: 500 Counters, Parent Re-Renders Frequently</summary>
+        <pre><code class="language-jsx">// Parent re-renders on every tick (e.g., a live clock elsewhere on the page)
+function Dashboard() {
+  const [, forceTick] = useReducer((x) =&gt; x + 1, 0);
+  useEffect(() =&gt; {
+    const id = setInterval(forceTick, 16);
+    return () =&gt; clearInterval(id);
+  }, []);
+
+  return (
+    &lt;div&gt;
+      {Array.from({ length: 500 }).map((_, i) =&gt; (
+        &lt;Counter key={i} onCountChange={(c) =&gt; console.log(i, c)} /&gt;
+      ))}
+    &lt;/div&gt;
+  );
+}</code></pre>
+        <p>Without optimization, every 16ms tick re-renders <code>Dashboard</code>, which re-creates a new <code>onCountChange</code> arrow function for all 500 children and re-renders every <code>Counter</code> even though none of their own state changed.</p>
+      </details>
+
+      <details>
+        <summary>useCallback, React.memo &amp; Extracting Components</summary>
+        <pre><code class="language-jsx">const Counter = memo(function Counter({ initial = 0, onCountChange }) {
+  const [count, setCount] = useState(initial);
+
+  const increment = useCallback(() =&gt; {
+    setCount((c) =&gt; {
+      const next = c + 1;
+      onCountChange?.(next);
+      return next;
+    });
+  }, [onCountChange]);
+
+  const decrement = useCallback(() =&gt; {
+    setCount((c) =&gt; {
+      const next = c - 1;
+      onCountChange?.(next);
+      return next;
+    });
+  }, [onCountChange]);
+
+  return (
+    &lt;div&gt;
+      &lt;button onClick={decrement}&gt;-&lt;/button&gt;
+      &lt;span&gt;{count}&lt;/span&gt;
+      &lt;button onClick={increment}&gt;+&lt;/button&gt;
+    &lt;/div&gt;
+  );
+});
+
+function Dashboard() {
+  const [, forceTick] = useReducer((x) =&gt; x + 1, 0);
+  useEffect(() =&gt; {
+    const id = setInterval(forceTick, 16);
+    return () =&gt; clearInterval(id);
+  }, []);
+
+  // Stable per-index callback so `memo` actually short-circuits
+  const handlers = useRef(new Map());
+  const getHandler = (i) =&gt; {
+    if (!handlers.current.has(i)) {
+      handlers.current.set(i, (c) =&gt; console.log(i, c));
+    }
+    return handlers.current.get(i);
+  };
+
+  return (
+    &lt;div&gt;
+      {Array.from({ length: 500 }).map((_, i) =&gt; (
+        &lt;Counter key={i} onCountChange={getHandler(i)} /&gt;
+      ))}
+    &lt;/div&gt;
+  );
+}</code></pre>
+        <div class="callout callout-warning">
+          <strong>The trap interviewers set:</strong> wrapping <code>Counter</code> in <code>memo</code> alone does nothing here if <code>Dashboard</code> still passes a fresh <code>(c) => console.log(i, c)</code> closure on every render — <code>memo</code>'s shallow prop comparison sees a new function reference and re-renders anyway. <code>useCallback</code> in the child is irrelevant; the fix has to happen at the <em>call site</em> that creates the prop.
+        </div>
+
+        <h3>Follow-up: "onCountChange fires on mount — how do you prevent that?"</h3>
+        <pre><code class="language-jsx">// Common interview follow-up: onCountChange should only fire on user interaction,
+// not on the initial mount when count is set to 'initial'
+const Counter = memo(function Counter({ initial = 0, onCountChange }) {
+  const [count, setCount] = useState(initial);
+  const isFirstRender = useRef(true);
+
+  useEffect(() =&gt; {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return; // Skip the mount notification
+    }
+    onCountChange?.(count);
+  }, [count, onCountChange]);
+
+  return (
+    &lt;div role="group" aria-label="Counter"&gt;
+      &lt;button onClick={() =&gt; setCount(c =&gt; c - 1)}&gt;-&lt;/button&gt;
+      &lt;output aria-live="polite"&gt;{count}&lt;/output&gt;
+      &lt;button onClick={() =&gt; setCount(c =&gt; c + 1)}&gt;+&lt;/button&gt;
+    &lt;/div&gt;
+  );
+});</code></pre>
+      </details>
+
+      <details>
+        <summary>useReducer vs useState &amp; Batching</summary>
+        <p>For a single independent counter, <code>useState</code> is simpler and equally correct — reach for <code>useReducer</code> only once the counter grows extra transitions (min/max clamping, step size, reset-with-history) that would otherwise scatter across multiple <code>setCount</code> calls with duplicated logic.</p>
+        <pre><code class="language-jsx">function counterReducer(state, action) {
+  switch (action.type) {
+    case 'increment':
+      return { ...state, count: Math.min(state.count + state.step, state.max) };
+    case 'decrement':
+      return { ...state, count: Math.max(state.count - state.step, state.min) };
+    case 'reset':
+      return { ...state, count: state.initial };
+    default:
+      return state;
+  }
+}</code></pre>
+        <p><strong>Automatic batching (React 18+):</strong> multiple <code>setState</code> calls inside the same event handler, timeout, or promise callback are batched into a single re-render — this used to only happen inside React event handlers pre-18. In a counter that calls both <code>setCount</code> and <code>onCountChange</code> (which might itself trigger a parent <code>setState</code>) within one click, both updates commit together, not as two separate renders.</p>
+      </details>
+
+      <details>
+        <summary>Complete Implementation</summary>
+        <pre><code class="language-jsx">const Counter = memo(function Counter({ step = 1, min = -Infinity, max = Infinity, initial = 0, onCountChange }) {
+  const [state, dispatch] = useReducer(counterReducer, { count: initial, step, min, max, initial });
+
+  useEffect(() =&gt; {
+    onCountChange?.(state.count);
+  }, [state.count, onCountChange]);
+
+  return (
+    &lt;div role="group" aria-label="Counter"&gt;
+      &lt;button onClick={() =&gt; dispatch({ type: 'decrement' })} aria-label="Decrement"&gt;-&lt;/button&gt;
+      &lt;output aria-live="polite"&gt;{state.count}&lt;/output&gt;
+      &lt;button onClick={() =&gt; dispatch({ type: 'increment' })} aria-label="Increment"&gt;+&lt;/button&gt;
+      &lt;button onClick={() =&gt; dispatch({ type: 'reset' })}&gt;Reset&lt;/button&gt;
+    &lt;/div&gt;
+  );
+});</code></pre>
+        <p>Notice <code>onCountChange</code> moved to a <code>useEffect</code> reacting to <code>state.count</code> rather than being called imperatively inside the dispatch action — this keeps the reducer a pure function (no side effects inside it) and decouples "notify the parent" from "compute the next state," which interviewers specifically probe for ("should a reducer call a prop function?").</p>
+      </details>
+
+      <details>
+        <summary>Edge Cases</summary>
+        <ul>
+          <li><strong>Rapid double-clicks past <code>max</code>/<code>min</code>:</strong> the reducer's clamping (<code>Math.min</code>/<code>Math.max</code>) must happen inside the reducer, not in the click handler, so it's correct even under React 18 batching where several increments might process from a stale closure otherwise.</li>
+          <li><strong>Controlled counter (value/onChange from parent):</strong> once a parent wants to own the count, the component must switch to a fully controlled pattern — this is a common "now make it controlled" follow-up, and mixing both controlled and uncontrolled modes in one component is the mistake to avoid (pick one, or explicitly support both via a documented "is <code>value</code> provided?" branch).</li>
+          <li><strong><code>onCountChange</code> in a <code>useEffect</code> firing on mount:</strong> if the parent doesn't expect an initial notification, guard with a ref flag to skip the first effect run, or document that mount always notifies (know which behavior you're choosing and say so).</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Common LLD Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common LLD Mistakes</h2>
+      <details>
+        <summary>Mistakes that cost points across all five components</summary>
+        <ul>
+          <li><strong>Skipping accessibility until asked:</strong> <code>role</code>, <code>aria-*</code>, and focus management are graded even when not explicitly requested — senior candidates build them in from the start.</li>
+          <li><strong>Optimizing before measuring:</strong> wrapping everything in <code>memo</code>/<code>useMemo</code>/<code>useCallback</code> pre-emptively, then being unable to explain why a specific one is necessary.</li>
+          <li><strong>Mutating state directly</strong> (<code>todos.push(...)</code>, <code>array[i] = x</code>) instead of returning new references — breaks both <code>memo</code> comparisons and React's change detection.</li>
+          <li><strong>Ignoring cleanup:</strong> forgetting to remove event listeners, clear intervals, or unlock scroll when a component unmounts mid-interaction.</li>
+          <li><strong>Treating <code>localStorage</code> as infallible:</strong> not handling quota errors, disabled storage, or corrupt JSON on read.</li>
+          <li><strong>Not asking about scale:</strong> building a 10-item solution when the interviewer's follow-up ("what if there are 10,000?") was actually the point of the question.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- The Pattern -->
+    <section id="the-pattern">
+      <h2>The Pattern: What Every Interviewer Evaluates</h2>
+      <details>
+        <summary>The five components reduce to four repeating skills</summary>
+        <ol>
+          <li><strong>State shape design before rendering:</strong> in every component above, the hardest part was deciding what state to hold and in what shape (reducer actions, context split, ref vs state) — not the JSX.</li>
+          <li><strong>Escape hatches used deliberately:</strong> portals, refs, and effects are used exactly where React's declarative model can't reach (DOM position, focus, subscriptions to browser APIs) and nowhere else.</li>
+          <li><strong>Accessibility as a first-class requirement:</strong> every component includes ARIA roles, keyboard support, and focus management without being asked.</li>
+          <li><strong>Correctness under real-world hostility:</strong> disabled storage, unmounted components, stale closures, and race conditions are handled explicitly, not assumed away.</li>
+        </ol>
+        <div class="callout callout-tip">
+          <strong>If you internalize one thing from these two LLD chapters:</strong> an interviewer is pattern-matching your solution against "have they built this before, for real users, and hit the edge case that bit them in production?" — the fastest way to signal yes is to mention the edge case unprompted, then show the one line of code that handles it.
+        </div>
+      </details>
+    </section>
+
+    <!-- Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Decisions worth stating out loud during the round</summary>
+        <ul>
+          <li><strong>Portal vs in-place render for Modal:</strong> portals solve stacking/clipping correctly but complicate testing (content lives outside the component's DOM subtree) and server-rendering (no <code>document.body</code> during SSR).</li>
+          <li><strong>CSS variables vs CSS-in-JS theming:</strong> CSS variables avoid React re-renders entirely on toggle but push more logic into the stylesheet; CSS-in-JS keeps theme logic in JS but couples every themed component to a re-render when the theme context changes.</li>
+          <li><strong>Debounced persistence vs write-through:</strong> debouncing reduces I/O and jank but creates a small window where a crash/tab-close loses the last few hundred milliseconds of change; write-through is safer but slower under rapid interaction.</li>
+          <li><strong><code>memo</code> everywhere vs selectively:</strong> blanket memoization adds a shallow-comparison cost to every render, which can net-negative for cheap components; it pays off specifically for expensive subtrees re-rendered by an unrelated, frequently-updating parent.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Testing Example -->
+    <section id="testing-example">
+      <h2>Testing LLD Components (Interview Follow-up)</h2>
+      <details>
+        <summary>A complete test file for the debounce hook — the most common "how would you test this?" follow-up</summary>
+        <pre><code class="language-jsx">import { renderHook, act } from '@testing-library/react';
+import { useDebouncedValue } from './useDebouncedValue';
+
+describe('useDebouncedValue', () =&gt; {
+  beforeEach(() =&gt; jest.useFakeTimers());
+  afterEach(() =&gt; jest.useRealTimers());
+
+  it('returns initial value immediately', () =&gt; {
+    const { result } = renderHook(() =&gt; useDebouncedValue('hello', 300));
+    expect(result.current).toBe('hello');
+  });
+
+  it('does not update before delay expires', () =&gt; {
+    const { result, rerender } = renderHook(
+      ({ value }) =&gt; useDebouncedValue(value, 300),
+      { initialProps: { value: 'hello' } }
+    );
+
+    rerender({ value: 'world' });
+    act(() =&gt; jest.advanceTimersByTime(200)); // 200ms &lt; 300ms delay
+    expect(result.current).toBe('hello'); // Still old value
+  });
+
+  it('updates after delay expires', () =&gt; {
+    const { result, rerender } = renderHook(
+      ({ value }) =&gt; useDebouncedValue(value, 300),
+      { initialProps: { value: 'hello' } }
+    );
+
+    rerender({ value: 'world' });
+    act(() =&gt; jest.advanceTimersByTime(300));
+    expect(result.current).toBe('world'); // Updated
+  });
+
+  it('resets timer on rapid changes (only last value fires)', () =&gt; {
+    const { result, rerender } = renderHook(
+      ({ value }) =&gt; useDebouncedValue(value, 300),
+      { initialProps: { value: 'a' } }
+    );
+
+    rerender({ value: 'ab' });
+    act(() =&gt; jest.advanceTimersByTime(100));
+    rerender({ value: 'abc' });
+    act(() =&gt; jest.advanceTimersByTime(100));
+    rerender({ value: 'abcd' });
+    act(() =&gt; jest.advanceTimersByTime(300));
+
+    expect(result.current).toBe('abcd'); // Only final value
+  });
+
+  it('cleans up timer on unmount', () =&gt; {
+    const { unmount } = renderHook(() =&gt; useDebouncedValue('test', 300));
+    unmount();
+    // No act warnings or state-update-on-unmounted errors
+    expect(() =&gt; jest.runAllTimers()).not.toThrow();
+  });
+});</code></pre>
+        <div class="callout callout-tip">
+          <p><strong>Interview tip:</strong> When asked "how would you test this?", mention: (1) <code>jest.useFakeTimers()</code> for deterministic timing, (2) <code>renderHook</code> for testing hooks in isolation, (3) <code>act()</code> wrapping timer advances to flush React state updates. For component tests (modal focus trap, form validation), use <code>@testing-library/react</code> with <code>screen.getByRole()</code> and <code>userEvent</code> for realistic interaction simulation.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Follow-up Interview Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Q1: How would you make the Modal work correctly with React Server Components?</summary>
+        <p><strong>Strong answer:</strong> the Modal must be a Client Component (<code>"use client"</code>) because it uses <code>useState</code>, <code>useEffect</code>, refs, and <code>document</code> access — none of which exist on the server. The trigger button and modal content can still be composed from a Server Component parent by passing the modal's children as a React node (the "server component passed as children to a client component" pattern), keeping the modal's contents server-rendered where possible while only the Modal shell itself is client-side.</p>
+      </details>
+
+      <details>
+        <summary>Q2: The theme switcher flashes the wrong theme specifically on the very first visit (no localStorage entry yet) on a slow connection. Why, and how do you fix it?</summary>
+        <p><strong>Strong answer:</strong> on first visit there's no stored preference, so the inline script falls back to <code>matchMedia</code> — if that call itself is somehow delayed relative to first paint (rare, but possible if the script isn't placed early enough in <code>&lt;head&gt;</code>, e.g., after a blocking stylesheet), a flash can still occur. The fix is ensuring the inline theme script is the very first thing in <code>&lt;head&gt;</code>, before any <code>&lt;link rel="stylesheet"&gt;</code>, so it runs before the browser has anything to paint.</p>
+      </details>
+
+      <details>
+        <summary>Q3: Your form's async username-availability check occasionally shows a stale result. Walk through the race condition and the fix.</summary>
+        <p><strong>Strong answer:</strong> if the user types "ab", triggering a check, then quickly types "abc" before the first request resolves, both requests are in flight; if the "ab" response arrives after the "abc" response, it overwrites the correct, more recent result with a stale one. The fix is a monotonically increasing request ID (or an <code>AbortController</code> per keystroke) — only the response matching the latest issued request ID is allowed to update state, exactly as shown in the <code>useAsyncFieldValidation</code> hook above.</p>
+      </details>
+
+      <details>
+        <summary>Q4: How would you test the focus trap without a real browser?</summary>
+        <p><strong>Strong answer:</strong> using React Testing Library with <code>jsdom</code>, render the Modal open, assert <code>document.activeElement</code> equals the expected initial-focus element, simulate <code>Tab</code> key presses via <code>userEvent.tab()</code> repeatedly past the last focusable element, and assert focus wraps to the first. Also assert that closing the modal restores focus to the originally-focused trigger element — this is the part most implementations get wrong and the part a good test suite catches.</p>
+      </details>
+
+      <details>
+        <summary>Q5: The todo list needs to support 10,000 items with instant search. What changes?</summary>
+        <p><strong>Strong answer:</strong> the <code>useMemo</code>-based filter is still O(n) per keystroke, which is fine computationally (10k simple string comparisons is sub-millisecond), but rendering 10k <code>&lt;li&gt;</code> elements is not — pair the existing filter logic with the virtualization approach from Chapter 23's Infinite Scroll component so only visible rows mount, and debounce the search input itself so filtering doesn't run on every single keystroke during fast typing.</p>
+      </details>
+
+      <details>
+        <summary>Q6: Why does the Counter example move the <code>onCountChange</code> call into a <code>useEffect</code> instead of calling it inside the click handler?</summary>
+        <p><strong>Strong answer:</strong> calling a prop callback inside a reducer or directly inside the state updater couples "compute next state" with "notify the outside world," which breaks if React ever batches, replays, or double-invokes the updater (as Strict Mode does in development for reducers). Moving the notification to an effect keyed on the resulting state value guarantees it fires exactly once per committed state change, regardless of how many times the updater function itself was invoked internally.</p>
+      </details>
+    </section>
+
+    <!-- Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <div class="callout callout-tip">
+        <p><strong>Key mental models for the interview:</strong></p>
+        <ul>
+          <li><strong>Modal = Portal + Focus Trap + Scroll Lock.</strong> Conditional rendering alone is not a modal.</li>
+          <li><strong>Theming is a CSS problem wearing a React costume.</strong> Store the preference in React; apply it via a DOM attribute and CSS variables so toggling doesn't re-render your tree.</li>
+          <li><strong>Forms are reducers with fields.</strong> Model changes as named transitions (CHANGE, BLUR, SUBMIT) rather than scattered <code>setState</code> calls.</li>
+          <li><strong>Todo lists are reducers with persistence.</strong> Debounce the write, not the render; degrade gracefully when storage fails.</li>
+          <li><strong>Counters teach restraint.</strong> Start unoptimized, add <code>memo</code>/<code>useCallback</code> only once a real re-render cost is demonstrated, and remember the optimization must happen at the call site creating the prop, not just in the child.</li>
+        </ul>
+      </div>
+      <div class="callout callout-warning">
+        <p><strong>What NOT to say in an interview:</strong></p>
+        <ul>
+          <li>❌ "I'll just use a library for this" when the interviewer explicitly asked you to build the primitive — naming the library your production code would use is fine, using it here defeats the purpose of the round.</li>
+          <li>❌ "This doesn't need accessibility, it's just a demo" — LLD rounds grade accessibility as a default expectation, not an extra.</li>
+          <li>❌ "<code>memo</code> everywhere is always safe" — it isn't free; you should be able to justify each one.</li>
+          <li>❌ "localStorage always works" — ignoring quota/availability failures is a signal of not having shipped this to real users.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-jsx.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+</body>
+</html>

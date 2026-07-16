@@ -1,0 +1,1876 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 10: Generics &amp; Conditional Types | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <a href="../index.html" class="sidebar-brand">
+      <span class="chapter-num">Ch 10</span>
+      <span class="chapter-title">Generics &amp; Conditional Types</span>
+    </a>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#generic-constraints">Generic Constraints</a></li>
+        <li><a href="#generic-inference">Generic Inference</a></li>
+        <li><a href="#conditional-types">Conditional Types</a></li>
+        <li><a href="#distributive-conditionals">Distributive Conditionals</a></li>
+        <li><a href="#infer-keyword">The infer Keyword</a></li>
+        <li><a href="#recursive-types">Recursive Conditional Types</a></li>
+        <li><a href="#type-level-programming">Type-Level Programming</a></li>
+        <li><a href="#utility-types">Building Utility Types</a></li>
+        <li><a href="#generic-overloads">Generic Overloads</a></li>
+        <li><a href="#higher-kinded-types">Higher-Kinded Types</a></li>
+        <li><a href="#production-patterns">Production Patterns</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <span>Part II — TypeScript Advanced Patterns</span> &gt;
+      <span>Chapter 10</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-ts">TypeScript</span>
+        <span class="badge badge-topic">Generics</span>
+        <span class="badge badge-topic">Conditional Types</span>
+        <span class="badge badge-topic">infer</span>
+      </div>
+      <h1>Chapter 10: Generics &amp; Conditional Types</h1>
+      <p class="chapter-question">"Explain generics, conditional types, and infer. How would you build a type-safe event emitter?"</p>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Generics provide type parameters that flow through a computation. Conditional types (<code>T extends U ? X : Y</code>) enable type-level branching. The <code>infer</code> keyword extracts types from positions within other types. Together they form TypeScript's type-level programming language — enabling patterns like extracting function return types, building recursive type transformations, and creating fully type-safe APIs that infer types from usage.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content" />
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details>
+        <summary>What the interviewer is really testing</summary>
+        <div class="callout callout-info">
+          <p>This question probes three distinct competencies:</p>
+        </div>
+        <ul>
+          <li><strong>Type-level programming skill:</strong> Can you think about types as a computation that runs at compile time? Do you understand that TypeScript's type system is Turing-complete (bounded by a recursion depth limit of ~50 without tail-call optimization, ~1000 with)?</li>
+          <li><strong>Ability to design type-safe APIs:</strong> Can you create APIs where the types flow through and the consumer gets full autocomplete and error checking without manual annotations?</li>
+          <li><strong>Understanding of type inference flow:</strong> Do you know where TypeScript infers types, how inference sites work, and when you need explicit annotations vs. when inference handles it?</li>
+        </ul>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────┐
+│              INTERVIEW EVALUATION AXES                    │
+├──────────────────┬──────────────────┬───────────────────┤
+│  Type-Level      │  API Design      │  Inference Flow   │
+│  Programming     │  Skill           │  Understanding    │
+├──────────────────┼──────────────────┼───────────────────┤
+│  - Generics      │  - Builder       │  - Inference      │
+│  - Conditionals  │    pattern       │    sites          │
+│  - infer         │  - Event         │  - Contextual     │
+│  - Recursion     │    emitter       │    typing         │
+│  - Mapped types  │  - Type-safe     │  - Constraints    │
+│                  │    routing       │    as hints       │
+└──────────────────┴──────────────────┴───────────────────┘
+        </pre>
+        <p>Senior candidates are expected to demonstrate not just knowledge of syntax, but judgment about <em>when</em> to use complex types vs. simpler alternatives.</p>
+      </details>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details>
+        <summary>Concise interview response</summary>
+        <div class="callout callout-tip">
+          <p><strong>Use this as your opening.</strong> Then dive deeper based on follow-ups.</p>
+        </div>
+        <p><strong>Generics</strong> are type parameters — they let functions, classes, and interfaces work with any type while preserving type information through the computation. Think of them as "type arguments" that flow through like values do at runtime.</p>
+        <p><strong>Conditional types</strong> (<code>T extends U ? X : Y</code>) are the ternary operator at the type level. They enable branching logic in types — choosing different output types based on what the input type is.</p>
+        <p><strong>The <code>infer</code> keyword</strong> is pattern matching for types. It lets you extract a type from a position within another type — like extracting the return type from a function signature or the element type from an array.</p>
+        <p><strong>For a type-safe event emitter</strong>, I'd define an event map as a generic parameter, then use <code>keyof</code> to constrain event names and indexed access types to infer the correct payload type for each event's handler:</p>
+        <pre><code class="language-typescript">interface EventMap {
+  login: { userId: string; timestamp: number };
+  logout: { reason: string };
+}
+
+class TypedEmitter&lt;Events extends Record&lt;string, unknown&gt;&gt; {
+  on&lt;K extends keyof Events&gt;(
+    event: K,
+    handler: (payload: Events[K]) =&gt; void
+  ): this { /* ... */ return this; }
+
+  emit&lt;K extends keyof Events&gt;(
+    event: K,
+    payload: Events[K]
+  ): void { /* ... */ }
+}
+
+const emitter = new TypedEmitter&lt;EventMap&gt;();
+emitter.on('login', (payload) =&gt; {
+  // payload is { userId: string; timestamp: number }
+  console.log(payload.userId);
+});
+// emitter.emit('login', { reason: 'x' }); // ❌ Type error
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 3: Generic Constraints -->
+    <section id="generic-constraints">
+      <h2>Generic Constraints (extends)</h2>
+      <details>
+        <summary>Constraining type parameters for safety and inference</summary>
+
+        <h3>Basic Constraints</h3>
+        <p>Without constraints, a generic type parameter can be <em>anything</em>. The <code>extends</code> keyword narrows what types are acceptable:</p>
+        <pre><code class="language-typescript">// Without constraint — T could be anything
+function broken&lt;T&gt;(arg: T): number {
+  return arg.length; // ❌ Property 'length' does not exist on type 'T'
+}
+
+// With constraint — T must have a length property
+function withLength&lt;T extends { length: number }&gt;(arg: T): number {
+  return arg.length; // ✅ Safe
+}
+
+withLength("hello");     // T = string, returns 5
+withLength([1, 2, 3]);   // T = number[], returns 3
+withLength({ length: 7 }); // T = { length: number }, returns 7
+// withLength(42);        // ❌ number has no 'length'
+</code></pre>
+
+        <h3>Multiple Constraints with Intersection</h3>
+        <pre><code class="language-typescript">interface Serializable {
+  serialize(): string;
+}
+
+interface Loggable {
+  log(level: string): void;
+}
+
+// T must satisfy BOTH interfaces
+function process&lt;T extends Serializable &amp; Loggable&gt;(item: T): string {
+  item.log('info');
+  return item.serialize();
+}
+</code></pre>
+
+        <h3>keyof Constraint</h3>
+        <pre><code class="language-typescript">// K is constrained to keys of T
+function getProperty&lt;T, K extends keyof T&gt;(obj: T, key: K): T[K] {
+  return obj[key];
+}
+
+const user = { name: 'Alice', age: 30, email: 'a@b.com' };
+const name = getProperty(user, 'name');  // type: string
+const age = getProperty(user, 'age');    // type: number
+// getProperty(user, 'foo');             // ❌ 'foo' is not in keyof user
+</code></pre>
+
+        <h3>Constraint Narrows the Type Parameter</h3>
+        <div class="callout callout-warning">
+          <p><strong>Important:</strong> The constraint is a <em>minimum guarantee</em>, not the actual type. <code>T</code> retains its full type — it doesn't collapse to the constraint.</p>
+        </div>
+        <pre><code class="language-typescript">function clone&lt;T extends object&gt;(source: T): T {
+  return { ...source }; // Returns T, not just 'object'
+}
+
+const original = { x: 1, y: 2, label: 'point' };
+const copy = clone(original);
+// copy has type { x: number; y: number; label: string } — not just 'object'
+</code></pre>
+
+        <h3>Common Constraint Patterns</h3>
+        <pre><code class="language-typescript">// Constructor constraint
+type Constructor&lt;T = unknown&gt; = new (...args: any[]) =&gt; T;
+
+function createInstance&lt;T&gt;(Ctor: Constructor&lt;T&gt;): T {
+  return new Ctor();
+}
+
+// Function constraint
+type AnyFunction = (...args: any[]) =&gt; any;
+
+function memoize&lt;T extends AnyFunction&gt;(fn: T): T {
+  const cache = new Map();
+  return ((...args: any[]) =&gt; {
+    const key = JSON.stringify(args);
+    if (!cache.has(key)) cache.set(key, fn(...args));
+    return cache.get(key);
+  }) as T;
+}
+
+// Recursive constraint (self-referential)
+interface TreeNode&lt;T extends TreeNode&lt;T&gt;&gt; {
+  parent: T | null;
+  children: T[];
+}
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 4: Generic Inference -->
+    <section id="generic-inference">
+      <h2>Generic Inference</h2>
+      <details>
+        <summary>How TypeScript infers type arguments from usage</summary>
+
+        <h3>Inference Sites</h3>
+        <p>TypeScript infers generic type arguments from <em>inference sites</em> — positions where the type parameter appears in the function signature:</p>
+        <pre><code class="language-typescript">function identity&lt;T&gt;(x: T): T {
+  return x;
+}
+
+// T inferred from the argument
+const a = identity(42);        // T = number (inferred from parameter)
+const b = identity&lt;string&gt;("hi"); // T = string (explicit)
+</code></pre>
+
+        <h3>Multiple Inference Sites</h3>
+        <pre><code class="language-typescript">function merge&lt;T&gt;(a: T, b: T): T {
+  return { ...a, ...b };
+}
+
+// Both arguments are inference sites for T
+// TS uses the "best common type" algorithm
+merge({ x: 1 }, { x: 2 });           // T = { x: number }
+merge({ x: 1 }, { x: 2, y: 3 });     // ❌ Type error without widening
+
+// Fix: use separate type parameters
+function merge2&lt;T, U&gt;(a: T, b: U): T &amp; U {
+  return { ...a, ...b };
+}
+</code></pre>
+
+        <h3>Multiple Inference Candidates</h3>
+        <pre><code class="language-typescript">// When the same type parameter appears in multiple positions,
+// TS collects candidates and picks the best one
+
+function firstOrDefault&lt;T&gt;(arr: T[], defaultValue: T): T {
+  return arr.length &gt; 0 ? arr[0] : defaultValue;
+}
+
+// T has two inference candidates: number (from arr) and number (from default)
+firstOrDefault([1, 2, 3], 0);  // T = number ✅
+
+// Conflicting candidates — widened to union
+firstOrDefault([1, 2, 3], "fallback");  // ❌ string not assignable to number
+</code></pre>
+
+        <h3>Inference Priority</h3>
+        <div class="callout callout-info">
+          <p>TypeScript uses these rules for inference priority:</p>
+          <ol>
+            <li>Explicit type arguments always win</li>
+            <li>Contextual typing (callback return types) has high priority</li>
+            <li>Co-variant positions (return types) are preferred over contra-variant (parameters)</li>
+            <li>Later inference sites can refine earlier ones</li>
+          </ol>
+        </div>
+        <pre><code class="language-typescript">// Inference from callback return type (contextual typing)
+declare function createState&lt;T&gt;(init: () =&gt; T): { get(): T; set(v: T): void };
+
+// T inferred from what the callback returns
+const state = createState(() =&gt; ({ count: 0, label: 'hello' }));
+state.get().count; // number ✅
+state.set({ count: 1, label: 'world' }); // ✅
+
+// Inference flows "backwards" into the callback parameter
+declare function map&lt;T, U&gt;(arr: T[], fn: (item: T) =&gt; U): U[];
+
+const lengths = map(['hello', 'world'], (s) =&gt; s.length);
+// T = string (from array), U = number (from callback return)
+// s is inferred as string without annotation
+</code></pre>
+
+        <h3><code>NoInfer&lt;T&gt;</code> — Controlling Inference Sites (TS 5.4)</h3>
+        <p>Sometimes you want to <em>prevent</em> a position from being an inference site — forcing inference from other positions only:</p>
+        <pre><code class="language-typescript">// Problem: T inferred from BOTH params — no validation
+function createFSM&lt;S extends string&gt;(initial: S, states: S[]) {}
+createFSM("typo", ["idle", "loading", "error"]); // ✅ No error — T widens to union
+
+// Solution: NoInfer blocks inference from 'initial'
+function createFSM&lt;S extends string&gt;(initial: NoInfer&lt;S&gt;, states: S[]) {}
+createFSM("loading", ["idle", "loading", "error"]); // ✅ S inferred from states
+createFSM("typo", ["idle", "loading", "error"]);    // ❌ "typo" not in S
+
+// Another common use: default values
+function createSignal&lt;T&gt;(value: T, defaultValue: NoInfer&lt;T&gt;) {}
+createSignal(42, "oops"); // ❌ Error — T=number from first arg, string doesn't match
+</code></pre>
+        <div class="callout callout-tip">
+          <p><strong>Interview tip:</strong> <code>NoInfer&lt;T&gt;</code> is increasingly asked about in 2024 interviews. It shows you understand the inference algorithm deeply enough to <em>control</em> it, not just use it. Pair it with your knowledge of inference sites from above.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 5: Conditional Types -->
+    <section id="conditional-types">
+      <h2>Conditional Types</h2>
+      <details>
+        <summary>Type-level branching with extends</summary>
+
+        <h3>Basic Syntax</h3>
+        <pre><code class="language-typescript">// Syntax: T extends U ? TrueType : FalseType
+// "If T is assignable to U, resolve to TrueType, otherwise FalseType"
+
+type IsString&lt;T&gt; = T extends string ? true : false;
+
+type A = IsString&lt;string&gt;;   // true
+type B = IsString&lt;number&gt;;   // false
+type C = IsString&lt;"hello"&gt;;  // true (literal extends string)
+</code></pre>
+
+        <h3>Nesting Conditional Types</h3>
+        <pre><code class="language-typescript">type TypeName&lt;T&gt; =
+  T extends string ? "string" :
+  T extends number ? "number" :
+  T extends boolean ? "boolean" :
+  T extends undefined ? "undefined" :
+  T extends Function ? "function" :
+  "object";
+
+type T0 = TypeName&lt;string&gt;;      // "string"
+type T1 = TypeName&lt;() =&gt; void&gt;;  // "function"
+type T2 = TypeName&lt;string[]&gt;;    // "object"
+</code></pre>
+
+        <h3>Practical Examples</h3>
+        <pre><code class="language-typescript">// IsArray — checks if T is an array type
+type IsArray&lt;T&gt; = T extends readonly any[] ? true : false;
+
+type X = IsArray&lt;number[]&gt;;       // true
+type Y = IsArray&lt;readonly string[]&gt;; // true
+type Z = IsArray&lt;string&gt;;         // false
+
+// NonNullable implementation
+type MyNonNullable&lt;T&gt; = T extends null | undefined ? never : T;
+
+type Safe = MyNonNullable&lt;string | null | undefined&gt;; // string
+
+// Flatten one level
+type Flatten&lt;T&gt; = T extends Array&lt;infer U&gt; ? U : T;
+
+type Flat = Flatten&lt;number[]&gt;;   // number
+type NoOp = Flatten&lt;string&gt;;     // string
+</code></pre>
+
+        <h3>Relationship to Ternary Operator</h3>
+        <pre class="diagram">
+  RUNTIME                          TYPE-LEVEL
+  ───────                          ──────────
+  condition ? a : b                T extends U ? X : Y
+
+  if (x instanceof Array)         T extends Array&lt;any&gt;
+    return x[0]                     ? T[number]
+  else                              : T
+    return x
+
+  Evaluated at runtime             Evaluated at compile time
+  Produces values                  Produces types
+  Can have side effects            Pure (no side effects)
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 6: Distributive Conditional Types -->
+    <section id="distributive-conditionals">
+      <h2>Distributive Conditional Types</h2>
+      <details>
+        <summary>When and how conditional types distribute over unions</summary>
+
+        <h3>When Distribution Happens</h3>
+        <p>A conditional type <strong>distributes</strong> over a union when the checked type is a <em>naked type parameter</em> (not wrapped in anything):</p>
+        <pre><code class="language-typescript">type ToArray&lt;T&gt; = T extends any ? T[] : never;
+
+// T is "naked" — distribution happens
+type Result = ToArray&lt;string | number&gt;;
+// Distributes: ToArray&lt;string&gt; | ToArray&lt;number&gt;
+// = string[] | number[]
+// NOT (string | number)[]
+</code></pre>
+
+        <h3>How Distribution Works Step-by-Step</h3>
+        <pre class="diagram">
+  Input: ToArray&lt;string | number&gt;
+
+  Step 1: Distribute over union members
+    → ToArray&lt;string&gt; | ToArray&lt;number&gt;
+
+  Step 2: Evaluate each member
+    → (string extends any ? string[] : never)
+    | (number extends any ? number[] : never)
+
+  Step 3: Resolve
+    → string[] | number[]
+        </pre>
+
+        <h3>Preventing Distribution</h3>
+        <pre><code class="language-typescript">// Wrap in tuple to prevent distribution
+type ToArrayNonDist&lt;T&gt; = [T] extends [any] ? T[] : never;
+
+type Result2 = ToArrayNonDist&lt;string | number&gt;;
+// = (string | number)[]  — no distribution!
+
+// Why? [string | number] is NOT a naked type parameter
+// It's a tuple containing the union
+</code></pre>
+
+        <h3>Exclude &amp; Extract Implementation</h3>
+        <pre><code class="language-typescript">// Exclude: remove members from a union
+type MyExclude&lt;T, U&gt; = T extends U ? never : T;
+
+type E1 = MyExclude&lt;'a' | 'b' | 'c', 'a'&gt;;
+// Distributes:
+//   'a' extends 'a' ? never : 'a'  → never
+// | 'b' extends 'a' ? never : 'b'  → 'b'
+// | 'c' extends 'a' ? never : 'c'  → 'c'
+// = 'b' | 'c'
+
+// Extract: keep only members assignable to U
+type MyExtract&lt;T, U&gt; = T extends U ? T : never;
+
+type E2 = MyExtract&lt;string | number | boolean, string | boolean&gt;;
+// = string | boolean
+</code></pre>
+
+        <h3>Practical Examples</h3>
+        <pre><code class="language-typescript">// Filter object keys by value type
+type KeysOfType&lt;T, V&gt; = {
+  [K in keyof T]: T[K] extends V ? K : never;
+}[keyof T];
+
+interface User {
+  id: number;
+  name: string;
+  email: string;
+  age: number;
+  isAdmin: boolean;
+}
+
+type StringKeys = KeysOfType&lt;User, string&gt;; // "name" | "email"
+type NumberKeys = KeysOfType&lt;User, number&gt;; // "id" | "age"
+
+// Discriminated union filtering
+type SuccessEvents = Extract&lt;
+  | { type: 'success'; data: unknown }
+  | { type: 'error'; message: string }
+  | { type: 'loading' },
+  { type: 'success' }
+&gt;;
+// = { type: 'success'; data: unknown }
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 7: The infer Keyword -->
+    <section id="infer-keyword">
+      <h2>The infer Keyword</h2>
+      <details>
+        <summary>Pattern matching and type extraction</summary>
+
+        <h3>Pattern Matching in Types</h3>
+        <p>The <code>infer</code> keyword declares a type variable within a conditional type's <code>extends</code> clause. It "captures" whatever type occupies that position:</p>
+        <pre><code class="language-typescript">// infer R captures the return type
+type MyReturnType&lt;T&gt; = T extends (...args: any[]) =&gt; infer R ? R : never;
+
+type A = MyReturnType&lt;() =&gt; string&gt;;           // string
+type B = MyReturnType&lt;(x: number) =&gt; boolean&gt;; // boolean
+type C = MyReturnType&lt;string&gt;;                  // never (not a function)
+</code></pre>
+
+        <h3>Extracting Parameters</h3>
+        <pre><code class="language-typescript">// Capture all parameters as a tuple
+type MyParameters&lt;T&gt; = T extends (...args: infer P) =&gt; any ? P : never;
+
+type Params = MyParameters&lt;(a: string, b: number) =&gt; void&gt;;
+// [a: string, b: number]
+
+// First parameter only
+type FirstParam&lt;T&gt; = T extends (first: infer F, ...rest: any[]) =&gt; any
+  ? F
+  : never;
+
+type First = FirstParam&lt;(x: string, y: number) =&gt; void&gt;; // string
+</code></pre>
+
+        <h3>Extracting Promise Inner Type</h3>
+        <pre><code class="language-typescript">// Unwrap one level
+type Awaited1&lt;T&gt; = T extends Promise&lt;infer U&gt; ? U : T;
+
+type R1 = Awaited1&lt;Promise&lt;string&gt;&gt;;          // string
+type R2 = Awaited1&lt;Promise&lt;Promise&lt;number&gt;&gt;&gt;; // Promise&lt;number&gt; (one level)
+
+// Recursively unwrap (like built-in Awaited)
+type DeepAwaited&lt;T&gt; = T extends Promise&lt;infer U&gt; ? DeepAwaited&lt;U&gt; : T;
+
+type R3 = DeepAwaited&lt;Promise&lt;Promise&lt;Promise&lt;string&gt;&gt;&gt;&gt;; // string
+</code></pre>
+
+        <h3>Extracting Array Element Type</h3>
+        <pre><code class="language-typescript">type ElementType&lt;T&gt; = T extends readonly (infer E)[] ? E : T;
+
+type El1 = ElementType&lt;string[]&gt;;          // string
+type El2 = ElementType&lt;readonly number[]&gt;; // number
+type El3 = ElementType&lt;[string, number]&gt;;  // string | number (tuple → union)
+type El4 = ElementType&lt;boolean&gt;;           // boolean (not an array)
+</code></pre>
+
+        <h3>Multiple infer Positions</h3>
+        <pre><code class="language-typescript">// Extract key and value types from a Map
+type MapTypes&lt;T&gt; = T extends Map&lt;infer K, infer V&gt;
+  ? { key: K; value: V }
+  : never;
+
+type M = MapTypes&lt;Map&lt;string, number&gt;&gt;; // { key: string; value: number }
+
+// Extract head and tail of a tuple
+type Head&lt;T extends any[]&gt; = T extends [infer H, ...any[]] ? H : never;
+type Tail&lt;T extends any[]&gt; = T extends [any, ...infer R] ? R : never;
+
+type H = Head&lt;[1, 2, 3]&gt;; // 1
+type T = Tail&lt;[1, 2, 3]&gt;; // [2, 3]
+</code></pre>
+
+        <h3>infer in Template Literal Types</h3>
+        <pre><code class="language-typescript">// Parse dot-separated paths
+type Split&lt;S extends string, D extends string&gt; =
+  S extends `${infer Head}${D}${infer Tail}`
+    ? [Head, ...Split&lt;Tail, D&gt;]
+    : [S];
+
+type Parts = Split&lt;'user.profile.name', '.'&gt;; // ['user', 'profile', 'name']
+
+// Extract route params
+type ExtractParams&lt;T extends string&gt; =
+  T extends `${string}:${infer Param}/${infer Rest}`
+    ? { [K in Param | keyof ExtractParams&lt;Rest&gt;]: string }
+    : T extends `${string}:${infer Param}`
+      ? { [K in Param]: string }
+      : {};
+
+type RouteParams = ExtractParams&lt;'/users/:id/posts/:postId'&gt;;
+// { id: string; postId: string }
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 8: Recursive Conditional Types -->
+    <section id="recursive-types">
+      <h2>Recursive Conditional Types</h2>
+      <details>
+        <summary>Deep type operations and recursive patterns</summary>
+
+        <h3>Deep Type Operations</h3>
+        <pre><code class="language-typescript">// DeepPartial — make all properties optional recursively
+type DeepPartial&lt;T&gt; = T extends object
+  ? { [K in keyof T]?: DeepPartial&lt;T[K]&gt; }
+  : T;
+
+interface Config {
+  server: {
+    host: string;
+    port: number;
+    ssl: {
+      enabled: boolean;
+      cert: string;
+    };
+  };
+  database: {
+    url: string;
+    pool: { min: number; max: number };
+  };
+}
+
+// All nested properties become optional
+type PartialConfig = DeepPartial&lt;Config&gt;;
+const patch: PartialConfig = {
+  server: { ssl: { enabled: true } }  // ✅ No need for host, port, cert
+};
+</code></pre>
+
+        <h3>Recursive Type Limits</h3>
+        <div class="callout callout-warning">
+          <p><strong>Warning:</strong> TypeScript has a recursion depth limit (~50 levels pre-4.5, ~1000 with tail-call optimization). Exceeding it causes "Type instantiation is excessively deep and possibly infinite" errors.</p>
+        </div>
+        <pre><code class="language-typescript">// This will hit the recursion limit with large inputs
+type TupleOfSize&lt;
+  N extends number,
+  Acc extends any[] = []
+&gt; = Acc['length'] extends N
+  ? Acc
+  : TupleOfSize&lt;N, [...Acc, unknown]&gt;;
+
+type T5 = TupleOfSize&lt;5&gt;;    // [unknown, unknown, unknown, unknown, unknown]
+// type T1000 = TupleOfSize&lt;1000&gt;; // ❌ Might hit limit depending on TS version
+</code></pre>
+
+        <h3>Tail-Call Optimization (TS 4.5+)</h3>
+        <p>TypeScript 4.5 introduced tail-call elimination for recursive conditional types. The recursion must be in "tail position" — the result of the recursive call is returned directly:</p>
+        <pre><code class="language-typescript">// ✅ Tail-recursive — the recursive call IS the result
+type ReverseStr&lt;
+  S extends string,
+  Acc extends string = ''
+&gt; = S extends `${infer First}${infer Rest}`
+  ? ReverseStr&lt;Rest, `${First}${Acc}`&gt;  // tail position
+  : Acc;
+
+type Rev = ReverseStr&lt;'hello'&gt;; // 'olleh'
+
+// ❌ NOT tail-recursive — wraps the recursive result
+type BadReverse&lt;S extends string&gt; =
+  S extends `${infer First}${infer Rest}`
+    ? `${BadReverse&lt;Rest&gt;}${First}`  // NOT tail position (wraps result)
+    : '';
+</code></pre>
+
+        <h3>Practical Recursive Types</h3>
+        <pre><code class="language-typescript">// Paths — get all dot-notation paths of an object
+type Paths&lt;T, Prefix extends string = ''&gt; = T extends object
+  ? {
+      [K in keyof T &amp; string]: K extends string
+        ? Prefix extends ''
+          ? K | Paths&lt;T[K], K&gt;
+          : `${Prefix}.${K}` | Paths&lt;T[K], `${Prefix}.${K}`&gt;
+        : never;
+    }[keyof T &amp; string]
+  : never;
+
+type ConfigPaths = Paths&lt;Config&gt;;
+// "server" | "server.host" | "server.port" | "server.ssl" | ...
+
+// DeepFlatten — flatten nested arrays to any depth
+type DeepFlatten&lt;T&gt; = T extends readonly (infer U)[]
+  ? DeepFlatten&lt;U&gt;
+  : T;
+
+type Flat = DeepFlatten&lt;number[][][]&gt;; // number
+
+// JSON-compatible types (recursive definition)
+type JSONValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JSONValue[]
+  | { [key: string]: JSONValue };
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 9: Type-Level Programming -->
+    <section id="type-level-programming">
+      <h2>Type-Level Programming</h2>
+      <details>
+        <summary>TypeScript's type system as a programming language</summary>
+
+        <h3>Types as a Programming Language</h3>
+        <div class="callout callout-info">
+          <p>TypeScript's type system is Turing-complete. You can perform loops (recursion), branching (conditional types), data structures (tuples, mapped types), and even arithmetic (via tuple length). But just because you <em>can</em> doesn't mean you <em>should</em>.</p>
+        </div>
+        <pre class="diagram">
+  TYPE-LEVEL PROGRAMMING PRIMITIVES
+  ──────────────────────────────────
+  Variables       → Type parameters (T, U, K)
+  Functions       → Generic types: type F&lt;T&gt; = ...
+  If/else         → Conditional types: T extends U ? X : Y
+  Pattern match   → infer keyword
+  Loop            → Recursive conditional types
+  Data structures → Tuples ([A, B, C]), mapped types
+  Arithmetic      → Tuple length manipulation
+  String ops      → Template literal types
+        </pre>
+
+        <h3>Type-Level Arithmetic (Tuple Manipulation)</h3>
+        <pre><code class="language-typescript">// Addition via tuple concatenation (reuses TupleOfSize from above)
+type Add&lt;A extends number, B extends number&gt; =
+  [...TupleOfSize&lt;A&gt;, ...TupleOfSize&lt;B&gt;]['length'] extends infer R
+    ? R extends number ? R : never
+    : never;
+
+type Sum = Add&lt;3, 4&gt;;  // 7
+
+// Subtraction via tuple difference
+type Subtract&lt;A extends number, B extends number&gt; =
+  TupleOfSize&lt;A&gt; extends [...TupleOfSize&lt;B&gt;, ...infer Rest]
+    ? Rest['length']
+    : never;
+
+type Diff = Subtract&lt;10, 3&gt;; // 7
+
+// Comparison
+type IsGreater&lt;A extends number, B extends number&gt; =
+  TupleOfSize&lt;A&gt; extends [...TupleOfSize&lt;B&gt;, ...infer Rest]
+    ? Rest extends []
+      ? false
+      : true
+    : false;
+
+type GT = IsGreater&lt;5, 3&gt;;  // true
+type EQ = IsGreater&lt;3, 3&gt;;  // false
+</code></pre>
+
+        <h3>Type-Level String Parsing</h3>
+        <pre><code class="language-typescript">// Parse a simple CSS color format
+type ParseHex&lt;S extends string&gt; =
+  S extends `#${infer R}`
+    ? R extends `${infer A}${infer B}${infer C}${infer D}${infer E}${infer F}`
+      ? { r: `${A}${B}`; g: `${C}${D}`; b: `${E}${F}` }
+      : never
+    : never;
+
+type Color = ParseHex&lt;'#ff8800'&gt;;
+// { r: 'ff'; g: '88'; b: '00' }
+
+// Parse query string
+type ParseQS&lt;S extends string&gt; =
+  S extends `${infer Key}=${infer Value}&amp;${infer Rest}`
+    ? { [K in Key]: Value } &amp; ParseQS&lt;Rest&gt;
+    : S extends `${infer Key}=${infer Value}`
+      ? { [K in Key]: Value }
+      : {};
+
+type Query = ParseQS&lt;'name=alice&amp;age=30&amp;city=nyc'&gt;;
+// { name: 'alice' } &amp; { age: '30' } &amp; { city: 'nyc' }
+</code></pre>
+
+        <h3>Limitations and When to Stop</h3>
+        <div class="callout callout-warning">
+          <p><strong>Judgment call for seniors:</strong> Complex type-level programming has real costs. Know when to stop.</p>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Use Type-Level Programming When</th>
+              <th>Avoid When</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Library/framework API design</td>
+              <td>Application-level code</td>
+            </tr>
+            <tr>
+              <td>Types prevent runtime errors</td>
+              <td>Types only provide convenience</td>
+            </tr>
+            <tr>
+              <td>Team understands the patterns</td>
+              <td>Team can't maintain the types</td>
+            </tr>
+            <tr>
+              <td>Errors are caught at compile time</td>
+              <td>Error messages are unreadable</td>
+            </tr>
+            <tr>
+              <td>Compilation stays fast</td>
+              <td>IDE becomes slow</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 10: Building Complex Utility Types -->
+    <section id="utility-types">
+      <h2>Building Complex Utility Types</h2>
+      <details>
+        <summary>Advanced utility type implementations</summary>
+
+        <h3>DeepPartial&lt;T&gt;</h3>
+        <pre><code class="language-typescript">type DeepPartial&lt;T&gt; = T extends Function
+  ? T  // Don't recurse into functions
+  : T extends object
+    ? { [K in keyof T]?: DeepPartial&lt;T[K]&gt; }
+    : T;
+
+// Handles edge cases: arrays, Maps, Sets
+type DeepPartialAdvanced&lt;T&gt; =
+  T extends Function ? T :
+  T extends Map&lt;infer K, infer V&gt; ? Map&lt;K, DeepPartialAdvanced&lt;V&gt;&gt; :
+  T extends Set&lt;infer U&gt; ? Set&lt;DeepPartialAdvanced&lt;U&gt;&gt; :
+  T extends Array&lt;infer U&gt; ? Array&lt;DeepPartialAdvanced&lt;U&gt;&gt; :
+  T extends object ? { [K in keyof T]?: DeepPartialAdvanced&lt;T[K]&gt; } :
+  T;
+</code></pre>
+
+        <h3>DeepReadonly&lt;T&gt;</h3>
+        <pre><code class="language-typescript">type DeepReadonly&lt;T&gt; =
+  T extends Function ? T :
+  T extends Map&lt;infer K, infer V&gt; ? ReadonlyMap&lt;K, DeepReadonly&lt;V&gt;&gt; :
+  T extends Set&lt;infer U&gt; ? ReadonlySet&lt;DeepReadonly&lt;U&gt;&gt; :
+  T extends Array&lt;infer U&gt; ? readonly DeepReadonly&lt;U&gt;[] :
+  T extends object ? { readonly [K in keyof T]: DeepReadonly&lt;T[K]&gt; } :
+  T;
+
+// Usage
+type FrozenConfig = DeepReadonly&lt;Config&gt;;
+// All nested properties are readonly — any mutation is a compile error
+</code></pre>
+
+        <h3>PathType (Dot-Notation Access Typing)</h3>
+        <pre><code class="language-typescript">// Get the type at a dot-separated path
+type PathType&lt;T, P extends string&gt; =
+  P extends `${infer Key}.${infer Rest}`
+    ? Key extends keyof T
+      ? PathType&lt;T[Key], Rest&gt;
+      : never
+    : P extends keyof T
+      ? T[P]
+      : never;
+
+interface AppState {
+  user: {
+    profile: { name: string; avatar: string };
+    settings: { theme: 'dark' | 'light'; lang: string };
+  };
+  posts: Array&lt;{ id: number; title: string }&gt;;
+}
+
+type Theme = PathType&lt;AppState, 'user.settings.theme'&gt;; // 'dark' | 'light'
+type Name = PathType&lt;AppState, 'user.profile.name'&gt;;    // string
+
+// Type-safe getter function
+function get&lt;T, P extends Paths&lt;T&gt;&gt;(obj: T, path: P): PathType&lt;T, P&gt; {
+  return path.split('.').reduce((o: any, k) =&gt; o?.[k], obj);
+}
+</code></pre>
+
+        <h3>Type-Safe Event Emitter (Full Implementation)</h3>
+        <pre><code class="language-typescript">// Define event map interface
+interface AppEvents {
+  'user:login': { userId: string; timestamp: number };
+  'user:logout': { reason: 'manual' | 'timeout' | 'error' };
+  'data:loaded': { items: unknown[]; total: number };
+  'error': { code: number; message: string };
+}
+
+// Type-safe emitter class
+class TypedEventEmitter&lt;Events extends Record&lt;string, unknown&gt;&gt; {
+  private listeners = new Map&lt;string, Set&lt;Function&gt;&gt;();
+
+  on&lt;K extends keyof Events &amp; string&gt;(
+    event: K,
+    handler: (payload: Events[K]) =&gt; void
+  ): () =&gt; void {
+    if (!this.listeners.has(event)) {
+      this.listeners.set(event, new Set());
+    }
+    this.listeners.get(event)!.add(handler);
+
+    // Return unsubscribe function
+    return () =&gt; {
+      this.listeners.get(event)?.delete(handler);
+    };
+  }
+
+  once&lt;K extends keyof Events &amp; string&gt;(
+    event: K,
+    handler: (payload: Events[K]) =&gt; void
+  ): () =&gt; void {
+    const wrapper = (payload: Events[K]) =&gt; {
+      unsub();
+      handler(payload);
+    };
+    const unsub = this.on(event, wrapper);
+    return unsub;
+  }
+
+  emit&lt;K extends keyof Events &amp; string&gt;(
+    event: K,
+    payload: Events[K]
+  ): void {
+    this.listeners.get(event)?.forEach(handler =&gt; handler(payload));
+  }
+
+  removeAllListeners&lt;K extends keyof Events &amp; string&gt;(event?: K): void {
+    if (event) {
+      this.listeners.delete(event);
+    } else {
+      this.listeners.clear();
+    }
+  }
+}
+
+// Usage — fully type-safe
+const bus = new TypedEventEmitter&lt;AppEvents&gt;();
+
+bus.on('user:login', (payload) =&gt; {
+  console.log(payload.userId);      // ✅ string
+  console.log(payload.timestamp);   // ✅ number
+  // console.log(payload.foo);       // ❌ Property 'foo' does not exist
+});
+
+bus.emit('user:logout', { reason: 'manual' });  // ✅
+// bus.emit('user:logout', { reason: 'invalid' }); // ❌ Type error
+// bus.emit('unknown', {});                        // ❌ Type error
+</code></pre>
+
+        <h3>Strict Omit (Errors on Invalid Keys)</h3>
+        <pre><code class="language-typescript">// Built-in Omit allows any string — no error for typos
+type UnsafeResult = Omit&lt;User, 'naem'&gt;; // No error! 'naem' is just ignored
+
+// Strict version that requires valid keys
+type StrictOmit&lt;T, K extends keyof T&gt; = Omit&lt;T, K&gt;;
+
+// type Bad = StrictOmit&lt;User, 'naem'&gt;; // ❌ Type error!
+type Good = StrictOmit&lt;User, 'name'&gt;;   // ✅ { id; email; age; isAdmin }
+
+// Even stricter — also preserves exact types
+type ExactOmit&lt;T, K extends keyof T&gt; = {
+  [P in Exclude&lt;keyof T, K&gt;]: T[P];
+};
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 11: Generic Function Overloads -->
+    <section id="generic-overloads">
+      <h2>Generic Function Overloads</h2>
+      <details>
+        <summary>When generics aren't enough and overloads are needed</summary>
+
+        <h3>When Generics Aren't Enough</h3>
+        <p>Generics express "same type flows through." Overloads express "different input shapes produce different output shapes" when the relationship isn't expressible with conditional types:</p>
+        <pre><code class="language-typescript">// Problem: return type depends on input in complex ways
+// Generic approach — loses precision
+function parseGeneric&lt;T&gt;(input: string, format: T): unknown {
+  // Can't express: format='json' → object, format='number' → number
+  return undefined;
+}
+
+// Overload approach — precise per case
+function parse(input: string, format: 'json'): object;
+function parse(input: string, format: 'number'): number;
+function parse(input: string, format: 'boolean'): boolean;
+function parse(input: string, format: string): unknown;
+function parse(input: string, format: string): unknown {
+  switch (format) {
+    case 'json': return JSON.parse(input);
+    case 'number': return Number(input);
+    case 'boolean': return input === 'true';
+    default: return input;
+  }
+}
+
+const obj = parse('{"a":1}', 'json');    // object
+const num = parse('42', 'number');        // number
+</code></pre>
+
+        <h3>Overload Resolution Order</h3>
+        <div class="callout callout-info">
+          <p>TypeScript tries overloads <strong>top-to-bottom</strong> and uses the first match. Put the most specific overloads first.</p>
+          <p><strong>Note:</strong> This "top-to-bottom" rule applies to <em>call resolution</em>. In <em>declaration merging</em> (<a href="ch13-declaration-merging-module-augmentation.html">Ch13</a>), later declarations get higher priority — the opposite direction. Don't confuse these two contexts.</p>
+        </div>
+        <pre><code class="language-typescript">// ❌ Wrong order — generic overload catches everything
+function bad(x: any): any;
+function bad(x: string): string;  // Never reached!
+function bad(x: any) { return x; }
+
+// ✅ Correct order — specific first
+function good(x: string): string;
+function good(x: number): number;
+function good(x: any): any;
+function good(x: any) { return x; }
+</code></pre>
+
+        <h3>Conditional Return Types vs Overloads</h3>
+        <pre><code class="language-typescript">// Conditional return type — single signature, type-level logic
+function createElement&lt;T extends string&gt;(
+  tag: T
+): T extends 'input' ? HTMLInputElement
+  : T extends 'div' ? HTMLDivElement
+  : T extends 'span' ? HTMLSpanElement
+  : HTMLElement {
+  return document.createElement(tag) as any;
+}
+
+// vs. Overloads — multiple signatures
+function createElement2(tag: 'input'): HTMLInputElement;
+function createElement2(tag: 'div'): HTMLDivElement;
+function createElement2(tag: 'span'): HTMLSpanElement;
+function createElement2(tag: string): HTMLElement;
+function createElement2(tag: string): HTMLElement {
+  return document.createElement(tag);
+}
+</code></pre>
+
+        <h3>Practical Comparison</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>Generics + Conditionals</th>
+              <th>Overloads</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Extensibility</td>
+              <td>New cases need type update</td>
+              <td>Add new overload signature</td>
+            </tr>
+            <tr>
+              <td>Implementation</td>
+              <td>Single function body</td>
+              <td>Single body + multiple sigs</td>
+            </tr>
+            <tr>
+              <td>Error messages</td>
+              <td>Can be cryptic</td>
+              <td>Clear "no matching overload"</td>
+            </tr>
+            <tr>
+              <td>Composability</td>
+              <td>Works with other generics</td>
+              <td>Hard to compose/wrap</td>
+            </tr>
+            <tr>
+              <td>Dynamic inputs</td>
+              <td>Resolves at type level</td>
+              <td>Picks broadest match</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 12: Higher-Kinded Types (Workarounds) -->
+    <section id="higher-kinded-types">
+      <h2>Higher-Kinded Types (Workarounds)</h2>
+      <div class="callout callout-warning">
+        <p><strong>Advanced / Library Authors Only:</strong> HKTs are rarely asked in FAANG interviews and the TypeScript encoding is convoluted. This section is primarily relevant for library authors (fp-ts, Effect) or if an interviewer specifically mentions category theory/functor abstractions. Presenting this unprompted in an interview can backfire — focus on practical generics and conditional types instead.</p>
+      </div>
+      <details>
+        <summary>Abstracting over type constructors in TypeScript</summary>
+
+        <h3>What Are Higher-Kinded Types?</h3>
+        <p>A higher-kinded type (HKT) is a type that takes another type constructor as a parameter — a "type of types." Think of it as a generic that accepts not just <code>string</code> or <code>number</code>, but <code>Array</code> or <code>Promise</code> themselves (the container, not the contained):</p>
+        <pre class="diagram">
+  Regular Generic:    Array&lt;string&gt;    — Array is applied to string
+  Higher-Kinded:      Functor&lt;Array&gt;   — Functor is applied to Array itself
+
+  Kind system:
+    string         : *           (a concrete type)
+    Array&lt;string&gt;  : *           (a concrete type)
+    Array          : * → *       (takes one type, produces a type)
+    Map            : * → * → *   (takes two types)
+    Functor        : (* → *) → * (takes a type constructor!)
+        </pre>
+
+        <h3>Why TypeScript Doesn't Support HKTs Natively</h3>
+        <p>TypeScript's type parameter system only supports <code>*</code> (concrete types). You can't write <code>type Functor&lt;F&lt;_&gt;&gt;</code>. The generic parameter <code>F</code> can only be a concrete type, not a type constructor.</p>
+
+        <h3>Workaround: Interface Extension Pattern</h3>
+        <pre><code class="language-typescript">// Step 1: Define a "type class" registry
+interface TypeRegistry&lt;A = unknown&gt; {
+  Array: Array&lt;A&gt;;
+  Promise: Promise&lt;A&gt;;
+  Set: Set&lt;A&gt;;
+}
+
+// Step 2: Use string keys to reference type constructors
+type Apply&lt;F extends keyof TypeRegistry, A&gt; = TypeRegistry&lt;A&gt;[F];
+
+// Step 3: Write generic code over type constructors
+type MapOver&lt;F extends keyof TypeRegistry, Items extends any[]&gt; = {
+  [K in keyof Items]: Apply&lt;F, Items[K]&gt;;
+};
+
+type Wrapped = MapOver&lt;'Promise', [string, number, boolean]&gt;;
+// [Promise&lt;string&gt;, Promise&lt;number&gt;, Promise&lt;boolean&gt;]
+
+type InSets = MapOver&lt;'Set', [string, number]&gt;;
+// [Set&lt;string&gt;, Set&lt;number&gt;]
+</code></pre>
+
+        <h3>Workaround: Generic Type Maps</h3>
+        <pre><code class="language-typescript">// Encode HKTs via a "URI" pattern (inspired by fp-ts)
+const URI = Symbol('URI');
+
+interface HKT&lt;URI, A&gt; {
+  readonly _URI: URI;
+  readonly _A: A;
+}
+
+// Each type constructor declares its URI
+interface ArrayHKT extends HKT&lt;'Array', unknown&gt; {
+  readonly type: Array&lt;this['_A']&gt;;
+}
+
+interface PromiseHKT extends HKT&lt;'Promise', unknown&gt; {
+  readonly type: Promise&lt;this['_A']&gt;;
+}
+
+// "Kind" type applies a type constructor to an argument
+type Kind&lt;F extends { type: unknown; _A: unknown }, A&gt; =
+  (F &amp; { _A: A })['type'];
+
+type Result1 = Kind&lt;ArrayHKT, string&gt;;   // string[]
+type Result2 = Kind&lt;PromiseHKT, number&gt;; // Promise&lt;number&gt;
+</code></pre>
+
+        <h3>Comparison with fp-ts Approach</h3>
+        <pre><code class="language-typescript">// fp-ts uses a similar pattern with URIs and module augmentation
+// Simplified version of how fp-ts defines Functor:
+
+interface URI2HKT&lt;A&gt; {} // Augmented by each module
+
+type URIS = keyof URI2HKT&lt;unknown&gt;;
+type HKT2&lt;URI extends URIS, A&gt; = URI2HKT&lt;A&gt;[URI];
+
+// Functor interface
+interface Functor&lt;F extends URIS&gt; {
+  map: &lt;A, B&gt;(fa: HKT2&lt;F, A&gt;, f: (a: A) =&gt; B) =&gt; HKT2&lt;F, B&gt;;
+}
+
+// Trade-off: complex types but enables truly generic FP code
+// Most teams should prefer simpler patterns unless building an FP library
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 13: Production Patterns -->
+    <section id="production-patterns">
+      <h2>Production Patterns</h2>
+      <details>
+        <summary>Real-world generic patterns for production code</summary>
+
+        <h3>Builder Pattern with Generics</h3>
+        <pre><code class="language-typescript">// Each method returns a new type that "remembers" what's been set
+class QueryBuilder&lt;
+  Selected extends string = never,
+  Filtered extends string = never
+&gt; {
+  private query: any = {};
+
+  select&lt;K extends string&gt;(
+    ...fields: K[]
+  ): QueryBuilder&lt;Selected | K, Filtered&gt; {
+    this.query.select = fields;
+    return this as any;
+  }
+
+  where&lt;K extends string&gt;(
+    field: K,
+    value: unknown
+  ): QueryBuilder&lt;Selected, Filtered | K&gt; {
+    this.query.where = { ...this.query.where, [field]: value };
+    return this as any;
+  }
+
+  // Only available if something is selected
+  execute(this: QueryBuilder&lt;string, any&gt;): Promise&lt;Record&lt;Selected, unknown&gt;[]&gt; {
+    return Promise.resolve([]);
+  }
+}
+
+const results = new QueryBuilder()
+  .select('name', 'email')       // Selected = 'name' | 'email'
+  .where('age', { $gt: 18 })    // Filtered = 'age'
+  .execute();                     // Promise&lt;Record&lt;'name' | 'email', unknown&gt;[]&gt;
+</code></pre>
+
+        <h3>Discriminated Union Factories</h3>
+        <pre><code class="language-typescript">// Type-safe action creators (Redux-style)
+type ActionMap = {
+  INCREMENT: { amount: number };
+  DECREMENT: { amount: number };
+  SET_NAME: { name: string };
+  RESET: undefined;
+};
+
+type Action&lt;K extends keyof ActionMap = keyof ActionMap&gt; = {
+  [P in K]: ActionMap[P] extends undefined
+    ? { type: P }
+    : { type: P; payload: ActionMap[P] }
+}[K];
+
+// Factory function
+function createAction&lt;K extends keyof ActionMap&gt;(
+  type: K,
+  ...args: ActionMap[K] extends undefined ? [] : [ActionMap[K]]
+): Action&lt;K&gt; {
+  const payload = args[0];
+  return (payload ? { type, payload } : { type }) as Action&lt;K&gt;;
+}
+
+const inc = createAction('INCREMENT', { amount: 1 });
+// { type: 'INCREMENT'; payload: { amount: number } }
+
+const reset = createAction('RESET');
+// { type: 'RESET' } — no payload argument needed!
+
+// createAction('RESET', { amount: 1 }); // ❌ Type error
+</code></pre>
+
+        <h3>Generic React Components</h3>
+        <pre><code class="language-typescript">// Generic list component
+interface ListProps&lt;T&gt; {
+  items: T[];
+  renderItem: (item: T, index: number) =&gt; React.ReactNode;
+  keyExtractor: (item: T) =&gt; string | number;
+  onSelect?: (item: T) =&gt; void;
+}
+
+function List&lt;T&gt;({ items, renderItem, keyExtractor, onSelect }: ListProps&lt;T&gt;) {
+  return (
+    &lt;ul&gt;
+      {items.map((item, i) =&gt; (
+        &lt;li key={keyExtractor(item)} onClick={() =&gt; onSelect?.(item)}&gt;
+          {renderItem(item, i)}
+        &lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}
+
+// Usage — T is inferred from `items`
+&lt;List
+  items={[{ id: 1, name: 'Alice' }, { id: 2, name: 'Bob' }]}
+  keyExtractor={(user) =&gt; user.id}     // user inferred as { id; name }
+  renderItem={(user) =&gt; user.name}     // user inferred as { id; name }
+  onSelect={(user) =&gt; console.log(user.name)}
+/&gt;
+</code></pre>
+
+        <h3>Type-Safe Routing</h3>
+        <pre><code class="language-typescript">// Define routes with typed params
+type Routes = {
+  '/': {};
+  '/users': {};
+  '/users/:id': { id: string };
+  '/users/:id/posts/:postId': { id: string; postId: string };
+};
+
+type ExtractRouteParams&lt;T extends string&gt; =
+  T extends `${string}:${infer Param}/${infer Rest}`
+    ? { [K in Param | keyof ExtractRouteParams&lt;`/${Rest}`&gt;]: string }
+    : T extends `${string}:${infer Param}`
+      ? { [K in Param]: string }
+      : {};
+
+function navigate&lt;T extends keyof Routes&gt;(
+  path: T,
+  ...args: Routes[T] extends Record&lt;string, never&gt;
+    ? []
+    : [params: Routes[T]]
+): void {
+  // Implementation
+}
+
+navigate('/');                                       // ✅ No params needed
+navigate('/users/:id/posts/:postId', {
+  id: '123',
+  postId: '456'
+});                                                 // ✅
+// navigate('/users/:id', {});                       // ❌ Missing 'id'
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 14: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Complete implementations for reference</summary>
+
+        <h3>Full Event Emitter (Production-Ready)</h3>
+        <pre><code class="language-typescript">type EventHandler&lt;T = unknown&gt; = (payload: T) =&gt; void;
+type WildcardHandler&lt;Events&gt; = (
+  event: keyof Events,
+  payload: Events[keyof Events]
+) =&gt; void;
+
+class EventEmitter&lt;Events extends Record&lt;string, unknown&gt;&gt; {
+  private handlers = new Map&lt;keyof Events | '*', Set&lt;Function&gt;&gt;();
+
+  on&lt;K extends keyof Events&gt;(event: K, handler: EventHandler&lt;Events[K]&gt;): this;
+  on(event: '*', handler: WildcardHandler&lt;Events&gt;): this;
+  on(event: string, handler: Function): this {
+    if (!this.handlers.has(event)) {
+      this.handlers.set(event, new Set());
+    }
+    this.handlers.get(event)!.add(handler);
+    return this;
+  }
+
+  off&lt;K extends keyof Events&gt;(event: K, handler: EventHandler&lt;Events[K]&gt;): this;
+  off(event: '*', handler: WildcardHandler&lt;Events&gt;): this;
+  off(event: string, handler: Function): this {
+    this.handlers.get(event)?.delete(handler);
+    return this;
+  }
+
+  emit&lt;K extends keyof Events&gt;(event: K, payload: Events[K]): this {
+    // Notify specific handlers
+    this.handlers.get(event)?.forEach((h) =&gt; h(payload));
+    // Notify wildcard handlers
+    this.handlers.get('*')?.forEach((h) =&gt; h(event, payload));
+    return this;
+  }
+
+  once&lt;K extends keyof Events&gt;(event: K, handler: EventHandler&lt;Events[K]&gt;): this {
+    const wrapper: EventHandler&lt;Events[K]&gt; = (payload) =&gt; {
+      this.off(event, wrapper);
+      handler(payload);
+    };
+    return this.on(event, wrapper);
+  }
+
+  listenerCount(event: keyof Events): number {
+    return this.handlers.get(event)?.size ?? 0;
+  }
+
+  removeAllListeners(event?: keyof Events): this {
+    if (event) {
+      this.handlers.delete(event);
+    } else {
+      this.handlers.clear();
+    }
+    return this;
+  }
+}
+
+// Usage
+interface ChatEvents {
+  'message': { from: string; text: string; timestamp: number };
+  'typing': { userId: string; isTyping: boolean };
+  'presence': { userId: string; status: 'online' | 'offline' };
+}
+
+const chat = new EventEmitter&lt;ChatEvents&gt;();
+
+chat.on('message', ({ from, text }) =&gt; {
+  console.log(`${from}: ${text}`);
+});
+
+chat.on('*', (event, payload) =&gt; {
+  console.log(`[${String(event)}]`, payload);
+});
+
+chat.emit('message', {
+  from: 'alice',
+  text: 'Hello!',
+  timestamp: Date.now()
+});
+</code></pre>
+
+        <h3>Type-Safe Builder</h3>
+        <pre><code class="language-typescript">// Ensures required fields are set before build()
+type RequiredKeys = 'host' | 'port';
+type OptionalKeys = 'timeout' | 'retries' | 'ssl';
+
+interface ServerConfig {
+  host: string;
+  port: number;
+  timeout: number;
+  retries: number;
+  ssl: boolean;
+}
+
+class ServerConfigBuilder&lt;Set extends string = never&gt; {
+  private config: Partial&lt;ServerConfig&gt; = {};
+
+  host(value: string): ServerConfigBuilder&lt;Set | 'host'&gt; {
+    this.config.host = value;
+    return this as any;
+  }
+
+  port(value: number): ServerConfigBuilder&lt;Set | 'port'&gt; {
+    this.config.port = value;
+    return this as any;
+  }
+
+  timeout(value: number): ServerConfigBuilder&lt;Set | 'timeout'&gt; {
+    this.config.timeout = value;
+    return this as any;
+  }
+
+  retries(value: number): ServerConfigBuilder&lt;Set | 'retries'&gt; {
+    this.config.retries = value;
+    return this as any;
+  }
+
+  ssl(value: boolean): ServerConfigBuilder&lt;Set | 'ssl'&gt; {
+    this.config.ssl = value;
+    return this as any;
+  }
+
+  // build() only available when all required keys are set
+  build(this: ServerConfigBuilder&lt;RequiredKeys&gt;): ServerConfig {
+    return {
+      timeout: 5000,
+      retries: 3,
+      ssl: false,
+      ...this.config
+    } as ServerConfig;
+  }
+}
+
+// ✅ All required fields set
+const config = new ServerConfigBuilder()
+  .host('localhost')
+  .port(3000)
+  .ssl(true)
+  .build();
+
+// ❌ Missing 'port' — build() not available
+// new ServerConfigBuilder().host('localhost').build(); // Type error!
+</code></pre>
+
+        <h3>Generic Fetch Wrapper</h3>
+        <pre><code class="language-typescript">// Type-safe API client
+interface APIEndpoints {
+  'GET /users': { response: User[]; params: { limit?: number } };
+  'GET /users/:id': { response: User; params: { id: string } };
+  'POST /users': { response: User; body: CreateUserDTO };
+  'PUT /users/:id': { response: User; params: { id: string }; body: UpdateUserDTO };
+  'DELETE /users/:id': { response: void; params: { id: string } };
+}
+
+type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
+
+type EndpointConfig&lt;K extends keyof APIEndpoints&gt; = APIEndpoints[K];
+
+async function api&lt;K extends keyof APIEndpoints&gt;(
+  endpoint: K,
+  ...args: 'body' extends keyof EndpointConfig&lt;K&gt;
+    ? [config: { params?: any; body: EndpointConfig&lt;K&gt; extends { body: infer B } ? B : never }]
+    : 'params' extends keyof EndpointConfig&lt;K&gt;
+      ? [config?: { params?: EndpointConfig&lt;K&gt; extends { params: infer P } ? P : never }]
+      : []
+): Promise&lt;EndpointConfig&lt;K&gt;['response' &amp; keyof EndpointConfig&lt;K&gt;]&gt; {
+  // Implementation
+  return undefined as any;
+}
+
+// Usage
+const users = await api('GET /users', { params: { limit: 10 } });
+// users: User[]
+
+const user = await api('GET /users/:id', { params: { id: '123' } });
+// user: User
+
+const created = await api('POST /users', { body: { name: 'Alice', email: 'a@b.com' } });
+// created: User
+</code></pre>
+
+        <h3>Recursive JSON Type</h3>
+        <pre><code class="language-typescript">// Strict JSON-compatible type
+type JSONPrimitive = string | number | boolean | null;
+type JSONArray = JSONValue[];
+type JSONObject = { [key: string]: JSONValue };
+type JSONValue = JSONPrimitive | JSONArray | JSONObject;
+
+// Convert a type to its JSON-serializable form
+type Serialized&lt;T&gt; =
+  T extends JSONPrimitive ? T :
+  T extends Date ? string :
+  T extends RegExp ? never :
+  T extends Function ? never :
+  T extends Array&lt;infer U&gt; ? Serialized&lt;U&gt;[] :
+  T extends object ? { [K in keyof T as T[K] extends Function ? never : K]: Serialized&lt;T[K]&gt; } :
+  never;
+
+interface UserWithMethods {
+  id: number;
+  name: string;
+  createdAt: Date;
+  greet(): string;
+  friends: UserWithMethods[];
+}
+
+type SerializedUser = Serialized&lt;UserWithMethods&gt;;
+// { id: number; name: string; createdAt: string; friends: Serialized&lt;UserWithMethods&gt;[] }
+// Note: greet() is removed (function), createdAt becomes string (Date)
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 15: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Five pitfalls to avoid with generics and conditional types</summary>
+
+        <h3>1. Over-Constraining Generics</h3>
+        <pre><code class="language-typescript">// ❌ Over-constrained — forces callers to match exact shape
+function bad&lt;T extends { id: number; name: string; email: string }&gt;(item: T) {
+  return item.id;
+}
+
+// ✅ Constrain only what you need
+function good&lt;T extends { id: number }&gt;(item: T) {
+  return item.id;
+}
+
+// Now ANY object with an `id` works
+good({ id: 1, name: 'Alice', extra: true }); // ✅
+</code></pre>
+
+        <h3>2. Forgetting Distribution Behavior</h3>
+        <pre><code class="language-typescript">// ❌ Unexpected distribution
+type IsNever&lt;T&gt; = T extends never ? true : false;
+type Oops = IsNever&lt;never&gt;; // never! (not true)
+// Why? `never` is an empty union — distributing over nothing yields never
+
+// ✅ Prevent distribution for never-checks
+type IsNeverFixed&lt;T&gt; = [T] extends [never] ? true : false;
+type Fixed = IsNeverFixed&lt;never&gt;; // true ✅
+
+// ❌ Forgetting that conditional distributes
+type Nullable&lt;T&gt; = T extends any ? T | null : never;
+type Bad = Nullable&lt;string | number&gt;; // string | number | null
+// Each member gets null: (string | null) | (number | null) = string | number | null
+// This happens to be the same, but for other cases distribution matters!
+</code></pre>
+
+        <h3>3. Using <code>any</code> as Default Type Parameter</h3>
+        <pre><code class="language-typescript">// ❌ any as default defeats the purpose of generics
+function fetch&lt;T = any&gt;(url: string): Promise&lt;T&gt; {
+  return window.fetch(url).then(r =&gt; r.json());
+}
+const data = fetch('/api'); // Promise&lt;any&gt; — no safety!
+
+// ✅ Use unknown and require explicit type
+function fetchTyped&lt;T = unknown&gt;(url: string): Promise&lt;T&gt; {
+  return window.fetch(url).then(r =&gt; r.json());
+}
+const safe = fetchTyped&lt;User[]&gt;('/api/users'); // Promise&lt;User[]&gt;
+
+// ✅ Even better — validate at runtime
+function fetchValidated&lt;T&gt;(url: string, schema: Schema&lt;T&gt;): Promise&lt;T&gt; {
+  return window.fetch(url)
+    .then(r =&gt; r.json())
+    .then(data =&gt; schema.parse(data));
+}
+</code></pre>
+
+        <h3>4. Too Many Type Parameters</h3>
+        <pre><code class="language-typescript">// ❌ Unreadable — too many type params
+function transform&lt;T, U, V, W, X&gt;(
+  input: T,
+  step1: (a: T) =&gt; U,
+  step2: (b: U) =&gt; V,
+  step3: (c: V) =&gt; W,
+  step4: (d: W) =&gt; X
+): X {
+  return step4(step3(step2(step1(input))));
+}
+
+// ✅ Use function composition or pipe
+function pipe&lt;A, B&gt;(a: A, ab: (a: A) =&gt; B): B;
+function pipe&lt;A, B, C&gt;(a: A, ab: (a: A) =&gt; B, bc: (b: B) =&gt; C): C;
+function pipe&lt;A, B, C, D&gt;(a: A, ab: (a: A) =&gt; B, bc: (b: B) =&gt; C, cd: (c: C) =&gt; D): D;
+function pipe(initial: unknown, ...fns: Function[]): unknown {
+  return fns.reduce((acc, fn) =&gt; fn(acc), initial);
+}
+</code></pre>
+
+        <h3>5. Not Using Inference (Manual Annotations Everywhere)</h3>
+        <pre><code class="language-typescript">// ❌ Redundant type annotations — let inference do its job
+const result: Array&lt;string&gt; = ['hello', 'world'].map&lt;string&gt;(
+  (item: string): string =&gt; item.toUpperCase()
+);
+
+// ✅ Let TypeScript infer
+const result2 = ['hello', 'world'].map(item =&gt; item.toUpperCase());
+// TypeScript infers: string[]
+
+// ❌ Specifying type parameter that could be inferred
+function identity&lt;T&gt;(x: T): T { return x; }
+const x: string = identity&lt;string&gt;('hello'); // Redundant &lt;string&gt;
+
+// ✅ Let inference flow
+const y = identity('hello'); // y: string — inferred!
+</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Rule of thumb:</strong> If you're writing the same type in both the type parameter and the argument, you're probably duplicating what inference would give you for free.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 16: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>When to use which approach</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Pros</th>
+              <th>Cons</th>
+              <th>Use When</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Complex types</strong></td>
+              <td>Maximum safety, catches bugs at compile time, great DX for consumers</td>
+              <td>Hard to maintain, slow compilation, cryptic errors for authors</td>
+              <td>Library APIs, shared infrastructure code</td>
+            </tr>
+            <tr>
+              <td><strong>Simple + assertions</strong></td>
+              <td>Easy to read, fast compilation, easy to maintain</td>
+              <td>Runtime errors possible, less IDE support, trust-based</td>
+              <td>Application code, small teams, prototypes</td>
+            </tr>
+            <tr>
+              <td><strong>Generics</strong></td>
+              <td>Type flows through, reusable, composable</td>
+              <td>Can be over-used, confusing when nested, inference sometimes fails</td>
+              <td>When the same logic applies to multiple types</td>
+            </tr>
+            <tr>
+              <td><strong>Overloads</strong></td>
+              <td>Clear per-case types, good error messages, explicit</td>
+              <td>Verbose, hard to compose, doesn't scale to many cases</td>
+              <td>Small number of distinct input/output shapes</td>
+            </tr>
+            <tr>
+              <td><strong>Conditional types</strong></td>
+              <td>Dynamic output types, works with generics, powerful</td>
+              <td>Hard to debug, distribution surprises, limits on recursion</td>
+              <td>When output type depends on input type programmatically</td>
+            </tr>
+            <tr>
+              <td><strong>Union types</strong></td>
+              <td>Simple, well-understood, narrowing support</td>
+              <td>Less precise than conditional return, no "computed" types</td>
+              <td>When all possible types are known statically</td>
+            </tr>
+            <tr>
+              <td><strong>Type safety</strong></td>
+              <td>Catches errors early, documents intent, refactor-safe</td>
+              <td>Slower compilation, steeper learning curve, boilerplate</td>
+              <td>Always in shared code; selectively in app code</td>
+            </tr>
+            <tr>
+              <td><strong>Compilation speed</strong></td>
+              <td>Fast feedback, better DX, CI/CD efficiency</td>
+              <td>May sacrifice type precision, runtime errors possible</td>
+              <td>Large codebases where tsc takes &gt;30s</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-tip">
+          <p><strong>Senior insight:</strong> The right answer is almost always "it depends on the audience." Library code serving 1000 developers justifies complex types. Application code read by 5 teammates should prefer simplicity.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 17: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>7 common follow-ups with concise answers</summary>
+
+        <h3>1. "How do you debug complex conditional types?"</h3>
+        <p>Use type aliases as "breakpoints" — assign intermediate results to named types and hover over them in the IDE. Use the <code>type _Debug = YourComplexType</code> pattern. For distribution issues, wrap in tuples to test both distributed and non-distributed forms. The VS Code "Type Challenges" extension can also help visualize.</p>
+
+        <h3>2. "What's the difference between <code>extends</code> in generics vs. conditional types?"</h3>
+        <p>In generics (<code>T extends U</code>), it's a <strong>constraint</strong> — "T must be assignable to U." In conditional types (<code>T extends U ? X : Y</code>), it's a <strong>test</strong> — "is T assignable to U?" The syntax is identical but the semantics differ: constraint restricts what you can pass, conditional branches on what was passed.</p>
+
+        <h3>3. "When would you use <code>infer</code> vs. indexed access types?"</h3>
+        <pre><code class="language-typescript">// Indexed access — when you know the structure
+type ReturnViaIndex = ((...args: any[]) =&gt; string) extends ((...args: any[]) =&gt; infer R) ? R : never;
+
+// But for known shapes, indexed access is simpler:
+type ArrayElement = string[][number]; // string
+
+// Use infer when:
+// 1. The position isn't directly indexable
+// 2. You're pattern-matching a complex structure
+// 3. You need to extract from a function signature
+</code></pre>
+
+        <h3>4. "How do variance annotations (<code>in</code>/<code>out</code>) relate to generics?"</h3>
+        <p>TypeScript 4.7 added explicit variance annotations. <code>out T</code> means T is covariant (only appears in output positions), <code>in T</code> means contravariant (input positions). They help TypeScript check structural compatibility faster and catch variance errors earlier:</p>
+        <pre><code class="language-typescript">interface Producer&lt;out T&gt; {
+  get(): T;
+  // put(value: T): void; // ❌ Error: T used in 'in' position
+}
+
+interface Consumer&lt;in T&gt; {
+  accept(value: T): void;
+  // get(): T; // ❌ Error: T used in 'out' position
+}
+</code></pre>
+
+        <h3>5. "How do you handle generic types with React's forwardRef?"</h3>
+        <pre><code class="language-typescript">// Problem: forwardRef doesn't preserve generic parameters
+// Solution: Type assertion pattern
+
+interface GenericListProps&lt;T&gt; {
+  items: T[];
+  renderItem: (item: T) =&gt; React.ReactNode;
+}
+
+// Workaround for forwardRef with generics
+function GenericListInner&lt;T&gt;(
+  props: GenericListProps&lt;T&gt; &amp; { ref?: React.Ref&lt;HTMLUListElement&gt; }
+) {
+  return &lt;ul ref={props.ref}&gt;{props.items.map(props.renderItem)}&lt;/ul&gt;;
+}
+
+// Or use the newer React.forwardRef pattern with type assertion
+const GenericList = React.forwardRef(GenericListInner) as &lt;T&gt;(
+  props: GenericListProps&lt;T&gt; &amp; { ref?: React.Ref&lt;HTMLUListElement&gt; }
+) =&gt; React.ReactElement;
+</code></pre>
+
+        <h3>6. "What are template literal types and how do they compose with conditionals?"</h3>
+        <pre><code class="language-typescript">// Template literals create new string literal types
+type EventName&lt;T extends string&gt; = `on${Capitalize&lt;T&gt;}`;
+type ChangeEvent = EventName&lt;'change'&gt;; // 'onChange'
+
+// Combined with conditionals and infer for parsing
+type ParseEvent&lt;T extends string&gt; =
+  T extends `on${infer E}`
+    ? Uncapitalize&lt;E&gt;
+    : T;
+
+type Parsed = ParseEvent&lt;'onClick'&gt;; // 'click'
+
+// Powerful composition: auto-generate event handler types
+type Handlers&lt;Events extends Record&lt;string, unknown&gt;&gt; = {
+  [K in keyof Events as `on${Capitalize&lt;string &amp; K&gt;}`]: (
+    payload: Events[K]
+  ) =&gt; void;
+};
+
+type AppHandlers = Handlers&lt;{ click: MouseEvent; scroll: Event }&gt;;
+// { onClick: (payload: MouseEvent) =&gt; void; onScroll: (payload: Event) =&gt; void }
+</code></pre>
+
+        <h3>7. "How do you test complex types?"</h3>
+        <pre><code class="language-typescript">// Type-level testing utilities
+type Expect&lt;T extends true&gt; = T;
+type Equal&lt;A, B&gt; =
+  (&lt;T&gt;() =&gt; T extends A ? 1 : 2) extends
+  (&lt;T&gt;() =&gt; T extends B ? 1 : 2)
+    ? true
+    : false;
+
+// Write type-level test cases
+type TestCases = [
+  Expect&lt;Equal&lt;MyReturnType&lt;() =&gt; string&gt;, string&gt;&gt;,
+  Expect&lt;Equal&lt;MyReturnType&lt;() =&gt; void&gt;, void&gt;&gt;,
+  Expect&lt;Equal&lt;IsNeverFixed&lt;never&gt;, true&gt;&gt;,
+  Expect&lt;Equal&lt;IsNeverFixed&lt;string&gt;, false&gt;&gt;,
+];
+
+// If any test fails, you get a compile error
+// Libraries: tsd, expect-type, @type-challenges/utils
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 18: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Mental models and what NOT to say</summary>
+
+        <h3>Mental Models</h3>
+        <pre class="diagram">
+  ┌────────────────────────────────────────────────────────────┐
+  │                 GENERICS MENTAL MODEL                       │
+  │                                                            │
+  │  Generics = "Type Variables"                               │
+  │  They flow through computations like runtime values        │
+  │                                                            │
+  │  function f&lt;T&gt;(x: T): T[]                                 │
+  │              │      │    │                                  │
+  │              │      │    └─ T appears in return             │
+  │              │      └─ T appears in param (inference site)  │
+  │              └─ T declared as type parameter                │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────┐
+  │              CONDITIONAL TYPES MENTAL MODEL                 │
+  │                                                            │
+  │  "Pattern matching at the type level"                      │
+  │                                                            │
+  │  T extends Pattern ? ExtractedResult : Fallback            │
+  │                                                            │
+  │  Distribution: union members processed one-by-one          │
+  │  infer: captures a type from a position in the pattern     │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────┐
+  │                  DECISION FRAMEWORK                         │
+  │                                                            │
+  │  "Same type flows through?"        → Generic               │
+  │  "Output depends on input shape?"  → Conditional type      │
+  │  "Need to extract from a type?"    → infer                 │
+  │  "Few distinct cases?"             → Overloads             │
+  │  "Transform all properties?"       → Mapped type           │
+  │  "Abstract over containers?"       → HKT workaround        │
+  └────────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Key Points to Hit in Your Answer</h3>
+        <ul>
+          <li>Generics preserve type information through computations</li>
+          <li>Constraints (<code>extends</code>) narrow what's acceptable while keeping the full type</li>
+          <li>Conditional types are the ternary operator at type level</li>
+          <li>Distribution happens with naked type parameters in conditionals</li>
+          <li><code>infer</code> is pattern matching — it captures types from positions</li>
+          <li>Recursive types enable deep transformations (with depth limits)</li>
+          <li>The event emitter pattern demonstrates generics + keyof + indexed access</li>
+          <li>Know when complexity is justified vs. when simpler types suffice</li>
+        </ul>
+
+        <h3>What NOT to Say</h3>
+        <div class="callout callout-warning">
+          <ul>
+            <li><strong>Don't say:</strong> "Generics are like templates in C++." — They're structurally typed and erased, not monomorphized.</li>
+            <li><strong>Don't say:</strong> "You should always use the most type-safe approach." — Over-engineering types has real costs (compilation speed, maintainability, error readability).</li>
+            <li><strong>Don't say:</strong> "I use <code>any</code> when generics get complicated." — This reveals you give up rather than finding the right abstraction level.</li>
+            <li><strong>Don't say:</strong> "Conditional types always distribute." — Only naked type parameters distribute. Show you understand the nuance.</li>
+            <li><strong>Don't say:</strong> "TypeScript's type system can do anything." — It has practical limits (recursion depth, compilation speed, error readability). Acknowledge trade-offs.</li>
+            <li><strong>Don't confuse:</strong> Constraints (<code>T extends U</code> in generics) with conditional tests (<code>T extends U ? X : Y</code>). Same keyword, different semantics.</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+</body>
+</html>

@@ -1399,6 +1399,255 @@ k6 run --vus 1000 --duration 30s inventory-load-test.js
       </details>
     </section>
 
+    <!-- Section: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+
+      <details>
+        <summary>Spring Data JPA optimistic locking with retry</summary>
+        <pre><code class="language-java">@Entity
+public class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Version
+    private Long version; // JPA manages this automatically
+
+    private String name;
+    private int stock;
+    private BigDecimal price;
+
+    public void decrementStock(int quantity) {
+        if (this.stock < quantity) {
+            throw new InsufficientStockException(this.id, this.stock, quantity);
+        }
+        this.stock -= quantity;
+    }
+}
+
+@Service
+@RequiredArgsConstructor
+public class OrderService {
+
+    private final ProductRepository productRepository;
+    private final OrderRepository orderRepository;
+
+    @Retryable(
+        retryFor = OptimisticLockingFailureException.class,
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 50, multiplier = 2, random = true)
+    )
+    @Transactional
+    public Order placeOrder(Long productId, int quantity) {
+        Product product = productRepository.findById(productId)
+            .orElseThrow(() -> new ProductNotFoundException(productId));
+
+        product.decrementStock(quantity); // Modifies entity
+
+        // On flush, JPA emits: UPDATE product SET stock=?, version=version+1
+        //                       WHERE id=? AND version=?
+        // If version doesn't match → OptimisticLockingFailureException → retry
+
+        Order order = Order.create(product, quantity);
+        return orderRepository.save(order);
+    }
+
+    @Recover
+    public Order handleRetryExhausted(OptimisticLockingFailureException ex,
+                                       Long productId, int quantity) {
+        log.error("Failed to place order after 3 retries: product={}, qty={}",
+                  productId, quantity);
+        throw new OrderFailedException("High contention — please try again", ex);
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Raw SQL optimistic locking with CAS pattern</summary>
+        <pre><code class="language-sql">-- Compare-And-Swap pattern without ORM
+-- Step 1: Read current state
+SELECT id, stock, version FROM products WHERE id = 42;
+-- Returns: id=42, stock=100, version=7
+
+-- Step 2: Conditional update (atomic CAS)
+UPDATE products
+SET stock = stock - 1,
+    version = version + 1
+WHERE id = 42
+  AND version = 7;  -- Only succeeds if no one else modified it
+
+-- Check affected rows:
+-- 1 row affected → success
+-- 0 rows affected → conflict (someone else updated version)
+--                  → retry from Step 1</code></pre>
+      </details>
+
+      <details>
+        <summary>Exponential backoff with jitter for retry</summary>
+        <pre><code class="language-java">public class RetryWithBackoff {
+
+    public &lt;T&gt; T executeWithRetry(Supplier&lt;T&gt; operation,
+                                    int maxRetries,
+                                    long baseDelayMs) {
+        int attempt = 0;
+        while (true) {
+            try {
+                return operation.get();
+            } catch (OptimisticLockingFailureException e) {
+                attempt++;
+                if (attempt >= maxRetries) {
+                    throw new RetriesExhaustedException(
+                        "Failed after " + maxRetries + " attempts", e);
+                }
+                // Exponential backoff with full jitter
+                long maxDelay = baseDelayMs * (1L &lt;&lt; attempt); // 2^attempt * base
+                long delay = ThreadLocalRandom.current().nextLong(0, maxDelay);
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Retry interrupted", ie);
+                }
+            }
+        }
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Mistakes that make optimistic locking worse in production</summary>
+
+        <h3>Mistake 1: Retrying without backoff or jitter</h3>
+        <p><strong>The mistake:</strong> Immediate retry on <code>OptimisticLockingFailureException</code> with no delay.</p>
+        <p><strong>Why it fails:</strong> All conflicting threads retry simultaneously, causing the same conflict again (thundering herd). Exponential backoff with <em>random jitter</em> is essential to spread retries across time.</p>
+
+        <h3>Mistake 2: Using optimistic locking on hot rows</h3>
+        <p><strong>The mistake:</strong> Using @Version on a row that thousands of requests update per second (global counter, inventory of a viral product).</p>
+        <p><strong>Why it fails:</strong> Conflict rate approaches 100%. The retry amplification (N(N+1)/2 total attempts for N concurrent requests) creates a self-inflicted DDoS. Solution: partition the hot row (sharded counters), use atomic operations (UPDATE SET stock = stock - 1 with a CHECK constraint), or switch to pessimistic locking with SKIP LOCKED for queue-like access patterns.</p>
+
+        <h3>Mistake 3: Holding the transaction open too long</h3>
+        <p><strong>The mistake:</strong> Reading the entity, doing expensive computation or calling external services, then writing back — all within one @Transactional method.</p>
+        <p><strong>Why it fails:</strong> The longer the transaction, the higher the probability another transaction modifies the same row before you commit. Move expensive operations outside the transaction boundary: read → compute (no TX) → short TX (read-verify-write).</p>
+
+        <h3>Mistake 4: Not handling the ABA problem</h3>
+        <p><strong>The mistake:</strong> Assuming version checks catch all semantic conflicts.</p>
+        <p><strong>Why it fails:</strong> If value goes A→B→A and version increments correctly (1→2→3), your read of "A at version 1" correctly fails when it finds version 3. But if your business logic only checks the <em>value</em> (not version), it might incorrectly assume no change happened. Always rely on the version column, not value comparison.</p>
+
+        <h3>Mistake 5: Forgetting to version the right entity in aggregate roots</h3>
+        <p><strong>The mistake:</strong> Versioning only the child entity when the business invariant spans the aggregate root.</p>
+        <p><strong>Why it fails:</strong> Two transactions can modify different children of the same aggregate without conflicting, even though the aggregate's invariant is violated. Solution: increment the aggregate root's version whenever any child is modified (DDD pattern: modify aggregates only through the root).</p>
+      </details>
+    </section>
+
+    <!-- Section: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-Offs</h2>
+
+      <details>
+        <summary>Optimistic vs Pessimistic vs Event Sourcing vs Queue Serialization</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Throughput</th>
+              <th>Contention Handling</th>
+              <th>Complexity</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Optimistic Locking</strong></td>
+              <td>High (no lock waits)</td>
+              <td>Retry on conflict</td>
+              <td>Low-Medium</td>
+              <td>Low-moderate contention, read-heavy workloads</td>
+            </tr>
+            <tr>
+              <td><strong>Pessimistic Locking</strong></td>
+              <td>Lower (threads wait)</td>
+              <td>Serialize access</td>
+              <td>Low</td>
+              <td>High contention, short critical sections</td>
+            </tr>
+            <tr>
+              <td><strong>SKIP LOCKED</strong></td>
+              <td>High</td>
+              <td>Skip contested rows</td>
+              <td>Low</td>
+              <td>Queue-like processing, job workers</td>
+            </tr>
+            <tr>
+              <td><strong>Sharded Counters</strong></td>
+              <td>Very High</td>
+              <td>Partition hot data</td>
+              <td>Medium</td>
+              <td>Counters, inventory, rate limiting</td>
+            </tr>
+            <tr>
+              <td><strong>Event Sourcing</strong></td>
+              <td>High (append-only)</td>
+              <td>No conflicts (append)</td>
+              <td>High</td>
+              <td>Audit trails, complex business events</td>
+            </tr>
+            <tr>
+              <td><strong>Serialized Queue</strong></td>
+              <td>Limited by consumer</td>
+              <td>No conflicts (ordered)</td>
+              <td>Medium</td>
+              <td>Strict ordering requirements, financial systems</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-info">
+          <p><strong>Rule of thumb:</strong> If contention is &lt;5% of requests, optimistic locking is ideal. Between 5-20%, consider pessimistic locking or SKIP LOCKED. Above 20%, you need architectural changes (sharding, queuing, event sourcing) — no locking strategy will save you.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-Up Questions</h2>
+
+      <details>
+        <summary>Q1: Why might optimistic locking fail even with REPEATABLE READ isolation?</summary>
+        <p><strong>Strong answer:</strong> It depends on the database engine. In PostgreSQL, REPEATABLE READ uses true snapshot isolation — it will throw a serialization error if you try to update a row modified after your snapshot started, which works synergistically with optimistic locking. In MySQL/InnoDB, REPEATABLE READ uses MVCC for reads but still allows "last writer wins" for updates — your UPDATE sees the latest committed version, not your snapshot. So InnoDB's REPEATABLE READ does NOT prevent lost updates without explicit optimistic locking (@Version) or SELECT FOR UPDATE.</p>
+      </details>
+
+      <details>
+        <summary>Q2: How do you decide between optimistic and pessimistic locking?</summary>
+        <p><strong>Strong answer:</strong> It's primarily a contention probability decision. Optimistic locking assumes conflicts are rare — it optimizes for the happy path (no lock acquisition overhead) but pays a high cost on conflict (retry entire transaction). Pessimistic locking assumes conflicts are likely — it pays upfront (lock wait) but guarantees progress without retries. Secondarily, consider transaction duration: optimistic is better for long-running operations (no lock held), pessimistic for short critical sections. Also consider user experience: optimistic locking can report "conflict, please retry" which may be acceptable for some UIs.</p>
+      </details>
+
+      <details>
+        <summary>Q3: What is the retry amplification problem and how do you solve it?</summary>
+        <p><strong>Strong answer:</strong> With N concurrent requests on the same row, optimistic locking produces N(N-1)/2 total retries in the worst case — only one succeeds per round, the rest all fail and retry, creating another round of N-1 competing, then N-2, etc. This is O(N²) total database operations. Solutions: (1) exponential backoff with jitter to temporally spread retries, (2) cap maximum retry attempts (fail fast), (3) switch to pessimistic locking or SKIP LOCKED for hot rows, (4) partition the data so fewer requests target the same row, (5) use a queue to serialize access.</p>
+      </details>
+
+      <details>
+        <summary>Q4: How does @Version interact with batch updates and bulk operations?</summary>
+        <p><strong>Strong answer:</strong> JPA/Hibernate @Version only works for entity-level operations (find → modify → flush). Bulk JPQL/HQL updates (UPDATE Entity SET ... WHERE ...) bypass version checking entirely — Hibernate doesn't increment the version automatically. If you use bulk updates, you must manually add "AND version = :expectedVersion" and "SET version = version + 1" to your query. Spring Data's @Modifying queries have the same limitation. This is a common source of lost updates in systems that mix entity operations with bulk operations.</p>
+      </details>
+
+      <details>
+        <summary>Q5: How would you handle optimistic locking in a microservices saga?</summary>
+        <p><strong>Strong answer:</strong> In a saga spanning multiple services, each service applies optimistic locking independently on its own data. If Service B's optimistic lock fails, it signals the saga orchestrator, which must issue compensating transactions to Service A (which already committed). The key challenge is that you can't atomically commit across services, so you need: (1) idempotent operations in each step, (2) compensating transactions for rollback, (3) a decision on whether to retry the failed step or abort the entire saga. Some teams use a reservation pattern — reserve (lock) resources in all services first, then confirm, reducing the compensation complexity.</p>
+      </details>
+
+      <details>
+        <summary>Q6: What's the difference between SELECT FOR UPDATE and @Version?</summary>
+        <p><strong>Strong answer:</strong> SELECT FOR UPDATE is pessimistic — it acquires a row-level lock immediately, blocking other transactions from reading (FOR UPDATE) or writing that row until you commit. @Version is optimistic — it allows concurrent access freely but detects conflicts at write time via a conditional UPDATE. SELECT FOR UPDATE guarantees no conflict but reduces concurrency. @Version maximizes concurrency but requires retry logic. SELECT FOR UPDATE NOWAIT / SKIP LOCKED are hybrids — they provide pessimistic guarantees without blocking (fail fast or skip).</p>
+      </details>
+    </section>
+
     <!-- Section: Transaction Isolation Levels -->
     <section id="isolation-levels">
       <h2>Relationship to Transaction Isolation Levels</h2>
@@ -1452,6 +1701,33 @@ k6 run --vus 1000 --duration 30s inventory-load-test.js
 
         <p><strong>Bottom line:</strong> In most production systems running READ COMMITTED or REPEATABLE READ, optimistic locking (or pessimistic locking) is <em>still needed</em> to prevent lost updates. Isolation levels alone are not sufficient unless you use SERIALIZABLE.</p>
       </details>
+    </section>
+
+    <!-- Section: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Key mental models for the interview:</strong></p>
+        <ul>
+          <li><strong>Optimistic locking = CAS (Compare-And-Swap) at the database level.</strong> Read version, do work, write-if-version-matches. Simple concept, complex at scale.</li>
+          <li><strong>Low contention = optimistic. High contention = pessimistic or redesign.</strong> The break-even point is typically around 5-10% conflict rate.</li>
+          <li><strong>Retry amplification is O(N²).</strong> N concurrent conflicting requests produce N(N-1)/2 total retries. Always use backoff with jitter.</li>
+          <li><strong>Isolation levels don't eliminate the need for application-level locking.</strong> READ COMMITTED and InnoDB REPEATABLE READ both allow lost updates without @Version.</li>
+          <li><strong>PostgreSQL REPEATABLE READ throws serialization errors; MySQL silently allows last-writer-wins.</strong> Know your database's behavior.</li>
+          <li><strong>Hot rows need architectural solutions, not more retries.</strong> Sharded counters, queues, or SKIP LOCKED.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout-warning">
+        <p><strong>What NOT to say in an interview:</strong></p>
+        <ul>
+          <li>❌ "Just retry until it works" — shows no understanding of amplification, thundering herd, or when to give up.</li>
+          <li>❌ "Optimistic locking is always better because it's non-blocking" — wrong at high contention; pessimistic may give higher throughput.</li>
+          <li>❌ "SERIALIZABLE isolation solves everything" — technically true but shows no awareness of the throughput cost.</li>
+          <li>❌ "We don't need locking because we use transactions" — transactions provide isolation between reads and writes, but don't prevent lost updates at READ COMMITTED.</li>
+        </ul>
+      </div>
     </section>
 
     <!-- Chapter Navigation -->

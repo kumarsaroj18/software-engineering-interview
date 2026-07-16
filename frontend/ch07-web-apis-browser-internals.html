@@ -1,0 +1,1943 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 7: Web APIs &amp; Browser Internals | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <a href="../index.html" class="sidebar-brand">
+      <span class="chapter-num">Ch 7</span>
+      <span class="chapter-title">Web APIs &amp; Browser Internals</span>
+    </a>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#critical-rendering-path">Critical Rendering Path</a></li>
+        <li><a href="#gpu-layers">GPU Acceleration &amp; Layers</a></li>
+        <li><a href="#layout-thrashing">Layout Thrashing</a></li>
+        <li><a href="#forced-sync-layout">Forced Synchronous Layout</a></li>
+        <li><a href="#will-change">will-change &amp; Composite Layers</a></li>
+        <li><a href="#intersection-observer">Intersection Observer vs Scroll</a></li>
+        <li><a href="#observers">ResizeObserver, MutationObserver</a></li>
+        <li><a href="#raf-vs-css">rAF vs CSS Animations</a></li>
+        <li><a href="#web-vitals">Web Vitals</a></li>
+        <li><a href="#long-tasks">Long Tasks &amp; Main Thread</a></li>
+        <li><a href="#production-audit">Production Audit</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <ol>
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="../index.html#part-i">Part I — JavaScript Engine Internals</a></li>
+        <li aria-current="page">Chapter 7</li>
+      </ol>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Rendering</span>
+        <span class="badge badge-topic">DOM</span>
+        <span class="badge badge-topic">CSSOM</span>
+        <span class="badge badge-topic">GPU</span>
+        <span class="badge badge-topic">Web Vitals</span>
+      </div>
+      <h1>Chapter 7: Web APIs &amp; Browser Internals</h1>
+      <p class="chapter-question"><em>"How does the browser's rendering pipeline work, and where can JavaScript block it?"</em></p>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> The browser constructs a Render Tree from the DOM and CSSOM, then performs Layout, Paint, and Composite in sequence. JavaScript can block any phase by triggering forced synchronous layouts (layout thrashing), but composite-only animations (transform, opacity) bypass Layout and Paint entirely — running on the GPU compositor thread without touching the main thread.
+      </div>
+      <div class="callout callout-info">
+        <p><strong>Scope note:</strong> This chapter covers <em>how the browser renders</em> — the rendering pipeline, compositor architecture, GPU layers, observers, and Web Vitals measurement. For <em>loading performance strategy</em> (bundle budgets, code splitting, delivery optimization), see <a href="ch08-performance-critical-rendering.html">Chapter 8</a>.</p>
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details open>
+        <summary>What the interviewer is really asking</summary>
+        <p>When an interviewer asks about the rendering pipeline, they are probing for:</p>
+        <ul>
+          <li><strong>Depth of understanding:</strong> Can you explain the full path from HTML bytes to pixels on screen?</li>
+          <li><strong>Performance intuition:</strong> Do you know which operations are expensive and why?</li>
+          <li><strong>Practical optimization:</strong> Can you identify and fix real rendering bottlenecks?</li>
+          <li><strong>Architecture awareness:</strong> Do you understand the multi-threaded nature of modern browsers (main thread vs compositor thread vs raster threads)?</li>
+          <li><strong>Metrics literacy:</strong> Can you connect rendering internals to Core Web Vitals and user-perceived performance?</li>
+        </ul>
+        <div class="callout callout-info">
+          <p><strong>Senior Signal:</strong> A senior candidate doesn't just recite the pipeline steps — they explain <em>where</em> JavaScript can interrupt each step, <em>why</em> certain CSS properties are cheap, and <em>how</em> to diagnose rendering issues in production using DevTools and PerformanceObserver.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details open>
+        <summary>Concise interview response</summary>
+        <p>The browser rendering pipeline has six main stages:</p>
+        <ol>
+          <li><strong>DOM Construction</strong> — Parse HTML into a tree of nodes</li>
+          <li><strong>CSSOM Construction</strong> — Parse CSS into a style tree (render-blocking)</li>
+          <li><strong>Render Tree</strong> — Merge DOM + CSSOM (excludes display:none elements)</li>
+          <li><strong>Layout</strong> — Calculate geometry: positions, sizes, document flow</li>
+          <li><strong>Paint</strong> — Rasterize visual properties into paint layers</li>
+          <li><strong>Composite</strong> — Combine layers on the GPU, send to screen</li>
+        </ol>
+        <p>JavaScript blocks the pipeline when it triggers <strong>forced synchronous layout</strong> — reading layout properties (offsetHeight, getBoundingClientRect) after writing to the DOM forces the browser to recalculate layout immediately instead of batching.</p>
+        <p>The escape hatch: <strong>compositor-only properties</strong> (transform, opacity) skip Layout and Paint entirely, running on the GPU compositor thread. This is why transform-based animations are orders of magnitude cheaper than animating top/left/width/height.</p>
+      </details>
+    </section>
+
+    <!-- Section 3: Critical Rendering Path -->
+    <section id="critical-rendering-path">
+      <h2>Critical Rendering Path</h2>
+      <details>
+        <summary>The full pipeline from bytes to pixels</summary>
+
+        <h3>DOM Construction</h3>
+        <p>The browser processes HTML in a streaming pipeline:</p>
+<pre class="diagram">
+Bytes → Characters → Tokens → Nodes → DOM Tree
+ (network)  (encoding)  (lexer)  (parser)  (tree builder)
+</pre>
+        <ul>
+          <li><strong>Incremental parsing:</strong> The HTML parser builds the DOM incrementally as bytes arrive — it doesn't wait for the full document.</li>
+          <li><strong>Speculative parsing:</strong> While blocked on a script, the preload scanner continues discovering resources (images, stylesheets, scripts) to fetch.</li>
+          <li><strong>Parser-blocking scripts:</strong> A <code>&lt;script&gt;</code> without async/defer halts DOM construction until it executes. The DOM is incomplete during execution.</li>
+        </ul>
+<pre><code class="language-javascript">// DOM Construction timing
+const observer = new PerformanceObserver((list) =&gt; {
+  for (const entry of list.getEntries()) {
+    console.log(`DOM Interactive: ${entry.domInteractive}ms`);
+    console.log(`DOM Complete: ${entry.domComplete}ms`);
+  }
+});
+observer.observe({ type: 'navigation', buffered: true });</code></pre>
+
+        <h3>CSSOM Construction</h3>
+        <p>CSS is <strong>render-blocking</strong> — the browser won't paint until all stylesheets are parsed:</p>
+        <ul>
+          <li><strong>Render-blocking:</strong> No pixels are painted until the CSSOM is complete (prevents FOUC — Flash of Unstyled Content).</li>
+          <li><strong>Parser-blocking (indirect):</strong> If a <code>&lt;script&gt;</code> follows a <code>&lt;link&gt;</code>, the script waits for CSS because it might query computed styles.</li>
+          <li><strong>Specificity resolution:</strong> The CSSOM must resolve the cascade — inheritance, specificity, and source order — for every node.</li>
+        </ul>
+<pre><code class="language-css">/* Critical CSS should be inlined to avoid render-blocking */
+/* Non-critical CSS can use media queries to defer */
+&lt;link rel="stylesheet" href="print.css" media="print"&gt;
+&lt;link rel="stylesheet" href="large.css" media="(min-width: 1024px)"&gt;</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Performance Trap:</strong> <code>@import</code> in CSS creates sequential, blocking requests. A stylesheet that @imports another can't be fully parsed until the imported sheet downloads — adding round trips to the critical path.</p>
+        </div>
+
+        <h3>Render Tree</h3>
+        <p>The Render Tree combines visible DOM nodes with their computed styles:</p>
+        <ul>
+          <li>Starts at the document root, traverses each visible node.</li>
+          <li><strong>Excluded:</strong> <code>display: none</code> elements (not in render tree at all).</li>
+          <li><strong>Included but invisible:</strong> <code>visibility: hidden</code> and <code>opacity: 0</code> (still occupy layout space).</li>
+          <li>Pseudo-elements (::before, ::after) are <em>added</em> to the render tree even though they aren't in the DOM.</li>
+        </ul>
+<pre class="diagram">
+  DOM Tree              CSSOM               Render Tree
+  ─────────            ─────────           ─────────────
+  html                 body{font:16px}     html
+  ├─ head              p{color:black}      └─ body
+  │  └─ style          .hidden{display:    	├─ p "Hello"
+  └─ body                       none}      	└─ p "World"
+     ├─ p "Hello"                           (span.hidden excluded)
+     ├─ span.hidden
+     └─ p "World"
+</pre>
+
+        <h3>Layout / Reflow</h3>
+        <p>Layout calculates the exact position and size of every element in the render tree:</p>
+        <ul>
+          <li><strong>Box model:</strong> Content → Padding → Border → Margin computed for every box.</li>
+          <li><strong>Document flow:</strong> Block elements stack vertically, inline elements flow horizontally.</li>
+          <li><strong>Global vs. incremental:</strong> First layout is global. Subsequent layouts can be incremental (only dirty subtrees recalculated).</li>
+          <li><strong>Cost:</strong> Layout is O(n) where n is the number of nodes affected. Deeply nested flex/grid layouts are more expensive.</li>
+        </ul>
+<pre><code class="language-javascript">// Properties that trigger layout when READ:
+element.offsetTop;       element.offsetLeft;
+element.offsetWidth;     element.offsetHeight;
+element.scrollTop;       element.scrollLeft;
+element.clientTop;       element.clientWidth;
+element.getComputedStyle();
+element.getBoundingClientRect();</code></pre>
+
+        <h3>Paint</h3>
+        <p>Paint fills in pixels — converting the layout tree into actual visual output:</p>
+        <ul>
+          <li><strong>Paint records:</strong> The browser creates a display list (ordered paint instructions).</li>
+          <li><strong>Paint order:</strong> Background → Border → Content → Outline → Children (in stacking context order).</li>
+          <li><strong>Paint layers:</strong> Elements that trigger new stacking contexts or compositor layers get their own paint surface.</li>
+          <li><strong>Rasterization:</strong> Paint instructions are converted to pixels by raster threads (often GPU-accelerated).</li>
+        </ul>
+        <div class="callout callout-tip">
+          <p><strong>Paint Optimization:</strong> Properties like color, background-color, box-shadow, and border-radius trigger paint but NOT layout. Changing these is cheaper than changing width/height but more expensive than transform/opacity.</p>
+        </div>
+
+        <h3>Compositing</h3>
+        <p>The compositor combines paint layers into the final image sent to the display:</p>
+        <ul>
+          <li><strong>Compositor thread:</strong> Runs independently of the main thread — can handle scrolling and transform animations even when JS is blocked.</li>
+          <li><strong>Tiling:</strong> Large layers are broken into tiles for efficient GPU memory management.</li>
+          <li><strong>GPU upload:</strong> Rasterized tiles are uploaded as textures to the GPU.</li>
+          <li><strong>Layer composition:</strong> The GPU combines all layer textures in the correct Z-order.</li>
+        </ul>
+
+        <h3>Full Pipeline Diagram</h3>
+<pre class="diagram">
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        BROWSER RENDERING PIPELINE                             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────┐   ┌─────────┐   ┌──────────┐   ┌────────┐   ┌───────┐   ┌─────────────┐
+│  │  Parse   │──▶│  Style  │──▶│  Layout  │──▶│ Paint  │──▶│ Comp- │──▶│   Display   │
+│  │HTML/CSS  │   │ Resolve │   │ (Reflow) │   │(Raster)│   │ osite │   │  (Pixels)   │
+│  └─────────┘   └─────────┘   └──────────┘   └────────┘   └───────┘   └─────────────┘
+│       │               │              │             │            │                     │
+│  Main Thread    Main Thread    Main Thread   Raster Thr   Compositor              GPU │
+│                                                              Thread                   │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  JS can block:   ✓ yes         ✓ yes          ✓ yes        ✗ NO         ✗ NO        │
+│  (main thread)                                                                       │
+│                                                                                      │
+│  transform/opacity skip: ───────────────────────────────────▶ starts here            │
+└──────────────────────────────────────────────────────────────────────────────┘
+</pre>
+      </details>
+    </section>
+
+
+    <!-- Section 4: GPU Acceleration & Layers -->
+    <section id="gpu-layers">
+      <h2>GPU Acceleration &amp; Layers</h2>
+      <details>
+        <summary>Compositor layers, GPU promotion, and the layer explosion problem</summary>
+
+        <h3>What Promotes an Element to Its Own Compositor Layer</h3>
+        <p>An element gets its own GPU-backed layer when it has:</p>
+        <ul>
+          <li><code>transform: translateZ(0)</code> or <code>translate3d(0,0,0)</code> (the classic "hack")</li>
+          <li><code>will-change: transform</code> or <code>will-change: opacity</code></li>
+          <li>Active CSS animation or transition on transform/opacity</li>
+          <li><code>position: fixed</code> or <code>position: sticky</code></li>
+          <li>An element that overlaps another composited layer (implicit promotion)</li>
+          <li><code>&lt;video&gt;</code>, <code>&lt;canvas&gt;</code>, <code>&lt;iframe&gt;</code> elements</li>
+          <li><code>backface-visibility: hidden</code></li>
+        </ul>
+
+        <h3>will-change Property and Implications</h3>
+<pre><code class="language-css">/* Correct: set before animation starts */
+.card:hover {
+  will-change: transform;
+}
+.card.animating {
+  transform: scale(1.05);
+  transition: transform 200ms ease-out;
+}
+
+/* WRONG: applying to everything */
+* {
+  will-change: transform; /* memory explosion! */
+}</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Memory Cost:</strong> Each compositor layer consumes GPU memory proportional to its pixel area. A 1920×1080 layer at 2x DPR = 1920 × 1080 × 4 bytes × 4 (2x in each dimension) ≈ <strong>33 MB</strong> per layer. Promoting 50 elements can exhaust GPU memory on mobile devices.</p>
+        </div>
+
+        <h3>transform/opacity as Compositor-Only Properties</h3>
+        <p>These two properties are special because they can be applied <em>after</em> rasterization:</p>
+        <ul>
+          <li><strong>transform:</strong> The GPU applies a matrix transformation to the already-rasterized texture — no re-layout or re-paint needed.</li>
+          <li><strong>opacity:</strong> The GPU adjusts alpha blending between layers — just a compositing operation.</li>
+          <li><strong>Result:</strong> 60fps animations with zero main thread involvement.</li>
+        </ul>
+<pre><code class="language-css">/* ✅ Compositor-only — runs on GPU thread */
+.animated {
+  transform: translateX(100px);
+  opacity: 0.5;
+  transition: transform 300ms, opacity 300ms;
+}
+
+/* ❌ Triggers Layout + Paint + Composite on EVERY frame */
+.animated-bad {
+  left: 100px;       /* triggers layout */
+  width: 200px;      /* triggers layout */
+  background: red;   /* triggers paint */
+}</code></pre>
+
+        <h3>Layer Explosion Problem</h3>
+        <p>Implicit layer promotion can cascade:</p>
+<pre><code class="language-javascript">// Scenario: a z-indexed element overlaps composited content
+// Browser must promote overlapping elements to maintain correct
+// paint order → sudden jump from 3 layers to 300 layers
+
+// Detection in DevTools:
+// 1. Open Layers panel (More Tools → Layers)
+// 2. Look for unexpected layer count spikes
+// 3. Check "Compositing Reasons" for each layer</code></pre>
+        <div class="callout callout-tip">
+          <p><strong>Fix:</strong> Use <code>isolation: isolate</code> to contain stacking contexts and prevent unintended layer promotion of sibling elements.</p>
+        </div>
+
+        <h3>Chrome Layers Panel in DevTools</h3>
+        <ul>
+          <li><strong>Layers tab:</strong> 3D visualization of all compositor layers, their sizes, and memory consumption.</li>
+          <li><strong>Compositing Reasons:</strong> Shows why each layer was promoted (will-change, overlap, fixed position, etc.).</li>
+          <li><strong>Paint count:</strong> Shows how many times each layer has been repainted.</li>
+          <li><strong>Rendering tab → Paint flashing:</strong> Green overlay shows which areas are being repainted each frame.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 5: Layout Thrashing -->
+    <section id="layout-thrashing">
+      <h2>Layout Thrashing</h2>
+      <details>
+        <summary>The read-write anti-pattern that kills frame budgets</summary>
+
+        <h3>What Triggers Forced Synchronous Layout</h3>
+        <p>Browsers <em>batch</em> layout calculations to the end of the frame. But if you <strong>write</strong> to the DOM and then <strong>read</strong> a layout property, the browser must calculate layout <em>immediately</em> to return an accurate value:</p>
+<pre><code class="language-javascript">// ❌ LAYOUT THRASHING — forces layout on every iteration
+function resizeBoxes(boxes) {
+  for (const box of boxes) {
+    // WRITE: invalidates layout
+    box.style.width = box.offsetWidth + 10 + 'px';
+    //                    ↑ READ: forces synchronous layout!
+  }
+}
+// With 1000 boxes: 1000 forced layouts per frame!</code></pre>
+
+        <h3>Properties That Trigger Layout</h3>
+        <table>
+          <thead>
+            <tr><th>Category</th><th>Properties</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Element geometry</td><td><code>offsetTop, offsetLeft, offsetWidth, offsetHeight</code></td></tr>
+            <tr><td>Scroll</td><td><code>scrollTop, scrollLeft, scrollWidth, scrollHeight</code></td></tr>
+            <tr><td>Client</td><td><code>clientTop, clientLeft, clientWidth, clientHeight</code></td></tr>
+            <tr><td>Window</td><td><code>getComputedStyle(), innerWidth, innerHeight, scrollX, scrollY</code></td></tr>
+            <tr><td>Bounding box</td><td><code>getBoundingClientRect(), getClientRects()</code></td></tr>
+            <tr><td>Focus/Selection</td><td><code>focus(), select(), scrollIntoView()</code></td></tr>
+          </tbody>
+        </table>
+
+        <h3>The Read-Write-Read-Write Anti-Pattern</h3>
+<pre class="diagram">
+Frame Timeline (LAYOUT THRASHING):
+
+  ┌─Write─┐ ┌─Layout─┐ ┌─Read─┐ ┌─Write─┐ ┌─Layout─┐ ┌─Read─┐
+  │style.w│─▶│(forced)│─▶│offW  │─▶│style.w│─▶│(forced)│─▶│offW  │ ... × N
+  └───────┘ └────────┘ └──────┘ └───────┘ └────────┘ └──────┘
+            ↑ expensive!                    ↑ expensive!
+
+Frame Timeline (BATCHED — correct):
+
+  ┌─Read──┐ ┌─Read──┐ ┌─Read──┐ ┌─Write─┐ ┌─Write─┐ ┌─Write─┐ ┌─Layout─┐
+  │offW[0]│ │offW[1]│ │offW[2]│ │style.0│ │style.1│ │style.2│ │(once!) │
+  └───────┘ └───────┘ └───────┘ └───────┘ └───────┘ └───────┘ └────────┘
+</pre>
+
+        <h3>FastDOM Pattern (Batch Reads Then Writes)</h3>
+<pre><code class="language-javascript">// ✅ FASTDOM PATTERN — separate read and write phases
+function resizeBoxesFast(boxes) {
+  // Phase 1: Read ALL measurements
+  const widths = boxes.map(box =&gt; box.offsetWidth);
+
+  // Phase 2: Write ALL mutations
+  boxes.forEach((box, i) =&gt; {
+    box.style.width = widths[i] + 10 + 'px';
+  });
+  // Only ONE layout at end of frame!
+}
+
+// Using a FastDOM library:
+import fastdom from 'fastdom';
+
+function resizeWithFastDOM(boxes) {
+  boxes.forEach(box =&gt; {
+    fastdom.measure(() =&gt; {
+      const width = box.offsetWidth;
+      fastdom.mutate(() =&gt; {
+        box.style.width = width + 10 + 'px';
+      });
+    });
+  });
+}</code></pre>
+
+        <h3>Using requestAnimationFrame to Batch DOM Writes</h3>
+<pre><code class="language-javascript">// ✅ Defer writes to next frame using rAF
+function animateElement(el, measurements) {
+  // Reads happen synchronously (fine — no pending writes)
+  const currentHeight = el.offsetHeight;
+  const currentWidth = el.offsetWidth;
+
+  // Writes deferred to just before next paint
+  requestAnimationFrame(() =&gt; {
+    el.style.height = currentHeight * 2 + 'px';
+    el.style.width = currentWidth * 2 + 'px';
+  });
+}
+
+// Double-rAF pattern for guaranteed next frame:
+function nextFrame(callback) {
+  requestAnimationFrame(() =&gt; {
+    requestAnimationFrame(callback);
+  });
+}</code></pre>
+        <div class="callout callout-info">
+          <p><strong>Budget:</strong> At 60fps you have ~16.7ms per frame. A single forced synchronous layout on a complex page can take 5-15ms — consuming your entire budget before any other work happens.</p>
+        </div>
+      </details>
+    </section>
+
+
+    <!-- Section 6: Forced Synchronous Layout -->
+    <section id="forced-sync-layout">
+      <h2>Forced Synchronous Layout</h2>
+      <details>
+        <summary>When JavaScript forces immediate layout calculation</summary>
+
+        <h3>How Browsers Normally Batch Layout</h3>
+        <p>In a normal frame, the browser processes work in this order:</p>
+<pre class="diagram">
+Normal Frame (16.7ms budget at 60fps):
+┌───────────────────────────────────────────────────────────────┐
+│ JavaScript │ Style Calc │ Layout │ Paint │ Composite │ Idle   │
+│   (rAF)    │            │        │       │           │        │
+└───────────────────────────────────────────────────────────────┘
+         ▲                                              ▲
+    Input events                                   VSync signal
+</pre>
+        <p>DOM mutations made during JavaScript execution are batched — layout only runs once, after all JS completes. This is the efficient path.</p>
+
+        <h3>When JavaScript Forces Immediate Layout</h3>
+<pre><code class="language-javascript">// The browser has pending style changes (layout is "dirty")
+element.style.width = '500px';  // Invalidates layout
+element.style.height = '300px'; // Still dirty, no layout yet
+
+// NOW we read a geometry property:
+const rect = element.getBoundingClientRect(); // FORCED LAYOUT!
+// Browser MUST calculate layout RIGHT NOW to return accurate rect
+
+// More writes after the forced layout = MORE forced layouts later
+element.style.margin = '10px';
+const height = element.offsetHeight; // ANOTHER forced layout!</code></pre>
+
+        <h3>Detecting in Performance Panel</h3>
+        <ul>
+          <li>Open DevTools → Performance tab → Record interaction.</li>
+          <li>Forced reflows appear as <strong>purple bars</strong> labeled "Layout (Forced)".</li>
+          <li>Hover to see the call stack that triggered the forced layout.</li>
+          <li>Look for a <strong>red triangle</strong> warning icon in the Summary panel.</li>
+          <li>The "Recalculate Style" entry will show "First Invalidated" pointing to the write that dirtied layout.</li>
+        </ul>
+
+        <h3>Problem and Fix Examples</h3>
+<pre><code class="language-javascript">// ❌ PROBLEM: Forced synchronous layout in animation loop
+function animateSlider(items) {
+  items.forEach(item =&gt; {
+    const containerWidth = item.parentElement.offsetWidth; // READ (forced!)
+    item.style.transform = `translateX(${containerWidth}px)`; // WRITE
+  });
+  requestAnimationFrame(() =&gt; animateSlider(items));
+}
+
+// ✅ FIX: Read once outside the loop
+function animateSliderFixed(items) {
+  const containerWidth = items[0].parentElement.offsetWidth; // Single READ
+  items.forEach(item =&gt; {
+    item.style.transform = `translateX(${containerWidth}px)`; // WRITE only
+  });
+  requestAnimationFrame(() =&gt; animateSliderFixed(items));
+}
+
+// ✅ FIX: Use ResizeObserver for container width changes
+const widthCache = new WeakMap();
+
+const ro = new ResizeObserver(entries =&gt; {
+  for (const entry of entries) {
+    widthCache.set(entry.target, entry.contentRect.width);
+  }
+});
+
+function animateWithCache(items) {
+  const width = widthCache.get(items[0].parentElement) || 0;
+  items.forEach(item =&gt; {
+    item.style.transform = `translateX(${width}px)`;
+  });
+  requestAnimationFrame(() =&gt; animateWithCache(items));
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 7: will-change & Composite Layers -->
+    <section id="will-change">
+      <h2>will-change &amp; Composite Layers</h2>
+      <details>
+        <summary>Correct usage, over-promotion, and memory trade-offs</summary>
+
+        <h3>Correct Usage: Set Before Animation, Remove After</h3>
+<pre><code class="language-javascript">// ✅ Best practice: apply will-change just before animation
+const card = document.querySelector('.card');
+
+card.addEventListener('mouseenter', () =&gt; {
+  card.style.willChange = 'transform';
+});
+
+card.addEventListener('animationend', () =&gt; {
+  card.style.willChange = 'auto'; // Release GPU memory
+});
+
+// Or via CSS with hover (acceptable for hover animations):
+</code></pre>
+<pre><code class="language-css">/* ✅ Applied on ancestor hover — gives browser advance warning */
+.card-container:hover .card {
+  will-change: transform;
+}
+
+.card-container:hover .card:active {
+  transform: scale(0.95);
+}
+
+/* ❌ WRONG: permanent will-change */
+.card {
+  will-change: transform; /* Layer always allocated, wasting memory */
+}</code></pre>
+
+        <h3>Over-Promotion and Memory Cost</h3>
+        <ul>
+          <li>Each promoted layer = separate GPU texture at full pixel dimensions × device pixel ratio.</li>
+          <li>A 375×667 iPhone screen at 3x DPR: each full-screen layer = 1125 × 2001 × 4 bytes = <strong>~9 MB</strong>.</li>
+          <li>20 full-screen layers = 180 MB of GPU memory — causes jank from GPU memory pressure.</li>
+          <li>On mobile, exceeding GPU memory triggers <strong>layer falling</strong> — browser de-promotes layers, causing sudden jank.</li>
+        </ul>
+
+        <h3>Creating Stacking Contexts</h3>
+        <p><code>will-change</code> with transform or opacity creates a new stacking context — same as if you applied <code>position: relative; z-index: 0</code>:</p>
+<pre><code class="language-css">/* This creates a stacking context — can break z-index expectations */
+.modal-overlay {
+  will-change: opacity;
+  /* Now acts as a stacking context root — children's z-index
+     is resolved relative to THIS element, not the page root */
+}
+
+/* Same effect as: */
+.modal-overlay {
+  position: relative;
+  z-index: 0;
+  isolation: isolate;
+}</code></pre>
+
+        <h3>Alternatives: translateZ(0) Hack vs Proper will-change</h3>
+        <table>
+          <thead>
+            <tr><th>Approach</th><th>Pros</th><th>Cons</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>transform: translateZ(0)</code></td>
+              <td>Works in older browsers, immediate promotion</td>
+              <td>Permanent layer, can't be "un-promoted", forces composited layer always</td>
+            </tr>
+            <tr>
+              <td><code>will-change: transform</code></td>
+              <td>Semantic intent, removable, lets browser optimize</td>
+              <td>Must be managed (add/remove), creates stacking context</td>
+            </tr>
+            <tr>
+              <td>CSS animation on transform</td>
+              <td>Auto-promoted during animation only, no JS needed</td>
+              <td>Less control over timing of promotion</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout-tip">
+          <p><strong>Rule of Thumb:</strong> Prefer CSS animations/transitions over manual will-change. The browser auto-promotes during active animations and auto-demotes afterward — zero memory waste, zero management code.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 7b: content-visibility -->
+    <section id="content-visibility">
+      <h2>content-visibility: auto</h2>
+      <details>
+        <summary>Skip rendering of off-screen content — one of the highest-impact single CSS properties for performance</summary>
+        <p><code>content-visibility: auto</code> tells the browser to skip layout, paint, and style computation for elements not currently visible in the viewport. The browser applies <strong>layout containment</strong> automatically, meaning the element's subtree doesn't affect the rest of the page.</p>
+
+        <pre><code class="language-css">/* Apply to large, repeated sections (cards, list items, article bodies) */
+.card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 300px; /* Estimated height for scrollbar accuracy */
+}
+
+/* Real-world: long article with many sections */
+article section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 500px;
+}
+
+/* Do NOT use on above-the-fold content — it delays initial render */
+.hero { content-visibility: visible; /* default, explicit */ }</code></pre>
+
+        <h3>How It Works Under the Hood</h3>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────┐
+│          Viewport                                    │
+│  ┌─────────────────────────────────────────┐        │
+│  │  Section 1 (visible) — fully rendered    │        │
+│  └─────────────────────────────────────────┘        │
+│  ┌─────────────────────────────────────────┐        │
+│  │  Section 2 (visible) — fully rendered    │        │
+│  └─────────────────────────────────────────┘        │
+└─────────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────┐
+  │  Section 3 (off-screen)                  │
+  │  content-visibility: auto                │
+  │  → Style: SKIPPED                        │
+  │  → Layout: SKIPPED (uses intrinsic size) │
+  │  → Paint: SKIPPED                        │
+  └─────────────────────────────────────────┘
+        </pre>
+
+        <h3>Performance Impact</h3>
+        <ul>
+          <li><strong>Initial render:</strong> Pages with many off-screen elements (e.g., long feeds, documentation) can see 50-70% reduction in initial rendering time.</li>
+          <li><strong>Scrolling:</strong> Elements are rendered just-in-time as they enter (or approach) the viewport.</li>
+          <li><strong>contain-intrinsic-size:</strong> Required for accurate scrollbar behavior. Without it, off-screen elements have 0 height, causing scrollbar jank. The <code>auto</code> keyword remembers the last rendered size.</li>
+        </ul>
+
+        <h3>Browser Support &amp; Caveats</h3>
+        <ul>
+          <li>Chrome 85+, Edge 85+, Firefox 125+, Safari 18+ (broad support as of 2024).</li>
+          <li>Do NOT apply to above-the-fold content — it will delay LCP.</li>
+          <li>Accessibility: hidden content is still accessible to screen readers (unlike <code>display: none</code>).</li>
+          <li>Find-in-page (Ctrl+F) works — browser renders content when searched.</li>
+        </ul>
+
+        <div class="callout callout-tip">
+          <p><strong>Interview tip:</strong> <code>content-visibility: auto</code> is the CSS equivalent of "virtualization" but without JavaScript complexity. Mention it when discussing rendering performance for long lists or content-heavy pages — it's simpler than virtual scrolling and works with native scroll.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 8: Intersection Observer vs Scroll Events -->
+    <section id="intersection-observer">
+      <h2>Intersection Observer vs Scroll Events</h2>
+      <details>
+        <summary>Why observer APIs outperform scroll event handlers</summary>
+
+        <h3>Why Scroll Events Are Expensive</h3>
+        <ul>
+          <li>Fire on the <strong>main thread</strong> at high frequency (potentially every frame).</li>
+          <li>Handlers often read layout properties → forced synchronous layout.</li>
+          <li>Even with throttling/debouncing, you still pay the handler invocation cost.</li>
+          <li>Prevent compositor-driven scrolling if not marked <code>{ passive: true }</code>.</li>
+        </ul>
+<pre><code class="language-javascript">// ❌ Expensive: scroll event with layout reads
+window.addEventListener('scroll', () =&gt; {
+  const items = document.querySelectorAll('.lazy-img');
+  items.forEach(img =&gt; {
+    const rect = img.getBoundingClientRect(); // FORCED LAYOUT per item!
+    if (rect.top &lt; window.innerHeight) {
+      img.src = img.dataset.src;
+    }
+  });
+}); // Fires 60+ times/sec, each time forcing layout for N elements</code></pre>
+
+        <h3>IntersectionObserver Runs Asynchronously</h3>
+        <p>IntersectionObserver executes callbacks <em>asynchronously</em>, batched between frames, without blocking the main thread:</p>
+<pre><code class="language-javascript">// ✅ IntersectionObserver — async, no forced layout
+const lazyObserver = new IntersectionObserver((entries, observer) =&gt; {
+  entries.forEach(entry =&gt; {
+    if (entry.isIntersecting) {
+      const img = entry.target;
+      img.src = img.dataset.src;
+      img.classList.add('loaded');
+      observer.unobserve(img); // Stop watching once loaded
+    }
+  });
+}, {
+  rootMargin: '200px 0px', // Start loading 200px before visible
+  threshold: 0.01
+});
+
+document.querySelectorAll('.lazy-img').forEach(img =&gt; {
+  lazyObserver.observe(img);
+});</code></pre>
+
+        <h3>Lazy Loading Images and Infinite Scroll</h3>
+<pre><code class="language-javascript">// Infinite scroll with IntersectionObserver
+class InfiniteScroll {
+  constructor(sentinel, loadMore) {
+    this.loadMore = loadMore;
+    this.loading = false;
+
+    this.observer = new IntersectionObserver(
+      ([entry]) =&gt; {
+        if (entry.isIntersecting &amp;&amp; !this.loading) {
+          this.loading = true;
+          this.loadMore().then(() =&gt; {
+            this.loading = false;
+          });
+        }
+      },
+      { rootMargin: '400px 0px' } // Trigger 400px before sentinel visible
+    );
+
+    this.observer.observe(sentinel);
+  }
+
+  destroy() {
+    this.observer.disconnect();
+  }
+}
+
+// Usage:
+const sentinel = document.querySelector('#scroll-sentinel');
+const feed = new InfiniteScroll(sentinel, async () =&gt; {
+  const posts = await fetchNextPage();
+  renderPosts(posts);
+});</code></pre>
+
+        <h3>rootMargin for Pre-Loading</h3>
+        <p><code>rootMargin</code> expands (or shrinks) the intersection area — enabling preloading before elements enter the viewport:</p>
+<pre><code class="language-javascript">// Pre-load resources 500px before they scroll into view
+const preloadObserver = new IntersectionObserver(callback, {
+  rootMargin: '500px 0px 500px 0px' // top, right, bottom, left
+});
+
+// Useful for: image preloading, component hydration,
+// video buffering, analytics viewport tracking</code></pre>
+
+        <h3>Performance Comparison</h3>
+        <table>
+          <thead>
+            <tr><th>Metric</th><th>Scroll Event</th><th>IntersectionObserver</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Thread</td><td>Main thread (blocks interaction)</td><td>Off main thread (async callback)</td></tr>
+            <tr><td>Frequency</td><td>Every frame (60+/sec)</td><td>Only on threshold crossing</td></tr>
+            <tr><td>Layout cost</td><td>Forces sync layout (getBoundingClientRect)</td><td>Zero (uses cached geometry)</td></tr>
+            <tr><td>Passive scroll</td><td>Blocks compositor if not passive</td><td>Never blocks scrolling</td></tr>
+            <tr><td>Battery</td><td>High CPU usage during scroll</td><td>Near-zero idle cost</td></tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+
+    <!-- Section 9: ResizeObserver, MutationObserver -->
+    <section id="observers">
+      <h2>ResizeObserver, MutationObserver</h2>
+      <details>
+        <summary>Modern observer APIs for efficient DOM monitoring</summary>
+
+        <h3>ResizeObserver: Element-Level Resize Detection</h3>
+        <p>Before ResizeObserver, detecting element resize required polling with setInterval or listening to window resize — both expensive and imprecise:</p>
+<pre><code class="language-javascript">// ✅ ResizeObserver — efficient, element-level, no polling
+const resizeObserver = new ResizeObserver(entries =&gt; {
+  for (const entry of entries) {
+    const { width, height } = entry.contentRect;
+    const { inlineSize, blockSize } = entry.borderBoxSize[0];
+
+    // Responsive component logic
+    if (width &lt; 300) {
+      entry.target.classList.add('compact');
+    } else {
+      entry.target.classList.remove('compact');
+    }
+
+    // Canvas resize handling
+    if (entry.target.tagName === 'CANVAS') {
+      entry.target.width = width * devicePixelRatio;
+      entry.target.height = height * devicePixelRatio;
+    }
+  }
+});
+
+// Observe specific elements (not window — elements!)
+resizeObserver.observe(document.querySelector('.sidebar'));
+resizeObserver.observe(document.querySelector('.chart-canvas'));</code></pre>
+        <div class="callout callout-info">
+          <p><strong>Use Case:</strong> Container queries polyfill, responsive charts, auto-sizing textareas, virtualized lists that need to know item dimensions.</p>
+        </div>
+
+        <h3>MutationObserver: DOM Mutation Tracking</h3>
+        <p>MutationObserver delivers DOM change notifications as <strong>microtasks</strong> — batched and efficient:</p>
+<pre><code class="language-javascript">// Watch for dynamic content changes (e.g., third-party widgets)
+const mutationObserver = new MutationObserver(mutations =&gt; {
+  for (const mutation of mutations) {
+    if (mutation.type === 'childList') {
+      mutation.addedNodes.forEach(node =&gt; {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          // Auto-initialize components on dynamically added elements
+          initializeWidgets(node);
+        }
+      });
+    }
+    if (mutation.type === 'attributes') {
+      console.log(`${mutation.attributeName} changed on`, mutation.target);
+    }
+  }
+});
+
+mutationObserver.observe(document.body, {
+  childList: true,    // Direct children added/removed
+  subtree: true,      // All descendants
+  attributes: true,   // Attribute changes
+  attributeFilter: ['class', 'data-state'], // Only these attributes
+  characterData: false // Text content changes (expensive if true)
+});
+
+// IMPORTANT: Disconnect when done to prevent memory leaks
+// mutationObserver.disconnect();</code></pre>
+
+        <h3>PerformanceObserver: Performance Entry Detection</h3>
+<pre><code class="language-javascript">// Detect Long Tasks (&gt;50ms main thread blocking)
+const longTaskObserver = new PerformanceObserver(list =&gt; {
+  for (const entry of list.getEntries()) {
+    console.warn('Long Task detected:', {
+      duration: entry.duration,
+      startTime: entry.startTime,
+      attribution: entry.attribution // Which script/iframe caused it
+    });
+    // Report to analytics
+    analytics.track('long_task', { duration: entry.duration });
+  }
+});
+longTaskObserver.observe({ type: 'longtask', buffered: true });
+
+// Detect Layout Shifts (CLS)
+const clsObserver = new PerformanceObserver(list =&gt; {
+  for (const entry of list.getEntries()) {
+    if (!entry.hadRecentInput) { // Ignore user-initiated shifts
+      console.warn('Layout shift:', entry.value, entry.sources);
+    }
+  }
+});
+clsObserver.observe({ type: 'layout-shift', buffered: true });
+
+// Detect LCP (Largest Contentful Paint)
+const lcpObserver = new PerformanceObserver(list =&gt; {
+  const entries = list.getEntries();
+  const lastEntry = entries[entries.length - 1]; // Last = largest
+  console.log('LCP:', lastEntry.startTime, lastEntry.element);
+});
+lcpObserver.observe({ type: 'largest-contentful-paint', buffered: true });</code></pre>
+
+        <h3>When to Use Each Observer</h3>
+        <table>
+          <thead>
+            <tr><th>Observer</th><th>Use Case</th><th>Memory Notes</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>IntersectionObserver</td><td>Visibility detection, lazy loading, ad viewability</td><td>Low — unobserve after trigger</td></tr>
+            <tr><td>ResizeObserver</td><td>Element resize, container queries, canvas sizing</td><td>Low — per-element tracking</td></tr>
+            <tr><td>MutationObserver</td><td>DOM changes, widget init, attribute tracking</td><td>Medium — subtree can be costly</td></tr>
+            <tr><td>PerformanceObserver</td><td>Web Vitals, long tasks, resource timing</td><td>Low — entries are lightweight</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout-warning">
+          <p><strong>Memory:</strong> Always call <code>.disconnect()</code> or <code>.unobserve()</code> when done. MutationObserver with <code>subtree: true</code> on <code>document.body</code> can hold references to removed nodes if not disconnected, causing memory leaks in SPAs.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: requestAnimationFrame vs CSS Animations -->
+    <section id="raf-vs-css">
+      <h2>requestAnimationFrame vs CSS Animations</h2>
+      <details>
+        <summary>Choosing the right animation approach for 60fps</summary>
+
+        <h3>rAF: JavaScript-Driven, Runs Before Paint</h3>
+<pre><code class="language-javascript">// requestAnimationFrame runs ONCE per frame, just before paint
+// Perfect for: physics, game loops, complex state-driven animations
+
+function springAnimation(element, target) {
+  let position = 0;
+  let velocity = 0;
+  const stiffness = 0.1;
+  const damping = 0.8;
+
+  function tick() {
+    const force = (target - position) * stiffness;
+    velocity = (velocity + force) * damping;
+    position += velocity;
+
+    element.style.transform = `translateX(${position}px)`;
+
+    // Stop when settled (velocity ≈ 0 and at target)
+    if (Math.abs(velocity) &gt; 0.01 || Math.abs(target - position) &gt; 0.1) {
+      requestAnimationFrame(tick);
+    }
+  }
+  requestAnimationFrame(tick);
+}
+
+// Cancellation pattern
+let rafId = null;
+function startLoop() {
+  function frame() {
+    // ... animation work
+    rafId = requestAnimationFrame(frame);
+  }
+  rafId = requestAnimationFrame(frame);
+}
+function stopLoop() {
+  cancelAnimationFrame(rafId);
+  rafId = null;
+}</code></pre>
+
+        <h3>CSS Transitions/Animations: Compositor Thread</h3>
+<pre><code class="language-css">/* ✅ Runs on compositor thread — immune to main thread jank */
+.slide-in {
+  transform: translateX(-100%);
+  transition: transform 300ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+.slide-in.active {
+  transform: translateX(0);
+}
+
+/* ✅ Keyframe animations — also compositor-eligible */
+@keyframes fadeSlideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-in {
+  animation: fadeSlideUp 400ms ease-out forwards;
+}</code></pre>
+        <div class="callout callout-info">
+          <p><strong>Key Insight:</strong> CSS animations on transform/opacity run on the compositor thread. Even if your JavaScript freezes for 200ms (Long Task), CSS compositor animations continue at 60fps.</p>
+        </div>
+
+        <h3>Web Animations API (WAAPI): Best of Both Worlds</h3>
+<pre><code class="language-javascript">// WAAPI — JavaScript control with compositor performance
+const animation = element.animate([
+  { transform: 'translateX(0)', opacity: 1 },
+  { transform: 'translateX(300px)', opacity: 0 }
+], {
+  duration: 500,
+  easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+  fill: 'forwards'
+});
+
+// Full programmatic control
+animation.pause();
+animation.playbackRate = 0.5;  // Slow motion
+animation.reverse();
+animation.finished.then(() =&gt; {
+  element.remove(); // Clean up after animation
+});
+
+// Cancellation
+animation.cancel();
+
+// Commit final state and release
+animation.commitStyles();
+animation.cancel();</code></pre>
+
+        <h3>When to Choose Each</h3>
+        <table>
+          <thead>
+            <tr><th>Approach</th><th>Best For</th><th>Thread</th><th>Control</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>CSS transitions</td><td>Simple state changes (hover, toggle)</td><td>Compositor</td><td>Low</td></tr>
+            <tr><td>CSS @keyframes</td><td>Looping animations, entry/exit</td><td>Compositor</td><td>Medium</td></tr>
+            <tr><td>WAAPI</td><td>Dynamic animations, sequencing</td><td>Compositor*</td><td>High</td></tr>
+            <tr><td>requestAnimationFrame</td><td>Physics, game loops, canvas</td><td>Main</td><td>Full</td></tr>
+          </tbody>
+        </table>
+        <p><em>*WAAPI runs on compositor when animating only compositor-friendly properties.</em></p>
+
+        <h3>Animation Performance Checklist</h3>
+        <ul>
+          <li>✅ Animate only <code>transform</code> and <code>opacity</code> whenever possible.</li>
+          <li>✅ Use <code>will-change</code> sparingly, remove after animation.</li>
+          <li>✅ Prefer CSS/WAAPI over rAF for visual animations.</li>
+          <li>✅ Use <code>prefers-reduced-motion</code> media query to respect user preferences.</li>
+          <li>✅ Test with 4x CPU slowdown in DevTools to catch marginal jank.</li>
+          <li>❌ Never animate <code>width</code>, <code>height</code>, <code>top</code>, <code>left</code>, <code>margin</code>, <code>padding</code>.</li>
+          <li>❌ Never read layout properties inside a rAF callback that also writes.</li>
+        </ul>
+<pre><code class="language-css">/* Always respect user preferences */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 11: Web Vitals -->
+    <section id="web-vitals">
+      <h2>Web Vitals (LCP, INP, CLS)</h2>
+      <details>
+        <summary>Core Web Vitals metrics, thresholds, and optimization strategies</summary>
+
+        <h3>LCP — Largest Contentful Paint</h3>
+        <p>Measures when the largest visible content element finishes rendering:</p>
+        <ul>
+          <li><strong>What counts:</strong> <code>&lt;img&gt;</code>, <code>&lt;video&gt;</code> poster, background-image via CSS, block-level text elements.</li>
+          <li><strong>Thresholds:</strong> Good ≤ 2.5s | Needs Improvement ≤ 4.0s | Poor &gt; 4.0s</li>
+        </ul>
+        <p><strong>Optimization strategies:</strong></p>
+        <ul>
+          <li>Preload the LCP image: <code>&lt;link rel="preload" as="image" href="hero.webp"&gt;</code></li>
+          <li>Use <code>fetchpriority="high"</code> on the LCP element.</li>
+          <li>Inline critical CSS, defer non-critical.</li>
+          <li>Use CDN, HTTP/2, and edge caching for fast TTFB.</li>
+          <li>Optimize image format (WebP/AVIF) and use responsive <code>srcset</code>.</li>
+          <li>Avoid lazy-loading the LCP image.</li>
+        </ul>
+
+        <h3>INP — Interaction to Next Paint</h3>
+        <p>Replaced FID in 2024. Measures the latency from user interaction to the next visual update:</p>
+        <ul>
+          <li><strong>What it measures:</strong> Click, tap, keypress → time until the next frame is painted.</li>
+          <li><strong>Thresholds:</strong> Good ≤ 200ms | Needs Improvement ≤ 500ms | Poor &gt; 500ms</li>
+          <li><strong>Includes:</strong> Input delay + Processing time + Presentation delay.</li>
+        </ul>
+        <p><strong>Optimization strategies:</strong></p>
+        <ul>
+          <li>Break Long Tasks with <code>scheduler.yield()</code> or manual yielding.</li>
+          <li>Move non-visual work off the main thread (Web Workers).</li>
+          <li>Reduce JavaScript bundle size (code splitting).</li>
+          <li>Avoid layout thrashing in event handlers.</li>
+          <li>Use <code>content-visibility: auto</code> to reduce rendering work.</li>
+        </ul>
+
+        <h3>CLS — Cumulative Layout Shift</h3>
+        <p>Measures visual stability — how much elements shift unexpectedly:</p>
+        <ul>
+          <li><strong>Thresholds:</strong> Good ≤ 0.1 | Needs Improvement ≤ 0.25 | Poor &gt; 0.25</li>
+          <li><strong>Formula:</strong> Impact Fraction × Distance Fraction for each shift.</li>
+        </ul>
+        <p><strong>Common causes and prevention:</strong></p>
+        <ul>
+          <li>Images without dimensions → <strong>Fix:</strong> Always set <code>width</code>/<code>height</code> or use <code>aspect-ratio</code>.</li>
+          <li>Ads/embeds without reserved space → <strong>Fix:</strong> Use <code>min-height</code> placeholders.</li>
+          <li>Dynamically injected content → <strong>Fix:</strong> Reserve space or use <code>content-visibility</code>.</li>
+          <li>Web fonts causing FOUT → <strong>Fix:</strong> <code>font-display: optional</code> or size-adjust.</li>
+          <li>Late-loading CSS → <strong>Fix:</strong> Inline critical CSS.</li>
+        </ul>
+
+        <h3>TTFB — Time to First Byte</h3>
+        <ul>
+          <li><strong>Thresholds:</strong> Good ≤ 800ms | Needs Improvement ≤ 1800ms | Poor &gt; 1800ms</li>
+          <li><strong>Optimization:</strong> CDN, edge rendering (SSR at edge), efficient server processing, HTTP/2 push, stale-while-revalidate caching.</li>
+        </ul>
+
+        <h3>Measurement APIs</h3>
+<pre><code class="language-javascript">// Using the web-vitals library (Google's official)
+import { onLCP, onINP, onCLS, onTTFB } from 'web-vitals';
+
+function sendToAnalytics(metric) {
+  const body = JSON.stringify({
+    name: metric.name,
+    value: metric.value,
+    rating: metric.rating, // 'good' | 'needs-improvement' | 'poor'
+    delta: metric.delta,
+    id: metric.id,
+    navigationType: metric.navigationType,
+    entries: metric.entries // Raw PerformanceEntry objects
+  });
+
+  // Use sendBeacon to avoid losing data on page unload
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon('/analytics', body);
+  } else {
+    fetch('/analytics', { body, method: 'POST', keepalive: true });
+  }
+}
+
+onLCP(sendToAnalytics);
+onINP(sendToAnalytics);
+onCLS(sendToAnalytics);
+onTTFB(sendToAnalytics);
+
+// Raw PerformanceObserver approach
+const lcpObserver = new PerformanceObserver(entryList =&gt; {
+  const entries = entryList.getEntries();
+  const lastEntry = entries[entries.length - 1];
+  console.log('LCP candidate:', lastEntry.startTime, lastEntry.element);
+});
+lcpObserver.observe({ type: 'largest-contentful-paint', buffered: true });</code></pre>
+
+        <h3>Thresholds Summary</h3>
+        <table>
+          <thead>
+            <tr><th>Metric</th><th>Good</th><th>Needs Improvement</th><th>Poor</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>LCP</td><td>≤ 2.5s</td><td>≤ 4.0s</td><td>&gt; 4.0s</td></tr>
+            <tr><td>INP</td><td>≤ 200ms</td><td>≤ 500ms</td><td>&gt; 500ms</td></tr>
+            <tr><td>CLS</td><td>≤ 0.1</td><td>≤ 0.25</td><td>&gt; 0.25</td></tr>
+            <tr><td>TTFB</td><td>≤ 800ms</td><td>≤ 1800ms</td><td>&gt; 1800ms</td></tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+
+    <!-- Section 12: Long Tasks & Main Thread Blocking -->
+    <section id="long-tasks">
+      <h2>Long Tasks &amp; Main Thread Blocking</h2>
+      <details>
+        <summary>Detecting and breaking up tasks that block responsiveness</summary>
+
+        <h3>What Constitutes a Long Task</h3>
+        <p>Any task that occupies the main thread for <strong>&gt;50ms</strong> is classified as a Long Task. During this time:</p>
+        <ul>
+          <li>User interactions (clicks, typing) are queued and delayed.</li>
+          <li>Rendering updates are blocked — animations jank.</li>
+          <li>Other scheduled callbacks (setTimeout, rAF) can't execute.</li>
+        </ul>
+<pre class="diagram">
+Main Thread Timeline:
+┌────────────────────────────────────────────────────────────────────┐
+│ ◀── 50ms ──▶│◀────────── 200ms Long Task ────────────▶│           │
+│  Responsive │  BLOCKED — user input queued, no paint   │ Responsive│
+│  (idle)     │  INP = input delay + 200ms               │ (idle)    │
+└────────────────────────────────────────────────────────────────────┘
+              ▲ user clicks here         ▲ response finally paints
+              Input Delay = 200ms!
+</pre>
+
+        <h3>Impact on INP and Responsiveness</h3>
+        <ul>
+          <li><strong>INP includes input delay:</strong> If a Long Task is running when the user clicks, the entire task duration adds to INP.</li>
+          <li><strong>50ms budget:</strong> RAIL model recommends responses within 100ms. After subtracting input processing, you have ~50ms for work.</li>
+          <li><strong>Compounding:</strong> Multiple Long Tasks back-to-back can make a page feel completely frozen.</li>
+        </ul>
+
+        <h3>PerformanceObserver for Long Task Detection</h3>
+<pre><code class="language-javascript">// Monitor Long Tasks in production
+const longTaskObserver = new PerformanceObserver(list =&gt; {
+  for (const entry of list.getEntries()) {
+    // entry.duration is always &gt; 50ms for longtask type
+    const attribution = entry.attribution[0];
+    console.warn(`Long Task: ${entry.duration.toFixed(1)}ms`, {
+      startTime: entry.startTime,
+      containerType: attribution?.containerType,
+      containerSrc: attribution?.containerSrc,
+      containerId: attribution?.containerId,
+      containerName: attribution?.containerName
+    });
+
+    // Report to monitoring
+    if (entry.duration &gt; 100) {
+      reportToMonitoring('critical_long_task', {
+        duration: entry.duration,
+        url: location.href
+      });
+    }
+  }
+});
+
+longTaskObserver.observe({ type: 'longtask', buffered: true });</code></pre>
+
+        <h3>Strategies: Code Splitting, Yielding, Web Workers</h3>
+<pre><code class="language-javascript">// Strategy 1: Yield to main thread (manual)
+async function processLargeArray(items) {
+  const CHUNK_SIZE = 50;
+
+  for (let i = 0; i &lt; items.length; i += CHUNK_SIZE) {
+    const chunk = items.slice(i, i + CHUNK_SIZE);
+    processChunk(chunk);
+
+    // Yield to main thread — let events, paint, etc. run
+    await new Promise(resolve =&gt; setTimeout(resolve, 0));
+  }
+}
+
+// Strategy 2: isInputPending (check if user is waiting)
+function processWithInputCheck(items) {
+  let i = 0;
+  function doWork() {
+    while (i &lt; items.length) {
+      processItem(items[i++]);
+
+      // Check if user has pending input — yield immediately
+      if (navigator.scheduling?.isInputPending()) {
+        setTimeout(doWork, 0);
+        return;
+      }
+    }
+  }
+  doWork();
+}
+
+// Strategy 3: Web Worker for CPU-heavy computation
+// main.js
+const worker = new Worker('/workers/heavy-calc.js');
+worker.postMessage({ data: largeDataset });
+worker.onmessage = (e) =&gt; {
+  renderResults(e.data); // Back on main thread for DOM updates
+};
+
+// heavy-calc.js (Web Worker)
+self.onmessage = (e) =&gt; {
+  const result = expensiveComputation(e.data); // No main thread impact
+  self.postMessage(result);
+};</code></pre>
+
+        <h3>scheduler.yield() (Chrome 129+, Sept 2024)</h3>
+<pre><code class="language-javascript">// scheduler.yield() — shipped in Chrome 129 (Sept 2024)
+// Yields to the browser but maintains task priority
+async function processItems(items) {
+  for (const item of items) {
+    processItem(item);
+
+    // Yield back to browser, but our continuation gets HIGH priority
+    // (unlike setTimeout which goes to the back of the queue)
+    await scheduler.yield();
+  }
+}
+
+// With priority:
+await scheduler.yield({ priority: 'user-visible' });
+
+// Fallback pattern for today:
+async function yieldToMain() {
+  if ('scheduler' in globalThis &amp;&amp; 'yield' in scheduler) {
+    return scheduler.yield();
+  }
+  return new Promise(resolve =&gt; setTimeout(resolve, 0));
+}</code></pre>
+        <div class="callout callout-info">
+          <p><strong>Key Difference:</strong> <code>setTimeout(fn, 0)</code> puts your continuation at the <em>back</em> of the task queue. <code>scheduler.yield()</code> preserves priority — your continuation runs before lower-priority tasks. This prevents priority inversion where yielding makes your task slower.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 13: Production Performance Audit -->
+    <section id="production-audit">
+      <h2>Production Performance Audit</h2>
+      <details>
+        <summary>Real-world incident: CLS and LCP degradation on product pages</summary>
+
+        <h3>Symptoms</h3>
+        <ul>
+          <li><strong>CLS:</strong> 0.3 on product detail pages (poor threshold &gt; 0.25).</li>
+          <li><strong>LCP:</strong> 4.8s on mobile (poor threshold &gt; 4.0s).</li>
+          <li><strong>Impact:</strong> 12% bounce rate increase, SEO ranking drop (Core Web Vitals are a ranking signal).</li>
+          <li><strong>User reports:</strong> "Page jumps around while loading" and "images pop in late."</li>
+        </ul>
+
+        <h3>Investigation</h3>
+<pre><code class="language-javascript">// Step 1: CrUX data confirmed field metrics matched lab data
+// PageSpeed Insights API query:
+// https://pagespeedonline.googleapis.com/pagespeedonline/v5/runPagespeed
+//   ?url=https://example.com/product/123&amp;strategy=mobile
+
+// Step 2: WebPageTest filmstrip showed layout shifts at 2.1s and 3.4s
+
+// Step 3: PerformanceObserver in production identified shift sources:
+const clsDebug = new PerformanceObserver(list =&gt; {
+  for (const entry of list.getEntries()) {
+    if (!entry.hadRecentInput &amp;&amp; entry.value &gt; 0.05) {
+      entry.sources.forEach(source =&gt; {
+        console.log('Shift source:', {
+          node: source.node,                    // DOM element
+          previousRect: source.previousRect,    // Before shift
+          currentRect: source.currentRect,      // After shift
+          shiftValue: entry.value
+        });
+      });
+    }
+  }
+});
+clsDebug.observe({ type: 'layout-shift', buffered: true });
+
+// Step 4: LCP element identified as hero product image
+// loaded via client-side JS after React hydration</code></pre>
+
+        <h3>Root Causes</h3>
+        <table>
+          <thead>
+            <tr><th>Issue</th><th>Metric Impact</th><th>Root Cause</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Hero image shift</td>
+              <td>CLS +0.15</td>
+              <td>Image without width/height, loaded after JS hydration</td>
+            </tr>
+            <tr>
+              <td>Price badge injection</td>
+              <td>CLS +0.08</td>
+              <td>Dynamic "SALE" badge added by A/B test script after paint</td>
+            </tr>
+            <tr>
+              <td>Web font FOUT</td>
+              <td>CLS +0.07</td>
+              <td>Custom font loaded via @font-face without size-adjust</td>
+            </tr>
+            <tr>
+              <td>Hero image format</td>
+              <td>LCP +2.1s</td>
+              <td>2.4MB unoptimized JPEG, no srcset, no preload</td>
+            </tr>
+            <tr>
+              <td>Client-side rendering</td>
+              <td>LCP +1.2s</td>
+              <td>Image URL determined by JS after hydration, not in HTML</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Resolution</h3>
+<pre><code class="language-javascript">// Fix 1: Explicit dimensions on all images
+// Before: &lt;img src={product.image} alt={product.name}&gt;
+// After:
+&lt;img
+  src={product.image}
+  alt={product.name}
+  width={600}
+  height={400}
+  style="aspect-ratio: 3/2"
+  fetchpriority="high"
+  loading="eager"
+/&gt;
+
+// Fix 2: Preload LCP image in SSR HTML head
+&lt;link rel="preload" as="image" href="/images/hero-product.webp"
+      imagesrcset="/images/hero-400.webp 400w, /images/hero-800.webp 800w"
+      imagesizes="(max-width: 768px) 100vw, 50vw"&gt;
+
+// Fix 3: Reserve space for dynamic content
+.sale-badge-container {
+  min-height: 32px; /* Reserve space even before badge loads */
+}
+
+// Fix 4: Font optimization
+@font-face {
+  font-family: 'ProductFont';
+  src: url('/fonts/product.woff2') format('woff2');
+  font-display: optional; /* No FOUT — fallback if slow */
+  size-adjust: 102%; /* Match fallback metrics */
+}
+
+// Fix 5: Performance budget in CI
+// lighthouse-ci.yml
+ci: {
+  assert: {
+    assertions: {
+      'cumulative-layout-shift': ['error', { maxNumericValue: 0.1 }],
+      'largest-contentful-paint': ['error', { maxNumericValue: 2500 }],
+      'interactive': ['error', { maxNumericValue: 3800 }]
+    }
+  }
+}</code></pre>
+
+        <h3>Results After Fix</h3>
+        <ul>
+          <li><strong>CLS:</strong> 0.3 → 0.04 (92% reduction)</li>
+          <li><strong>LCP:</strong> 4.8s → 1.9s (60% improvement)</li>
+          <li><strong>Bounce rate:</strong> Decreased 8% within 2 weeks of deployment.</li>
+          <li><strong>CI gate:</strong> Lighthouse CI now blocks PRs that regress Core Web Vitals.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 14: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Production-ready utilities for rendering performance</summary>
+
+        <h3>Layout Thrashing Detection Utility</h3>
+<pre><code class="language-javascript">// Development-only utility to detect layout thrashing
+class LayoutThrashingDetector {
+  constructor(threshold = 3) {
+    this.threshold = threshold;
+    this.readsAfterWrite = 0;
+    this.lastOperation = null;
+    this.enabled = process.env.NODE_ENV === 'development';
+
+    if (this.enabled) this.monkeyPatch();
+  }
+
+  monkeyPatch() {
+    const detector = this;
+    const layoutProps = [
+      'offsetTop', 'offsetLeft', 'offsetWidth', 'offsetHeight',
+      'scrollTop', 'scrollLeft', 'scrollWidth', 'scrollHeight',
+      'clientTop', 'clientLeft', 'clientWidth', 'clientHeight'
+    ];
+
+    // Intercept style writes
+    const originalSetProperty = CSSStyleDeclaration.prototype.setProperty;
+    CSSStyleDeclaration.prototype.setProperty = function(...args) {
+      detector.recordWrite();
+      return originalSetProperty.apply(this, args);
+    };
+
+    // Intercept layout reads via property descriptors
+    layoutProps.forEach(prop =&gt; {
+      const proto = HTMLElement.prototype;
+      const descriptor = Object.getOwnPropertyDescriptor(proto, prop);
+      if (descriptor &amp;&amp; descriptor.get) {
+        Object.defineProperty(proto, prop, {
+          get() {
+            detector.recordRead(prop);
+            return descriptor.get.call(this);
+          }
+        });
+      }
+    });
+  }
+
+  recordWrite() {
+    this.lastOperation = 'write';
+    this.readsAfterWrite = 0;
+  }
+
+  recordRead(prop) {
+    if (this.lastOperation === 'write') {
+      this.readsAfterWrite++;
+      if (this.readsAfterWrite &gt;= this.threshold) {
+        console.warn(
+          `⚠️ Layout thrashing detected! ${this.readsAfterWrite} forced ` +
+          `layouts after DOM write. Property: ${prop}`,
+          new Error().stack
+        );
+      }
+    }
+  }
+}
+
+// Enable in development:
+if (process.env.NODE_ENV === 'development') {
+  new LayoutThrashingDetector();
+}</code></pre>
+
+        <h3>Smooth Scroll with IntersectionObserver</h3>
+<pre><code class="language-javascript">// Reveal-on-scroll with staggered animation
+class ScrollReveal {
+  constructor(selector, options = {}) {
+    this.elements = document.querySelectorAll(selector);
+    this.options = {
+      threshold: 0.15,
+      rootMargin: '0px 0px -50px 0px',
+      staggerDelay: 100,
+      ...options
+    };
+
+    this.observer = new IntersectionObserver(
+      this.handleIntersect.bind(this),
+      {
+        threshold: this.options.threshold,
+        rootMargin: this.options.rootMargin
+      }
+    );
+
+    this.elements.forEach(el =&gt; {
+      el.style.opacity = '0';
+      el.style.transform = 'translateY(20px)';
+      el.style.transition = 'opacity 0.6s ease, transform 0.6s ease';
+      this.observer.observe(el);
+    });
+  }
+
+  handleIntersect(entries) {
+    const visible = entries.filter(e =&gt; e.isIntersecting);
+
+    visible.forEach((entry, index) =&gt; {
+      setTimeout(() =&gt; {
+        entry.target.style.opacity = '1';
+        entry.target.style.transform = 'translateY(0)';
+        this.observer.unobserve(entry.target);
+      }, index * this.options.staggerDelay);
+    });
+  }
+
+  destroy() {
+    this.observer.disconnect();
+  }
+}
+
+// Usage:
+const reveal = new ScrollReveal('.animate-on-scroll', {
+  staggerDelay: 80,
+  rootMargin: '0px 0px -100px 0px'
+});</code></pre>
+
+        <h3>Web Vitals Monitoring Setup</h3>
+<pre><code class="language-javascript">// Complete Web Vitals monitoring with attribution
+import { onLCP, onINP, onCLS, onFCP, onTTFB } from 'web-vitals/attribution';
+
+class WebVitalsMonitor {
+  constructor(reportEndpoint) {
+    this.endpoint = reportEndpoint;
+    this.queue = [];
+    this.flushTimeout = null;
+  }
+
+  init() {
+    onLCP(metric =&gt; this.enqueue(metric));
+    onINP(metric =&gt; this.enqueue(metric));
+    onCLS(metric =&gt; this.enqueue(metric));
+    onFCP(metric =&gt; this.enqueue(metric));
+    onTTFB(metric =&gt; this.enqueue(metric));
+
+    // Flush on page hide (tab switch, navigation)
+    document.addEventListener('visibilitychange', () =&gt; {
+      if (document.visibilityState === 'hidden') {
+        this.flush();
+      }
+    });
+  }
+
+  enqueue(metric) {
+    this.queue.push({
+      name: metric.name,
+      value: metric.value,
+      rating: metric.rating,
+      delta: metric.delta,
+      id: metric.id,
+      attribution: this.getAttribution(metric),
+      page: location.pathname,
+      connection: navigator.connection?.effectiveType,
+      deviceMemory: navigator.deviceMemory,
+      timestamp: Date.now()
+    });
+
+    // Batch flush after 5s of inactivity
+    clearTimeout(this.flushTimeout);
+    this.flushTimeout = setTimeout(() =&gt; this.flush(), 5000);
+  }
+
+  getAttribution(metric) {
+    switch (metric.name) {
+      case 'LCP':
+        return { element: metric.attribution.element, url: metric.attribution.url };
+      case 'INP':
+        return { eventTarget: metric.attribution.eventTarget, eventType: metric.attribution.eventType };
+      case 'CLS':
+        return { largestShiftTarget: metric.attribution.largestShiftTarget };
+      default:
+        return {};
+    }
+  }
+
+  flush() {
+    if (this.queue.length === 0) return;
+    const payload = JSON.stringify(this.queue);
+    this.queue = [];
+
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(this.endpoint, payload);
+    } else {
+      fetch(this.endpoint, {
+        method: 'POST',
+        body: payload,
+        keepalive: true
+      });
+    }
+  }
+}
+
+// Initialize:
+const vitals = new WebVitalsMonitor('/api/vitals');
+vitals.init();</code></pre>
+
+        <h3>Animation Performance Comparison</h3>
+<pre><code class="language-javascript">// Compare: transform vs top/left (open DevTools Performance to see difference)
+
+// ❌ BAD: Animating top/left — triggers Layout + Paint every frame
+function animateWithTopLeft(element) {
+  let pos = 0;
+  function frame() {
+    pos += 2;
+    element.style.left = pos + 'px'; // Triggers layout!
+    element.style.top = Math.sin(pos / 50) * 100 + 'px'; // Triggers layout!
+    if (pos &lt; 500) requestAnimationFrame(frame);
+  }
+  element.style.position = 'relative';
+  requestAnimationFrame(frame);
+}
+
+// ✅ GOOD: Animating transform — compositor only, no layout/paint
+function animateWithTransform(element) {
+  let pos = 0;
+  function frame() {
+    pos += 2;
+    // Single transform — no layout, no paint, GPU only
+    element.style.transform =
+      `translate(${pos}px, ${Math.sin(pos / 50) * 100}px)`;
+    if (pos &lt; 500) requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+// ✅ BEST: WAAPI — runs on compositor thread entirely
+function animateWithWAAPI(element) {
+  element.animate([
+    { transform: 'translate(0, 0)' },
+    { transform: 'translate(500px, 0)' }
+  ], {
+    duration: 2000,
+    easing: 'ease-in-out',
+    composite: 'replace'
+  });
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- Section 15: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Five critical performance anti-patterns</summary>
+
+        <h3>Mistake 1: Animating width/height Instead of transform</h3>
+        <div class="callout callout-warning">
+          <p><strong>Impact:</strong> Triggers Layout + Paint on every single frame. At 60fps that's 60 layout recalculations per second, often causing dropped frames and visible jank.</p>
+        </div>
+<pre><code class="language-css">/* ❌ WRONG — triggers layout every frame */
+.expanding-panel {
+  transition: height 300ms ease;
+  height: 0;
+}
+.expanding-panel.open {
+  height: 200px;
+}
+
+/* ✅ CORRECT — compositor-only, smooth 60fps */
+.expanding-panel {
+  transform: scaleY(0);
+  transform-origin: top;
+  transition: transform 300ms ease;
+}
+.expanding-panel.open {
+  transform: scaleY(1);
+}
+
+/* ✅ ALTERNATIVE for content-aware height animation */
+.expanding-panel {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 300ms ease;
+}
+.expanding-panel.open {
+  grid-template-rows: 1fr;
+}</code></pre>
+
+        <h3>Mistake 2: Reading Layout Properties in a Loop</h3>
+<pre><code class="language-javascript">// ❌ WRONG — N forced layouts per frame
+document.querySelectorAll('.card').forEach(card =&gt; {
+  card.style.width = card.parentElement.offsetWidth * 0.8 + 'px';
+  //                                    ↑ FORCED LAYOUT on every iteration
+});
+
+// ✅ CORRECT — single layout, then batch writes
+const parentWidth = document.querySelector('.card').parentElement.offsetWidth;
+document.querySelectorAll('.card').forEach(card =&gt; {
+  card.style.width = parentWidth * 0.8 + 'px'; // Write only
+});</code></pre>
+
+        <h3>Mistake 3: Not Setting Explicit Dimensions on Images/Videos</h3>
+<pre><code class="language-javascript">// ❌ WRONG — causes CLS when image loads
+&lt;img src="product.jpg" alt="Product"&gt;
+
+// ✅ CORRECT — browser reserves space before load
+&lt;img src="product.jpg" alt="Product"
+     width="800" height="600"
+     style="aspect-ratio: 4/3; width: 100%; height: auto;"
+     loading="lazy"&gt;
+
+// ✅ CORRECT — CSS aspect-ratio for responsive images
+&lt;img src="product.jpg" alt="Product" class="responsive-img"&gt;</code></pre>
+<pre><code class="language-css">.responsive-img {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+}</code></pre>
+
+        <h3>Mistake 4: Overusing will-change (Memory Explosion)</h3>
+<pre><code class="language-css">/* ❌ WRONG — every element gets its own GPU layer */
+* {
+  will-change: transform;
+  /* 500 elements × ~2-10 MB per layer = potential GPU memory crash */
+}
+
+/* ❌ WRONG — permanent allocation for rarely-animated element */
+.header {
+  will-change: transform; /* Static header — wasted GPU memory 24/7 */
+}
+
+/* ✅ CORRECT — apply only when animation is imminent */
+.card:hover {
+  will-change: transform;
+}
+.card:active {
+  transform: scale(0.97);
+  transition: transform 150ms;
+}
+
+/* ✅ CORRECT — in JavaScript, apply and remove */</code></pre>
+<pre><code class="language-javascript">el.addEventListener('pointerenter', () =&gt; {
+  el.style.willChange = 'transform';
+});
+el.addEventListener('transitionend', () =&gt; {
+  el.style.willChange = 'auto';
+});</code></pre>
+
+        <h3>Mistake 5: Blocking Rendering with Synchronous Scripts in Head</h3>
+<pre><code class="language-javascript">// ❌ WRONG — blocks DOM parsing AND rendering
+&lt;head&gt;
+  &lt;script src="analytics.js"&gt;&lt;/script&gt;       &lt;!-- Blocks parsing --&gt;
+  &lt;script src="vendor-bundle.js"&gt;&lt;/script&gt;   &lt;!-- Blocks parsing --&gt;
+  &lt;link rel="stylesheet" href="all-styles.css"&gt; &lt;!-- Render-blocking --&gt;
+&lt;/head&gt;
+
+// ✅ CORRECT — non-blocking loading strategies
+&lt;head&gt;
+  &lt;!-- Critical CSS inlined --&gt;
+  &lt;style&gt;/* critical styles */&lt;/style&gt;
+
+  &lt;!-- Non-critical CSS with media hint --&gt;
+  &lt;link rel="stylesheet" href="non-critical.css" media="print" onload="this.media='all'"&gt;
+
+  &lt;!-- Scripts: defer (preserves order, runs after DOM) --&gt;
+  &lt;script src="vendor-bundle.js" defer&gt;&lt;/script&gt;
+  &lt;script src="app.js" defer&gt;&lt;/script&gt;
+
+  &lt;!-- Analytics: async (independent, no order guarantee) --&gt;
+  &lt;script src="analytics.js" async&gt;&lt;/script&gt;
+
+  &lt;!-- Preload critical resources --&gt;
+  &lt;link rel="preload" as="image" href="hero.webp"&gt;
+  &lt;link rel="preload" as="font" href="main.woff2" crossorigin&gt;
+&lt;/head&gt;</code></pre>
+        <div class="callout callout-info">
+          <p><strong>Rule:</strong> <code>defer</code> = "run after DOM is ready, in order." <code>async</code> = "run ASAP, no order guarantee." Default (no attribute) = "stop everything, run now." Almost all scripts should use <code>defer</code>.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 16: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Key architectural trade-offs in rendering performance</summary>
+
+        <table>
+          <thead>
+            <tr><th>Decision</th><th>Option A</th><th>Option B</th><th>When to Choose A</th><th>When to Choose B</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Animation Engine</strong></td>
+              <td>CSS Transitions/Animations</td>
+              <td>JavaScript (rAF / WAAPI)</td>
+              <td>Simple state transitions, hover effects, entry/exit animations. Compositor thread = immune to JS jank.</td>
+              <td>Physics-based motion, complex sequences, dynamic targets, canvas/WebGL, game loops.</td>
+            </tr>
+            <tr>
+              <td><strong>Visibility Detection</strong></td>
+              <td>Observer APIs (Intersection, Resize, Mutation)</td>
+              <td>Event-based Polling (scroll, resize, setInterval)</td>
+              <td>Any case where you're detecting state changes. Async, batched, off main thread. Use by default.</td>
+              <td>Legacy browser support (<IE11), or when you need synchronous notification timing.</td>
+            </tr>
+            <tr>
+              <td><strong>GPU Layer Promotion</strong></td>
+              <td>More compositor layers (will-change, translateZ)</td>
+              <td>Fewer layers (rely on browser auto-promotion)</td>
+              <td>Known animation targets, smooth critical animations, isolated repaint boundaries.</td>
+              <td>Memory-constrained devices, many elements, static pages. Over-promotion wastes GPU memory.</td>
+            </tr>
+            <tr>
+              <td><strong>Rendering Strategy</strong></td>
+              <td>SSR/SSG (server-rendered HTML)</td>
+              <td>CSR (client-side rendering)</td>
+              <td>LCP-critical content, SEO, slow devices. HTML arrives ready to paint.</td>
+              <td>Highly interactive apps, authenticated dashboards, offline-first PWAs.</td>
+            </tr>
+            <tr>
+              <td><strong>Font Loading</strong></td>
+              <td><code>font-display: swap</code> (show text immediately)</td>
+              <td><code>font-display: optional</code> (no layout shift)</td>
+              <td>Content-heavy pages where text visibility is critical (blogs, news).</td>
+              <td>CLS-sensitive pages where layout stability matters more than font appearance.</td>
+            </tr>
+            <tr>
+              <td><strong>Image Loading</strong></td>
+              <td>Eager load with preload (LCP images)</td>
+              <td>Lazy load with IntersectionObserver</td>
+              <td>Above-the-fold hero images, LCP elements. Never lazy-load LCP content.</td>
+              <td>Below-the-fold images, image galleries, long scrollable pages.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-tip">
+          <p><strong>Meta-Trade-off:</strong> Performance optimization is always a balance between <em>time</em> (speed), <em>space</em> (memory/bandwidth), and <em>complexity</em> (code maintainability). GPU layers trade memory for speed. Code splitting trades complexity for initial load time. Choose based on your constraints.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section: View Transitions API -->
+    <section id="view-transitions">
+      <h2>View Transitions API (Chrome 111+)</h2>
+      <details>
+        <summary>Native animated transitions between DOM states — the modern alternative to JS-driven page transitions</summary>
+        <p>The View Transitions API provides a native mechanism for animating between two DOM states (same-document) or two pages (cross-document, Chrome 126+). It replaces complex JS animation libraries for navigation transitions.</p>
+
+        <pre><code class="language-javascript">// Same-document view transition (SPA navigation)
+async function navigateTo(url) {
+  // 1. Browser snapshots the current state (::view-transition-old)
+  const transition = document.startViewTransition(async () => {
+    // 2. Update DOM to new state
+    const html = await fetch(url).then(r => r.text());
+    document.querySelector('main').innerHTML = html;
+  });
+  // 3. Browser snapshots new state (::view-transition-new)
+  // 4. Animates between old and new snapshots (cross-fade by default)
+  await transition.finished;
+}
+
+// CSS: customize the transition
+::view-transition-old(root) {
+  animation: 300ms ease-out fade-out;
+}
+::view-transition-new(root) {
+  animation: 300ms ease-in fade-in;
+}
+
+// Named transitions for specific elements (shared element transitions)
+// CSS: .hero-image { view-transition-name: hero; }
+// The browser matches elements with the same view-transition-name
+// across old/new states and animates position + size between them.</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Interview relevance:</strong> View Transitions replace libraries like Framer Motion's <code>AnimatePresence</code> or FLIP animations for page-level transitions. Cross-document transitions (MPA support, Chrome 126+) work with <code>@view-transition { navigation: auto; }</code> in CSS — zero JavaScript required for basic page transitions.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 17: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Seven deep-dive questions interviewers ask next</summary>
+
+        <h3>1. "How does content-visibility: auto improve rendering performance?"</h3>
+        <p><strong>Answer:</strong> <code>content-visibility: auto</code> tells the browser to skip rendering (layout, paint) for off-screen elements entirely. The browser assigns a fixed <code>contain-intrinsic-size</code> for layout purposes but doesn't compute the subtree. When the element scrolls into view, the browser renders it on-demand. For a page with 1000 product cards, only the ~10 visible ones get rendered — potentially saving hundreds of milliseconds of layout time on initial load.</p>
+
+        <h3>2. "Explain the difference between reflow, repaint, and recomposite. Which CSS properties trigger which?"</h3>
+        <p><strong>Answer:</strong></p>
+        <ul>
+          <li><strong>Reflow (Layout):</strong> Triggered by geometry changes — width, height, margin, padding, position, display, font-size. Recalculates positions of affected elements and descendants. Most expensive.</li>
+          <li><strong>Repaint:</strong> Triggered by visual-only changes — color, background, box-shadow, border-color, visibility. Rasterizes pixels without recalculating geometry. Medium cost.</li>
+          <li><strong>Recomposite:</strong> Triggered by transform, opacity on promoted layers. GPU simply recomposes existing textures. Cheapest — doesn't touch main thread.</li>
+        </ul>
+        <p>The cascade is: Layout → Paint → Composite. Triggering Layout always causes Paint and Composite. Triggering Paint always causes Composite. But Composite-only changes bypass both Layout and Paint.</p>
+
+        <h3>3. "How would you debug a page that has smooth animations in DevTools but janks on real user devices?"</h3>
+        <p><strong>Answer:</strong> DevTools uses a powerful desktop CPU — mask this with Performance tab → CPU throttling (4x/6x slowdown). Check: (1) Are animations running on compositor thread? (Enable Paint flashing — if green flashes during animation, it's not compositor-only). (2) Use chrome://tracing for frame-level compositor analysis. (3) Profile on a real mid-range Android device via remote debugging. (4) Check GPU memory with Layers panel — mobile GPUs have much less VRAM. (5) Look for Long Tasks overlapping animation frames using PerformanceObserver.</p>
+
+        <h3>4. "What is the stacking context, and how does it interact with compositor layers?"</h3>
+        <p><strong>Answer:</strong> A stacking context is a 3D conceptual container that determines paint order (z-index). Created by: position + z-index, opacity &lt; 1, transform, filter, will-change, isolation: isolate. Compositor layers often align with stacking contexts because the browser needs to maintain correct z-order when compositing. However, not every stacking context becomes a compositor layer (that would be too expensive). The browser only promotes when there's an animation or explicit will-change hint.</p>
+
+        <h3>5. "How does the browser handle scroll on the compositor thread, and when does it fall back to the main thread?"</h3>
+        <p><strong>Answer:</strong> Modern browsers handle scroll on the compositor thread for smoothness — no main thread involvement. However, scroll falls back to main thread when: (1) A non-passive scroll event listener exists (<code>{ passive: false }</code>), because the handler might call preventDefault(). (2) The scroll container has complex overflow clipping. (3) Scroll-linked effects need JavaScript (scroll snap points can stay on compositor). Solution: Always use <code>{ passive: true }</code> for scroll listeners, or better — use IntersectionObserver and CSS scroll-snap instead of JS-driven scroll effects.</p>
+
+        <h3>6. "Explain how the browser's preload scanner works and why it matters for performance."</h3>
+        <p><strong>Answer:</strong> When the HTML parser hits a blocking resource (sync script waiting on network), it stops building the DOM. But the <strong>preload scanner</strong> continues scanning ahead in the raw HTML tokens, discovering resource URLs (images, stylesheets, scripts) and issuing fetch requests speculatively. This means by the time the blocking script loads and DOM parsing resumes, many subsequent resources are already in-flight or cached. This is why you should keep URLs in HTML markup (not construct them in JS), use standard attributes (src, href), and avoid patterns that hide resource URLs from the scanner (like data-src without native lazy loading).</p>
+
+        <h3>7. "How would you implement a 60fps drag-and-drop without jank?"</h3>
+        <p><strong>Answer:</strong> Key principles: (1) Use pointer events (not mouse events) for unified touch/mouse handling. (2) On pointerdown, promote the element with <code>will-change: transform</code>. (3) On pointermove, update ONLY <code>transform: translate(dx, dy)</code> — never top/left. (4) Use <code>touch-action: none</code> to prevent browser scroll interference. (5) Batch position updates in rAF to avoid redundant paints from multiple pointermove events per frame. (6) On pointerup, animate to final position with WAAPI, then remove will-change. (7) For drop targets, use IntersectionObserver or hit-testing with <code>document.elementsFromPoint()</code> instead of getBoundingClientRect in the move handler.</p>
+      </details>
+    </section>
+
+    <!-- Section 18: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details open>
+        <summary>Mental models and interview do's/don'ts</summary>
+
+        <h3>Mental Models</h3>
+        <ul>
+          <li><strong>The Pipeline:</strong> Parse → Style → Layout → Paint → Composite. Each stage can be skipped if the change doesn't affect it. transform/opacity skip Layout and Paint.</li>
+          <li><strong>Two Threads:</strong> Main thread (JS, Layout, Paint record) vs Compositor thread (layer composition, scroll, transform animations). Keep the compositor fed and independent.</li>
+          <li><strong>Read-Write Separation:</strong> DOM reads and writes are cheap individually — they're expensive when <em>interleaved</em>. Batch reads, then batch writes.</li>
+          <li><strong>Memory vs Speed:</strong> GPU layers trade memory for animation speed. Profile both, not just frame rate.</li>
+          <li><strong>Measure, Don't Guess:</strong> Use PerformanceObserver, Lighthouse, WebPageTest, and CrUX data. Lab metrics catch regressions; field metrics show real user experience.</li>
+        </ul>
+
+        <h3>What TO Say in an Interview</h3>
+        <ul>
+          <li>"The critical rendering path has six stages — and the key insight is that compositor-only properties bypass four of them."</li>
+          <li>"Layout thrashing happens when you interleave DOM reads and writes — the fix is batch all reads first, then all writes."</li>
+          <li>"I'd measure this with PerformanceObserver for longtask entries and web-vitals for INP attribution."</li>
+          <li>"will-change is a hint, not a magic bullet — it trades GPU memory for animation smoothness and should be applied and removed dynamically."</li>
+          <li>"IntersectionObserver is preferred over scroll events because it runs asynchronously without forcing layout."</li>
+        </ul>
+
+        <h3>What NOT to Say</h3>
+        <ul>
+          <li>❌ "Just add will-change: transform to everything for better performance." — Shows no understanding of memory trade-offs.</li>
+          <li>❌ "The virtual DOM prevents layout thrashing." — React's virtual DOM batches React state, but doesn't prevent forced synchronous layout in event handlers.</li>
+          <li>❌ "GPU acceleration makes everything faster." — Over-promotion causes memory pressure and can make things <em>slower</em>.</li>
+          <li>❌ "requestAnimationFrame makes animations smooth." — rAF still runs on main thread. If your rAF callback takes 20ms, you'll jank.</li>
+          <li>❌ "CLS only matters for SEO." — CLS directly affects user experience and conversion rates, not just search rankings.</li>
+        </ul>
+
+        <div class="callout callout-tip">
+          <p><strong>Interview Framework:</strong> When asked about any rendering performance topic: (1) Name the pipeline stage affected, (2) Explain what thread it runs on, (3) Describe the measurement approach (DevTools panel or API), (4) Give the optimization with trade-offs. This structure demonstrates systems thinking.</p>
+        </div>
+      </details>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+</body>
+</html>

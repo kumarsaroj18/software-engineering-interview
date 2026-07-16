@@ -1,0 +1,2202 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 11: Type Narrowing &amp; Guards | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <a href="../index.html" class="sidebar-brand">
+      <span class="chapter-num">Ch 11</span>
+      <span class="chapter-title">Type Narrowing &amp; Guards</span>
+    </a>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#control-flow-analysis">Control Flow Analysis</a></li>
+        <li><a href="#type-guards">Type Guards</a></li>
+        <li><a href="#discriminated-unions">Discriminated Unions</a></li>
+        <li><a href="#exhaustive-checks">Exhaustive Checks</a></li>
+        <li><a href="#assertion-functions">Assertion Functions</a></li>
+        <li><a href="#custom-predicates">Custom Predicates</a></li>
+        <li><a href="#non-null-assertion">Non-Null Assertion vs Optional Chaining</a></li>
+        <li><a href="#satisfies-operator">satisfies Operator</a></li>
+        <li><a href="#const-assertions">const Assertions</a></li>
+        <li><a href="#template-literal-narrowing">Template Literal Narrowing</a></li>
+        <li><a href="#production-patterns">Production Patterns</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <a href="../index.html#part-ii">Part II — TypeScript Advanced Patterns</a> &gt;
+      <span>Chapter 11</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-typescript">TypeScript</span>
+        <span class="badge badge-narrowing">Narrowing</span>
+        <span class="badge badge-type-guards">Type Guards</span>
+        <span class="badge badge-exhaustive">Exhaustive</span>
+      </div>
+      <h1>Chapter 11: Type Narrowing &amp; Guards</h1>
+      <p class="chapter-question"><em>"How does TypeScript narrow types, and how would you implement exhaustive checking in a large codebase?"</em></p>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> TypeScript's control flow analysis (CFA) narrows types through type guards, discriminated unions, and assertion functions. Exhaustive checking via the <code>never</code> type ensures that all variants of a union are handled — making the compiler catch missing cases when new variants are added. This is the foundation of safe, maintainable domain modeling at scale.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search" />
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details>
+        <summary>What the interviewer is really testing…</summary>
+        <p>When an interviewer asks about type narrowing and exhaustive checks, they are probing for:</p>
+        <ul>
+          <li><strong>Control Flow Analysis (CFA) understanding</strong> — Do you know how TypeScript's compiler tracks types through branches, loops, and assignments?</li>
+          <li><strong>Practical narrowing patterns</strong> — Can you choose the right guard (<code>typeof</code>, <code>instanceof</code>, <code>in</code>, custom predicates) for each situation?</li>
+          <li><strong>Exhaustive checking mastery</strong> — Can you use the <code>never</code> type to guarantee all union variants are handled at compile time?</li>
+          <li><strong>Assertion functions</strong> — Do you understand <code>asserts</code> functions and when they're preferable to type guards?</li>
+          <li><strong>Domain modeling maturity</strong> — Can you design discriminated unions that scale across a large codebase with multiple contributors?</li>
+        </ul>
+        <div class="callout callout-info">
+          <p><strong>Senior signal:</strong> A senior developer doesn't just use narrowing — they design types that <em>force</em> narrowing, making illegal states unrepresentable and ensuring the compiler catches regressions when the domain evolves.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details>
+        <summary>The concise interview response…</summary>
+        <p>TypeScript uses <strong>Control Flow Analysis</strong> to narrow types at each point in code. After an <code>if (typeof x === "string")</code> check, the compiler knows <code>x</code> is a <code>string</code> inside that branch. This works with <code>typeof</code>, <code>instanceof</code>, the <code>in</code> operator, and custom type predicates (<code>x is Type</code>).</p>
+        <p>For complex domain models, I use <strong>discriminated unions</strong> — unions where each variant has a literal <code>kind</code> or <code>type</code> field. A <code>switch</code> on that discriminant narrows to the specific variant in each case.</p>
+        <p>For <strong>exhaustive checking</strong>, I add a <code>default</code> case that assigns the value to <code>never</code>:</p>
+<pre><code class="language-typescript">function assertNever(x: never): never {
+  throw new Error(`Unexpected value: ${x}`);
+}
+
+function handleShape(shape: Shape) {
+  switch (shape.kind) {
+    case "circle":    return Math.PI * shape.radius ** 2;
+    case "rectangle": return shape.width * shape.height;
+    default:          return assertNever(shape);
+    // ^^ compile error if a new Shape variant is added
+  }
+}</code></pre>
+        <p>This makes the compiler report an error whenever a new variant is added to the union but not handled — catching bugs at build time, not runtime.</p>
+      </details>
+    </section>
+
+    <!-- Section 3: Control Flow Analysis -->
+    <section id="control-flow-analysis">
+      <h2>Control Flow Analysis</h2>
+      <details>
+        <summary>How TypeScript tracks types through code execution paths…</summary>
+        <p>Control Flow Analysis (CFA) is the mechanism by which TypeScript's compiler narrows types as code executes. At every point in the program, the compiler maintains a <em>type state</em> for each variable.</p>
+
+        <h3>How CFA Tracks Types</h3>
+<pre class="diagram">
+┌─────────────────────────────────────────────────────┐
+│  function process(value: string | number | null) {  │
+│                                                     │
+│    // value: string | number | null                 │
+│                                                     │
+│    if (value === null) {                            │
+│      // value: null                                 │
+│      return;                                        │
+│    }                                                │
+│                                                     │
+│    // value: string | number  (null eliminated)     │
+│                                                     │
+│    if (typeof value === "string") {                 │
+│      // value: string                              │
+│      value.toUpperCase(); // ✓                      │
+│    } else {                                         │
+│      // value: number                              │
+│      value.toFixed(2);    // ✓                      │
+│    }                                                │
+│  }                                                  │
+└─────────────────────────────────────────────────────┘
+</pre>
+
+        <h3>Narrowing After if / switch</h3>
+<pre><code class="language-typescript">type Response = { status: "ok"; data: string } | { status: "error"; message: string };
+
+function handle(res: Response) {
+  if (res.status === "ok") {
+    // res: { status: "ok"; data: string }
+    console.log(res.data);
+  } else {
+    // res: { status: "error"; message: string }
+    console.error(res.message);
+  }
+}</code></pre>
+
+        <h3>Assignment Narrowing</h3>
+<pre><code class="language-typescript">let value: string | number;
+
+value = "hello";
+// value: string — narrowed by assignment
+console.log(value.toUpperCase()); // ✓
+
+value = 42;
+// value: number — re-narrowed by assignment
+console.log(value.toFixed(2)); // ✓</code></pre>
+
+        <h3>Truthiness Narrowing</h3>
+<pre><code class="language-typescript">function printLength(str: string | undefined) {
+  if (str) {
+    // str: string (undefined and "" eliminated)
+    console.log(str.length);
+  }
+}
+
+// Beware: truthiness eliminates "", 0, NaN, null, undefined
+function processNumber(n: number | undefined) {
+  if (n) {
+    // n: number — but 0 is also excluded!
+    // This is a common bug source
+  }
+  // Prefer: if (n !== undefined) for numbers
+}</code></pre>
+
+        <h3>Type Widening After Reassignment</h3>
+<pre><code class="language-typescript">function example(x: string | number) {
+  if (typeof x === "string") {
+    // x: string
+    x = 42; // x re-assigned
+    // x: number — widened to the assigned type
+  }
+  // x: string | number — back to original declared type
+}
+
+// Closures and narrowing:
+function closureProblem(x: string | number) {
+  if (typeof x === "string") {
+    x = x.toUpperCase(); // x is reassigned after narrowing
+    setTimeout(() =&gt; {
+      // x: string | number — narrowing lost!
+      // TS cannot guarantee x wasn't reassigned before callback runs
+    }, 0);
+  }
+}
+
+// TS 5.x improvement: if the variable is NEVER reassigned after the
+// narrowing check, narrowing now persists into closures:
+function closureFixed(x: string | number) {
+  if (typeof x === "string") {
+    // x is NOT reassigned anywhere in this scope
+    setTimeout(() =&gt; {
+      // x: string ✅ — narrowing preserved in TS 5.x!
+      console.log(x.toUpperCase());
+    }, 0);
+  }
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Gotcha:</strong> In TS 5.x, narrowing persists into closures for variables that are never reassigned after the narrowing check. If the variable <em>is</em> reassigned, narrowing is still lost. For maximum compatibility, assign to a <code>const</code> or pass as a parameter.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: Type Guards -->
+    <section id="type-guards">
+      <h2>Type Guards (typeof, instanceof, in, is)</h2>
+      <details>
+        <summary>The four built-in narrowing mechanisms and custom predicates…</summary>
+
+        <h3>typeof Narrowing</h3>
+        <p>Works for primitive types: <code>"string"</code>, <code>"number"</code>, <code>"bigint"</code>, <code>"boolean"</code>, <code>"symbol"</code>, <code>"undefined"</code>, <code>"object"</code>, <code>"function"</code>.</p>
+<pre><code class="language-typescript">function padLeft(value: string | number, padding: string | number): string {
+  if (typeof padding === "number") {
+    // padding: number
+    return " ".repeat(padding) + value;
+  }
+  // padding: string
+  return padding + value;
+}
+
+// Limitation: typeof null === "object" — a historical JS bug
+function processValue(val: object | null) {
+  if (typeof val === "object") {
+    // val: object | null — NOT narrowed! null leaks through
+  }
+  if (val !== null &amp;&amp; typeof val === "object") {
+    // val: object — correctly narrowed
+  }
+}</code></pre>
+
+        <h3>instanceof Narrowing</h3>
+        <p>Works for class instances and built-in constructors:</p>
+<pre><code class="language-typescript">class ApiError extends Error {
+  constructor(public statusCode: number, message: string) {
+    super(message);
+  }
+}
+
+class ValidationError extends Error {
+  constructor(public fields: string[], message: string) {
+    super(message);
+  }
+}
+
+function handleError(error: Error) {
+  if (error instanceof ApiError) {
+    // error: ApiError
+    console.log(`API ${error.statusCode}: ${error.message}`);
+  } else if (error instanceof ValidationError) {
+    // error: ValidationError
+    console.log(`Invalid fields: ${error.fields.join(", ")}`);
+  } else {
+    // error: Error
+    console.log(`Unknown: ${error.message}`);
+  }
+}</code></pre>
+
+        <h3>'in' Operator Narrowing</h3>
+        <p>Checks for property existence — ideal for interfaces without shared constructors:</p>
+<pre><code class="language-typescript">interface Fish { swim: () =&gt; void; }
+interface Bird { fly: () =&gt; void; }
+interface Dog  { run: () =&gt; void; swim: () =&gt; void; }
+
+function move(animal: Fish | Bird | Dog) {
+  if ("fly" in animal) {
+    // animal: Bird
+    animal.fly();
+  } else if ("run" in animal) {
+    // animal: Dog (has swim too, but 'run' is unique)
+    animal.run();
+  } else {
+    // animal: Fish
+    animal.swim();
+  }
+}</code></pre>
+
+        <h3>Custom Type Predicates (paramName is Type)</h3>
+<pre><code class="language-typescript">interface AdminUser {
+  role: "admin";
+  permissions: string[];
+  auditLog: string[];
+}
+
+interface RegularUser {
+  role: "user";
+  permissions: string[];
+}
+
+type User = AdminUser | RegularUser;
+
+// Type predicate function
+function isAdmin(user: User): user is AdminUser {
+  return user.role === "admin";
+}
+
+function renderDashboard(user: User) {
+  if (isAdmin(user)) {
+    // user: AdminUser
+    console.log(user.auditLog); // ✓ accessible
+  } else {
+    // user: RegularUser
+    // user.auditLog — ✗ compile error
+  }
+}</code></pre>
+
+        <h3>When to Use Each Guard</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Guard</th>
+              <th>Best For</th>
+              <th>Limitations</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>typeof</code></td>
+              <td>Primitives (string, number, boolean)</td>
+              <td>Cannot distinguish interfaces/objects; <code>typeof null === "object"</code></td>
+            </tr>
+            <tr>
+              <td><code>instanceof</code></td>
+              <td>Class hierarchies, built-in objects</td>
+              <td>Doesn't work across realms (iframes); no interface support</td>
+            </tr>
+            <tr>
+              <td><code>in</code></td>
+              <td>Structural checks, interface unions</td>
+              <td>Only checks property existence, not type; inherited props match</td>
+            </tr>
+            <tr>
+              <td><code>x is Type</code></td>
+              <td>Complex validation logic, reusable guards</td>
+              <td>Compiler trusts your implementation — can lie</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 5: Discriminated Unions -->
+    <section id="discriminated-unions">
+      <h2>Discriminated Unions</h2>
+      <details>
+        <summary>The most powerful narrowing pattern for domain modeling…</summary>
+
+        <h3>What Makes a Good Discriminant?</h3>
+        <p>A discriminant must be a property present in every variant with a <strong>literal type</strong> (string literal, number literal, or boolean literal) that is unique per variant:</p>
+<pre><code class="language-typescript">// ✓ Good discriminant: literal string union
+type Shape =
+  | { kind: "circle"; radius: number }
+  | { kind: "rectangle"; width: number; height: number }
+  | { kind: "triangle"; base: number; height: number };
+
+// ✗ Bad discriminant: non-literal type
+type BadShape =
+  | { type: string; radius: number }   // "string" is too wide
+  | { type: string; width: number };   // can't distinguish</code></pre>
+
+        <h3>Switch Exhaustiveness</h3>
+<pre><code class="language-typescript">function area(shape: Shape): number {
+  switch (shape.kind) {
+    case "circle":
+      return Math.PI * shape.radius ** 2;
+    case "rectangle":
+      return shape.width * shape.height;
+    case "triangle":
+      return 0.5 * shape.base * shape.height;
+    // If we add a new variant to Shape and forget a case,
+    // TypeScript errors IF we enable noImplicitReturns or use assertNever
+  }
+}</code></pre>
+
+        <h3>Nested Discriminated Unions</h3>
+<pre><code class="language-typescript">type AsyncState&lt;T&gt; =
+  | { status: "idle" }
+  | { status: "loading"; progress?: number }
+  | { status: "success"; data: T; cachedAt: number }
+  | { status: "error"; error: Error; retryCount: number };
+
+type FormField =
+  | { type: "text"; value: string; validation: TextValidation }
+  | { type: "select"; value: string; options: Option[] }
+  | { type: "multi-select"; value: string[]; options: Option[] };
+
+// Nested: Form has fields, each narrowed independently
+interface Form {
+  fields: Record&lt;string, FormField&gt;;
+  submission: AsyncState&lt;{ id: string }&gt;;
+}</code></pre>
+
+        <h3>Real-World Domain Modeling</h3>
+
+        <h4>API Responses</h4>
+<pre><code class="language-typescript">type ApiResponse&lt;T&gt; =
+  | { type: "success"; data: T; meta: { requestId: string; duration: number } }
+  | { type: "error"; code: number; message: string; details?: unknown }
+  | { type: "redirect"; location: string; permanent: boolean };
+
+function handleResponse&lt;T&gt;(res: ApiResponse&lt;T&gt;): T | null {
+  switch (res.type) {
+    case "success":
+      return res.data;
+    case "error":
+      reportError(res.code, res.message);
+      return null;
+    case "redirect":
+      window.location.href = res.location;
+      return null;
+  }
+}</code></pre>
+
+        <h4>Redux Actions</h4>
+<pre><code class="language-typescript">type TodoAction =
+  | { type: "TODO_ADD"; payload: { id: string; text: string } }
+  | { type: "TODO_TOGGLE"; payload: { id: string } }
+  | { type: "TODO_DELETE"; payload: { id: string } }
+  | { type: "TODO_BULK_UPDATE"; payload: { ids: string[]; done: boolean } };
+
+function todoReducer(state: TodoState, action: TodoAction): TodoState {
+  switch (action.type) {
+    case "TODO_ADD":
+      return { ...state, items: [...state.items, action.payload] };
+    case "TODO_TOGGLE":
+      return {
+        ...state,
+        items: state.items.map(t =&gt;
+          t.id === action.payload.id ? { ...t, done: !t.done } : t
+        ),
+      };
+    case "TODO_DELETE":
+      return {
+        ...state,
+        items: state.items.filter(t =&gt; t.id !== action.payload.id),
+      };
+    case "TODO_BULK_UPDATE":
+      return {
+        ...state,
+        items: state.items.map(t =&gt;
+          action.payload.ids.includes(t.id)
+            ? { ...t, done: action.payload.done }
+            : t
+        ),
+      };
+  }
+}</code></pre>
+
+        <h4>State Machines</h4>
+<pre><code class="language-typescript">type AuthState =
+  | { state: "anonymous" }
+  | { state: "authenticating"; provider: string }
+  | { state: "authenticated"; user: User; token: string; expiresAt: number }
+  | { state: "error"; error: Error; lastAttempt: Date };
+
+type AuthEvent =
+  | { type: "LOGIN_START"; provider: string }
+  | { type: "LOGIN_SUCCESS"; user: User; token: string }
+  | { type: "LOGIN_FAILURE"; error: Error }
+  | { type: "LOGOUT" }
+  | { type: "TOKEN_REFRESH"; token: string };
+
+function transition(state: AuthState, event: AuthEvent): AuthState {
+  switch (state.state) {
+    case "anonymous":
+      if (event.type === "LOGIN_START") {
+        return { state: "authenticating", provider: event.provider };
+      }
+      return state;
+    case "authenticating":
+      switch (event.type) {
+        case "LOGIN_SUCCESS":
+          return {
+            state: "authenticated",
+            user: event.user,
+            token: event.token,
+            expiresAt: Date.now() + 3600_000,
+          };
+        case "LOGIN_FAILURE":
+          return { state: "error", error: event.error, lastAttempt: new Date() };
+        default:
+          return state;
+      }
+    case "authenticated":
+      if (event.type === "LOGOUT") return { state: "anonymous" };
+      if (event.type === "TOKEN_REFRESH") return { ...state, token: event.token };
+      return state;
+    case "error":
+      if (event.type === "LOGIN_START") {
+        return { state: "authenticating", provider: event.provider };
+      }
+      return state;
+  }
+}</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Tip:</strong> When designing discriminated unions for large codebases, keep discriminant fields consistent (<code>kind</code>, <code>type</code>, or <code>status</code>) across the entire codebase. This makes auto-complete and refactoring predictable.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 6: Exhaustive Checks -->
+    <section id="exhaustive-checks">
+      <h2>Exhaustive Checks (never type)</h2>
+      <details>
+        <summary>Compile-time guarantees that every variant is handled…</summary>
+
+        <h3>The assertNever Pattern</h3>
+        <p>The <code>never</code> type represents values that should never occur. If a value reaches a point where it should be <code>never</code> but isn't, TypeScript reports a compile error:</p>
+<pre><code class="language-typescript">function assertNever(value: never, message?: string): never {
+  throw new Error(message ?? `Unexpected value: ${JSON.stringify(value)}`);
+}
+
+type Direction = "north" | "south" | "east" | "west";
+
+function move(direction: Direction): [number, number] {
+  switch (direction) {
+    case "north": return [0, 1];
+    case "south": return [0, -1];
+    case "east":  return [1, 0];
+    case "west":  return [-1, 0];
+    default:      return assertNever(direction);
+  }
+}
+
+// Later, someone adds "northeast" to Direction:
+// type Direction = "north" | "south" | "east" | "west" | "northeast";
+// 
+// Compile error in assertNever(direction):
+// Argument of type '"northeast"' is not assignable to parameter of type 'never'
+// This forces them to handle the new case!</code></pre>
+
+        <h3>Switch Default with never</h3>
+<pre><code class="language-typescript">// Alternative: inline never check without a helper function
+function getLabel(status: AsyncState&lt;unknown&gt;["status"]): string {
+  switch (status) {
+    case "idle":    return "Ready";
+    case "loading": return "Loading…";
+    case "success": return "Done";
+    case "error":   return "Failed";
+    default: {
+      const _exhaustive: never = status;
+      return _exhaustive; // unreachable, but satisfies return type
+    }
+  }
+}</code></pre>
+
+        <h3>Why This Catches Missing Cases at Compile Time</h3>
+<pre class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│  Union: "A" | "B" | "C"                                    │
+│                                                             │
+│  case "A": → handled, removes "A" from remaining type      │
+│  case "B": → handled, removes "B" from remaining type      │
+│  case "C": → handled, removes "C" from remaining type      │
+│  default:  → remaining type is never → no error            │
+│                                                             │
+│  If "D" is added to union:                                  │
+│  case "A": → removes "A"                                   │
+│  case "B": → removes "B"                                   │
+│  case "C": → removes "C"                                   │
+│  default:  → remaining type is "D" → ERROR: "D" ≠ never   │
+└─────────────────────────────────────────────────────────────┘
+</pre>
+
+        <h3>Comparison with ESLint switch-exhaustiveness-check</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Catches at</th>
+              <th>Runtime safety</th>
+              <th>Works in expressions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>assertNever</code></td>
+              <td>Compile time + Runtime</td>
+              <td>Yes (throws)</td>
+              <td>Yes</td>
+            </tr>
+            <tr>
+              <td>ESLint <code>switch-exhaustiveness-check</code></td>
+              <td>Lint time only</td>
+              <td>No</td>
+              <td>No (statements only)</td>
+            </tr>
+            <tr>
+              <td><code>noImplicitReturns</code> tsconfig</td>
+              <td>Compile time</td>
+              <td>No</td>
+              <td>No</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-tip">
+          <p><strong>Best practice:</strong> Use <code>assertNever</code> AND the ESLint rule together. The ESLint rule gives faster IDE feedback, while <code>assertNever</code> provides runtime safety for unexpected values (e.g., from deserialized JSON).</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 7: Assertion Functions -->
+    <section id="assertion-functions">
+      <h2>Assertion Functions (asserts)</h2>
+      <details>
+        <summary>Narrow types by asserting conditions or types…</summary>
+
+        <h3>asserts condition Syntax</h3>
+<pre><code class="language-typescript">function assertDefined&lt;T&gt;(
+  value: T | null | undefined,
+  message?: string
+): asserts value is T {
+  if (value === null || value === undefined) {
+    throw new Error(message ?? "Value is null or undefined");
+  }
+}
+
+function processUser(user: User | null) {
+  assertDefined(user, "User must be loaded");
+  // After this line, user: User (narrowed!)
+  console.log(user.name);
+}
+
+// asserts condition — narrows in the enclosing scope
+function assertIsString(value: unknown): asserts value is string {
+  if (typeof value !== "string") {
+    throw new TypeError(`Expected string, got ${typeof value}`);
+  }
+}</code></pre>
+
+        <h3>asserts value is Type Syntax</h3>
+<pre><code class="language-typescript">interface LoadedDocument {
+  id: string;
+  content: string;
+  metadata: DocumentMetadata;
+}
+
+interface UnloadedDocument {
+  id: string;
+  content: null;
+  metadata: null;
+}
+
+type Document = LoadedDocument | UnloadedDocument;
+
+function assertLoaded(doc: Document): asserts doc is LoadedDocument {
+  if (doc.content === null) {
+    throw new Error(`Document ${doc.id} has not been loaded`);
+  }
+}
+
+function renderDocument(doc: Document) {
+  assertLoaded(doc);
+  // doc: LoadedDocument — safely access content and metadata
+  render(doc.content, doc.metadata);
+}</code></pre>
+
+        <h3>When to Use vs Type Guards</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th>Type Guard (<code>is</code>)</th>
+              <th>Assertion Function (<code>asserts</code>)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Return type</td>
+              <td><code>boolean</code></td>
+              <td><code>void</code> (throws on failure)</td>
+            </tr>
+            <tr>
+              <td>Control flow</td>
+              <td>Narrows in if/else branches</td>
+              <td>Narrows everything after the call</td>
+            </tr>
+            <tr>
+              <td>Use case</td>
+              <td>Conditional logic, filtering</td>
+              <td>Preconditions, invariants, fail-fast</td>
+            </tr>
+            <tr>
+              <td>Composability</td>
+              <td>Works with <code>&amp;&amp;</code>, <code>||</code>, ternaries</td>
+              <td>Must be standalone statement</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Relationship to Node's assert Module</h3>
+<pre><code class="language-typescript">import assert from "node:assert";
+
+// Node's assert already narrows in TypeScript!
+function process(value: string | undefined) {
+  assert(value !== undefined, "value is required");
+  // value: string — narrowed by assert
+  console.log(value.toUpperCase());
+}
+
+// Custom assert with more specific narrowing:
+function assertInstanceOf&lt;T&gt;(
+  value: unknown,
+  constructor: new (...args: any[]) =&gt; T,
+  message?: string
+): asserts value is T {
+  if (!(value instanceof constructor)) {
+    throw new Error(message ?? `Expected instance of ${constructor.name}`);
+  }
+}</code></pre>
+
+        <h3>Limitations</h3>
+        <ul>
+          <li>Assertion functions cannot be used in expressions — only as standalone statements</li>
+          <li>They cannot be arrow functions assigned to variables (must be function declarations or methods) — <em>Note: TS 5.5 relaxed this restriction; arrow functions can now have assertion signatures</em></li>
+          <li>The compiler trusts your assertion — an incorrect implementation causes unsound types</li>
+          <li>No narrowing in the "else" branch (unlike type guards)</li>
+          <li>Cannot be used with <code>Promise</code> — async assertion functions don't narrow</li>
+        </ul>
+
+        <div class="callout callout-warning">
+          <p><strong>Warning:</strong> Assertion functions are <em>trusted</em> by the compiler. If your assertion logic is wrong, TypeScript will still narrow the type, leading to runtime errors that look type-safe at compile time.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 8: Custom Predicates -->
+    <section id="custom-predicates">
+      <h2>Narrowing with Custom Predicates</h2>
+      <details>
+        <summary>Writing reusable, composable type guard functions…</summary>
+
+        <h3>Writing Type Guard Functions</h3>
+<pre><code class="language-typescript">// Basic type guard
+function isNonNull&lt;T&gt;(value: T | null | undefined): value is T {
+  return value !== null &amp;&amp; value !== undefined;
+}
+
+// Compound type guard
+interface ApiError {
+  code: number;
+  message: string;
+  details?: Record&lt;string, unknown&gt;;
+}
+
+function isApiError(error: unknown): error is ApiError {
+  return (
+    typeof error === "object" &amp;&amp;
+    error !== null &amp;&amp;
+    "code" in error &amp;&amp;
+    "message" in error &amp;&amp;
+    typeof (error as ApiError).code === "number" &amp;&amp;
+    typeof (error as ApiError).message === "string"
+  );
+}</code></pre>
+
+        <h3>Generic Type Guards</h3>
+<pre><code class="language-typescript">// Guard that narrows array elements
+function isArrayOf&lt;T&gt;(
+  arr: unknown[],
+  guard: (item: unknown) =&gt; item is T
+): arr is T[] {
+  return arr.every(guard);
+}
+
+// Usage
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+const data: unknown[] = ["a", "b", "c"];
+if (isArrayOf(data, isString)) {
+  // data: string[]
+  data.map(s =&gt; s.toUpperCase());
+}
+
+// Generic "has property" guard
+function hasProperty&lt;K extends string&gt;(
+  obj: object,
+  key: K
+): obj is object &amp; Record&lt;K, unknown&gt; {
+  return key in obj;
+}</code></pre>
+
+        <h3>Narrowing Arrays (filter with Type Predicates)</h3>
+<pre><code class="language-typescript">const items: (string | null | undefined)[] = ["a", null, "b", undefined, "c"];
+
+// Without type predicate: result is (string | null | undefined)[]
+const filtered1 = items.filter(item =&gt; item != null);
+
+// With type predicate: result is string[]
+const filtered2 = items.filter((item): item is string =&gt; item != null);
+
+// Real-world: filtering resolved results
+type Result&lt;T&gt; = { ok: true; value: T } | { ok: false; error: Error };
+
+function isOk&lt;T&gt;(result: Result&lt;T&gt;): result is { ok: true; value: T } {
+  return result.ok;
+}
+
+async function fetchAll(urls: string[]): Promise&lt;string[]&gt; {
+  const results = await Promise.allSettled(urls.map(fetch));
+  return results
+    .filter((r): r is PromiseFulfilledResult&lt;Response&gt; =&gt; r.status === "fulfilled")
+    .map(r =&gt; r.value.url);
+}</code></pre>
+
+        <h3>Common Pitfalls: Lying Predicates</h3>
+<pre><code class="language-typescript">// ✗ DANGEROUS: This predicate lies!
+function isNumber(value: unknown): value is number {
+  return typeof value === "string"; // BUG: checking string, claiming number
+}
+
+const val: unknown = "hello";
+if (isNumber(val)) {
+  // val is narrowed to number — but it's actually a string!
+  console.log(val.toFixed(2)); // Runtime crash: val.toFixed is not a function
+}
+
+// ✗ SUBTLE BUG: Incomplete validation
+interface Config {
+  host: string;
+  port: number;
+  ssl: boolean;
+}
+
+function isConfig(obj: unknown): obj is Config {
+  // Only checks one field — could pass with missing fields!
+  return typeof obj === "object" &amp;&amp; obj !== null &amp;&amp; "host" in obj;
+}
+
+// ✓ SAFE: Use a validation library (zod, io-ts) for runtime checks
+import { z } from "zod";
+
+const ConfigSchema = z.object({
+  host: z.string(),
+  port: z.number(),
+  ssl: z.boolean(),
+});
+
+function isValidConfig(obj: unknown): obj is Config {
+  return ConfigSchema.safeParse(obj).success;
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Rule of thumb:</strong> The compiler <em>trusts</em> your type predicate unconditionally. If you lie, you get unsound types. For complex shapes, prefer schema validation (zod, io-ts, valibot) over hand-written predicates.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 9: Non-Null Assertion vs Optional Chaining -->
+    <section id="non-null-assertion">
+      <h2>Non-Null Assertion vs Optional Chaining</h2>
+      <details>
+        <summary>Navigating nullable types safely (and unsafely)…</summary>
+
+        <h3>The ! Operator (Dangerous)</h3>
+<pre><code class="language-typescript">// Non-null assertion: tells TS "I know this isn't null"
+function getElement(id: string): HTMLElement {
+  const el = document.getElementById(id)!;
+  // el: HTMLElement (null possibility removed)
+  // If element doesn't exist → runtime error!
+  return el;
+}
+
+// When it's acceptable (rare):
+// - After a runtime check that TS can't understand
+// - In tests where you control the DOM
+// - Immediately after a Map.set() → Map.get()
+
+const map = new Map&lt;string, number&gt;();
+map.set("key", 42);
+const value = map.get("key")!; // We just set it — safe-ish</code></pre>
+
+        <h3>Optional Chaining ?. (Safe)</h3>
+<pre><code class="language-typescript">interface Company {
+  name: string;
+  address?: {
+    street: string;
+    city: string;
+    country?: {
+      code: string;
+      name: string;
+    };
+  };
+}
+
+function getCountryCode(company: Company): string | undefined {
+  // Safe traversal — returns undefined if any link is missing
+  return company.address?.country?.code;
+}
+
+// Works with method calls and indexed access
+const arr: number[] | undefined = getNumbers();
+const first = arr?.[0];            // number | undefined
+const length = arr?.length;        // number | undefined
+const result = arr?.map(x =&gt; x * 2); // number[] | undefined</code></pre>
+
+        <h3>Nullish Coalescing ?? </h3>
+<pre><code class="language-typescript">// ?? returns right-hand side ONLY for null/undefined (not "" or 0)
+const port = config.port ?? 3000;        // default only if null/undefined
+const name = config.name ?? "anonymous"; // "" would NOT trigger default
+
+// Compare with ||  which treats "", 0, NaN, false as falsy:
+const port2 = config.port || 3000; // 0 would trigger default — likely a bug!
+
+// Combining ?. and ??
+function getDisplayName(user: User | null): string {
+  return user?.profile?.displayName ?? user?.email ?? "Unknown User";
+}
+
+// ??= assignment operator
+let cache: Map&lt;string, Data&gt; | undefined;
+cache ??= new Map(); // initialize only if null/undefined</code></pre>
+
+        <h3>When Each Is Appropriate</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Operator</th>
+              <th>Use When</th>
+              <th>Risk Level</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>!</code> (non-null assertion)</td>
+              <td>You have external proof the value exists</td>
+              <td>🔴 High — runtime crash if wrong</td>
+            </tr>
+            <tr>
+              <td><code>?.</code> (optional chaining)</td>
+              <td>Navigating nullable structures safely</td>
+              <td>🟢 Safe — returns undefined</td>
+            </tr>
+            <tr>
+              <td><code>??</code> (nullish coalescing)</td>
+              <td>Providing defaults for null/undefined</td>
+              <td>🟢 Safe — explicit fallback</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>ESLint Rules</h3>
+<pre><code class="language-typescript">// .eslintrc.json
+{
+  "rules": {
+    "@typescript-eslint/no-non-null-assertion": "warn",
+    "@typescript-eslint/prefer-optional-chain": "error",
+    "@typescript-eslint/prefer-nullish-coalescing": "error"
+  }
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Senior stance:</strong> Ban <code>!</code> in production code via ESLint. Allow it only in test files. Every <code>!</code> is a potential runtime crash hiding behind type safety.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: satisfies Operator -->
+    <section id="satisfies-operator">
+      <h2>satisfies Operator (TS 4.9+)</h2>
+      <details>
+        <summary>Type-check without widening — the best of both worlds</summary>
+        <div class="callout callout-info">
+          <p><strong>Cross-reference:</strong> For <code>satisfies</code> in the context of type checking and validation, see <a href="ch09-advanced-type-system.html#satisfies-and-modern-ts">Ch9: satisfies &amp; TS 5.x Features</a>. This section focuses specifically on how <code>satisfies</code> interacts with <em>narrowing preservation</em>.</p>
+        </div>
+
+        <h3>What It Does vs Type Annotation</h3>
+<pre><code class="language-typescript">type Color = "red" | "green" | "blue";
+type Theme = Record&lt;string, Color&gt;;
+
+// With type annotation: loses literal key info
+const theme1: Theme = {
+  primary: "blue",
+  secondary: "green",
+};
+// theme1.primary — type is Color (widened)
+// theme1.oops — no error! (Record&lt;string, Color&gt; allows any key)
+
+// With satisfies: keeps literal types AND validates
+const theme2 = {
+  primary: "blue",
+  secondary: "green",
+} satisfies Theme;
+// theme2.primary — type is "blue" (literal preserved!)
+// theme2.oops — Error: Property 'oops' does not exist</code></pre>
+
+        <h3>Preserving Literal Types While Checking Constraints</h3>
+<pre><code class="language-typescript">type Route = {
+  path: string;
+  method: "GET" | "POST" | "PUT" | "DELETE";
+  handler: (...args: any[]) =&gt; any;
+};
+
+const routes = [
+  { path: "/users", method: "GET", handler: getUsers },
+  { path: "/users", method: "POST", handler: createUser },
+  { path: "/users/:id", method: "PUT", handler: updateUser },
+] satisfies Route[];
+// Each route is validated, but method stays as "GET" | "POST" | "PUT"
+// not widened to string
+
+// Error reporting is immediate:
+const badRoutes = [
+  { path: "/users", method: "PATCH", handler: getUsers },
+  //                         ^^^^^^^ Error: "PATCH" not in "GET"|"POST"|"PUT"|"DELETE"
+] satisfies Route[];</code></pre>
+
+        <h3>Practical Use Cases</h3>
+<pre><code class="language-typescript">// 1. Configuration objects
+type Config = { port: number; host: string; debug: boolean };
+const config = { port: 3000, host: "localhost", debug: true } satisfies Config;
+// config.port is type: 3000 (literal), not number
+
+// 2. Event maps
+type EventMap = Record&lt;string, (...args: any[]) =&gt; void&gt;;
+const handlers = {
+  click: (e: MouseEvent) =&gt; console.log(e.clientX),
+  keydown: (e: KeyboardEvent) =&gt; console.log(e.key),
+} satisfies EventMap;
+// handlers.click — fully typed parameter!
+
+// 3. Ensuring exhaustive object keys
+type Permission = "read" | "write" | "delete";
+const descriptions = {
+  read: "View content",
+  write: "Edit content",
+  delete: "Remove content",
+} satisfies Record&lt;Permission, string&gt;;
+// Error if any Permission key is missing!</code></pre>
+
+        <h3>Comparison with 'as const'</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th><code>satisfies</code></th>
+              <th><code>as const</code></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Validates against type</td>
+              <td>✓ Yes</td>
+              <td>✗ No</td>
+            </tr>
+            <tr>
+              <td>Preserves literals</td>
+              <td>✓ Yes</td>
+              <td>✓ Yes</td>
+            </tr>
+            <tr>
+              <td>Makes readonly</td>
+              <td>✗ No</td>
+              <td>✓ Yes (deeply)</td>
+            </tr>
+            <tr>
+              <td>Catches invalid values</td>
+              <td>✓ Yes</td>
+              <td>✗ No</td>
+            </tr>
+            <tr>
+              <td>Catches missing keys</td>
+              <td>✓ Yes (with Record)</td>
+              <td>✗ No</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 11: const Assertions -->
+    <section id="const-assertions">
+      <h2>const Assertions</h2>
+      <details>
+        <summary>Locking down types to their narrowest possible form…</summary>
+
+        <h3>'as const' for Literal Types</h3>
+<pre><code class="language-typescript">// Without as const: type is { name: string; age: number }
+const user1 = { name: "Alice", age: 30 };
+
+// With as const: type is { readonly name: "Alice"; readonly age: 30 }
+const user2 = { name: "Alice", age: 30 } as const;
+
+// Useful for action types
+const INCREMENT = "INCREMENT" as const; // type: "INCREMENT", not string
+const DECREMENT = "DECREMENT" as const; // type: "DECREMENT", not string</code></pre>
+
+        <h3>Readonly Tuples</h3>
+<pre><code class="language-typescript">// Without as const: type is (string | number)[]
+const pair1 = ["hello", 42];
+
+// With as const: type is readonly ["hello", 42]
+const pair2 = ["hello", 42] as const;
+
+// Practical: function return types
+function useToggle() {
+  const [state, setState] = useState(false);
+  const toggle = useCallback(() =&gt; setState(s =&gt; !s), []);
+  return [state, toggle] as const;
+  // Return type: readonly [boolean, () =&gt; void]
+  // Without as const: (boolean | (() =&gt; void))[] — unusable!
+}</code></pre>
+
+        <h3>Object Literal Narrowing</h3>
+<pre><code class="language-typescript">// Enum-like patterns without actual enums
+const HttpStatus = {
+  OK: 200,
+  NOT_FOUND: 404,
+  SERVER_ERROR: 500,
+} as const;
+
+type HttpStatus = (typeof HttpStatus)[keyof typeof HttpStatus];
+// type HttpStatus = 200 | 404 | 500
+
+// Use in function signatures
+function handleStatus(status: HttpStatus) {
+  switch (status) {
+    case 200: return "OK";
+    case 404: return "Not Found";
+    case 500: return "Server Error";
+  }
+}</code></pre>
+
+        <h3>Interaction with satisfies</h3>
+<pre><code class="language-typescript">// Combine both: validate AND make readonly with literals
+type RouteConfig = {
+  path: string;
+  method: "GET" | "POST";
+};
+
+const routes = [
+  { path: "/api/users", method: "GET" },
+  { path: "/api/users", method: "POST" },
+] as const satisfies readonly RouteConfig[];
+// ✓ Validated against RouteConfig[]
+// ✓ Fully readonly
+// ✓ Literal types preserved: method is "GET" not "GET" | "POST"
+
+// Order matters: `as const satisfies T` (not `satisfies T as const`)</code></pre>
+
+        <h3>Enum-Like Patterns</h3>
+<pre><code class="language-typescript">// Modern alternative to TypeScript enums
+const Direction = {
+  Up: "UP",
+  Down: "DOWN",
+  Left: "LEFT",
+  Right: "RIGHT",
+} as const;
+
+type Direction = (typeof Direction)[keyof typeof Direction];
+// "UP" | "DOWN" | "LEFT" | "RIGHT"
+
+// Advantages over enum:
+// - No runtime code generation
+// - Tree-shakeable
+// - Works with discriminated unions
+// - No reverse mapping confusion
+
+function move(dir: Direction) {
+  // dir: "UP" | "DOWN" | "LEFT" | "RIGHT"
+}</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>When to use <code>as const</code>:</strong> Use it for configuration objects, lookup tables, action type strings, and function return tuples. Don't use it for mutable data structures that need to change after creation.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 12: Template Literal Narrowing -->
+    <section id="template-literal-narrowing">
+      <h2>Template Literal Narrowing</h2>
+      <details>
+        <summary>Pattern matching and narrowing with string template types…</summary>
+
+        <h3>Narrowing String Types with Template Literals</h3>
+<pre><code class="language-typescript">type EventName = `${string}Changed`;
+
+function onPropertyChange(event: EventName) {
+  // event must end with "Changed"
+}
+
+onPropertyChange("nameChanged");    // ✓
+onPropertyChange("ageChanged");     // ✓
+onPropertyChange("clicked");        // ✗ Error
+
+// Discriminating with template literals
+type CSSUnit = `${number}px` | `${number}rem` | `${number}%`;
+
+function parseUnit(value: CSSUnit): { amount: number; unit: string } {
+  if (value.endsWith("px")) {
+    return { amount: parseFloat(value), unit: "px" };
+  } else if (value.endsWith("rem")) {
+    return { amount: parseFloat(value), unit: "rem" };
+  } else {
+    return { amount: parseFloat(value), unit: "%" };
+  }
+}</code></pre>
+
+        <h3>Pattern Matching Strings</h3>
+<pre><code class="language-typescript">// Event system with typed event names
+type DOMEventMap = {
+  [K in keyof HTMLElementEventMap as `on${Capitalize&lt;K&gt;}`]: HTMLElementEventMap[K];
+};
+
+// Route parameter extraction
+type ExtractParams&lt;T extends string&gt; =
+  T extends `${string}:${infer Param}/${infer Rest}`
+    ? { [K in Param | keyof ExtractParams&lt;Rest&gt;]: string }
+    : T extends `${string}:${infer Param}`
+      ? { [K in Param]: string }
+      : {};
+
+// Usage:
+type UserRouteParams = ExtractParams&lt;"/users/:userId/posts/:postId"&gt;;
+// { userId: string; postId: string }
+
+function navigate&lt;T extends string&gt;(
+  route: T,
+  params: ExtractParams&lt;T&gt;
+): void {
+  // Implementation
+}
+
+navigate("/users/:userId/posts/:postId", {
+  userId: "123",
+  postId: "456",
+}); // ✓ Type-safe route params!</code></pre>
+
+        <h3>Extracting Parts of String Types</h3>
+<pre><code class="language-typescript">// Split a dot-notation path into parts
+type Split&lt;S extends string, D extends string&gt; =
+  S extends `${infer Head}${D}${infer Tail}`
+    ? [Head, ...Split&lt;Tail, D&gt;]
+    : [S];
+
+type Path = Split&lt;"user.address.city", "."&gt;;
+// ["user", "address", "city"]
+
+// Deep property access type
+type DeepGet&lt;T, Path extends string&gt; =
+  Path extends `${infer Key}.${infer Rest}`
+    ? Key extends keyof T
+      ? DeepGet&lt;T[Key], Rest&gt;
+      : never
+    : Path extends keyof T
+      ? T[Path]
+      : never;
+
+interface AppState {
+  user: { profile: { name: string; age: number }; settings: { theme: string } };
+}
+
+type UserName = DeepGet&lt;AppState, "user.profile.name"&gt;; // string
+type Theme = DeepGet&lt;AppState, "user.settings.theme"&gt;;   // string
+
+// Narrowing at runtime with template literal checks
+type ApiVersion = `v${number}`;
+
+function isApiVersion(s: string): s is ApiVersion {
+  return /^v\d+$/.test(s);
+}
+
+function callApi(version: string) {
+  if (isApiVersion(version)) {
+    // version: ApiVersion (`v${number}`)
+    fetch(`/api/${version}/users`);
+  }
+}</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Senior tip:</strong> Template literal types shine for API route typing, event systems, and configuration keys. But beware complexity — deeply recursive template types can slow down the compiler. Keep them under 3-4 levels of recursion.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 13: Production Architecture Examples -->
+    <section id="production-patterns">
+      <h2>Production Architecture Examples</h2>
+      <details>
+        <summary>Real-world patterns using narrowing at scale…</summary>
+
+        <h3>State Machine with Discriminated Unions</h3>
+<pre><code class="language-typescript">// Complete checkout flow state machine
+type CheckoutState =
+  | { step: "cart"; items: CartItem[]; coupon?: string }
+  | { step: "shipping"; items: CartItem[]; address: Address }
+  | { step: "payment"; items: CartItem[]; address: Address; method: PaymentMethod }
+  | { step: "confirming"; orderId: string }
+  | { step: "complete"; orderId: string; receipt: Receipt }
+  | { step: "error"; previousStep: CheckoutState["step"]; error: Error };
+
+type CheckoutEvent =
+  | { type: "PROCEED_TO_SHIPPING"; address: Address }
+  | { type: "PROCEED_TO_PAYMENT"; method: PaymentMethod }
+  | { type: "CONFIRM_ORDER" }
+  | { type: "ORDER_CONFIRMED"; orderId: string; receipt: Receipt }
+  | { type: "GO_BACK" }
+  | { type: "ERROR"; error: Error };
+
+function checkoutTransition(
+  state: CheckoutState,
+  event: CheckoutEvent
+): CheckoutState {
+  switch (state.step) {
+    case "cart":
+      if (event.type === "PROCEED_TO_SHIPPING") {
+        return { step: "shipping", items: state.items, address: event.address };
+      }
+      return state;
+
+    case "shipping":
+      if (event.type === "PROCEED_TO_PAYMENT") {
+        return { ...state, step: "payment", method: event.method };
+      }
+      if (event.type === "GO_BACK") {
+        return { step: "cart", items: state.items, coupon: undefined };
+      }
+      return state;
+
+    case "payment":
+      if (event.type === "CONFIRM_ORDER") {
+        return { step: "confirming", orderId: crypto.randomUUID() };
+      }
+      return state;
+
+    case "confirming":
+      if (event.type === "ORDER_CONFIRMED") {
+        return { step: "complete", orderId: state.orderId, receipt: event.receipt };
+      }
+      if (event.type === "ERROR") {
+        return { step: "error", previousStep: "confirming", error: event.error };
+      }
+      return state;
+
+    case "complete":
+      return state; // terminal state
+
+    case "error":
+      return state; // requires explicit reset
+  }
+}</code></pre>
+
+        <h3>API Response Handling</h3>
+<pre><code class="language-typescript">// Type-safe API layer with exhaustive error handling
+type HttpResult&lt;T&gt; =
+  | { status: "success"; code: 200 | 201; data: T }
+  | { status: "client-error"; code: 400 | 401 | 403 | 404 | 422; message: string }
+  | { status: "server-error"; code: 500 | 502 | 503; retryable: boolean }
+  | { status: "network-error"; error: TypeError };
+
+async function fetchWithNarrowing&lt;T&gt;(
+  url: string,
+  schema: { parse: (data: unknown) =&gt; T }
+): Promise&lt;HttpResult&lt;T&gt;&gt; {
+  try {
+    const res = await fetch(url);
+    if (res.ok) {
+      const data = schema.parse(await res.json());
+      return { status: "success", code: res.status as 200 | 201, data };
+    }
+    if (res.status &lt; 500) {
+      return {
+        status: "client-error",
+        code: res.status as 400 | 401 | 403 | 404 | 422,
+        message: await res.text(),
+      };
+    }
+    return {
+      status: "server-error",
+      code: res.status as 500 | 502 | 503,
+      retryable: res.status !== 501,
+    };
+  } catch (err) {
+    return { status: "network-error", error: err as TypeError };
+  }
+}
+
+// Consumer narrows with switch
+function handleResult&lt;T&gt;(result: HttpResult&lt;T&gt;): T | null {
+  switch (result.status) {
+    case "success":
+      return result.data;
+    case "client-error":
+      if (result.code === 401) redirectToLogin();
+      toast.error(result.message);
+      return null;
+    case "server-error":
+      if (result.retryable) scheduleRetry();
+      return null;
+    case "network-error":
+      toast.error("Network unavailable");
+      return null;
+  }
+}</code></pre>
+
+        <h3>Form Validation Types</h3>
+<pre><code class="language-typescript">type FieldState&lt;T&gt; =
+  | { status: "pristine"; value: T }
+  | { status: "touched"; value: T; dirty: boolean }
+  | { status: "validating"; value: T }
+  | { status: "valid"; value: T }
+  | { status: "invalid"; value: T; errors: string[] };
+
+type FormState&lt;T extends Record&lt;string, unknown&gt;&gt; = {
+  fields: { [K in keyof T]: FieldState&lt;T[K]&gt; };
+  submission: "idle" | "submitting" | "submitted" | "failed";
+};
+
+function canSubmit&lt;T extends Record&lt;string, unknown&gt;&gt;(
+  form: FormState&lt;T&gt;
+): boolean {
+  return Object.values(form.fields).every(
+    (field) =&gt; (field as FieldState&lt;unknown&gt;).status === "valid"
+  );
+}</code></pre>
+
+        <h3>Error Handling Hierarchies</h3>
+<pre><code class="language-typescript">type AppError =
+  | { kind: "validation"; fields: Record&lt;string, string[]&gt; }
+  | { kind: "auth"; reason: "expired" | "invalid" | "forbidden" }
+  | { kind: "network"; retryable: boolean; timeout: boolean }
+  | { kind: "business"; code: string; userMessage: string }
+  | { kind: "unknown"; original: unknown };
+
+function toAppError(err: unknown): AppError {
+  if (err instanceof Response) {
+    if (err.status === 401 || err.status === 403) {
+      return { kind: "auth", reason: err.status === 401 ? "expired" : "forbidden" };
+    }
+  }
+  if (err instanceof TypeError &amp;&amp; err.message.includes("fetch")) {
+    return { kind: "network", retryable: true, timeout: false };
+  }
+  return { kind: "unknown", original: err };
+}
+
+function showError(error: AppError): string {
+  switch (error.kind) {
+    case "validation":
+      return `Please fix: ${Object.keys(error.fields).join(", ")}`;
+    case "auth":
+      return error.reason === "expired" ? "Session expired" : "Access denied";
+    case "network":
+      return error.timeout ? "Request timed out" : "Connection lost";
+    case "business":
+      return error.userMessage;
+    case "unknown":
+      return "An unexpected error occurred";
+  }
+}</code></pre>
+
+        <h3>React Component Props Narrowing</h3>
+<pre><code class="language-typescript">// Discriminated union for component variants
+type ButtonProps =
+  | { variant: "link"; href: string; external?: boolean }
+  | { variant: "button"; onClick: () =&gt; void; disabled?: boolean }
+  | { variant: "submit"; form: string; loading?: boolean };
+
+function Button(props: ButtonProps) {
+  switch (props.variant) {
+    case "link":
+      return (
+        &lt;a href={props.href} target={props.external ? "_blank" : undefined}&gt;
+          {/* ... */}
+        &lt;/a&gt;
+      );
+    case "button":
+      return (
+        &lt;button onClick={props.onClick} disabled={props.disabled}&gt;
+          {/* ... */}
+        &lt;/button&gt;
+      );
+    case "submit":
+      return (
+        &lt;button type="submit" form={props.form} disabled={props.loading}&gt;
+          {/* ... */}
+        &lt;/button&gt;
+      );
+  }
+}
+
+// Usage — TypeScript ensures correct props per variant:
+&lt;Button variant="link" href="/about" /&gt;          // ✓
+&lt;Button variant="button" onClick={handleClick} /&gt; // ✓
+&lt;Button variant="link" onClick={handleClick} /&gt;   // ✗ Error</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 14: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Complete, production-ready implementations…</summary>
+
+        <h3>Complete State Machine</h3>
+<pre><code class="language-typescript">// Generic finite state machine with type-safe transitions
+type StateMachine&lt;
+  States extends string,
+  Events extends string,
+  Context extends Record&lt;string, unknown&gt;
+&gt; = {
+  initial: States;
+  context: Context;
+  states: {
+    [S in States]: {
+      on?: Partial&lt;Record&lt;Events, States&gt;&gt;;
+      entry?: (ctx: Context) =&gt; Context;
+      exit?: (ctx: Context) =&gt; Context;
+    };
+  };
+};
+
+type MachineInstance&lt;S extends string, C&gt; = {
+  current: S;
+  context: C;
+  send: (event: string) =&gt; void;
+};
+
+function createMachine&lt;
+  S extends string,
+  E extends string,
+  C extends Record&lt;string, unknown&gt;
+&gt;(definition: StateMachine&lt;S, E, C&gt;): MachineInstance&lt;S, C&gt; {
+  let current = definition.initial;
+  let context = { ...definition.context };
+
+  return {
+    get current() { return current; },
+    get context() { return context; },
+    send(event: string) {
+      const stateConfig = definition.states[current];
+      const nextState = stateConfig.on?.[event as E];
+      if (nextState) {
+        if (stateConfig.exit) context = stateConfig.exit(context);
+        current = nextState;
+        const nextConfig = definition.states[nextState];
+        if (nextConfig.entry) context = nextConfig.entry(context);
+      }
+    },
+  };
+}
+
+// Usage
+const trafficLight = createMachine({
+  initial: "red" as const,
+  context: { count: 0 },
+  states: {
+    red: { on: { TIMER: "green" }, entry: (ctx) =&gt; ({ ...ctx, count: ctx.count + 1 }) },
+    green: { on: { TIMER: "yellow" } },
+    yellow: { on: { TIMER: "red" } },
+  },
+});</code></pre>
+
+        <h3>API Response Handler</h3>
+<pre><code class="language-typescript">// Complete type-safe API client with narrowing
+type ApiState&lt;T&gt; =
+  | { tag: "idle" }
+  | { tag: "loading"; abortController: AbortController }
+  | { tag: "success"; data: T; fetchedAt: number }
+  | { tag: "error"; error: AppError; failedAt: number };
+
+class TypedApiClient {
+  private cache = new Map&lt;string, ApiState&lt;unknown&gt;&gt;();
+
+  async fetch&lt;T&gt;(
+    url: string,
+    parse: (raw: unknown) =&gt; T
+  ): Promise&lt;ApiState&lt;T&gt;&gt; {
+    const controller = new AbortController();
+    const loadingState: ApiState&lt;T&gt; = { tag: "loading", abortController: controller };
+    this.cache.set(url, loadingState);
+
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      if (!res.ok) {
+        const errorState: ApiState&lt;T&gt; = {
+          tag: "error",
+          error: { kind: "network", retryable: res.status &gt;= 500, timeout: false },
+          failedAt: Date.now(),
+        };
+        this.cache.set(url, errorState);
+        return errorState;
+      }
+      const data = parse(await res.json());
+      const successState: ApiState&lt;T&gt; = {
+        tag: "success",
+        data,
+        fetchedAt: Date.now(),
+      };
+      this.cache.set(url, successState);
+      return successState;
+    } catch (err) {
+      const errorState: ApiState&lt;T&gt; = {
+        tag: "error",
+        error: { kind: "unknown", original: err },
+        failedAt: Date.now(),
+      };
+      this.cache.set(url, errorState);
+      return errorState;
+    }
+  }
+
+  getState&lt;T&gt;(url: string): ApiState&lt;T&gt; {
+    return (this.cache.get(url) as ApiState&lt;T&gt;) ?? { tag: "idle" };
+  }
+}</code></pre>
+
+        <h3>Generic Type Guard Library</h3>
+<pre><code class="language-typescript">// Composable type guard utilities
+const Guards = {
+  isString: (v: unknown): v is string =&gt; typeof v === "string",
+  isNumber: (v: unknown): v is number =&gt; typeof v === "number" &amp;&amp; !Number.isNaN(v),
+  isBoolean: (v: unknown): v is boolean =&gt; typeof v === "boolean",
+  isNull: (v: unknown): v is null =&gt; v === null,
+  isUndefined: (v: unknown): v is undefined =&gt; v === undefined,
+  isNonNull: &lt;T&gt;(v: T | null | undefined): v is T =&gt; v != null,
+
+  isObject: (v: unknown): v is Record&lt;string, unknown&gt; =&gt;
+    typeof v === "object" &amp;&amp; v !== null &amp;&amp; !Array.isArray(v),
+
+  isArray: (v: unknown): v is unknown[] =&gt; Array.isArray(v),
+
+  isArrayOf: &lt;T&gt;(guard: (v: unknown) =&gt; v is T) =&gt;
+    (v: unknown): v is T[] =&gt; Array.isArray(v) &amp;&amp; v.every(guard),
+
+  hasKey: &lt;K extends string&gt;(key: K) =&gt;
+    (v: unknown): v is Record&lt;K, unknown&gt; =&gt;
+      typeof v === "object" &amp;&amp; v !== null &amp;&amp; key in v,
+
+  // Compose guards with AND logic
+  and: &lt;A, B&gt;(
+    guardA: (v: unknown) =&gt; v is A,
+    guardB: (v: unknown) =&gt; v is B
+  ) =&gt; (v: unknown): v is A &amp; B =&gt; guardA(v) &amp;&amp; guardB(v),
+
+  // Compose guards with OR logic
+  or: &lt;A, B&gt;(
+    guardA: (v: unknown) =&gt; v is A,
+    guardB: (v: unknown) =&gt; v is B
+  ) =&gt; (v: unknown): v is A | B =&gt; guardA(v) || guardB(v),
+};
+
+// Usage
+const isStringArray = Guards.isArrayOf(Guards.isString);
+const isConfig = Guards.and(
+  Guards.hasKey("host"),
+  Guards.hasKey("port")
+);
+
+const data: unknown = getExternalData();
+if (isStringArray(data)) {
+  // data: string[]
+  data.forEach(s =&gt; console.log(s.toUpperCase()));
+}</code></pre>
+
+        <h3>Exhaustive Redux Reducer</h3>
+<pre><code class="language-typescript">// Type-safe Redux with exhaustive action handling
+interface AppState {
+  users: User[];
+  loading: boolean;
+  error: string | null;
+  selectedId: string | null;
+}
+
+type AppAction =
+  | { type: "USERS_FETCH_START" }
+  | { type: "USERS_FETCH_SUCCESS"; payload: User[] }
+  | { type: "USERS_FETCH_ERROR"; payload: string }
+  | { type: "USER_SELECT"; payload: string }
+  | { type: "USER_DESELECT" }
+  | { type: "USER_UPDATE"; payload: { id: string; changes: Partial&lt;User&gt; } };
+
+function assertNever(action: never): never {
+  throw new Error(`Unhandled action: ${JSON.stringify(action)}`);
+}
+
+function appReducer(state: AppState, action: AppAction): AppState {
+  switch (action.type) {
+    case "USERS_FETCH_START":
+      return { ...state, loading: true, error: null };
+
+    case "USERS_FETCH_SUCCESS":
+      return { ...state, loading: false, users: action.payload };
+
+    case "USERS_FETCH_ERROR":
+      return { ...state, loading: false, error: action.payload };
+
+    case "USER_SELECT":
+      return { ...state, selectedId: action.payload };
+
+    case "USER_DESELECT":
+      return { ...state, selectedId: null };
+
+    case "USER_UPDATE":
+      return {
+        ...state,
+        users: state.users.map(u =&gt;
+          u.id === action.payload.id
+            ? { ...u, ...action.payload.changes }
+            : u
+        ),
+      };
+
+    default:
+      return assertNever(action);
+      // If a new action type is added to AppAction without handling here,
+      // TypeScript will report: Argument of type '{ type: "NEW_ACTION" }' is not
+      // assignable to parameter of type 'never'
+  }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 15: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>Five pitfalls that trip up even experienced developers…</summary>
+
+        <h3>1. Using Type Assertions Instead of Guards</h3>
+<pre><code class="language-typescript">// ✗ BAD: Asserts bypass type checking entirely
+function processEvent(event: unknown) {
+  const e = event as MouseEvent; // No runtime check!
+  console.log(e.clientX); // May crash if event is KeyboardEvent
+}
+
+// ✓ GOOD: Guard provides runtime + compile-time safety
+function processEvent(event: unknown) {
+  if (event instanceof MouseEvent) {
+    console.log(event.clientX); // Narrowed safely
+  }
+}</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Rule:</strong> <code>as</code> is a lie you tell the compiler. Type guards are a proof you show it. Prefer proofs.</p>
+        </div>
+
+        <h3>2. Non-Exhaustive Switch Without never Check</h3>
+<pre><code class="language-typescript">type Status = "active" | "inactive" | "suspended" | "deleted";
+
+// ✗ BAD: Silently returns undefined for new variants
+function getLabel(status: Status): string {
+  switch (status) {
+    case "active": return "Active";
+    case "inactive": return "Inactive";
+    // "suspended" and "deleted" fall through — returns undefined!
+  }
+}
+
+// ✓ GOOD: Compile error for missing cases
+function getLabel(status: Status): string {
+  switch (status) {
+    case "active": return "Active";
+    case "inactive": return "Inactive";
+    case "suspended": return "Suspended";
+    case "deleted": return "Deleted";
+    default: {
+      const _: never = status;
+      throw new Error(`Unknown status: ${_}`);
+    }
+  }
+}</code></pre>
+
+        <h3>3. Lying Type Predicates</h3>
+<pre><code class="language-typescript">// ✗ BAD: Predicate doesn't match the claimed type
+interface User { id: string; name: string; email: string }
+
+function isUser(obj: unknown): obj is User {
+  // Only checks 'id' — name and email might be missing!
+  return typeof obj === "object" &amp;&amp; obj !== null &amp;&amp; "id" in obj;
+}
+
+const data: unknown = { id: "1" }; // Missing name, email
+if (isUser(data)) {
+  console.log(data.name.toUpperCase()); // Runtime crash!
+}
+
+// ✓ GOOD: Validate all required properties
+function isUser(obj: unknown): obj is User {
+  return (
+    typeof obj === "object" &amp;&amp;
+    obj !== null &amp;&amp;
+    "id" in obj &amp;&amp; typeof (obj as any).id === "string" &amp;&amp;
+    "name" in obj &amp;&amp; typeof (obj as any).name === "string" &amp;&amp;
+    "email" in obj &amp;&amp; typeof (obj as any).email === "string"
+  );
+}</code></pre>
+
+        <h3>4. Narrowing Not Persisting Across Function Boundaries</h3>
+<pre><code class="language-typescript">// ✗ BAD: Narrowing lost in callback
+function processItems(items: (string | number)[]) {
+  items.forEach(item =&gt; {
+    if (typeof item === "string") {
+      // item: string — narrowed here ✓
+      setTimeout(() =&gt; {
+        // item: string — actually still narrowed in this case ✓
+        // (TS is smart enough for const-like loop variables)
+      }, 0);
+    }
+  });
+}
+
+// ✗ BAD: Narrowing lost when passed to another function
+function isValid(x: string | number): void {
+  if (typeof x === "string") {
+    doSomething(x); // x: string here ✓
+  }
+}
+
+function doSomething(x: string) {
+  // If doSomething reassigns x to a mutable variable, narrowing is gone
+  let y: string | number = x;
+  // y: string | number — widened
+}
+
+// ✓ GOOD: Use const to preserve narrowing
+function example(input: string | number) {
+  if (typeof input === "string") {
+    const str = input; // const preserves the narrowed type
+    setTimeout(() =&gt; {
+      console.log(str.toUpperCase()); // str: string ✓
+    }, 100);
+  }
+}</code></pre>
+
+        <h3>5. Forgetting undefined in Optional Properties</h3>
+<pre><code class="language-typescript">// ✗ BAD: Optional property ≠ property with type | undefined
+interface Config {
+  timeout?: number;   // type is number | undefined
+  retries?: number;
+}
+
+function init(config: Config) {
+  // ✗ This doesn't narrow properly with exactOptionalPropertyTypes
+  if (config.timeout) {
+    // timeout: number — but 0 is valid and would fail this check!
+  }
+
+  // ✓ GOOD: Explicit undefined check
+  if (config.timeout !== undefined) {
+    // timeout: number (correctly handles 0)
+    console.log(`Timeout: ${config.timeout}ms`);
+  }
+
+  // ✓ GOOD: Nullish coalescing for defaults
+  const timeout = config.timeout ?? 5000;
+  const retries = config.retries ?? 3;
+}
+
+// Enable exactOptionalPropertyTypes in tsconfig for strictest checking:
+// { "compilerOptions": { "exactOptionalPropertyTypes": true } }
+// This distinguishes { timeout?: number } from { timeout: number | undefined }
+//
+// Without this flag:  { timeout?: number } means timeout can be number | undefined
+//   → You can write: config.timeout = undefined  ✅ (allowed)
+//
+// With this flag:     { timeout?: number } means timeout can be number OR absent
+//   → config.timeout = undefined  ❌ (Error! undefined !== absent)
+//   → delete config.timeout       ✅ (removes the property)
+//
+// This fundamentally changes narrowing: with the flag enabled, checking
+// 'timeout' in config narrows to number (not number | undefined).
+// It's a senior-level differentiator — most devs don't know this flag exists.
+// Not included in strict: true — must be enabled explicitly.</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 16: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Comparing approaches and their engineering costs…</summary>
+
+        <h3>Type Guards vs Assertion Functions</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>Type Guards (<code>is</code>)</th>
+              <th>Assertion Functions (<code>asserts</code>)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Control flow</td>
+              <td>Narrows in branches (if/else)</td>
+              <td>Narrows everything after the call</td>
+            </tr>
+            <tr>
+              <td>Composability</td>
+              <td>Works in expressions, <code>filter()</code>, ternaries</td>
+              <td>Must be standalone statement</td>
+            </tr>
+            <tr>
+              <td>Failure handling</td>
+              <td>Returns false — caller decides</td>
+              <td>Throws — fail-fast, no recovery</td>
+            </tr>
+            <tr>
+              <td>Best for</td>
+              <td>Conditional paths, array filtering</td>
+              <td>Preconditions, invariants, validation at boundaries</td>
+            </tr>
+            <tr>
+              <td>Testing</td>
+              <td>Easy to test (returns boolean)</td>
+              <td>Requires try/catch in tests</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Discriminated Unions vs Class Hierarchy</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>Discriminated Unions</th>
+              <th>Class Hierarchy</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Extensibility</td>
+              <td>Add variant = add to union (open)</td>
+              <td>Add subclass (open, but scattered)</td>
+            </tr>
+            <tr>
+              <td>Exhaustiveness</td>
+              <td>Built-in via <code>never</code></td>
+              <td>Requires visitor pattern or <code>instanceof</code> chains</td>
+            </tr>
+            <tr>
+              <td>Serialization</td>
+              <td>Plain objects — easy JSON roundtrip</td>
+              <td>Requires custom serialization logic</td>
+            </tr>
+            <tr>
+              <td>Bundle size</td>
+              <td>Zero runtime cost (erased)</td>
+              <td>Classes remain in bundle</td>
+            </tr>
+            <tr>
+              <td>Pattern matching</td>
+              <td>Native via switch on discriminant</td>
+              <td>Requires <code>instanceof</code> or visitor</td>
+            </tr>
+            <tr>
+              <td>Encapsulation</td>
+              <td>No private state</td>
+              <td>Private fields and methods</td>
+            </tr>
+            <tr>
+              <td>Best for</td>
+              <td>Data modeling, state machines, API types</td>
+              <td>Services, complex behaviors, DI</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Strict Null Checks: Cost vs Safety</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>strictNullChecks: true</th>
+              <th>strictNullChecks: false</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Safety</td>
+              <td>Catches null/undefined bugs at compile time</td>
+              <td>Runtime "cannot read property of undefined" errors</td>
+            </tr>
+            <tr>
+              <td>Developer friction</td>
+              <td>More guards/checks required, more verbose</td>
+              <td>Less code, faster initial development</td>
+            </tr>
+            <tr>
+              <td>Refactoring</td>
+              <td>Compiler guides all affected code paths</td>
+              <td>Silent breakage — found only at runtime</td>
+            </tr>
+            <tr>
+              <td>Onboarding</td>
+              <td>Steeper learning curve for juniors</td>
+              <td>Feels easier initially</td>
+            </tr>
+            <tr>
+              <td>Verdict</td>
+              <td colspan="2"><strong>Always enable <code>strictNullChecks</code>.</strong> The short-term cost is repaid many times over in prevented production bugs.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-info">
+          <p><strong>Senior perspective:</strong> In a large codebase, discriminated unions + exhaustive checks prevent entire categories of bugs from reaching production. The compile-time investment pays for itself on the first missed case that the compiler catches.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 17: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>Seven questions interviewers ask as follow-ups…</summary>
+
+        <h3>1. "How does narrowing interact with generics?"</h3>
+        <p>TypeScript cannot narrow generic type parameters directly. You need to constrain the generic or use a type guard that returns a specific instantiation:</p>
+<pre><code class="language-typescript">// ✗ Doesn't work: TS can't narrow T
+function process&lt;T extends string | number&gt;(value: T) {
+  if (typeof value === "string") {
+    // value is still T, not string — TS preserves the generic
+    // value.toUpperCase(); // Error!
+  }
+}
+
+// ✓ Works: assign to a wider variable
+function process&lt;T extends string | number&gt;(value: T) {
+  const v: string | number = value; // widen from T
+  if (typeof v === "string") {
+    v.toUpperCase(); // ✓ v is string
+  }
+}</code></pre>
+
+        <h3>2. "What happens with narrowing in async code?"</h3>
+        <p>Narrowing persists across <code>await</code> as long as the variable isn't reassigned. But assertion functions don't work with async:</p>
+<pre><code class="language-typescript">async function example(x: string | null) {
+  if (x !== null) {
+    await someAsyncOp();
+    // x is still string ✓ (not reassigned)
+    console.log(x.toUpperCase());
+  }
+}
+
+// ✗ Async assertion functions don't narrow
+async function assertLoaded(doc: Doc): asserts doc is LoadedDoc {
+  // This doesn't compile — asserts cannot be async
+}</code></pre>
+
+        <h3>3. "How do you narrow unknown vs any?"</h3>
+        <p><code>unknown</code> requires narrowing before use — it's the type-safe counterpart to <code>any</code>. <code>any</code> disables all type checking:</p>
+<pre><code class="language-typescript">function handleUnknown(value: unknown) {
+  // value.toString(); // ✗ Error — must narrow first
+  if (typeof value === "string") {
+    value.toUpperCase(); // ✓ narrowed to string
+  }
+}
+
+function handleAny(value: any) {
+  value.anything.goes.here(); // No error — no safety
+}</code></pre>
+
+        <h3>4. "Can you narrow based on array length?"</h3>
+<pre><code class="language-typescript">// TypeScript doesn't narrow array length natively,
+// but you can use tuples and type predicates:
+type NonEmptyArray&lt;T&gt; = [T, ...T[]];
+
+function isNonEmpty&lt;T&gt;(arr: T[]): arr is NonEmptyArray&lt;T&gt; {
+  return arr.length &gt; 0;
+}
+
+function first&lt;T&gt;(arr: T[]): T | undefined {
+  if (isNonEmpty(arr)) {
+    return arr[0]; // ✓ T, not T | undefined
+  }
+  return undefined;
+}</code></pre>
+
+        <h3>5. "What's the difference between type narrowing and type casting?"</h3>
+        <p>Narrowing is <em>sound</em> — the compiler verifies the check. Casting (<code>as</code>) is <em>unsound</em> — you override the compiler with no proof:</p>
+<pre><code class="language-typescript">// Narrowing: compiler verifies
+if (typeof x === "string") { /* x: string — proven */ }
+
+// Casting: compiler trusts you blindly
+const x = value as string; // May be wrong — no verification</code></pre>
+
+        <h3>6. "How does narrowing work with branded types?"</h3>
+<pre><code class="language-typescript">type UserId = string &amp; { __brand: "UserId" };
+type PostId = string &amp; { __brand: "PostId" };
+
+function isUserId(id: string): id is UserId {
+  return id.startsWith("usr_");
+}
+
+function isPostId(id: string): id is PostId {
+  return id.startsWith("post_");
+}
+
+function getUser(id: UserId): User { /* ... */ }
+
+const rawId = "usr_123";
+if (isUserId(rawId)) {
+  getUser(rawId); // ✓ rawId is narrowed to UserId
+}
+// getUser(rawId); // ✗ Error: string is not UserId</code></pre>
+
+        <h3>7. "How do you migrate a codebase to stricter narrowing?"</h3>
+        <p>Progressive strictness strategy:</p>
+        <ol>
+          <li>Enable <code>strictNullChecks</code> in tsconfig (the biggest win)</li>
+          <li>Fix errors file-by-file using <code>// @ts-expect-error</code> as temporary markers</li>
+          <li>Replace <code>as</code> assertions with proper type guards one module at a time</li>
+          <li>Add <code>assertNever</code> to all switch statements on discriminated unions</li>
+          <li>Enable <code>noUncheckedIndexedAccess</code> last (most disruptive)</li>
+          <li>Use ESLint <code>@typescript-eslint/no-unnecessary-type-assertion</code> to prevent regression</li>
+        </ol>
+
+        <h3>8. "How does <code>using</code> (TS 5.2) interact with narrowing?"</h3>
+        <p>The <code>using</code> declaration (<a href="ch09-advanced-type-system.html#satisfies-and-modern-ts">Explicit Resource Management</a>) guarantees <code>Symbol.dispose</code> is called at block exit — even on throw. This interacts with control flow because the compiler knows the resource is valid for the entire block scope. It doesn't add new narrowing capability, but it eliminates the need for try/finally patterns that break narrowing (since variables declared inside try blocks aren't narrowed across the catch/finally boundary).</p>
+      </details>
+    </section>
+
+    <!-- Section 18: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Mental models and what NOT to say in an interview…</summary>
+
+        <h3>Mental Models</h3>
+<pre class="diagram">
+┌──────────────────────────────────────────────────────────────────┐
+│                    TYPE NARROWING HIERARCHY                       │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Built-in Guards          Custom Guards         Advanced         │
+│  ─────────────           ──────────────        ─────────         │
+│  • typeof                • x is Type           • satisfies       │
+│  • instanceof            • asserts x is Type   • as const        │
+│  • in operator           • Generic guards      • Template        │
+│  • === / !== null        • Composed guards       literal types   │
+│  • truthiness                                                    │
+│                                                                  │
+│  Patterns                                                        │
+│  ────────                                                        │
+│  • Discriminated unions + switch + assertNever                   │
+│  • Branded types + custom predicates                             │
+│  • Schema validation (zod) at boundaries                         │
+│  • State machines with exhaustive transitions                    │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+</pre>
+
+        <h3>Key Principles</h3>
+        <ul>
+          <li><strong>Narrow, don't assert.</strong> Type guards prove; <code>as</code> asserts without proof.</li>
+          <li><strong>Discriminate at the top level.</strong> A single literal property enables the entire narrowing chain.</li>
+          <li><strong>Exhaust with never.</strong> Every switch on a union should end with <code>assertNever</code>.</li>
+          <li><strong>Validate at boundaries.</strong> External data gets schema-validated; internal data uses compile-time checks.</li>
+          <li><strong>satisfies &gt; annotation</strong> when you want validation without widening.</li>
+        </ul>
+
+        <h3>What NOT to Say</h3>
+        <div class="callout callout-warning">
+          <ul>
+            <li>❌ "I use <code>as any</code> to fix type errors quickly" — signals you bypass the type system</li>
+            <li>❌ "Type guards are just for primitives" — ignores custom predicates, discriminated unions</li>
+            <li>❌ "I don't bother with exhaustive checks in switch" — misses the core maintenance benefit</li>
+            <li>❌ "Non-null assertion is fine if you're careful" — seniors know careful isn't scalable</li>
+            <li>❌ "I use enums for discriminated unions" — string enums are fine, but const objects + <code>as const</code> are preferred in modern TS</li>
+          </ul>
+        </div>
+
+        <h3>One-Sentence Summary</h3>
+        <p><strong>Design your types so that the compiler narrows them naturally, use <code>never</code> to make exhaustive handling mandatory, and validate at system boundaries — this makes illegal states unrepresentable and the compiler your most reliable reviewer.</strong></p>
+      </details>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+</body>
+</html>

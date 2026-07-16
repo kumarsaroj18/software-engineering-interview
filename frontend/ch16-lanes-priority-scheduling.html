@@ -1,0 +1,1707 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 16: Lanes, Priority &amp; Scheduling | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <a href="../index.html" class="brand">Senior Frontend Interview Handbook</a>
+    <span class="chapter-num">Ch 16</span>
+    <span class="chapter-title">Lanes &amp; Scheduling</span>
+    <nav>
+      <a href="#interviewer-intent">Interviewer Intent</a>
+      <a href="#quick-answer">Quick Answer</a>
+      <a href="#lane-bit-representation">Lane Bit Representation</a>
+      <a href="#lane-priority-levels">Lane Priority Levels</a>
+      <a href="#priority-assignment">Priority Assignment</a>
+      <a href="#update-queue-lanes">Update Queue Lanes</a>
+      <a href="#interrupt-restart">Interrupt &amp; Restart</a>
+      <a href="#starvation-prevention">Starvation Prevention</a>
+      <a href="#entanglement">Entanglement</a>
+      <a href="#comparison-expiration-times">Comparison: Expiration Times</a>
+      <a href="#scheduler-priorities">Scheduler Priorities</a>
+      <a href="#production-performance">Production Performance</a>
+      <a href="#code-examples">Code Examples</a>
+      <a href="#common-mistakes">Common Mistakes</a>
+      <a href="#trade-offs">Trade-offs</a>
+      <a href="#follow-up-questions">Follow-up Questions</a>
+      <a href="#summary">Summary</a>
+    </nav>
+    <button class="expand-btn" aria-label="Expand all sections">Expand All</button>
+    <button class="collapse-btn" aria-label="Collapse all sections">Collapse All</button>
+  </aside>
+
+  <main>
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <span>Part III — React Internals &amp; Architecture</span> &gt;
+      <span>Chapter 16</span>
+    </nav>
+
+    <div class="badges">
+      <span class="badge badge-hard">Hard</span>
+      <span class="badge badge-react">React</span>
+      <span class="badge badge-topic">Lanes</span>
+      <span class="badge badge-topic">Priority</span>
+      <span class="badge badge-topic">Scheduling</span>
+    </div>
+
+    <h1>Chapter 16: Lanes, Priority &amp; Scheduling</h1>
+
+    <div class="takeaway">
+      <p><strong>Key Takeaway:</strong> Lanes are a bitmask-based priority system replacing the old expiration time model. Each update is assigned a lane (SyncLane for user input, TransitionLane for non-urgent updates, IdleLane for background work). React can interrupt a lower-priority render when a higher-priority update arrives, restart the render with the new update included, and prevent starvation of lower-priority lanes through entanglement and expiration.</p>
+    </div>
+
+    <div class="search-container">
+      <input type="search" placeholder="Search this chapter..." aria-label="Search">
+    </div>
+
+    <!-- Section 1: Interviewer Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>Why interviewers ask about Lanes &amp; Scheduling</summary>
+        <p>When an interviewer asks <em>"How does React's Lane model work for priority scheduling? What happens when a high-priority update interrupts a low-priority render?"</em>, they want to assess:</p>
+        <ul>
+          <li>Whether you understand React's concurrent rendering at the scheduler level</li>
+          <li>Your grasp of bitmask-based priority systems and why they replaced expiration times</li>
+          <li>Can you explain interrupt/restart mechanics without hand-waving</li>
+          <li>Do you understand the real-world implications for app performance</li>
+          <li>Are you familiar with starvation prevention and entanglement concepts</li>
+        </ul>
+        <div class="callout callout-info">
+          <p><strong>Signal they're looking for:</strong> Deep systems-level understanding of React's internals, not just API-level knowledge of useTransition or Suspense.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 2: Quick Answer -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <details>
+        <summary>30-second answer for time-pressured interviews</summary>
+        <p>React uses a 31-bit integer where each bit represents a "lane" — a priority level. Updates are assigned lanes based on their origin: user clicks get SyncLane (highest priority), transitions get TransitionLanes, and background work gets IdleLane. When a high-priority update arrives during a low-priority render, React checks <code>shouldYield()</code>, abandons the in-progress work, and restarts the render loop from the fiber root with the higher-priority lanes included. Lower-priority lanes are prevented from starving through expiration timestamps and entanglement — a mechanism that forces certain lanes to always render together.</p>
+        <div class="callout callout-tip">
+          <p><strong>Interview tip:</strong> Mention that lanes replaced expirationTime because bitmasks allow multiple independent priority levels to be tracked simultaneously without creating ordering constraints.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 3: Lane Bit Representation -->
+    <section id="lane-bit-representation">
+      <h2>Lane Bit Representation</h2>
+      <details>
+        <summary>How lanes are encoded as a 31-bit integer bitmask</summary>
+        <p>Lanes use a 31-bit integer (JavaScript's bitwise operators work on 32-bit signed integers, so React uses 31 bits to avoid the sign bit). Each lane occupies exactly one bit position.</p>
+
+        <div class="callout callout-info">
+          <p><strong>Note:</strong> The lane values below are simplified for clarity. The actual React source interleaves hydration lanes (SyncHydrationLane, InputContinuousHydrationLane, etc.) between the primary lanes, shifting bit positions. The conceptual model and bitmask operations remain the same — what matters for interviews is understanding the priority ordering, bitwise mechanics, and scheduling behavior, not memorizing exact bit positions.</p>
+        </div>
+
+        <pre><code class="language-javascript">// Simplified lane representation (conceptual model)
+// Each lane is a single bit in a 31-bit integer
+export const NoLanes    = /*                        */ 0b0000000000000000000000000000000;
+export const NoLane     = /*                        */ 0b0000000000000000000000000000000;
+export const SyncLane   = /*                        */ 0b0000000000000000000000000000001;
+export const InputContinuousLane = /*               */ 0b0000000000000000000000000000100;
+export const DefaultLane = /*                       */ 0b0000000000000000000000000010000;
+export const TransitionLane1 = /*                   */ 0b0000000000000000000000001000000;
+export const TransitionLane2 = /*                   */ 0b0000000000000000000000010000000;
+export const IdleLane   = /*                        */ 0b0100000000000000000000000000000;
+export const OffscreenLane = /*                     */ 0b1000000000000000000000000000000;</code></pre>
+
+        <h3>Merging Lanes with Bitwise OR</h3>
+        <p>Multiple lanes are combined into a single integer using the OR operator. This allows React to track which lanes have pending work:</p>
+
+        <pre><code class="language-javascript">// Merging lanes — combining pending work
+function mergeLanes(a, b) {
+  return a | b;
+}
+
+// Example: SyncLane | DefaultLane
+// 0b0000000000000000000000000000001
+// 0b0000000000000000000000000010000
+// Result: 0b0000000000000000000000000010001
+const pendingLanes = mergeLanes(SyncLane, DefaultLane); // 17</code></pre>
+
+        <h3>Checking Lanes with Bitwise AND</h3>
+        <pre><code class="language-javascript">// Checking if a specific lane is included in a set
+function includesSomeLane(set, subset) {
+  return (set &amp; subset) !== NoLanes;
+}
+
+// Check if SyncLane is in our pendingLanes
+includesSomeLane(pendingLanes, SyncLane); // true
+includesSomeLane(pendingLanes, IdleLane); // false
+
+// Removing a lane from a set
+function removeLanes(set, subset) {
+  return set &amp; ~subset;
+}
+
+// After processing SyncLane, remove it
+const remaining = removeLanes(pendingLanes, SyncLane);
+// Result: 0b0000000000000000000000000010000 (only DefaultLane)</code></pre>
+
+        <h3>Why Bitmasks Over Simple Numbers?</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th>Numeric Priority</th>
+              <th>Bitmask Lanes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Track multiple priorities simultaneously</td>
+              <td>Requires array/set</td>
+              <td>Single integer</td>
+            </tr>
+            <tr>
+              <td>Merge priority sets</td>
+              <td>O(n) union</td>
+              <td>O(1) bitwise OR</td>
+            </tr>
+            <tr>
+              <td>Check membership</td>
+              <td>O(n) lookup</td>
+              <td>O(1) bitwise AND</td>
+            </tr>
+            <tr>
+              <td>Independent priority groups</td>
+              <td>Hard — ordering forced</td>
+              <td>Natural — bits are independent</td>
+            </tr>
+            <tr>
+              <td>Memory cost</td>
+              <td>Heap allocation</td>
+              <td>Single 32-bit integer</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────┐
+│              31-bit Lane Integer                      │
+├─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┤
+│30│29│28│...│ Transition Lanes │...│4│3│2│1│0│        │
+├─┴─┴─┴─┴───┴──────────────────┴───┴─┴─┴─┴─┴─┘      │
+│ ↑                                          ↑        │
+│ OffscreenLane                     SyncLane (highest) │
+│ (lowest priority)                                    │
+└─────────────────────────────────────────────────────┘
+        </pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Caveat:</strong> The 31-bit limit means React has a fixed number of priority levels. This is intentional — it forces the system to be coarse-grained enough that scheduling decisions remain fast (O(1) operations).</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: Lane Priority Levels -->
+    <section id="lane-priority-levels">
+      <h2>Lane Priority Levels</h2>
+      <details>
+        <summary>Complete lane hierarchy with values and use cases</summary>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Lane</th>
+              <th>Bit Position</th>
+              <th>Decimal Value</th>
+              <th>Use Case</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>SyncLane</code></td>
+              <td>0</td>
+              <td>1</td>
+              <td>Discrete user input (click, keydown), flushSync</td>
+            </tr>
+            <tr>
+              <td><code>InputContinuousLane</code></td>
+              <td>2</td>
+              <td>4</td>
+              <td>Continuous input (drag, scroll, mousemove)</td>
+            </tr>
+            <tr>
+              <td><code>DefaultLane</code></td>
+              <td>4</td>
+              <td>16</td>
+              <td>Normal setState outside event handlers, useEffect updates</td>
+            </tr>
+            <tr>
+              <td><code>TransitionLane1–16</code></td>
+              <td>6–21</td>
+              <td>64–2097152</td>
+              <td>startTransition, useTransition, useDeferredValue</td>
+            </tr>
+            <tr>
+              <td><code>RetryLane1–5</code></td>
+              <td>22–26</td>
+              <td>4194304–67108864</td>
+              <td>Suspense retry after data resolves</td>
+            </tr>
+            <tr>
+              <td><code>SelectiveHydrationLane</code></td>
+              <td>27</td>
+              <td>134217728</td>
+              <td>Selective hydration of clicked Suspense boundary</td>
+            </tr>
+            <tr>
+              <td><code>IdleLane</code></td>
+              <td>29</td>
+              <td>536870912</td>
+              <td>Background pre-rendering, offscreen updates</td>
+            </tr>
+            <tr>
+              <td><code>OffscreenLane</code></td>
+              <td>30</td>
+              <td>1073741824</td>
+              <td>Hidden/offscreen tree preparation</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <pre><code class="language-javascript">// Priority ordering: lower bit position = higher priority
+// SyncLane (bit 0) &gt; InputContinuousLane (bit 2) &gt; DefaultLane (bit 4)
+// &gt; TransitionLanes (bits 6-21) &gt; RetryLanes (bits 22-26)
+// &gt; IdleLane (bit 29) &gt; OffscreenLane (bit 30)
+
+function getHighestPriorityLane(lanes) {
+  // Returns the rightmost bit (lowest position = highest priority)
+  return lanes &amp; -lanes;
+}
+
+// Example
+const pending = 0b0000000000000000000000000010001; // Sync + Default
+getHighestPriorityLane(pending); // 0b1 = SyncLane</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Why 16 TransitionLanes?</strong> Multiple transitions can run concurrently. Each new <code>startTransition</code> call claims the next available TransitionLane, preventing unrelated transitions from blocking each other. When all 16 are used, React wraps around and reuses lanes.</p>
+        </div>
+
+        <pre class="diagram">
+Priority (High → Low):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SyncLane → InputContinuous → Default → Transitions
+     → Retries → Idle → Offscreen
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  User clicks   Drag/scroll   Normal   startTransition
+  flushSync()   mousemove     setState  useDeferredValue
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Priority Assignment -->
+    <section id="priority-assignment">
+      <h2>Priority Assignment</h2>
+      <details>
+        <summary>How React assigns lanes to updates based on context</summary>
+
+        <p>When you call <code>setState</code>, React doesn't immediately re-render. Instead, it assigns a lane to the update based on the execution context:</p>
+
+        <pre><code class="language-javascript">// Simplified requestUpdateLane logic
+function requestUpdateLane(fiber) {
+  // 1. Check if we're inside flushSync
+  if (isFlushingSyncQueue) {
+    return SyncLane;
+  }
+
+  // 2. Check if we're inside a transition
+  const transition = ReactCurrentBatchConfig.transition;
+  if (transition !== null) {
+    // Claim the next available transition lane
+    return claimNextTransitionLane();
+  }
+
+  // 3. Check the current event priority
+  const updateLane = getCurrentUpdatePriority();
+  if (updateLane !== NoLane) {
+    return updateLane;
+  }
+
+  // 4. Check the current event in the browser
+  const eventLane = getCurrentEventPriority();
+  return eventLane;
+}
+
+// getCurrentEventPriority maps DOM events to lanes:
+function getCurrentEventPriority() {
+  const currentEvent = window.event;
+  if (currentEvent === undefined) {
+    return DefaultLane;
+  }
+  // Discrete events: click, keydown, input, focus, blur
+  // → DiscreteEventPriority → SyncLane
+  // Continuous events: drag, mousemove, scroll, wheel
+  // → ContinuousEventPriority → InputContinuousLane
+  return getEventPriority(currentEvent.type);
+}</code></pre>
+
+        <h3>Lane Assignment by Trigger</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Trigger</th>
+              <th>Assigned Lane</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>setState</code> in click handler</td>
+              <td>SyncLane</td>
+              <td>Click is a discrete event</td>
+            </tr>
+            <tr>
+              <td><code>setState</code> in scroll handler</td>
+              <td>InputContinuousLane</td>
+              <td>Scroll is a continuous event</td>
+            </tr>
+            <tr>
+              <td><code>setState</code> in useEffect</td>
+              <td>DefaultLane</td>
+              <td>No event context</td>
+            </tr>
+            <tr>
+              <td><code>setState</code> in setTimeout</td>
+              <td>DefaultLane</td>
+              <td>No event context</td>
+            </tr>
+            <tr>
+              <td><code>setState</code> inside <code>startTransition</code></td>
+              <td>TransitionLane</td>
+              <td>Explicitly marked low-priority</td>
+            </tr>
+            <tr>
+              <td><code>flushSync(() =&gt; setState(...))</code></td>
+              <td>SyncLane</td>
+              <td>Forced synchronous</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <pre class="diagram">
+setState() called
+      │
+      ▼
+┌─────────────────────┐
+│ requestUpdateLane() │
+└─────────┬───────────┘
+          │
+    ┌─────┼─────────────────┐
+    │     │                 │
+    ▼     ▼                 ▼
+flushSync? transition?   event type?
+    │         │              │
+    ▼         ▼              ▼
+SyncLane  TransitionLane  SyncLane / InputContinuous / Default
+        </pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Key insight:</strong> The lane is determined at the time of the <code>setState</code> call, not at the time the update is processed. This is why wrapping setState in <code>startTransition</code> changes its priority — it changes the execution context.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 6: Update Queue Lanes -->
+    <section id="update-queue-lanes">
+      <h2>Update Queue Lanes</h2>
+      <details>
+        <summary>How update queues store and process lane information</summary>
+
+        <p>Each fiber maintains an update queue. Every update in the queue is tagged with the lane it was assigned:</p>
+
+        <pre><code class="language-javascript">// Update object structure
+const update = {
+  lane: TransitionLane1,       // Which lane this update belongs to
+  action: newStateOrReducer,   // The setState argument
+  hasEagerState: false,
+  eagerState: null,
+  next: null,                  // Linked list pointer
+};
+
+// Fiber stores lanes info
+fiber.lanes = mergeLanes(fiber.lanes, update.lane);
+// Also propagate up to ancestors
+fiber.alternate.lanes = mergeLanes(fiber.alternate.lanes, update.lane);</code></pre>
+
+        <h3>Processing Updates by Lane Subset</h3>
+        <p>During render, React only processes updates that match the currently rendering lanes:</p>
+
+        <pre><code class="language-javascript">// Simplified processUpdateQueue
+function processUpdateQueue(fiber, renderLanes) {
+  const queue = fiber.updateQueue;
+  let update = queue.firstBaseUpdate;
+  let newState = queue.baseState;
+
+  while (update !== null) {
+    const updateLane = update.lane;
+
+    if (!isSubsetOfLanes(renderLanes, updateLane)) {
+      // This update has lower priority than what we're rendering
+      // SKIP it — save for later
+      cloneUpdate(update); // preserve for next render pass
+    } else {
+      // This update is included in current render
+      newState = computeNewState(newState, update);
+    }
+    update = update.next;
+  }
+
+  fiber.memoizedState = newState;
+}
+
+// isSubsetOfLanes: checks if updateLane is within renderLanes
+function isSubsetOfLanes(set, subset) {
+  return (set &amp; subset) === subset;
+}</code></pre>
+
+        <h3>mergeLanes in Practice</h3>
+        <pre><code class="language-javascript">// When an update is enqueued, its lane is merged into the fiber's lanes
+function enqueueUpdate(fiber, update) {
+  const pending = fiber.updateQueue.shared.pending;
+  // ... add to circular linked list ...
+
+  // Mark this fiber and its ancestors as having pending work
+  // at this lane
+  markUpdateLaneFromFiberToRoot(fiber, update.lane);
+}
+
+function markUpdateLaneFromFiberToRoot(fiber, lane) {
+  // Mark the fiber itself
+  fiber.lanes = mergeLanes(fiber.lanes, lane);
+  if (fiber.alternate) {
+    fiber.alternate.lanes = mergeLanes(fiber.alternate.lanes, lane);
+  }
+  // Walk up to root, marking childLanes
+  let parent = fiber.return;
+  while (parent !== null) {
+    parent.childLanes = mergeLanes(parent.childLanes, lane);
+    if (parent.alternate) {
+      parent.alternate.childLanes = mergeLanes(parent.alternate.childLanes, lane);
+    }
+    parent = parent.return;
+  }
+}</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Why mark ancestors?</strong> The <code>childLanes</code> field on each fiber lets React bail out early during traversal. If a fiber's <code>childLanes</code> doesn't include the current render lanes, React can skip the entire subtree — a crucial optimization.</p>
+        </div>
+
+        <pre class="diagram">
+Update Queue (linked list):
+┌────────────┐   ┌────────────┐   ┌────────────┐
+│ Update A   │──▶│ Update B   │──▶│ Update C   │
+│ lane: Sync │   │ lane: Trans│   │ lane: Sync │
+└────────────┘   └────────────┘   └────────────┘
+
+Rendering with renderLanes = SyncLane:
+  ✓ Process A (Sync ⊆ SyncLane)
+  ✗ Skip B    (Trans ⊄ SyncLane)
+  ✓ Process C (Sync ⊆ SyncLane)
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 7: Interrupt & Restart -->
+    <section id="interrupt-restart">
+      <h2>Interrupt &amp; Restart</h2>
+      <details>
+        <summary>What happens when a high-priority update interrupts a low-priority render</summary>
+
+        <p>This is the core of concurrent React. When a high-priority update arrives while a low-priority render is in progress:</p>
+
+        <pre><code class="language-javascript">// Simplified workLoop (concurrent mode)
+function workLoopConcurrent() {
+  // Render fiber-by-fiber, checking for interrupts between each unit
+  while (workInProgress !== null &amp;&amp; !shouldYield()) {
+    performUnitOfWork(workInProgress);
+  }
+}
+
+// shouldYield checks:
+// 1. Has the time slice expired? (5ms default)
+// 2. Is there higher-priority work pending?
+function shouldYield() {
+  const currentTime = getCurrentTime();
+  if (currentTime &gt;= deadline) {
+    // Time slice expired — yield unconditionally
+    // Note: React previously checked scheduling.isInputPending() here,
+    // but that API was removed from Chrome in 2024. Current React simply
+    // yields when the time slice (5ms) expires, relying on the MessageChannel
+    // macrotask boundary to let pending input events fire.
+    return true;
+  }
+  return false;
+}</code></pre>
+
+        <h3>The Interrupt Sequence</h3>
+        <pre class="diagram">
+Timeline:
+═══════════════════════════════════════════════════════════════
+
+1. Low-priority render begins (TransitionLane)
+   ┌───────────────────────────────────────┐
+   │ workLoopConcurrent() processing...    │
+   │ fiber A → fiber B → fiber C → ...     │
+   └───────────────────┬───────────────────┘
+                       │
+2. User clicks button ──┤ (SyncLane update enqueued)
+                       │
+3. shouldYield() returns true
+   workLoopConcurrent() exits
+                       │
+4. ensureRootIsScheduled() detects higher-priority lanes
+                       │
+5. prepareFreshStack() — discard WIP tree
+   ┌───────────────────────────────────────┐
+   │ workInProgress = createWorkInProgress  │
+   │ workInProgressRootRenderLanes = Sync   │
+   └───────────────────────────────────────┘
+                       │
+6. Restart from root with SyncLane
+   Process ONLY Sync-priority updates
+                       │
+7. Commit Sync result to DOM
+                       │
+8. Re-schedule TransitionLane work
+   (starts over from the beginning)
+═══════════════════════════════════════════════════════════════
+        </pre>
+
+        <pre><code class="language-javascript">// Key function: ensureRootIsScheduled
+function ensureRootIsScheduled(root) {
+  const nextLanes = getNextLanes(root, root === workInProgressRoot
+    ? workInProgressRootRenderLanes
+    : NoLanes
+  );
+
+  const existingCallbackPriority = root.callbackPriority;
+  const newCallbackPriority = getHighestPriorityLane(nextLanes);
+
+  // If higher priority work arrived, cancel the existing task
+  if (newCallbackPriority &gt; existingCallbackPriority) {
+    cancelCallback(existingCallbackNode);
+    // Schedule new, higher-priority task
+  }
+
+  let schedulerPriorityLevel;
+  if (includesSyncLane(nextLanes)) {
+    // Sync work — schedule as Immediate
+    schedulerPriorityLevel = ImmediateSchedulerPriority;
+  } else {
+    // Map lane to scheduler priority
+    schedulerPriorityLevel = lanesToSchedulerPriority(nextLanes);
+  }
+
+  const newCallbackNode = scheduleCallback(
+    schedulerPriorityLevel,
+    performConcurrentWorkOnRoot.bind(null, root)
+  );
+  root.callbackNode = newCallbackNode;
+  root.callbackPriority = newCallbackPriority;
+}
+
+// prepareFreshStack discards incomplete work
+function prepareFreshStack(root, lanes) {
+  root.finishedWork = null;
+  root.finishedLanes = NoLanes;
+
+  // Reset the work-in-progress tree
+  workInProgressRoot = root;
+  workInProgress = createWorkInProgress(root.current, null);
+  workInProgressRootRenderLanes = lanes;
+  // All in-progress state from the interrupted render is lost
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Critical concept:</strong> When a higher-priority update <em>preempts</em> an in-progress render, the work is discarded and React restarts from the root with the new priority. However, when React merely <em>yields</em> (time slice expired, no higher-priority work), the workInProgress pointer is preserved and work resumes from where it left off in the next time slice. The discard-and-restart only happens on true preemption. This is why render functions must be pure: they might be called multiple times due to interruptions.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 8: Starvation Prevention -->
+    <section id="starvation-prevention">
+      <h2>Starvation Prevention</h2>
+      <details>
+        <summary>How React ensures lower-priority work eventually gets done</summary>
+
+        <p>If high-priority updates keep arriving, lower-priority lanes could theoretically starve. React prevents this with two mechanisms:</p>
+
+        <h3>1. Lane Expiration</h3>
+        <pre><code class="language-javascript">// Each lane has an expiration time
+function markStarvedLanesAsExpired(root, currentTime) {
+  const pendingLanes = root.pendingLanes;
+  const expirationTimes = root.expirationTimes;
+
+  let lanes = pendingLanes;
+  while (lanes &gt; 0) {
+    const index = pickArbitraryLaneIndex(lanes);
+    const lane = 1 &lt;&lt; index;
+    const expirationTime = expirationTimes[index];
+
+    if (expirationTime === NoTimestamp) {
+      // This lane just became pending — assign expiration
+      expirationTimes[index] = computeExpirationTime(lane, currentTime);
+    } else if (expirationTime &lt;= currentTime) {
+      // This lane has EXPIRED — mark it
+      root.expiredLanes |= lane;
+    }
+
+    lanes &amp;= ~lane;
+  }
+}
+
+// Expiration timeouts by priority:
+// SyncLane:            250ms
+// InputContinuousLane: 500ms
+// DefaultLane:         5000ms
+// TransitionLanes:     5000ms
+// RetryLanes:          5000ms
+// IdleLane:            Never (no expiration)</code></pre>
+
+        <h3>2. Expired Lanes Get Sync Priority</h3>
+        <pre><code class="language-javascript">// In getNextLanes, expired lanes are treated as highest priority
+function getNextLanes(root, wipLanes) {
+  const pendingLanes = root.pendingLanes;
+  if (pendingLanes === NoLanes) return NoLanes;
+
+  // Check for expired lanes FIRST
+  const expiredLanes = root.expiredLanes;
+  if (expiredLanes !== NoLanes) {
+    // Expired lanes are processed synchronously — cannot be interrupted
+    return expiredLanes;
+  }
+
+  // ... normal priority selection logic
+}</code></pre>
+
+        <pre class="diagram">
+Starvation Timeline:
+═════════════════════════════════════════════════════════
+t=0ms    TransitionLane update arrives → expiration set to t+5000ms
+t=50ms   SyncLane update arrives → interrupts Transition
+t=100ms  SyncLane update arrives → interrupts Transition (again)
+t=200ms  SyncLane update arrives → interrupts Transition (again)
+  ...
+t=5000ms TransitionLane EXPIRES
+         → root.expiredLanes |= TransitionLane1
+         → getNextLanes returns TransitionLane1
+         → Renders synchronously (cannot be interrupted!)
+═════════════════════════════════════════════════════════
+        </pre>
+
+        <div class="callout callout-info">
+          <p><strong>Key point:</strong> Once a lane expires, it gets promoted to synchronous priority. This guarantees eventual completion. IdleLane is the exception — it never expires and can be starved indefinitely (which is by design for truly optional background work).</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 9: Entanglement -->
+    <section id="entanglement">
+      <h2>Entanglement</h2>
+      <details>
+        <summary>When lanes must render together and why</summary>
+
+        <p>Entanglement means certain lanes are "linked" and must always be included together in a render. If lane A is entangled with lane B, rendering A also requires rendering B.</p>
+
+        <pre><code class="language-javascript">// Entanglement is stored as an array of lane masks
+// root.entanglements[laneIndex] = set of lanes entangled with this lane
+
+function entangleTransitions(root, fiber, lane) {
+  const updateQueue = fiber.updateQueue;
+  const sharedQueue = updateQueue.shared;
+
+  if (isTransitionLane(lane)) {
+    let queueLanes = sharedQueue.lanes;
+    // Mark all lanes in this queue as entangled with each other
+    queueLanes = mergeLanes(queueLanes, lane);
+    sharedQueue.lanes = queueLanes;
+
+    // Entangle with the root
+    root.entangledLanes |= queueLanes;
+    const entanglements = root.entanglements;
+    let lanes = queueLanes;
+    while (lanes &gt; 0) {
+      const index = pickArbitraryLaneIndex(lanes);
+      const entangledLane = 1 &lt;&lt; index;
+      // Each lane in the group becomes entangled with ALL lanes in the group
+      entanglements[index] |= queueLanes;
+      lanes &amp;= ~entangledLane;
+    }
+  }
+}
+
+// When selecting lanes to render, include entangled lanes
+function getEntangledLanes(root, renderLanes) {
+  let entangledLanes = renderLanes;
+  const allEntangledLanes = root.entangledLanes;
+
+  if (allEntangledLanes !== NoLanes) {
+    const entanglements = root.entanglements;
+    let lanes = entangledLanes &amp; allEntangledLanes;
+    while (lanes &gt; 0) {
+      const index = pickArbitraryLaneIndex(lanes);
+      const lane = 1 &lt;&lt; index;
+      // Pull in entangled lanes
+      entangledLanes |= entanglements[index];
+      lanes &amp;= ~lane;
+    }
+  }
+  return entangledLanes;
+}</code></pre>
+
+        <h3>When Do Lanes Become Entangled?</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Scenario</th>
+              <th>Entanglement Effect</th>
+              <th>Why</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Multiple setState in same transition</td>
+              <td>All transition lanes are entangled</td>
+              <td>Must show consistent state</td>
+            </tr>
+            <tr>
+              <td>setState on same fiber at different priorities</td>
+              <td>Shared queue lanes entangled</td>
+              <td>Updates to same state must be ordered</td>
+            </tr>
+            <tr>
+              <td>Suspense boundary retry</td>
+              <td>Retry lane entangled with original</td>
+              <td>Can't show partial resolution</td>
+            </tr>
+            <tr>
+              <td>useDeferredValue</td>
+              <td>Deferred lane entangled with trigger</td>
+              <td>Must reflect same data source</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Practical Example</h3>
+        <pre><code class="language-javascript">// Example 1: Updates in the same startTransition get the SAME lane
+// (no entanglement needed — they're already on the same lane via batching)
+startTransition(() =&gt; {
+  setResults(fetchResults(query));  // TransitionLane1
+  setCount(fetchCount(query));      // TransitionLane1 (same batch)
+});
+// Both are on TransitionLane1 — consistency is automatic, not via entanglement.
+
+// Example 2: TRUE entanglement — Suspense retry
+// This is where entanglement actually matters:
+startTransition(() =&gt; {
+  setQuery("react"); // Gets TransitionLane1
+});
+// Later, a Suspense boundary inside this transition resolves and retries.
+// The retry is assigned TransitionLane2 (different lane, different time).
+// But it MUST render together with TransitionLane1 — otherwise you'd see
+// the resolved data without the query update, or vice versa.
+// React entangles TransitionLane1 and TransitionLane2:
+// root.entanglements[lane1Index] |= TransitionLane2;
+// root.entanglements[lane2Index] |= TransitionLane1;</code></pre>
+
+        <pre class="diagram">
+Entanglement Example (Suspense Retry):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ TransitionLane1 (query update — T=0)
+         ╲
+          ╳ ENTANGLED — must render together
+         ╱
+ TransitionLane2 (Suspense retry — T=500ms)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Without entanglement:
+  Render 1: resolved data + OLD query  ← INCONSISTENT!
+
+With entanglement:
+  Render 1: resolved data + new query  ← CONSISTENT ✓
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        </pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Interview insight:</strong> Entanglement is how React guarantees consistency in concurrent mode without requiring developers to manually batch updates. It's the mechanism behind "automatic batching" for transitions.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: Comparison with Expiration Times -->
+    <section id="comparison-expiration-times">
+      <h2>Comparison: Expiration Times vs Lanes</h2>
+      <details>
+        <summary>Why lanes replaced the old expirationTime model</summary>
+
+        <p>React originally used an <code>expirationTime</code> number for priority. The lane model replaced it in React 17+ (internal) for significant architectural reasons:</p>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>expirationTime Model</th>
+              <th>Lanes Model</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Data structure</td>
+              <td>Single number (ms timestamp)</td>
+              <td>31-bit bitmask</td>
+            </tr>
+            <tr>
+              <td>Comparison</td>
+              <td>Linear: A &gt; B means higher priority</td>
+              <td>Bitwise: independent priority groups</td>
+            </tr>
+            <tr>
+              <td>Batch selection</td>
+              <td>All work ≥ threshold processed together</td>
+              <td>Arbitrary subsets selected via bitmask</td>
+            </tr>
+            <tr>
+              <td>IO-bound vs CPU-bound</td>
+              <td>Cannot distinguish</td>
+              <td>Separate lane groups (Retry vs Default)</td>
+            </tr>
+            <tr>
+              <td>Multiple transitions</td>
+              <td>All collapse to same priority</td>
+              <td>Each gets own lane — independent</td>
+            </tr>
+            <tr>
+              <td>Suspense integration</td>
+              <td>Awkward — hijacks priority number</td>
+              <td>Natural — RetryLanes are separate bits</td>
+            </tr>
+            <tr>
+              <td>Hydration priority</td>
+              <td>Special-cased hacks</td>
+              <td>SelectiveHydrationLane is just another bit</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Problems with expirationTime</h3>
+        <pre><code class="language-javascript">// OLD MODEL — Problems illustrated
+// expirationTime: higher number = higher priority
+
+// Problem 1: Forced linear ordering
+// If update A has expiration 5000 and B has 3000,
+// A MUST be processed before B. But what if they're independent?
+
+// Problem 2: Cannot skip work
+// To render "all work above priority X", you render everything
+// with expirationTime &gt;= X. You can't say "render X but skip Y"
+// even if Y is between them.
+
+// Problem 3: Suspense rebasing
+// When Suspense needs to "retry" at a different priority,
+// it had to manipulate expiration times in fragile ways
+
+// OLD: Everything above the threshold renders together
+//                    threshold
+//                       │
+// ─────────────────────┼────────────────── priority axis
+// [C: 1000] [B: 3000] │ [A: 5000]
+//   skip      skip     │  render
+//                      │
+// But what if we WANT C without B? Impossible!
+
+// NEW: Select exactly which lanes to render
+// renderLanes = SyncLane | TransitionLane3
+// → Process only updates tagged with those specific lanes
+// → Skip everything else, regardless of "priority order"</code></pre>
+
+        <pre class="diagram">
+expirationTime (linear):
+──────────────────────────────────────────────▶ priority
+  Idle    Low    Normal    High    Sync
+  1000    2000   3000      4000    5000
+
+  "Render everything ≥ 3000" → must include 4000 and 5000
+  Cannot selectively skip 4000 but include 3000
+
+Lanes (bitmask):
+┌─────┬─────┬─────┬─────┬─────┬─────┐
+│ Bit5│ Bit4│ Bit3│ Bit2│ Bit1│ Bit0│
+│Idle │Trans│Trans│Deflt│Input│Sync │
+└─────┴─────┴─────┴─────┴─────┴─────┘
+
+  renderLanes = 0b001001 → render Bit0 (Sync) + Bit3 (Trans)
+  Skip Bit1, Bit2, Bit4, Bit5 — any combination is possible!
+        </pre>
+
+        <div class="callout callout-info">
+          <p><strong>Historical note:</strong> Andrew Clark's PR introducing lanes describes the key insight: "Expiration times impose an ordering on updates that prevents us from expressing concepts like 'IO-bound work' vs 'CPU-bound work' as orthogonal priorities."</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 11: Scheduler Priorities -->
+    <section id="scheduler-priorities">
+      <h2>Scheduler Priorities</h2>
+      <details>
+        <summary>The scheduler package's priority queue and how it maps to lanes</summary>
+
+        <p>React's <code>scheduler</code> package is a separate abstraction from lanes. It manages a priority queue of tasks using its own priority levels:</p>
+
+        <pre><code class="language-javascript">// packages/scheduler/src/SchedulerPriorities.js
+export const ImmediatePriority = 1;   // Must run now
+export const UserBlockingPriority = 2; // Must run soon (250ms timeout)
+export const NormalPriority = 3;       // Can wait a bit (5s timeout)
+export const LowPriority = 4;         // Can wait longer (10s timeout)
+export const IdlePriority = 5;        // Run whenever (no timeout)
+
+// Timeout values
+const IMMEDIATE_PRIORITY_TIMEOUT = -1;     // Already expired
+const USER_BLOCKING_PRIORITY_TIMEOUT = 250;
+const NORMAL_PRIORITY_TIMEOUT = 5000;
+const LOW_PRIORITY_TIMEOUT = 10000;
+const IDLE_PRIORITY_TIMEOUT = maxSigned31BitInt; // ~12.4 days</code></pre>
+
+        <h3>Lane → Scheduler Priority Mapping</h3>
+        <pre><code class="language-javascript">// How React maps lanes to scheduler priorities
+function lanesToSchedulerPriority(lanes) {
+  const lane = getHighestPriorityLane(lanes);
+
+  if (lane === SyncLane) {
+    return ImmediatePriority;
+  }
+  if (lane === InputContinuousLane) {
+    return UserBlockingPriority;
+  }
+  if (lane === DefaultLane) {
+    return NormalPriority;
+  }
+  if (lane &amp; TransitionLanes) {
+    return NormalPriority;
+  }
+  if (lane &amp; RetryLanes) {
+    return NormalPriority;
+  }
+  if (lane === IdleLane || lane === OffscreenLane) {
+    return IdlePriority;
+  }
+  return NormalPriority;
+}</code></pre>
+
+        <h3>Scheduler's Priority Queue</h3>
+        <pre><code class="language-javascript">// The scheduler uses a min-heap based on sortIndex (expiration time)
+// Each task has: { id, callback, priorityLevel, startTime, expirationTime, sortIndex }
+
+function scheduleCallback(priorityLevel, callback) {
+  const currentTime = getCurrentTime();
+  const startTime = currentTime; // or + delay for delayed tasks
+  const timeout = getTimeoutByPriority(priorityLevel);
+  const expirationTime = startTime + timeout;
+
+  const newTask = {
+    id: taskIdCounter++,
+    callback,
+    priorityLevel,
+    startTime,
+    expirationTime,
+    sortIndex: -1,
+  };
+
+  // Push to taskQueue (min-heap sorted by expirationTime)
+  newTask.sortIndex = expirationTime;
+  push(taskQueue, newTask);
+
+  // Request host callback (MessageChannel or setTimeout)
+  if (!isHostCallbackScheduled) {
+    requestHostCallback(flushWork);
+  }
+
+  return newTask;
+}</code></pre>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Scheduler Priority</th>
+              <th>Timeout</th>
+              <th>Mapped From Lanes</th>
+              <th>Behavior</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Immediate</td>
+              <td>-1 (expired)</td>
+              <td>SyncLane</td>
+              <td>Runs synchronously, cannot be preempted</td>
+            </tr>
+            <tr>
+              <td>UserBlocking</td>
+              <td>250ms</td>
+              <td>InputContinuousLane</td>
+              <td>Runs soon, short yield window</td>
+            </tr>
+            <tr>
+              <td>Normal</td>
+              <td>5000ms</td>
+              <td>Default, Transition, Retry</td>
+              <td>Standard concurrent render</td>
+            </tr>
+            <tr>
+              <td>Low</td>
+              <td>10000ms</td>
+              <td>(not directly mapped)</td>
+              <td>Rarely used in React itself</td>
+            </tr>
+            <tr>
+              <td>Idle</td>
+              <td>~12 days</td>
+              <td>IdleLane, OffscreenLane</td>
+              <td>Only when nothing else is pending</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <pre class="diagram">
+┌──────────────────────────────────────────────┐
+│         Scheduler Task Queue (Min-Heap)       │
+├──────────────────────────────────────────────┤
+│                                              │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐     │
+│  │ Task A  │  │ Task B  │  │ Task C  │     │
+│  │ Immed.  │  │ Normal  │  │ Idle    │     │
+│  │ exp:-1  │  │ exp:5s  │  │ exp:12d │     │
+│  └────┬────┘  └────┬────┘  └────┬────┘     │
+│       │             │             │          │
+│       ▼             ▼             ▼          │
+│   Runs first    Runs second   Runs last     │
+│                                              │
+└──────────────────────────────────────────────┘
+
+Lanes (React)           Scheduler (generic)
+━━━━━━━━━━━━━           ━━━━━━━━━━━━━━━━━━
+SyncLane        ──────▶  ImmediatePriority
+InputContinuous ──────▶  UserBlockingPriority
+DefaultLane     ──────▶  NormalPriority
+TransitionLanes ──────▶  NormalPriority
+IdleLane        ──────▶  IdlePriority
+        </pre>
+
+        <div class="callout callout-info">
+          <p><strong>Architecture note:</strong> The scheduler is deliberately decoupled from React. It knows nothing about lanes, fibers, or DOM. React uses it as a generic task scheduling primitive. This separation allows the scheduler to potentially be used by other frameworks or even the browser itself (there's an ongoing proposal for a browser-native scheduling API).</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 12: Production Performance -->
+    <section id="production-performance">
+      <h2>Production Performance</h2>
+      <details>
+        <summary>How lanes affect your app and identifying priority issues</summary>
+
+        <h3>How Lanes Affect Your App</h3>
+        <ul>
+          <li><strong>Input responsiveness:</strong> SyncLane ensures user input never waits for background renders to complete</li>
+          <li><strong>Smooth transitions:</strong> TransitionLanes let heavy UI updates happen without blocking interactions</li>
+          <li><strong>Automatic batching:</strong> Multiple setState calls in the same event share a lane, batching into one render</li>
+          <li><strong>Selective hydration:</strong> Clicking an unhydrated Suspense boundary promotes it to SelectiveHydrationLane</li>
+        </ul>
+
+        <h3>Identifying Priority Issues in React DevTools Profiler</h3>
+        <pre><code class="language-javascript">// Signs of priority problems in the Profiler:
+
+// 1. Long "render" times on SyncLane
+// → You're doing too much work at sync priority
+// Fix: Move heavy computation into startTransition
+
+// 2. Multiple interrupted renders for the same transition
+// → Frequent high-priority interruptions (too many sync updates)
+// Fix: Audit which updates truly need SyncLane
+
+// 3. "Delayed" commits that take &gt;5 seconds
+// → Transition is starving and finally expiring
+// Fix: Break up the transition or reduce competing sync work
+
+// 4. Redundant renders of the same component
+// → Missing memoization — component re-renders on every lane
+// Fix: React.memo, useMemo for expensive calculations</code></pre>
+
+        <h3>Common Patterns</h3>
+        <pre><code class="language-javascript">// PATTERN 1: Immediate feedback + deferred heavy render
+function SearchInput() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+
+  function handleChange(e) {
+    // SyncLane: update input immediately (user sees typed characters)
+    setQuery(e.target.value);
+
+    // TransitionLane: heavy filtering doesn't block typing
+    startTransition(() =&gt; {
+      setResults(filterLargeDataset(e.target.value));
+    });
+  }
+
+  return (
+    &lt;&gt;
+      &lt;input value={query} onChange={handleChange} /&gt;
+      {isPending &amp;&amp; &lt;Spinner /&gt;}
+      &lt;ResultsList results={results} /&gt;
+    &lt;/&gt;
+  );
+}
+
+// PATTERN 2: Using useDeferredValue for derived state
+function Dashboard({ data }) {
+  const deferredData = useDeferredValue(data);
+  // deferredData updates at TransitionLane priority
+  // Original data prop updates at whatever lane triggered the parent render
+
+  return (
+    &lt;&gt;
+      &lt;Header data={data} /&gt; {/* Always current */}
+      &lt;ExpensiveChart data={deferredData} /&gt; {/* May lag behind */}
+    &lt;/&gt;
+  );
+}</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>DevTools tip:</strong> In the React DevTools Profiler, look for the "Priority" label on each commit. Commits labeled "Transition" that take very long may indicate starvation. Commits labeled "Sync" that contain heavy components indicate work that should be moved to a transition.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 13: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Demonstrating priority with useTransition, lane assignment, and scheduler visualization</summary>
+
+        <h3>Priority Demonstration with useTransition</h3>
+        <pre><code class="language-javascript">import { useState, useTransition, useEffect, useRef } from 'react';
+
+function PriorityDemo() {
+  const [urgent, setUrgent] = useState('');
+  const [list, setList] = useState([]);
+  const [isPending, startTransition] = useTransition();
+  const renderCount = useRef({ sync: 0, transition: 0 });
+
+  function handleInput(e) {
+    const value = e.target.value;
+
+    // This update gets SyncLane (discrete event handler)
+    // React processes this IMMEDIATELY
+    setUrgent(value);
+    renderCount.current.sync++;
+
+    // This update gets TransitionLane
+    // React can INTERRUPT this if more typing happens
+    startTransition(() =&gt; {
+      const items = [];
+      for (let i = 0; i &lt; 20000; i++) {
+        if (value &amp;&amp; `Item ${i}`.includes(value)) {
+          items.push(`Item ${i}`);
+        }
+      }
+      setList(items);
+      renderCount.current.transition++;
+    });
+  }
+
+  return (
+    &lt;div&gt;
+      &lt;input
+        value={urgent}
+        onChange={handleInput}
+        placeholder="Type to filter 20k items..."
+      /&gt;
+      &lt;p&gt;Sync renders: {renderCount.current.sync}&lt;/p&gt;
+      &lt;p&gt;Transition renders: {renderCount.current.transition}&lt;/p&gt;
+      &lt;p&gt;{isPending ? 'Filtering...' : `${list.length} results`}&lt;/p&gt;
+      &lt;ul&gt;
+        {list.slice(0, 100).map((item, i) =&gt; (
+          &lt;li key={i}&gt;{item}&lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/div&gt;
+  );
+}
+
+// What happens when user types "abc" quickly:
+// t=0ms:   'a' → SyncLane(setUrgent) + TransitionLane1(setList)
+// t=30ms:  'ab' → SyncLane interrupts TransitionLane1
+//          → TransitionLane1 work DISCARDED
+//          → SyncLane(setUrgent) processed, new TransitionLane2(setList)
+// t=60ms:  'abc' → SyncLane interrupts TransitionLane2
+//          → TransitionLane2 work DISCARDED
+//          → SyncLane(setUrgent) processed, new TransitionLane3(setList)
+// t=60ms+: No more typing → TransitionLane3 completes uninterrupted</code></pre>
+
+        <h3>Simulating Lane Assignment</h3>
+        <pre><code class="language-javascript">// Educational: showing how different contexts produce different lanes
+function LaneAssignmentVisualization() {
+  const [log, setLog] = useState([]);
+
+  const addLog = (source, expectedLane) =&gt; {
+    setLog(prev =&gt; [...prev, { source, expectedLane, time: Date.now() }]);
+  };
+
+  // Click handler → SyncLane
+  const handleClick = () =&gt; {
+    addLog('click handler', 'SyncLane');
+  };
+
+  // Inside startTransition → TransitionLane
+  const handleTransition = () =&gt; {
+    startTransition(() =&gt; {
+      addLog('startTransition', 'TransitionLane');
+    });
+  };
+
+  // Inside useEffect → DefaultLane
+  useEffect(() =&gt; {
+    addLog('useEffect', 'DefaultLane');
+  }, []);
+
+  // Inside setTimeout → DefaultLane (no event context)
+  const handleTimeout = () =&gt; {
+    setTimeout(() =&gt; {
+      addLog('setTimeout callback', 'DefaultLane');
+    }, 0);
+  };
+
+  // flushSync → SyncLane (forced)
+  const handleFlushSync = () =&gt; {
+    startTransition(() =&gt; {
+      // Even inside a transition, flushSync forces SyncLane
+      flushSync(() =&gt; {
+        addLog('flushSync inside transition', 'SyncLane');
+      });
+    });
+  };
+
+  return (
+    &lt;div&gt;
+      &lt;button onClick={handleClick}&gt;Click (SyncLane)&lt;/button&gt;
+      &lt;button onClick={handleTransition}&gt;Transition&lt;/button&gt;
+      &lt;button onClick={handleTimeout}&gt;setTimeout&lt;/button&gt;
+      &lt;button onClick={handleFlushSync}&gt;flushSync&lt;/button&gt;
+      &lt;ul&gt;
+        {log.map((entry, i) =&gt; (
+          &lt;li key={i}&gt;
+            {entry.source} → {entry.expectedLane}
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+        <h3>Scheduler Priority Visualization</h3>
+        <pre><code class="language-javascript">// Visualizing how the scheduler processes tasks by priority
+import { unstable_scheduleCallback, unstable_ImmediatePriority,
+  unstable_UserBlockingPriority, unstable_NormalPriority,
+  unstable_LowPriority, unstable_IdlePriority
+} from 'scheduler';
+
+function demonstrateSchedulerOrder() {
+  const executionOrder = [];
+
+  // Schedule in reverse priority order
+  unstable_scheduleCallback(unstable_IdlePriority, () =&gt; {
+    executionOrder.push('5: Idle');
+    console.log('Execution order:', executionOrder);
+  });
+
+  unstable_scheduleCallback(unstable_LowPriority, () =&gt; {
+    executionOrder.push('4: Low');
+  });
+
+  unstable_scheduleCallback(unstable_NormalPriority, () =&gt; {
+    executionOrder.push('3: Normal');
+  });
+
+  unstable_scheduleCallback(unstable_UserBlockingPriority, () =&gt; {
+    executionOrder.push('2: UserBlocking');
+  });
+
+  unstable_scheduleCallback(unstable_ImmediatePriority, () =&gt; {
+    executionOrder.push('1: Immediate');
+  });
+
+  // Despite being scheduled last, Immediate runs first
+  // Output: ['1: Immediate', '2: UserBlocking', '3: Normal', '4: Low', '5: Idle']
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Note:</strong> The <code>unstable_</code> prefix indicates these are internal APIs subject to change. Don't use them directly in production. Use <code>startTransition</code> and <code>useDeferredValue</code> instead — they are the stable public interface to the scheduling system.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 14: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>5 critical mistakes developers make with React's priority system</summary>
+
+        <h3>Mistake 1: Marking Urgent Updates as Transitions</h3>
+        <pre><code class="language-javascript">// ❌ WRONG: User sees delayed feedback for critical action
+function PaymentForm() {
+  const [isPending, startTransition] = useTransition();
+
+  function handleSubmit() {
+    startTransition(() =&gt; {
+      // Payment submission should NOT be a transition!
+      // User expects immediate feedback
+      setSubmitting(true);
+      submitPayment(formData);
+    });
+  }
+}
+
+// ✓ CORRECT: Use SyncLane for user-critical actions
+function PaymentForm() {
+  function handleSubmit() {
+    // setState in event handler = SyncLane (immediate)
+    setSubmitting(true);
+    submitPayment(formData);
+  }
+}</code></pre>
+
+        <h3>Mistake 2: Not Using Transitions for Heavy Renders</h3>
+        <pre><code class="language-javascript">// ❌ WRONG: Heavy filtering blocks the input
+function SearchPage() {
+  const [query, setQuery] = useState('');
+
+  function handleChange(e) {
+    // Both updates get SyncLane — the heavy filter
+    // blocks the input from updating
+    setQuery(e.target.value);
+    setFilteredResults(heavyFilter(e.target.value, largeDataset));
+  }
+}
+
+// ✓ CORRECT: Separate urgent from non-urgent
+function SearchPage() {
+  const [query, setQuery] = useState('');
+  const [isPending, startTransition] = useTransition();
+
+  function handleChange(e) {
+    setQuery(e.target.value); // SyncLane — immediate
+    startTransition(() =&gt; {
+      setFilteredResults(heavyFilter(e.target.value, largeDataset));
+    }); // TransitionLane — interruptible
+  }
+}</code></pre>
+
+        <h3>Mistake 3: Misunderstanding Batching in Concurrent Mode</h3>
+        <pre><code class="language-javascript">// ❌ WRONG assumption: each setState triggers a separate render
+function Counter() {
+  function handleClick() {
+    setA(1); // Does NOT trigger render here
+    setB(2); // Does NOT trigger render here
+    setC(3); // Does NOT trigger render here
+    // All three are batched into ONE render (same event, same lane)
+  }
+
+  // But what about async boundaries?
+  async function handleAsync() {
+    setA(1);       // Batched...
+    await fetch(); // ...async boundary...
+    setB(2);       // In React 18+: STILL batched! (same DefaultLane)
+    setC(3);       // All three may end up in one render
+  }
+}
+
+// ✓ CORRECT understanding:
+// React 18 batches ALL setState calls that share a lane,
+// regardless of async boundaries. Only different lanes
+// produce separate renders.</code></pre>
+
+        <h3>Mistake 4: Over-Using flushSync</h3>
+        <pre><code class="language-javascript">// ❌ WRONG: Forcing sync rendering unnecessarily
+function AnimatedList({ items }) {
+  useEffect(() =&gt; {
+    items.forEach((item, i) =&gt; {
+      // Forces each update to be synchronous — defeats concurrency
+      flushSync(() =&gt; {
+        setVisibleItems(prev =&gt; [...prev, item]);
+      });
+    });
+  }, [items]);
+}
+
+// ✓ CORRECT: Let React batch and schedule naturally
+function AnimatedList({ items }) {
+  useEffect(() =&gt; {
+    // Single state update — React handles the rendering
+    setVisibleItems(items);
+    // If animation needed, use CSS transitions or requestAnimationFrame
+  }, [items]);
+}
+
+// flushSync is appropriate for:
+// - Measuring DOM after update (scrollTo, focus)
+// - Third-party library integration requiring sync DOM state
+// - Accessibility: screen reader announcements that must be immediate</code></pre>
+
+        <h3>Mistake 5: Ignoring Starvation Signals</h3>
+        <pre><code class="language-javascript">// ❌ WRONG: Causing excessive interruptions
+function RealTimeChat() {
+  useEffect(() =&gt; {
+    const ws = new WebSocket(url);
+    ws.onmessage = (e) =&gt; {
+      // Every message (100/sec) triggers SyncLane update
+      // This starves ALL transitions in the app
+      setMessages(prev =&gt; [...prev, JSON.parse(e.data)]);
+    };
+  }, []);
+}
+
+// ✓ CORRECT: Batch high-frequency updates, use appropriate priority
+function RealTimeChat() {
+  const bufferRef = useRef([]);
+
+  useEffect(() =&gt; {
+    const ws = new WebSocket(url);
+    ws.onmessage = (e) =&gt; {
+      bufferRef.current.push(JSON.parse(e.data));
+    };
+
+    // Flush buffer at reasonable intervals using transition
+    const interval = setInterval(() =&gt; {
+      if (bufferRef.current.length &gt; 0) {
+        const batch = bufferRef.current;
+        bufferRef.current = [];
+        startTransition(() =&gt; {
+          setMessages(prev =&gt; [...prev, ...batch]);
+        });
+      }
+    }, 100);
+
+    return () =&gt; { ws.close(); clearInterval(interval); };
+  }, []);
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Rule of thumb:</strong> If your app has transitions that take 5+ seconds to commit, something is causing starvation. Check for high-frequency sync-priority updates, heavy synchronous computations in event handlers, or excessive flushSync usage.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 15: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Comparing scheduling strategies and their implications</summary>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Pros</th>
+              <th>Cons</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Sync Rendering</strong> (SyncLane for everything)</td>
+              <td>Simple mental model, predictable order, no tearing</td>
+              <td>Blocks main thread, janky UI on heavy updates</td>
+              <td>Simple apps, critical paths where consistency matters more than responsiveness</td>
+            </tr>
+            <tr>
+              <td><strong>Concurrent Rendering</strong> (Transitions)</td>
+              <td>Responsive input, interruptible, better perceived performance</td>
+              <td>More complex, potential for stale UI, more re-renders</td>
+              <td>Complex UIs, heavy computations, search/filter scenarios</td>
+            </tr>
+            <tr>
+              <td><strong>TransitionLane</strong> (startTransition)</td>
+              <td>Explicit opt-in, clear intent, framework-managed priority</td>
+              <td>Extra API surface, not all updates benefit</td>
+              <td>Non-urgent UI updates derived from user actions</td>
+            </tr>
+            <tr>
+              <td><strong>DefaultLane</strong> (normal setState)</td>
+              <td>No extra code, good enough for most updates</td>
+              <td>Can block if heavy, higher priority than transitions</td>
+              <td>Standard state updates that should render promptly</td>
+            </tr>
+            <tr>
+              <td><strong>Fine-grained Priority</strong> (many lanes)</td>
+              <td>Maximum control, independent scheduling per update type</td>
+              <td>Hard to reason about, debugging complexity</td>
+              <td>Framework internals (React itself), not user code</td>
+            </tr>
+            <tr>
+              <td><strong>Coarse Priority</strong> (sync vs transition)</td>
+              <td>Easy to understand, covers 90% of cases</td>
+              <td>Cannot express nuanced priority differences</td>
+              <td>Application-level code, most real-world scenarios</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>When to Use Each Priority Level</h3>
+        <pre><code class="language-javascript">// SyncLane (default in event handlers) — Use for:
+// • Text input value updates (user must see what they typed)
+// • Toggle visibility (open/close modals)
+// • Form validation feedback
+// • Focus management
+
+// TransitionLane (startTransition) — Use for:
+// • Search result filtering
+// • Tab switching with heavy content
+// • Navigation in client-side routers
+// • Dashboard data re-aggregation
+// • Any "secondary" UI update triggered by a user action
+
+// DefaultLane (useEffect, setTimeout) — Use for:
+// • Data fetching results
+// • Subscription updates
+// • Timer-based state changes
+// • Effects that update state
+
+// IdleLane — Reserved for React internals:
+// • Offscreen pre-rendering
+// • Speculative rendering of hidden routes</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Practical guidance:</strong> Most apps only need two priority levels in practice — "urgent" (default event handler behavior) and "non-urgent" (startTransition). The fine-grained lane system exists for React's internal scheduling; you rarely need to think about individual lanes in application code.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 16: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>7 likely follow-up questions with strong answers</summary>
+
+        <h3>Q1: "Can two transitions run concurrently?"</h3>
+        <p><strong>Answer:</strong> Not truly concurrently (JavaScript is single-threaded), but they can be scheduled independently. Each <code>startTransition</code> claims a different TransitionLane. If Transition A is rendering and Transition B arrives, React can choose to include both in the same render pass (if they're entangled) or handle them separately. Multiple transition lanes allow React to track which transitions are complete independently — important for showing stale content while a specific transition is pending.</p>
+
+        <h3>Q2: "What's the relationship between lanes and time slicing?"</h3>
+        <p><strong>Answer:</strong> Lanes determine <em>what</em> work to do; time slicing determines <em>when</em> to yield. During a concurrent render (non-Sync lanes), React yields every ~5ms (the time slice). Between slices, it checks if higher-priority lanes have pending work. If so, it interrupts. SyncLane renders are NOT time-sliced — they run to completion without yielding, because user input feedback must be immediate.</p>
+
+        <h3>Q3: "How does Suspense interact with lanes?"</h3>
+        <p><strong>Answer:</strong> When a component suspends (throws a Promise), React remembers which lanes were being rendered. When the Promise resolves, React schedules a retry at a RetryLane. RetryLanes have lower priority than user-interactive lanes but higher than idle, ensuring data resolution happens promptly but doesn't block user interaction. The retry lane can be entangled with the original lane that caused the suspension.</p>
+
+        <h3>Q4: "Why doesn't React use Web Workers for concurrent rendering?"</h3>
+        <p><strong>Answer:</strong> React needs synchronous access to the DOM for commits and to the component tree for state reads. Web Workers cannot access the DOM. React's approach is cooperative multitasking on the main thread: render work is broken into small units, and the scheduler yields between them. This is why render must be pure — React needs to be able to abandon and restart work without side effects leaking.</p>
+
+        <h3>Q5: "How does useDeferredValue differ from startTransition internally?"</h3>
+        <p><strong>Answer:</strong> <code>startTransition</code> marks the <em>source</em> of an update as low priority — the setState inside it gets a TransitionLane. <code>useDeferredValue</code> creates a <em>derived</em> value that updates at transition priority. Internally, useDeferredValue triggers a re-render at TransitionLane when the source value changes, passing the new value to the deferred copy. The key difference: startTransition controls when an update happens; useDeferredValue controls when a value is consumed.</p>
+
+        <h3>Q6: "What happens to in-progress work when React interrupts?"</h3>
+        <p><strong>Answer:</strong> It's completely discarded. React calls <code>prepareFreshStack()</code>, which resets <code>workInProgress</code> to a fresh clone of the current tree. Any partially-built fiber nodes, any hooks that ran during the interrupted render — all gone. This is why:</p>
+        <ul>
+          <li>Render must be pure (no side effects to leak)</li>
+          <li>useRef mutations in render are dangerous (may happen multiple times)</li>
+          <li>Strict Mode double-renders to catch impurity</li>
+        </ul>
+
+        <h3>Q7: "Can lanes cause visual inconsistency (tearing)?"</h3>
+        <p><strong>Answer:</strong> React's design prevents tearing within a single render. All components in one commit see the same state for a given lane. However, <code>useDeferredValue</code> intentionally shows "stale" data — this is controlled inconsistency, not tearing. True tearing was a risk with external stores (Redux), which led to <code>useSyncExternalStore</code> — it forces sync re-renders when external state changes during a concurrent render to maintain consistency.</p>
+
+        <div class="callout callout-info">
+          <p><strong>Depth signal:</strong> Mentioning useSyncExternalStore and why it exists shows you understand the practical boundaries of the lane system — not just the happy path.</p>
+        </div>
+
+        <h3>Q8: "How does <code>useOptimistic</code> (React 19) interact with lanes?"</h3>
+        <p><strong>Answer:</strong> <code>useOptimistic</code> creates an update at a special priority — the optimistic value is applied immediately (SyncLane-level for instant feedback), while the "real" update resolves asynchronously. When the async action completes (or fails), the optimistic state is automatically reverted and replaced with the real result. Under the hood, this leverages the lane system's ability to commit partial work: the optimistic update commits to DOM immediately while the underlying transition processes at TransitionLane priority. If the transition fails, React reverts by replaying state without the optimistic update.</p>
+      </details>
+    </section>
+
+    <!-- Section 17: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Mental models and what NOT to say in an interview</summary>
+
+        <h3>Mental Models</h3>
+        <pre class="diagram">
+Mental Model 1: "Priority Highway"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SyncLane        = Emergency lane (ambulance)
+  InputContinuous = HOV/express lane
+  Default         = Regular traffic
+  Transition      = Scenic route (can be rerouted)
+  Idle            = Construction crew (works when road is empty)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mental Model 2: "Hospital Triage"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SyncLane        = Critical/life-threatening (treat NOW)
+  InputContinuous = Urgent (treat within minutes)
+  Default         = Standard (treat in order)
+  Transition      = Non-urgent (can wait, won't die)
+  Idle            = Routine checkup (if time permits)
+  Expiration      = Patient has waited too long → escalate!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mental Model 3: "Bitmask as Feature Flags"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Each bit = "Does this fiber have pending work at this priority?"
+  OR  = "Add a task to a priority level"
+  AND = "Check if a priority level has tasks"
+  ~   = "Remove a task from a priority level"
+  fiber.lanes     = "What work does THIS fiber have?"
+  fiber.childLanes = "What work exists BELOW this fiber?"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        </pre>
+
+        <h3>Key Points to Hit in Your Answer</h3>
+        <ul>
+          <li>Lanes are bitmasks — explain OR/AND operations briefly</li>
+          <li>Priority is position-based: lower bit = higher priority</li>
+          <li>Interruption means complete discard + restart, not pause/resume</li>
+          <li>Starvation is prevented by expiration (5s default for transitions)</li>
+          <li>Entanglement ensures consistency across related updates</li>
+          <li>The scheduler is separate from lanes — maps lanes to task priorities</li>
+          <li>Public API: startTransition and useDeferredValue are the user-facing controls</li>
+        </ul>
+
+        <h3>What NOT to Say</h3>
+        <div class="callout callout-warning">
+          <p><strong>Avoid these common misconceptions:</strong></p>
+          <ul>
+            <li>❌ "React pauses and resumes the render" — It DISCARDS and RESTARTS</li>
+            <li>❌ "Lanes are like thread priorities" — JavaScript is single-threaded; lanes are cooperative scheduling</li>
+            <li>❌ "Higher lane number = higher priority" — It's the opposite; lower bit position = higher priority</li>
+            <li>❌ "useTransition makes things faster" — It makes the UI MORE RESPONSIVE, not faster. Total work is the same or more</li>
+            <li>❌ "Concurrent mode is opt-in per component" — It's a root-level decision (createRoot vs render). Components opt into TRANSITIONS, not concurrency itself</li>
+            <li>❌ "Each setState is a separate render" — React 18 auto-batches all updates in the same lane</li>
+            <li>❌ "Lanes are exposed as a public API" — They're internal; startTransition/useDeferredValue are the public interface</li>
+          </ul>
+        </div>
+
+        <h3>One-Paragraph Summary</h3>
+        <p>React's lane model is a bitmask-based priority scheduling system where each of 31 bits represents a priority level. Updates are assigned lanes based on their execution context (event type, transition wrapper, etc.). During concurrent rendering, React processes work fiber-by-fiber, yielding every ~5ms. If a higher-priority lane has pending work, the current render is abandoned and restarted with the higher-priority lanes. Lower-priority work is protected from indefinite starvation through lane expiration (promoting to sync priority after a timeout) and entanglement (ensuring related updates render together for consistency). The public APIs — <code>startTransition</code> and <code>useDeferredValue</code> — let developers signal which updates are non-urgent, allowing React's scheduler to prioritize user interactions.</p>
+      </details>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+</body>
+</html>

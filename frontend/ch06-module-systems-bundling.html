@@ -1,0 +1,2269 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 6: Module Systems &amp; Bundling | Senior Frontend Interview Handbook</title>
+    <link rel="stylesheet" href="../assets/css/style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+    <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">☀️</button>
+    <button class="mobile-menu-toggle" id="mobileMenuToggle" aria-label="Toggle menu">☰</button>
+
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-brand">
+            <a href="../index.html">
+                <span class="chapter-num">Ch 6</span>
+                <span class="chapter-title">Module Systems &amp; Bundling</span>
+            </a>
+        </div>
+        <nav class="sidebar-nav">
+            <ul>
+                <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+                <li><a href="#quick-answer">60-Second Answer</a></li>
+                <li><a href="#commonjs">CommonJS require()</a></li>
+                <li><a href="#esm">ES Modules</a></li>
+                <li><a href="#module-resolution">Module Resolution</a></li>
+                <li><a href="#circular-deps">Circular Dependencies</a></li>
+                <li><a href="#tree-shaking">Tree-Shaking Mechanics</a></li>
+                <li><a href="#side-effects">Side Effects</a></li>
+                <li><a href="#code-splitting">Code Splitting</a></li>
+                <li><a href="#dynamic-import">Dynamic import()</a></li>
+                <li><a href="#module-federation">Module Federation</a></li>
+                <li><a href="#bundler-internals">Bundler Internals</a></li>
+                <li><a href="#import-maps">Import Maps</a></li>
+                <li><a href="#production-optimization">Production Optimization</a></li>
+                <li><a href="#production-incident">Production Incident</a></li>
+                <li><a href="#code-examples">Code Examples</a></li>
+                <li><a href="#common-mistakes">Common Mistakes</a></li>
+                <li><a href="#trade-offs">Trade-offs</a></li>
+                <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+                <li><a href="#summary">Summary</a></li>
+            </ul>
+        </nav>
+        <div class="sidebar-controls">
+            <button class="expand-all" id="expandAll">Expand All</button>
+            <button class="collapse-all" id="collapseAll">Collapse All</button>
+        </div>
+    </aside>
+
+    <main class="main-content">
+        <nav class="breadcrumb">
+            <a href="../index.html">Home</a> &gt;
+            <a href="../index.html#part-i">Part I — JavaScript Engine Internals</a> &gt;
+            <span>Chapter 6</span>
+        </nav>
+
+        <header class="chapter-header">
+            <div class="badges">
+                <span class="badge badge-difficulty-medium">Medium</span>
+                <span class="badge badge-topic">Modules</span>
+                <span class="badge badge-topic">Bundling</span>
+                <span class="badge badge-topic">Tree-Shaking</span>
+                <span class="badge badge-topic">ESM</span>
+            </div>
+            <h1>Chapter 6: Module Systems &amp; Bundling</h1>
+            <blockquote class="chapter-question">
+                "Explain the difference between CommonJS and ES Modules at the engine level. How does tree-shaking actually work?"
+            </blockquote>
+            <div class="chapter-takeaway">
+                <strong>Key Takeaway:</strong> CommonJS uses synchronous require() with dynamic resolution and value copies. ES Modules use static imports with live bindings, enabling tree-shaking through compile-time dead code elimination. Understanding the module graph, circular dependency handling, and bundler internals (chunk splitting, scope hoisting) is essential for optimizing production builds.
+            </div>
+        </header>
+
+        <div class="search-container">
+            <input type="search" class="search-input" id="searchInput" placeholder="Search this chapter..." aria-label="Search chapter content">
+        </div>
+
+        <!-- Section 1: Interviewer's Intent -->
+        <section id="interviewer-intent">
+            <h2>Interviewer's Intent</h2>
+            <details open>
+                <summary>What the interviewer is really evaluating</summary>
+                <div class="callout callout-info">
+                    <p>This question probes whether you understand modules at the <strong>engine level</strong>, not just the syntax. Interviewers want to see:</p>
+                </div>
+                <ul>
+                    <li><strong>Deep understanding of CJS vs ESM semantics</strong> — not just "import vs require" but how each system resolves, caches, and binds values</li>
+                    <li><strong>Why tree-shaking requires static analysis</strong> — understanding that it's a compile-time optimization impossible with dynamic module systems</li>
+                    <li><strong>Production awareness</strong> — how bundler choices affect load time, caching, and debugging</li>
+                    <li><strong>Debugging capability</strong> — can you diagnose why a library isn't being tree-shaken, or why a circular dependency causes undefined values?</li>
+                    <li><strong>Architecture decisions</strong> — when to split chunks, how to structure exports for optimal bundling, micro-frontend trade-offs</li>
+                </ul>
+                <div class="callout callout-warning">
+                    <p><strong>Red flags interviewers watch for:</strong> Saying "they're basically the same thing," not knowing about live bindings, inability to explain why <code>lodash</code> imports bloat bundles but <code>lodash-es</code> doesn't.</p>
+                </div>
+            </details>
+        </section>
+
+        <!-- Section 2: 60-Second Answer -->
+        <section id="quick-answer">
+            <h2>60-Second Answer</h2>
+            <details open>
+                <summary>Concise interview response</summary>
+                <div class="callout callout-tip">
+                    <p><strong>Use this as your opening, then dive deeper based on follow-ups.</strong></p>
+                </div>
+                <p>"CommonJS and ES Modules differ fundamentally in three ways:</p>
+                <p><strong>1. Resolution timing:</strong> CJS resolves dynamically at runtime — <code>require()</code> is a function call that can appear anywhere, even inside conditionals. ESM resolves statically at parse time — imports must be top-level declarations, enabling the engine to build the full dependency graph before execution.</p>
+                <p><strong>2. Value semantics:</strong> CJS creates <em>copies</em> of exported values (the <code>module.exports</code> object is evaluated once and cached). ESM creates <em>live bindings</em> — importing modules get a live reference to the exporting module's variable, so mutations are visible across module boundaries.</p>
+                <p><strong>3. Loading model:</strong> CJS is synchronous (blocks until the file is read and executed). ESM is asynchronous with three distinct phases: parsing (building the module graph), instantiation (creating bindings in memory), and evaluation (executing code to fill those bindings).</p>
+                <p>Tree-shaking works because ESM's static structure lets bundlers perform dead code elimination at build time. Since all imports/exports are known before execution, the bundler can trace which exports are actually consumed and eliminate unused ones. CJS can't be tree-shaken because <code>require()</code> calls could resolve to any string computed at runtime."</p>
+            </details>
+        </section>
+
+        <!-- Section 3: CommonJS -->
+        <section id="commonjs">
+            <h2>CommonJS require() — Synchronous, Dynamic</h2>
+            <details>
+                <summary>Module wrapper, require.cache, circular deps, dynamic requires</summary>
+
+                <h3>The Module Wrapper Function</h3>
+                <p>Every CJS module is wrapped by Node.js before execution:</p>
+                <pre><code class="language-javascript">// What you write:
+const fs = require('fs');
+module.exports = { readFile: fs.readFile };
+
+// What Node.js actually executes:
+(function(exports, require, module, __filename, __dirname) {
+    const fs = require('fs');
+    module.exports = { readFile: fs.readFile };
+})(module.exports, require, module, '/path/to/file.js', '/path/to');</code></pre>
+
+                <div class="callout callout-info">
+                    <p><strong>Key insight:</strong> This wrapper is why <code>exports</code>, <code>require</code>, <code>module</code>, <code>__filename</code>, and <code>__dirname</code> are available without declaration. They're function parameters, not globals.</p>
+                </div>
+
+                <h3>require.cache — Module Singleton Pattern</h3>
+                <pre><code class="language-javascript">// First require: executes module, caches result
+const a = require('./counter'); // Executes counter.js, stores in cache
+
+// Second require: returns cached module.exports
+const b = require('./counter'); // Returns same object from cache
+
+console.log(a === b); // true — same reference
+
+// Inspect the cache
+console.log(require.cache[require.resolve('./counter')]);
+// { id, exports, filename, loaded, children, paths }
+
+// Force re-evaluation (dangerous in production)
+delete require.cache[require.resolve('./counter')];
+const c = require('./counter'); // Re-executes module
+console.log(a === c); // false — new object</code></pre>
+
+                <h3>Circular Dependency Handling in CJS</h3>
+                <pre><code class="language-javascript">// a.js
+console.log('a.js: start');
+exports.done = false;
+const b = require('./b.js'); // Triggers b.js execution
+console.log('a.js: b.done =', b.done);
+exports.done = true;
+console.log('a.js: end');
+
+// b.js
+console.log('b.js: start');
+exports.done = false;
+const a = require('./a.js'); // Gets PARTIAL exports (done = false)
+console.log('b.js: a.done =', a.done); // false!
+exports.done = true;
+console.log('b.js: end');
+
+// Output:
+// a.js: start
+// b.js: start
+// b.js: a.done = false  &lt;-- partial export!
+// b.js: end
+// a.js: b.done = true
+// a.js: end</code></pre>
+
+                <div class="callout callout-warning">
+                    <p><strong>Danger:</strong> In circular dependencies, CJS returns a <em>partially constructed</em> <code>module.exports</code> object. This is a common source of "undefined" bugs in large codebases.</p>
+                </div>
+
+                <h3>Dynamic Requires — Why CJS Defeats Static Analysis</h3>
+                <pre><code class="language-javascript">// All of these are valid CJS — impossible to statically analyze
+const mod = require(getModuleName());
+const mod2 = require(`./plugins/${pluginName}`);
+const mod3 = require(condition ? './a' : './b');
+
+// Conditional requires
+if (process.env.NODE_ENV === 'development') {
+    require('./dev-tools'); // Bundler can't know at compile time
+}
+
+// require inside try/catch for optional deps
+try {
+    const sharp = require('sharp');
+} catch (e) {
+    console.log('sharp not available, using fallback');
+}</code></pre>
+
+                <pre class="diagram">
+┌─────────────────────────────────────────────────┐
+│           CJS Module Loading Flow                │
+├─────────────────────────────────────────────────┤
+│                                                  │
+│  require('./mod')                                │
+│       │                                          │
+│       ▼                                          │
+│  ┌─────────────────┐                             │
+│  │ Check require   │── Hit ──▶ Return cached     │
+│  │    .cache       │          module.exports     │
+│  └────────┬────────┘                             │
+│           │ Miss                                 │
+│           ▼                                      │
+│  ┌─────────────────┐                             │
+│  │ Resolve path    │  (Module Resolution Algo)   │
+│  └────────┬────────┘                             │
+│           ▼                                      │
+│  ┌─────────────────┐                             │
+│  │ Read file sync  │  (fs.readFileSync)          │
+│  └────────┬────────┘                             │
+│           ▼                                      │
+│  ┌─────────────────┐                             │
+│  │ Wrap in IIFE    │  (add module, exports, etc) │
+│  └────────┬────────┘                             │
+│           ▼                                      │
+│  ┌─────────────────┐                             │
+│  │ Execute &amp; cache │  (run code, store result)   │
+│  └─────────────────┘                             │
+│                                                  │
+└─────────────────────────────────────────────────┘
+                </pre>
+            </details>
+        </section>
+
+        <!-- Section 4: ES Modules -->
+        <section id="esm">
+            <h2>ES Modules — Static, Async, Live Bindings</h2>
+            <details>
+                <summary>Three phases, live bindings vs copies, TDZ in circular imports, import.meta</summary>
+
+                <h3>The Three Phases of ESM Loading</h3>
+                <pre class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│              ESM Loading: Three Distinct Phases               │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Phase 1: PARSING (Construction)                             │
+│  ┌───────────────────────────────────────────┐               │
+│  │ • Fetch module source                      │               │
+│  │ • Parse for import/export declarations     │               │
+│  │ • Build Module Record (not yet executed)   │               │
+│  │ • Recursively fetch all dependencies       │               │
+│  │ • Result: Complete dependency graph        │               │
+│  └───────────────────────────────────────────┘               │
+│                    │                                          │
+│                    ▼                                          │
+│  Phase 2: INSTANTIATION (Linking)                            │
+│  ┌───────────────────────────────────────────┐               │
+│  │ • Allocate memory for all exports          │               │
+│  │ • Wire import bindings to export locations  │               │
+│  │ • NO CODE EXECUTED YET                     │               │
+│  │ • Bindings exist but are uninitialized     │               │
+│  │ • Result: Linked module graph              │               │
+│  └───────────────────────────────────────────┘               │
+│                    │                                          │
+│                    ▼                                          │
+│  Phase 3: EVALUATION (Execution)                             │
+│  ┌───────────────────────────────────────────┐               │
+│  │ • Execute module code top-to-bottom        │               │
+│  │ • Fill in exported values                  │               │
+│  │ • Post-order DFS (dependencies first)      │               │
+│  │ • Each module evaluated exactly once       │               │
+│  │ • Result: Fully initialized modules        │               │
+│  └───────────────────────────────────────────┘               │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+                </pre>
+
+                <h3>Live Bindings vs Value Copies</h3>
+                <pre><code class="language-javascript">// counter.mjs (ES Module)
+export let count = 0;
+export function increment() {
+    count++;
+}
+
+// main.mjs
+import { count, increment } from './counter.mjs';
+
+console.log(count); // 0
+increment();
+console.log(count); // 1 — LIVE BINDING! We see the updated value
+
+// Compare with CJS equivalent:
+// counter.cjs
+let count = 0;
+module.exports = { count, increment() { count++; } };
+
+// main.cjs
+const { count, increment } = require('./counter.cjs');
+console.log(count); // 0
+increment();
+console.log(count); // 0 — COPY! Still the original value</code></pre>
+
+                <div class="callout callout-info">
+                    <p><strong>Under the hood:</strong> ESM live bindings work because imports are <em>indirect references</em> to a memory location owned by the exporting module. When the export changes, all importers see the new value immediately — it's the same memory slot.</p>
+                </div>
+
+                <h3>TDZ (Temporal Dead Zone) in Circular ESM Imports</h3>
+                <pre><code class="language-javascript">// a.mjs
+import { b } from './b.mjs';
+console.log('a.mjs: b =', b); // Works: b is initialized by now
+
+export const a = 'value-a';
+
+// b.mjs
+import { a } from './a.mjs';
+console.log('b.mjs: a =', a); // ReferenceError! TDZ!
+// 'a' binding exists but hasn't been initialized yet
+// because a.mjs hasn't been evaluated when b.mjs runs
+
+export const b = 'value-b';</code></pre>
+
+                <div class="callout callout-warning">
+                    <p><strong>Critical difference from CJS:</strong> CJS gives you a partial object (undefined values). ESM throws a <code>ReferenceError</code> because the binding exists but is in the Temporal Dead Zone — it's been allocated in Phase 2 but not yet assigned in Phase 3.</p>
+                </div>
+
+                <h3>import.meta — Module-Level Metadata</h3>
+                <pre><code class="language-javascript">// import.meta provides module-specific context
+console.log(import.meta.url);
+// "file:///path/to/module.mjs" (Node.js)
+// "https://example.com/js/module.mjs" (Browser)
+
+// Common patterns
+const __dirname = new URL('.', import.meta.url).pathname;
+const __filename = new URL(import.meta.url).pathname;
+
+// Vite-specific extensions
+if (import.meta.hot) {
+    import.meta.hot.accept('./dep.js', (newDep) =&gt; {
+        // HMR update handler
+    });
+}
+
+// Environment variables (Vite)
+console.log(import.meta.env.VITE_API_URL);
+
+// Check if module is main entry (Node.js)
+if (import.meta.url === `file://${process.argv[1]}`) {
+    // This module is the entry point
+    main();
+}</code></pre>
+            </details>
+        </section>
+
+        <!-- Section 5: Module Resolution -->
+        <section id="module-resolution">
+            <h2>Module Resolution Algorithm</h2>
+            <details>
+                <summary>Node.js resolution, browser resolution, exports field, conditional exports</summary>
+
+                <h3>Node.js Resolution (node_modules Walking)</h3>
+                <pre><code class="language-javascript">// When you write: require('lodash/get')
+// Node.js searches in this order:
+
+// 1. Core modules (fs, path, http...)
+// 2. File modules (starts with ./ or ../ or /)
+// 3. node_modules walking:
+//    /project/src/components/node_modules/lodash/get.js
+//    /project/src/node_modules/lodash/get.js
+//    /project/node_modules/lodash/get.js
+//    /node_modules/lodash/get.js
+
+// For each candidate, try these extensions:
+//    ./get.js
+//    ./get.json
+//    ./get.node
+//    ./get/index.js
+//    ./get/index.json
+//    ./get/index.node
+//    ./get/package.json → "main" field</code></pre>
+
+                <h3>The exports Field in package.json</h3>
+                <pre><code class="language-javascript">// package.json — modern module resolution
+{
+    "name": "my-lib",
+    "type": "module",
+    "exports": {
+        ".": {
+            "import": "./dist/esm/index.js",
+            "require": "./dist/cjs/index.cjs",
+            "types": "./dist/types/index.d.ts"
+        },
+        "./utils": {
+            "import": "./dist/esm/utils.js",
+            "require": "./dist/cjs/utils.cjs"
+        },
+        "./package.json": "./package.json"
+    },
+    // Prevent deep imports:
+    // import x from 'my-lib/internal/secret' → ERROR
+}</code></pre>
+
+                <h3>Conditional Exports</h3>
+                <pre><code class="language-javascript">// Advanced conditional exports
+{
+    "exports": {
+        ".": {
+            "node": {
+                "import": "./dist/node-esm.js",
+                "require": "./dist/node-cjs.cjs"
+            },
+            "browser": {
+                "import": "./dist/browser-esm.js",
+                "default": "./dist/browser-umd.js"
+            },
+            "deno": "./dist/deno.js",
+            "worker": "./dist/worker.js",
+            "development": "./dist/dev.js",
+            "production": "./dist/prod.min.js",
+            "default": "./dist/index.js"
+        }
+    }
+}
+
+// The "imports" field — private internal mapping
+{
+    "imports": {
+        "#internal/*": "./src/internal/*.js",
+        "#utils": {
+            "node": "./src/utils-node.js",
+            "default": "./src/utils-browser.js"
+        }
+    }
+}</code></pre>
+
+                <h3>Browser Module Resolution (Import Maps)</h3>
+                <pre><code class="language-javascript">// In the browser, bare specifiers don't work by default:
+import React from 'react'; // Error: relative URL required
+
+// Import maps solve this:
+// &lt;script type="importmap"&gt;
+{
+    "imports": {
+        "react": "https://esm.sh/react@18",
+        "react-dom": "https://esm.sh/react-dom@18",
+        "lodash/": "https://esm.sh/lodash-es/"
+    },
+    "scopes": {
+        "/vendor/": {
+            "react": "https://esm.sh/react@17"
+        }
+    }
+}
+// &lt;/script&gt;</code></pre>
+
+                <div class="callout callout-tip">
+                    <p><strong>Interview tip:</strong> Mention that TypeScript's <code>moduleResolution: "bundler"</code> (TS 5.0+) aligns with how modern bundlers resolve modules — supporting <code>exports</code> field, extensionless imports, and conditional exports without requiring file extensions. It's now the recommended default for application code (libraries still need <code>"node16"</code> for compatibility).</p>
+                    <p><strong>Node.js ESM:</strong> Setting <code>"type": "module"</code> in package.json makes all <code>.js</code> files in that package ESM by default. Files that need CJS must use <code>.cjs</code> extension. Without this field, Node defaults to CJS. This is a common interview gotcha — many candidates struggle with the <code>.mjs</code>/<code>.cjs</code> extension dance and top-level <code>await</code> requirements.</p>
+                </div>
+            </details>
+        </section>
+
+        <!-- Section 6: Circular Dependencies -->
+        <section id="circular-deps">
+            <h2>Circular Dependencies Handling</h2>
+            <details>
+                <summary>CJS partial objects, ESM live binding resolution, practical examples</summary>
+
+                <h3>CJS: Partial Object Exposure</h3>
+                <pre><code class="language-javascript">// models/user.js
+const Post = require('./post');
+class User {
+    getPosts() { return Post.findByUser(this.id); }
+}
+module.exports = User;
+
+// models/post.js
+const User = require('./user'); // Gets PARTIAL User (possibly {})
+class Post {
+    getAuthor() { return User.findById(this.authorId); }
+    // User might be {} here if user.js hasn't finished!
+    static findByUser(id) { /* ... */ }
+}
+module.exports = Post;
+
+// FIX: Lazy require inside methods
+class Post {
+    getAuthor() {
+        const User = require('./user'); // Resolved at call time
+        return User.findById(this.authorId);
+    }
+}</code></pre>
+
+                <h3>ESM: Live Binding Resolution</h3>
+                <pre><code class="language-javascript">// evenOdd.mjs — circular deps that WORK in ESM
+// even.mjs
+import { odd } from './odd.mjs';
+export function even(n) {
+    if (n === 0) return true;
+    return odd(n - 1); // Works! odd is a live binding to a function
+}
+
+// odd.mjs
+import { even } from './even.mjs';
+export function odd(n) {
+    if (n === 0) return false;
+    return even(n - 1); // Works! even is a live binding
+}
+
+// WHY this works: Function declarations are hoisted.
+// By the time either function is CALLED, both are initialized.
+// The bindings are wired up in Phase 2 (instantiation),
+// and functions are hoisted during Phase 3 (evaluation).
+
+// BUT this would FAIL:
+// even.mjs
+import { oddValue } from './odd.mjs';
+export const evenValue = oddValue + 1; // ReferenceError!
+// oddValue is in TDZ when even.mjs evaluates</code></pre>
+
+                <h3>How Bundlers Handle Circular Dependencies</h3>
+                <pre class="diagram">
+┌────────────────────────────────────────────────────┐
+│        Bundler Circular Dependency Strategies       │
+├────────────────────────────────────────────────────┤
+│                                                     │
+│  Webpack:                                           │
+│  • Detects cycles during graph construction         │
+│  • Emits modules in evaluation order                │
+│  • Uses __webpack_require__ with caching            │
+│  • May produce runtime errors if values accessed    │
+│    before initialization                            │
+│                                                     │
+│  Rollup:                                            │
+│  • Warns about circular dependencies               │
+│  • Reorders modules to minimize issues             │
+│  • Can inline modules to break cycles              │
+│  • "output.preserveModules" keeps original graph    │
+│                                                     │
+│  esbuild:                                           │
+│  • Preserves ESM semantics faithfully              │
+│  • Emits in correct evaluation order               │
+│  • Minimal transformation of circular refs          │
+│                                                     │
+└────────────────────────────────────────────────────┘
+                </pre>
+
+                <div class="callout callout-tip">
+                    <p><strong>Best practice:</strong> Avoid circular dependencies by extracting shared logic into a third module. If unavoidable, use function declarations (hoisted) rather than <code>const</code> arrow functions (TDZ-prone) for cross-module references.</p>
+                </div>
+            </details>
+        </section>
+
+        <!-- Section 7: Tree-Shaking -->
+        <section id="tree-shaking">
+            <h2>Tree-Shaking Mechanics</h2>
+            <details>
+                <summary>Static analysis, why CJS can't be tree-shaken, DCE, AST-level analysis</summary>
+
+                <h3>Static Analysis Requirement</h3>
+                <pre><code class="language-javascript">// ESM: Statically analyzable — bundler knows at compile time
+import { map, filter } from 'lodash-es';
+// Bundler can see: only map and filter are used
+// Everything else in lodash-es can be eliminated
+
+// CJS: NOT statically analyzable
+const _ = require('lodash');
+// What properties of _ are used? Can't know without execution
+// Must include entire lodash library</code></pre>
+
+                <h3>Why CJS Can't Be Tree-Shaken</h3>
+                <pre><code class="language-javascript">// Problem 1: Dynamic property access
+const utils = require('./utils');
+const method = getMethodName(); // Runtime value
+utils[method](); // Which export is used? Unknown!
+
+// Problem 2: Conditional requires
+if (Math.random() &gt; 0.5) {
+    module.exports = require('./a');
+} else {
+    module.exports = require('./b');
+}
+
+// Problem 3: Mutating exports
+const mod = require('./mod');
+mod.newProp = 'added at runtime';
+module.exports = mod; // Export object is mutable</code></pre>
+
+                <h3>ESM Static Structure Enables DCE</h3>
+                <pre><code class="language-javascript">// utils.js — library code
+export function used() { return 'I am used'; }
+export function unused() { return 'I am dead code'; }
+export const CONSTANT = 42;
+
+// app.js — consumer
+import { used, CONSTANT } from './utils.js';
+console.log(used(), CONSTANT);
+
+// After tree-shaking (conceptual output):
+function used() { return 'I am used'; }
+const CONSTANT = 42;
+console.log(used(), CONSTANT);
+// unused() is completely eliminated from the bundle</code></pre>
+
+                <h3>How Terser/esbuild Eliminate Dead Code (AST-Level)</h3>
+                <pre><code class="language-javascript">// Step 1: Bundler marks exports as used/unused
+// Module graph analysis:
+//   app.js imports { used, CONSTANT } from utils.js
+//   → used: USED, unused: UNUSED, CONSTANT: USED
+
+// Step 2: Unused exports are not included in bundle
+// The bundler simply doesn't emit code for 'unused'
+
+// Step 3: Terser performs additional DCE on the result
+// Before Terser:
+function used() { return 'I am used'; }
+const CONSTANT = 42;
+const deadLocal = 'never referenced';
+if (false) { console.log('unreachable'); }
+
+// After Terser:
+function used(){return'I am used'}
+const CONSTANT=42;
+// deadLocal removed (unreferenced)
+// if(false) block removed (unreachable)</code></pre>
+
+                <pre class="diagram">
+┌──────────────────────────────────────────────────────┐
+│            Tree-Shaking Pipeline                      │
+├──────────────────────────────────────────────────────┤
+│                                                       │
+│  Source Files                                         │
+│       │                                               │
+│       ▼                                               │
+│  ┌──────────────┐                                     │
+│  │ Parse to AST │  (identify import/export stmts)     │
+│  └──────┬───────┘                                     │
+│         ▼                                             │
+│  ┌──────────────────┐                                 │
+│  │ Build Module      │  (resolve all dependencies)    │
+│  │   Graph           │                                │
+│  └──────┬───────────┘                                 │
+│         ▼                                             │
+│  ┌──────────────────┐                                 │
+│  │ Mark Used Exports │  (trace from entry points)     │
+│  │ (Binding Analysis)│                                │
+│  └──────┬───────────┘                                 │
+│         ▼                                             │
+│  ┌──────────────────┐                                 │
+│  │ Eliminate Unused  │  (don't emit dead exports)     │
+│  │   (Tree-Shake)    │                                │
+│  └──────┬───────────┘                                 │
+│         ▼                                             │
+│  ┌──────────────────┐                                 │
+│  │ Minify &amp; DCE     │  (Terser removes dead locals)  │
+│  │ (Dead Code Elim)  │                                │
+│  └──────────────────┘                                 │
+│                                                       │
+└──────────────────────────────────────────────────────┘
+                </pre>
+
+                <div class="callout callout-info">
+                    <p><strong>Key distinction:</strong> Tree-shaking (module-level unused export removal) and Dead Code Elimination (statement-level unreachable code removal) are often conflated but are different stages in the pipeline. Tree-shaking is done by the bundler; DCE is done by the minifier.</p>
+                </div>
+            </details>
+        </section>
+
+        <!-- Section 8: Side Effects -->
+        <section id="side-effects">
+            <h2>Side Effects &amp; sideEffects Field</h2>
+            <details>
+                <summary>What constitutes a side effect, sideEffects field, CSS imports, module-level IIFEs</summary>
+
+                <h3>What Constitutes a Side Effect?</h3>
+                <pre><code class="language-javascript">// SIDE EFFECTS — code that affects state beyond the module
+import './polyfill.js';       // Modifies globals (Array.prototype)
+import './styles.css';         // Inserts CSS into DOM
+import './register-components'; // Registers with global registry
+
+// Inside a module, side effects include:
+export const x = 1;
+
+// Side effect: modifies global
+window.MY_LIB_VERSION = '1.0.0';
+
+// Side effect: DOM manipulation
+document.title = 'App Loaded';
+
+// Side effect: network request
+fetch('/api/analytics', { method: 'POST', body: '...' });
+
+// NOT a side effect (pure):
+export function add(a, b) { return a + b; }
+export const PI = 3.14159;</code></pre>
+
+                <h3>package.json sideEffects Field</h3>
+                <pre><code class="language-javascript">// package.json
+{
+    "name": "my-ui-library",
+    "sideEffects": false
+    // Tells bundler: "Every module in this package is pure.
+    // If you don't use an export, you can safely remove
+    // the entire module."
+}
+
+// With specific side-effectful files:
+{
+    "sideEffects": [
+        "**/*.css",
+        "./src/polyfills.js",
+        "./src/register.js"
+    ]
+}
+
+// What happens WITHOUT sideEffects: false
+import { Button } from 'my-ui-library';
+// Bundler must include ALL modules because any might have side effects
+
+// What happens WITH sideEffects: false
+import { Button } from 'my-ui-library';
+// Bundler only includes Button and its dependencies</code></pre>
+
+                <h3>Why CSS Imports Need sideEffects</h3>
+                <pre><code class="language-javascript">// components/Button.js
+import './Button.css'; // This IS a side effect!
+// The CSS file modifies global state (adds styles to document)
+// If sideEffects: false and Button isn't imported,
+// the CSS would be eliminated too — but what if other
+// components depend on those styles?
+
+// Solution in package.json:
+{
+    "sideEffects": ["**/*.css", "**/*.scss"]
+}
+
+// Or use CSS Modules (not side-effectful):
+import styles from './Button.module.css';
+// This is a VALUE import — tree-shakeable</code></pre>
+
+                <h3>Module-Level IIFE Problem</h3>
+                <pre><code class="language-javascript">// This pattern DEFEATS tree-shaking:
+export const myLib = (() =&gt; {
+    // IIFE — bundler can't prove this is side-effect-free
+    const internal = computeSomething();
+    return {
+        method1() { /* ... */ },
+        method2() { /* ... */ }
+    };
+})();
+
+// Even if you only use myLib.method1, the entire IIFE
+// must be kept because:
+// 1. computeSomething() might have side effects
+// 2. The IIFE itself might modify global state
+
+// Fix: Use pure annotations
+export const myLib = /*#__PURE__*/ (() =&gt; {
+    const internal = computeSomething();
+    return { method1() {}, method2() {} };
+})();
+// /*#__PURE__*/ tells Terser: "this call has no side effects,
+// safe to remove if result is unused"</code></pre>
+
+                <div class="callout callout-tip">
+                    <p><strong>Interview insight:</strong> The <code>/*#__PURE__*/</code> annotation is how libraries like React mark <code>createElement</code> calls as side-effect-free, enabling tree-shaking of unused components.</p>
+                </div>
+            </details>
+        </section>
+
+        <!-- Section 9: Code Splitting -->
+        <section id="code-splitting">
+            <h2>Code Splitting Strategies</h2>
+            <details>
+                <summary>Route-based, component-based, vendor chunking, shared chunks, magic comments</summary>
+
+                <h3>Route-Based Splitting</h3>
+                <pre><code class="language-javascript">// React Router with lazy loading
+import { lazy, Suspense } from 'react';
+import { Routes, Route } from 'react-router-dom';
+
+// Each route becomes its own chunk
+const Home = lazy(() =&gt; import('./pages/Home'));
+const Dashboard = lazy(() =&gt; import('./pages/Dashboard'));
+const Settings = lazy(() =&gt; import('./pages/Settings'));
+
+function App() {
+    return (
+        &lt;Suspense fallback={&lt;LoadingSpinner /&gt;}&gt;
+            &lt;Routes&gt;
+                &lt;Route path="/" element={&lt;Home /&gt;} /&gt;
+                &lt;Route path="/dashboard" element={&lt;Dashboard /&gt;} /&gt;
+                &lt;Route path="/settings" element={&lt;Settings /&gt;} /&gt;
+            &lt;/Routes&gt;
+        &lt;/Suspense&gt;
+    );
+}</code></pre>
+
+                <h3>Component-Based Splitting</h3>
+                <pre><code class="language-javascript">// Heavy components loaded on demand
+const HeavyEditor = lazy(() =&gt; import('./components/RichTextEditor'));
+const ChartLibrary = lazy(() =&gt; import('./components/ChartDashboard'));
+
+function ArticlePage({ isEditing }) {
+    return (
+        &lt;div&gt;
+            &lt;ArticleContent /&gt;
+            {isEditing &amp;&amp; (
+                &lt;Suspense fallback={&lt;EditorSkeleton /&gt;}&gt;
+                    &lt;HeavyEditor /&gt;
+                &lt;/Suspense&gt;
+            )}
+        &lt;/div&gt;
+    );
+}</code></pre>
+
+                <h3>Vendor Chunking &amp; Shared Chunk Optimization</h3>
+                <pre><code class="language-javascript">// webpack.config.js
+module.exports = {
+    optimization: {
+        splitChunks: {
+            chunks: 'all',
+            cacheGroups: {
+                // Vendor chunk: rarely changes, cached long-term
+                vendor: {
+                    test: /[\\/]node_modules[\\/]/,
+                    name: 'vendors',
+                    chunks: 'all',
+                    priority: 20,
+                },
+                // Framework chunk: React, React-DOM
+                framework: {
+                    test: /[\\/]node_modules[\\/](react|react-dom)[\\/]/,
+                    name: 'framework',
+                    chunks: 'all',
+                    priority: 30,
+                },
+                // Common chunk: shared between 2+ entry points
+                common: {
+                    minChunks: 2,
+                    name: 'common',
+                    chunks: 'all',
+                    priority: 10,
+                    reuseExistingChunk: true,
+                },
+            },
+        },
+    },
+};</code></pre>
+
+                <h3>Magic Comments (webpackChunkName)</h3>
+                <pre><code class="language-javascript">// Named chunks for debugging and caching
+const AdminPanel = lazy(() =&gt;
+    import(/* webpackChunkName: "admin" */ './AdminPanel')
+);
+
+// Prefetch: download in idle time (next navigation)
+const About = lazy(() =&gt;
+    import(/* webpackPrefetch: true */ './pages/About')
+);
+
+// Preload: download immediately (current navigation)
+const Modal = lazy(() =&gt;
+    import(/* webpackPreload: true */ './components/Modal')
+);
+
+// Combined magic comments
+const Chart = lazy(() =&gt; import(
+    /* webpackChunkName: "charts" */
+    /* webpackPrefetch: true */
+    './components/Chart'
+));</code></pre>
+
+                <pre class="diagram">
+┌─────────────────────────────────────────────────────┐
+│         Chunk Splitting Decision Tree                │
+├─────────────────────────────────────────────────────┤
+│                                                      │
+│  Is it a route?                                      │
+│  ├── YES → Route-based split (one chunk per route)   │
+│  └── NO ↓                                            │
+│                                                      │
+│  Is it &gt; 30KB and conditionally rendered?            │
+│  ├── YES → Component-based split (lazy load)         │
+│  └── NO ↓                                            │
+│                                                      │
+│  Is it a node_modules dependency?                    │
+│  ├── YES → Vendor chunk (long cache TTL)             │
+│  └── NO ↓                                            │
+│                                                      │
+│  Is it shared by 2+ entry points?                    │
+│  ├── YES → Common/shared chunk                       │
+│  └── NO → Keep in parent chunk                       │
+│                                                      │
+└─────────────────────────────────────────────────────┘
+                </pre>
+            </details>
+        </section>
+
+        <!-- Section 10: Dynamic import() -->
+        <section id="dynamic-import">
+            <h2>Dynamic import() &amp; Lazy Loading</h2>
+            <details>
+                <summary>import() Promise, React.lazy, prefetch/preload, error boundaries</summary>
+
+                <h3>import() Returns a Promise</h3>
+                <pre><code class="language-javascript">// Dynamic import() is an expression, not a declaration
+// It returns a Promise that resolves to the module namespace
+
+// Basic usage
+const module = await import('./heavy-module.js');
+module.default; // default export
+module.namedExport; // named export
+
+// Conditional loading
+async function loadLocale(lang) {
+    const translations = await import(`./locales/${lang}.js`);
+    return translations.default;
+}
+
+// Feature detection
+async function loadPolyfill() {
+    if (!('IntersectionObserver' in window)) {
+        await import('intersection-observer');
+    }
+}
+
+// Error handling
+try {
+    const mod = await import('./optional-feature.js');
+    mod.initialize();
+} catch (err) {
+    console.warn('Optional feature not available:', err);
+    // Graceful fallback
+}</code></pre>
+
+                <h3>React.lazy Integration</h3>
+                <pre><code class="language-javascript">// React.lazy expects a function returning a Promise
+// that resolves to a module with a default export
+const LazyComponent = React.lazy(() =&gt; import('./MyComponent'));
+
+// For named exports, re-export as default:
+const LazyNamed = React.lazy(() =&gt;
+    import('./utils').then(mod =&gt; ({ default: mod.SpecificComponent }))
+);
+
+// With retry logic for flaky networks
+function lazyWithRetry(importFn, retries = 3) {
+    return React.lazy(async () =&gt; {
+        for (let i = 0; i &lt; retries; i++) {
+            try {
+                return await importFn();
+            } catch (err) {
+                if (i === retries - 1) throw err;
+                await new Promise(r =&gt; setTimeout(r, 1000 * (i + 1)));
+            }
+        }
+    });
+}
+
+const ResilientComponent = lazyWithRetry(
+    () =&gt; import('./HeavyComponent')
+);</code></pre>
+
+                <h3>Prefetch &amp; Preload Hints</h3>
+                <pre><code class="language-javascript">// Programmatic prefetch on user intent
+function NavLink({ to, children }) {
+    const prefetch = () =&gt; {
+        // Start loading the chunk when user hovers
+        import(`./pages/${to}`);
+    };
+
+    return (
+        &lt;a href={to} onMouseEnter={prefetch}&gt;
+            {children}
+        &lt;/a&gt;
+    );
+}
+
+// Link prefetch/preload in HTML
+// &lt;link rel="prefetch" href="/chunks/dashboard.js"&gt;
+// &lt;link rel="preload" href="/chunks/critical.js" as="script"&gt;
+
+// Vite: automatic preload for dynamic imports
+// Vite injects &lt;link rel="modulepreload"&gt; for chunks
+// that are needed by the current route</code></pre>
+
+                <h3>Error Boundaries for Chunk Failures</h3>
+                <pre><code class="language-javascript">// Chunk load failures happen! (deploy during user session)
+class ChunkErrorBoundary extends React.Component {
+    state = { hasError: false, chunkError: false };
+
+    static getDerivedStateFromError(error) {
+        // Detect chunk load failure specifically
+        const isChunkError = (
+            error.name === 'ChunkLoadError' ||
+            error.message?.includes('Loading chunk') ||
+            error.message?.includes('Failed to fetch')
+        );
+        return { hasError: true, chunkError: isChunkError };
+    }
+
+    handleRetry = () =&gt; {
+        if (this.state.chunkError) {
+            // Force reload to get new chunk manifest
+            window.location.reload();
+        }
+        this.setState({ hasError: false, chunkError: false });
+    };
+
+    render() {
+        if (this.state.hasError) {
+            return (
+                &lt;div class="error-fallback"&gt;
+                    &lt;p&gt;{this.state.chunkError
+                        ? 'A new version is available.'
+                        : 'Something went wrong.'
+                    }&lt;/p&gt;
+                    &lt;button onClick={this.handleRetry}&gt;
+                        {this.state.chunkError ? 'Refresh' : 'Retry'}
+                    &lt;/button&gt;
+                &lt;/div&gt;
+            );
+        }
+        return this.props.children;
+    }
+}</code></pre>
+
+                <div class="callout callout-warning">
+                    <p><strong>Production reality:</strong> When you deploy a new version, old chunk filenames (with content hashes) are deleted from the CDN. Users with stale HTML will try to load non-existent chunks. Always implement chunk error recovery.</p>
+                </div>
+            </details>
+        </section>
+
+        <!-- Section 11: Module Federation -->
+        <section id="module-federation">
+            <h2>Module Federation (Micro-Frontends)</h2>
+            <details>
+                <summary>Webpack 5 concept, shared deps, remote/host architecture, version negotiation</summary>
+
+                <h3>Webpack 5 Module Federation Concept</h3>
+                <pre><code class="language-javascript">// Host application — webpack.config.js
+const { ModuleFederationPlugin } = require('webpack').container;
+
+module.exports = {
+    plugins: [
+        new ModuleFederationPlugin({
+            name: 'host',
+            remotes: {
+                // Load 'shop' app at runtime from this URL
+                shop: 'shop@https://shop.example.com/remoteEntry.js',
+                auth: 'auth@https://auth.example.com/remoteEntry.js',
+            },
+            shared: {
+                react: { singleton: true, requiredVersion: '^18.0.0' },
+                'react-dom': { singleton: true, requiredVersion: '^18.0.0' },
+            },
+        }),
+    ],
+};
+
+// Remote application (shop) — webpack.config.js
+module.exports = {
+    plugins: [
+        new ModuleFederationPlugin({
+            name: 'shop',
+            filename: 'remoteEntry.js',
+            exposes: {
+                './ProductList': './src/components/ProductList',
+                './Cart': './src/components/Cart',
+            },
+            shared: {
+                react: { singleton: true, requiredVersion: '^18.0.0' },
+                'react-dom': { singleton: true, requiredVersion: '^18.0.0' },
+            },
+        }),
+    ],
+};</code></pre>
+
+                <h3>Consuming Remote Modules</h3>
+                <pre><code class="language-javascript">// In the host application:
+// Static import (requires async boundary)
+import RemoteProductList from 'shop/ProductList';
+
+// Dynamic import (preferred — handles loading states)
+const ProductList = React.lazy(() =&gt; import('shop/ProductList'));
+
+function App() {
+    return (
+        &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+            &lt;ProductList /&gt;
+        &lt;/Suspense&gt;
+    );
+}
+
+// Bootstrap pattern (async boundary at entry)
+// index.js
+import('./bootstrap');
+
+// bootstrap.js
+import React from 'react';
+import ReactDOM from 'react-dom';
+import App from './App';
+ReactDOM.createRoot(document.getElementById('root')).render(&lt;App /&gt;);</code></pre>
+
+                <h3>Version Negotiation</h3>
+                <pre><code class="language-javascript">// Shared dependency configuration
+shared: {
+    react: {
+        singleton: true,       // Only one instance allowed
+        requiredVersion: '^18.0.0',
+        strictVersion: false,  // Warn (don't crash) on mismatch
+        eager: false,          // Load async (not in initial bundle)
+    },
+    lodash: {
+        singleton: false,      // Multiple versions OK
+        requiredVersion: '^4.17.0',
+    },
+    '@company/design-system': {
+        singleton: true,
+        requiredVersion: '>=2.0.0',
+        eager: true,           // Include in initial bundle
+    },
+}</code></pre>
+
+                <pre class="diagram">
+┌───────────────────────────────────────────────────────┐
+│          Module Federation Architecture               │
+├───────────────────────────────────────────────────────┤
+│                                                        │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐        │
+│  │  Host    │    │ Remote A │    │ Remote B │        │
+│  │  (Shell) │    │  (Shop)  │    │  (Auth)  │        │
+│  └────┬─────┘    └────┬─────┘    └────┬─────┘        │
+│       │               │               │               │
+│       │  remoteEntry  │               │               │
+│       │◄──────────────┤               │               │
+│       │               │               │               │
+│       │         remoteEntry           │               │
+│       │◄──────────────────────────────┤               │
+│       │                                               │
+│       ▼                                               │
+│  ┌─────────────────────────────────────────┐          │
+│  │         Shared Scope (Runtime)           │          │
+│  │  ┌───────┐  ┌───────────┐  ┌────────┐  │          │
+│  │  │ React │  │ React-DOM │  │ lodash │  │          │
+│  │  │  18.2 │  │   18.2    │  │  4.17  │  │          │
+│  │  └───────┘  └───────────┘  └────────┘  │          │
+│  └─────────────────────────────────────────┘          │
+│                                                        │
+└───────────────────────────────────────────────────────┘
+                </pre>
+
+                <div class="callout callout-info">
+                    <p><strong>Trade-off:</strong> Module Federation enables independent deployment of micro-frontends but adds runtime complexity — shared dependency negotiation, network waterfall for remote entries, and potential version conflicts. Consider simpler alternatives (npm packages, monorepo) before adopting.</p>
+                    <p><strong>Beyond Webpack:</strong> Module Federation is no longer Webpack-exclusive. <code>@module-federation/vite</code> brings support to Vite, and "Module Federation 2.0" (by Zack Jackson) provides framework-agnostic runtime with type safety and dev tools across bundlers.</p>
+                </div>
+            </details>
+        </section>
+
+        <!-- Section 12: Bundler Internals -->
+        <section id="bundler-internals">
+            <h2>Bundler Internals</h2>
+            <details>
+                <summary>Webpack, Vite, esbuild, Turbopack — architecture and comparison</summary>
+
+                <h3>Webpack — Dependency Graph, Loaders, Plugins</h3>
+                <pre><code class="language-javascript">// Webpack's core architecture:
+// 1. Entry → builds dependency graph via require/import statements
+// 2. Loaders → transform files (babel-loader, css-loader, etc.)
+// 3. Plugins → tap into compilation lifecycle hooks
+// 4. Output → emit chunks based on split configuration
+
+// Simplified Webpack compilation flow:
+class Compiler {
+    run() {
+        this.hooks.beforeCompile.call();
+        const compilation = this.newCompilation();
+
+        // Build module graph
+        for (const entry of this.entries) {
+            this.addModuleTree(entry); // Recursively resolve deps
+        }
+
+        // Seal: optimize, split chunks, assign IDs
+        compilation.seal();
+
+        // Emit: write files to output directory
+        this.emitAssets(compilation);
+    }
+}
+
+// How loaders work (pipeline):
+// file.scss → sass-loader → css-loader → style-loader → JS
+// Each loader transforms input and passes to next</code></pre>
+
+                <h3>Vite — Native ESM Dev, Rollup Production</h3>
+                <pre><code class="language-javascript">// Vite's dual-mode architecture:
+
+// DEVELOPMENT: No bundling!
+// 1. Pre-bundles dependencies with esbuild (fast!)
+// 2. Serves source files as native ES modules
+// 3. Browser requests each module individually
+// 4. HMR via WebSocket (module-level granularity)
+
+// Dev server handles:
+// - .ts → esbuild transpile on the fly
+// - .vue/.jsx → transform to JS on request
+// - .css → inject as &lt;style&gt; or CSS module
+
+// PRODUCTION: Rollup-based bundling
+// vite.config.js
+export default {
+    build: {
+        rollupOptions: {
+            output: {
+                manualChunks: {
+                    vendor: ['react', 'react-dom'],
+                    charts: ['d3', 'chart.js'],
+                },
+            },
+        },
+        target: 'es2015',   // Output target
+        minify: 'esbuild',  // Fast minification
+        cssCodeSplit: true,  // Per-chunk CSS
+    },
+};</code></pre>
+
+                <h3>esbuild — Go-Based Speed</h3>
+                <pre><code class="language-javascript">// Why esbuild is 10-100x faster:
+// 1. Written in Go (compiled, not interpreted)
+// 2. Parallelized parsing and code generation
+// 3. Minimal AST allocations (single pass)
+// 4. No plugin-based architecture overhead
+
+// esbuild API
+import * as esbuild from 'esbuild';
+
+await esbuild.build({
+    entryPoints: ['src/index.tsx'],
+    bundle: true,
+    splitting: true,      // Code splitting (ESM output only)
+    format: 'esm',
+    outdir: 'dist',
+    minify: true,
+    sourcemap: true,
+    target: ['es2020'],
+    treeShaking: true,
+    define: {
+        'process.env.NODE_ENV': '"production"',
+    },
+});
+
+// Limitations:
+// - No HMR (not designed as dev server)
+// - Limited plugin API compared to Webpack
+// - No TypeScript type checking (transpile only)
+// - CSS Modules support is basic</code></pre>
+
+                <h3>Bundler Comparison</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Feature</th>
+                            <th>Webpack</th>
+                            <th>Vite/Rollup</th>
+                            <th>esbuild</th>
+                            <th>Turbopack</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Language</td>
+                            <td>JavaScript</td>
+                            <td>JavaScript</td>
+                            <td>Go</td>
+                            <td>Rust</td>
+                        </tr>
+                        <tr>
+                            <td>Dev speed</td>
+                            <td>Slow</td>
+                            <td>Fast (no-bundle)</td>
+                            <td>Very fast</td>
+                            <td>Very fast</td>
+                        </tr>
+                        <tr>
+                            <td>Build speed</td>
+                            <td>Medium</td>
+                            <td>Medium (Rollup)</td>
+                            <td>Very fast</td>
+                            <td>Fast</td>
+                        </tr>
+                        <tr>
+                            <td>Code splitting</td>
+                            <td>Excellent</td>
+                            <td>Good</td>
+                            <td>Basic</td>
+                            <td>Good</td>
+                        </tr>
+                        <tr>
+                            <td>Plugin ecosystem</td>
+                            <td>Massive</td>
+                            <td>Growing (Rollup)</td>
+                            <td>Limited</td>
+                            <td>Webpack-compat</td>
+                        </tr>
+                        <tr>
+                            <td>HMR</td>
+                            <td>Yes</td>
+                            <td>Yes (fast)</td>
+                            <td>No</td>
+                            <td>Yes</td>
+                        </tr>
+                        <tr>
+                            <td>Tree-shaking</td>
+                            <td>Good</td>
+                            <td>Excellent</td>
+                            <td>Good</td>
+                            <td>Good</td>
+                        </tr>
+                        <tr>
+                            <td>Module Federation</td>
+                            <td>Yes</td>
+                            <td>Plugin</td>
+                            <td>No</td>
+                            <td>Planned</td>
+                        </tr>
+                        <tr>
+                            <td>Best for</td>
+                            <td>Complex apps</td>
+                            <td>Modern apps</td>
+                            <td>Libraries, tools</td>
+                            <td>Next.js apps</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <div class="callout callout-info">
+                    <p><strong>Table notes:</strong></p>
+                    <ul>
+                        <li><strong>Turbopack</strong> is currently Next.js-specific (not a standalone general-purpose bundler). It uses Webpack-compatible plugin architecture but isn't usable outside the Next.js ecosystem as of 2024.</li>
+                        <li><strong>esbuild "No HMR"</strong> refers to esbuild's standalone API. Vite uses esbuild under the hood for dependency pre-bundling and transforms, while providing its own fast HMR — so esbuild-powered toolchains absolutely support HMR.</li>
+                        <li><strong>Rspack</strong> (Rust-based, by ByteDance) is a notable addition — a Webpack-compatible drop-in replacement with 5-10x build speed improvements. Gaining significant traction in 2024 for teams that need Webpack plugin compatibility with Rust-level performance.</li>
+                    </ul>
+                </div>
+            </details>
+        </section>
+
+        <!-- Section 13: Import Maps -->
+        <section id="import-maps">
+            <h2>Import Maps &amp; Native ESM in Browsers</h2>
+            <details>
+                <summary>Import map syntax, browser support, CDN ESM, bare specifier resolution</summary>
+
+                <h3>Import Map Syntax</h3>
+                <pre><code class="language-javascript">// In HTML:
+// &lt;script type="importmap"&gt;
+{
+    "imports": {
+        // Bare specifier → URL mapping
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+
+        // Prefix mapping (trailing slash)
+        "lodash/": "https://esm.sh/lodash-es@4.17.21/",
+
+        // Local package mapping
+        "@app/": "/src/",
+        "@components/": "/src/components/"
+    },
+    "scopes": {
+        // Override mappings for specific URL paths
+        "/legacy/": {
+            "react": "https://esm.sh/react@17.0.2"
+        }
+    }
+}
+// &lt;/script&gt;
+
+// Now bare specifiers work in the browser:
+// &lt;script type="module"&gt;
+import React from 'react';
+import { debounce } from 'lodash/debounce';
+import { Button } from '@components/Button.js';
+// &lt;/script&gt;</code></pre>
+
+                <h3>CDN-Based ESM (esm.sh, Skypack)</h3>
+                <pre><code class="language-javascript">// esm.sh — converts npm packages to ESM on the fly
+import React from 'https://esm.sh/react@18.2.0';
+import confetti from 'https://esm.sh/canvas-confetti@1.6.0';
+
+// With TypeScript types
+// https://esm.sh/react@18.2.0?dts
+// Returns X-TypeScript-Types header for IDE support
+
+// Skypack — optimized ESM CDN
+import { format } from 'https://cdn.skypack.dev/date-fns@2.30.0';
+
+// Pinned URLs for production (content-addressed)
+import React from 'https://cdn.skypack.dev/pin/react@v18.2.0-xyz';
+
+// Benefits:
+// - No build step needed for prototypes
+// - No node_modules
+// - Browser-native module loading
+// - Cacheable at CDN edge
+
+// Drawbacks:
+// - Network waterfall for deep dependency trees
+// - No tree-shaking (get entire package)
+// - CDN availability becomes SPOF
+// - Slower than bundled local assets</code></pre>
+
+                <h3>Bare Specifier Resolution</h3>
+                <pre><code class="language-javascript">// Without import maps, browsers CANNOT resolve bare specifiers:
+import React from 'react';
+// Error: Failed to resolve module specifier "react"
+// Browsers require URLs: relative (./) or absolute (https://)
+
+// Import maps provide the browser with a "resolution map"
+// Similar to what bundlers do at build time
+
+// Priority order:
+// 1. Scoped mappings (most specific path wins)
+// 2. Top-level "imports" mappings
+// 3. URL resolution (relative/absolute)
+
+// Multiple import maps (additive, but order matters):
+// &lt;script type="importmap"&gt;{ "imports": { "a": "/a.js" } }&lt;/script&gt;
+// &lt;script type="importmap"&gt;{ "imports": { "b": "/b.js" } }&lt;/script&gt;
+// Note: Chrome 133+ (Jan 2025) supports multiple import maps per document.
+// Earlier browsers and the original spec only allowed ONE import map.
+// For max compatibility, consolidate into a single map.</code></pre>
+
+                <div class="callout callout-info">
+                    <p><strong>Browser support (2024):</strong> Import maps are supported in all modern browsers (Chrome 89+, Firefox 108+, Safari 16.4+). For older browsers, use the <code>es-module-shims</code> polyfill.</p>
+                </div>
+            </details>
+        </section>
+
+        <!-- Section 14: Production Optimization -->
+        <section id="production-optimization">
+            <h2>Production Bundle Optimization</h2>
+            <details>
+                <summary>Scope hoisting, bundle analysis, compression, differential loading</summary>
+
+                <h3>Scope Hoisting (Module Concatenation)</h3>
+                <pre><code class="language-javascript">// WITHOUT scope hoisting — each module wrapped in a function:
+// Bundle output (simplified):
+var modules = {
+    './src/math.js': function(module, exports) {
+        exports.add = (a, b) =&gt; a + b;
+        exports.multiply = (a, b) =&gt; a * b;
+    },
+    './src/app.js': function(module, exports, require) {
+        const { add } = require('./src/math.js');
+        console.log(add(1, 2));
+    }
+};
+// Each module = separate scope = overhead per module
+
+// WITH scope hoisting (Rollup/Webpack ModuleConcatenationPlugin):
+// Bundle output:
+const add = (a, b) =&gt; a + b;
+// multiply is tree-shaken away
+console.log(add(1, 2));
+// All modules in ONE scope — smaller, faster
+
+// Enable in Webpack:
+module.exports = {
+    optimization: {
+        concatenateModules: true, // default in production mode
+    },
+};</code></pre>
+
+                <div class="callout callout-info">
+                    <p><strong>Why it's faster:</strong> Scope hoisting eliminates per-module function wrappers and <code>__webpack_require__</code> calls. This reduces bundle size by ~5-10% and improves runtime performance by avoiding function call overhead.</p>
+                </div>
+
+                <h3>Bundle Analysis Tools</h3>
+                <pre><code class="language-javascript">// webpack-bundle-analyzer
+// npm install -D webpack-bundle-analyzer
+const BundleAnalyzerPlugin = require('webpack-bundle-analyzer')
+    .BundleAnalyzerPlugin;
+
+module.exports = {
+    plugins: [new BundleAnalyzerPlugin()],
+};
+
+// source-map-explorer (works with any bundler)
+// npx source-map-explorer dist/main.*.js
+
+// Vite: rollup-plugin-visualizer
+import { visualizer } from 'rollup-plugin-visualizer';
+export default {
+    plugins: [visualizer({ open: true, gzipSize: true })],
+};
+
+// CLI analysis
+// npx bundlephobia lodash     → shows package size
+// npx cost-of-modules         → shows node_modules cost</code></pre>
+
+                <h3>Compression (Brotli &amp; gzip)</h3>
+                <pre><code class="language-javascript">// Pre-compress at build time (better compression ratio)
+// vite.config.js with vite-plugin-compression
+import viteCompression from 'vite-plugin-compression';
+
+export default {
+    plugins: [
+        viteCompression({
+            algorithm: 'brotliCompress',
+            ext: '.br',
+            threshold: 1024, // Only compress files &gt; 1KB
+        }),
+        viteCompression({
+            algorithm: 'gzip',
+            ext: '.gz',
+        }),
+    ],
+};
+
+// Nginx serving pre-compressed files:
+// gzip_static on;
+// brotli_static on;
+
+// Compression ratios (typical JavaScript):
+// Original:  100 KB
+// gzip:       30 KB (~70% reduction)
+// Brotli:     25 KB (~75% reduction)</code></pre>
+
+                <h3>Differential Loading (Modern + Legacy)</h3>
+                <pre><code class="language-javascript">// Serve modern JS to modern browsers, legacy to old ones
+// &lt;script type="module" src="app.modern.js"&gt;&lt;/script&gt;
+// &lt;script nomodule src="app.legacy.js"&gt;&lt;/script&gt;
+
+// Modern browsers: load app.modern.js (smaller, ES2020+)
+// Legacy browsers: load app.legacy.js (transpiled, polyfilled)
+
+// Vite handles this automatically:
+export default {
+    build: {
+        target: 'es2015', // Modern build
+    },
+};
+// Use @vitejs/plugin-legacy for legacy support:
+import legacy from '@vitejs/plugin-legacy';
+export default {
+    plugins: [
+        legacy({
+            targets: ['defaults', 'not IE 11'],
+            // Generates both modern and legacy chunks
+            // Injects &lt;script type="module"&gt; and &lt;script nomodule&gt;
+        }),
+    ],
+};
+
+// Size impact:
+// Modern (ES2020):  150 KB (no polyfills, native syntax)
+// Legacy (ES5):     250 KB (polyfills + transpiled code)
+// 40% savings for 95%+ of users!</code></pre>
+            </details>
+        </section>
+
+        <!-- Section 15: Production Incident -->
+        <section id="production-incident">
+            <h2>Production Incident</h2>
+            <details>
+                <summary>Bundle size regression — diagnosis and fix</summary>
+
+                <h3>Incident: 800KB Bundle Size Regression After "Small" PR</h3>
+                <div class="callout callout-warning">
+                    <p><strong>Scenario:</strong> After a seemingly innocent PR that added a date picker component, the main bundle jumped from 320KB to 1.1MB (gzipped). Page load time increased from 1.8s to 4.2s on 3G. Multiple customer complaints about slow loading.</p>
+                </div>
+
+                <h4>Investigation Timeline</h4>
+                <pre><code class="language-javascript">// Step 1: Identify the regression
+// Run bundle analyzer on current vs previous build
+// npx source-map-explorer dist/main.*.js
+
+// Finding: moment.js (530KB!) appeared in the main bundle
+// The date picker imported moment with all locales
+
+// Step 2: Trace the import chain
+// The PR added:
+import { DatePicker } from '@company/ui-library';
+// Which internally did:
+import moment from 'moment'; // Pulls in ALL 300+ locales!
+
+// Step 3: Check why tree-shaking failed
+// @company/ui-library package.json had:
+{
+    "main": "dist/cjs/index.js",  // CJS entry!
+    "module": "dist/esm/index.js",
+    // Missing "sideEffects": false
+}
+// Webpack was using the CJS entry → no tree-shaking</code></pre>
+
+                <h4>Root Causes</h4>
+                <pre><code class="language-javascript">// ROOT CAUSE 1: Library used barrel file re-exports
+// @company/ui-library/src/index.ts
+export { Button } from './Button';
+export { DatePicker } from './DatePicker';  // imports moment
+export { Modal } from './Modal';
+export { Table } from './Table';
+// Importing ANYTHING from this library pulled in everything
+
+// ROOT CAUSE 2: No sideEffects field
+// Without sideEffects: false, bundler can't eliminate unused modules
+
+// ROOT CAUSE 3: moment.js is CJS with no ESM entry
+// Even if tree-shaking worked, moment bundles all locales</code></pre>
+
+                <h4>Fix Applied</h4>
+                <pre><code class="language-javascript">// FIX 1: Direct import path (immediate fix)
+// Before:
+import { DatePicker } from '@company/ui-library';
+// After:
+import { DatePicker } from '@company/ui-library/DatePicker';
+
+// FIX 2: Replace moment with date-fns (long-term)
+// date-fns is ESM-first, tree-shakeable
+import { format, parseISO } from 'date-fns';
+// Only imports what's used: ~3KB vs 530KB
+
+// FIX 3: Update library package.json
+{
+    "sideEffects": false,
+    "exports": {
+        ".": { "import": "./dist/esm/index.js" },
+        "./DatePicker": { "import": "./dist/esm/DatePicker.js" },
+        "./Button": { "import": "./dist/esm/Button.js" }
+    }
+}
+
+// FIX 4: Add bundle size CI check
+// bundlesize configuration
+{
+    "bundlesize": [
+        { "path": "dist/main.*.js", "maxSize": "350 KB" },
+        { "path": "dist/vendor.*.js", "maxSize": "200 KB" }
+    ]
+}
+
+// Result: 1.1MB → 285KB (74% reduction)</code></pre>
+
+                <h4>Prevention Measures</h4>
+                <pre><code class="language-javascript">// 1. CI bundle size gate (fails PR if budget exceeded)
+// .github/workflows/bundle-check.yml
+// Uses: andresz1/size-limit-action@v1
+
+// 2. Import cost IDE extension (shows size inline)
+// "lodash" → 71.4KB (gzipped: 25.2KB) 🚨
+
+// 3. Webpack analysis in CI
+const BundleAnalyzerPlugin = require('webpack-bundle-analyzer');
+if (process.env.ANALYZE) {
+    plugins.push(new BundleAnalyzerPlugin({ analyzerMode: 'static' }));
+}
+
+// 4. ESLint rule to prevent barrel imports
+// eslint-plugin-no-barrel-files
+// "no-restricted-imports": ["error", {
+//     "patterns": ["@company/ui-library"]
+// }]</code></pre>
+            </details>
+        </section>
+
+        <!-- Section 16: Code Examples -->
+        <section id="code-examples">
+            <h2>Code Examples</h2>
+            <details>
+                <summary>Custom tree-shaking analysis, dynamic import patterns, chunk optimization</summary>
+
+                <h3>Custom Tree-Shaking Analyzer</h3>
+                <pre><code class="language-javascript">// Simple tree-shaking analyzer using AST parsing
+import { parse } from '@babel/parser';
+import traverse from '@babel/traverse';
+import fs from 'fs';
+import path from 'path';
+
+class TreeShakeAnalyzer {
+    constructor(entryPoint) {
+        this.entryPoint = entryPoint;
+        this.moduleGraph = new Map(); // file → { exports, imports }
+        this.usedExports = new Map(); // file → Set of used export names
+    }
+
+    analyze() {
+        this.buildGraph(this.entryPoint);
+        this.markUsedExports(this.entryPoint);
+        return this.getReport();
+    }
+
+    buildGraph(filePath) {
+        if (this.moduleGraph.has(filePath)) return;
+
+        const code = fs.readFileSync(filePath, 'utf-8');
+        const ast = parse(code, {
+            sourceType: 'module',
+            plugins: ['typescript', 'jsx'],
+        });
+
+        const moduleInfo = { exports: new Set(), imports: [] };
+
+        traverse(ast, {
+            ExportNamedDeclaration(nodePath) {
+                if (nodePath.node.declaration) {
+                    const decl = nodePath.node.declaration;
+                    if (decl.id) moduleInfo.exports.add(decl.id.name);
+                    if (decl.declarations) {
+                        decl.declarations.forEach(d =&gt;
+                            moduleInfo.exports.add(d.id.name)
+                        );
+                    }
+                }
+            },
+            ExportDefaultDeclaration() {
+                moduleInfo.exports.add('default');
+            },
+            ImportDeclaration(nodePath) {
+                const source = nodePath.node.source.value;
+                const specifiers = nodePath.node.specifiers.map(s =&gt; ({
+                    imported: s.imported?.name || 'default',
+                    local: s.local.name,
+                }));
+                moduleInfo.imports.push({ source, specifiers });
+            },
+        });
+
+        this.moduleGraph.set(filePath, moduleInfo);
+
+        // Recursively build graph for dependencies
+        for (const imp of moduleInfo.imports) {
+            const resolvedPath = this.resolve(imp.source, filePath);
+            if (resolvedPath) this.buildGraph(resolvedPath);
+        }
+    }
+
+    markUsedExports(filePath) {
+        const info = this.moduleGraph.get(filePath);
+        if (!info) return;
+
+        for (const imp of info.imports) {
+            const resolvedPath = this.resolve(imp.source, filePath);
+            if (!resolvedPath) continue;
+
+            if (!this.usedExports.has(resolvedPath)) {
+                this.usedExports.set(resolvedPath, new Set());
+            }
+
+            for (const spec of imp.specifiers) {
+                this.usedExports.get(resolvedPath).add(spec.imported);
+            }
+
+            this.markUsedExports(resolvedPath);
+        }
+    }
+
+    getReport() {
+        const report = [];
+        for (const [file, info] of this.moduleGraph) {
+            const used = this.usedExports.get(file) || new Set();
+            const unused = [...info.exports].filter(e =&gt; !used.has(e));
+            if (unused.length &gt; 0) {
+                report.push({ file, unused, total: info.exports.size });
+            }
+        }
+        return report;
+    }
+
+    resolve(specifier, from) {
+        if (!specifier.startsWith('.')) return null;
+        return path.resolve(path.dirname(from), specifier + '.js');
+    }
+}
+
+// Usage:
+const analyzer = new TreeShakeAnalyzer('./src/index.js');
+const report = analyzer.analyze();
+console.table(report);
+// [{ file: './src/utils.js', unused: ['helperFn'], total: 5 }]</code></pre>
+
+                <h3>Advanced Dynamic Import Patterns</h3>
+                <pre><code class="language-javascript">// Pattern 1: Feature flag-based loading
+async function loadFeature(featureFlags) {
+    const modules = {};
+
+    if (featureFlags.analytics) {
+        modules.analytics = await import('./features/analytics');
+    }
+    if (featureFlags.experiments) {
+        modules.experiments = await import('./features/ab-testing');
+    }
+
+    return modules;
+}
+
+// Pattern 2: Locale-based chunk loading
+const LOCALE_MAP = {
+    en: () =&gt; import('./locales/en.json'),
+    fr: () =&gt; import('./locales/fr.json'),
+    ja: () =&gt; import('./locales/ja.json'),
+};
+
+async function loadLocale(locale) {
+    const loader = LOCALE_MAP[locale] || LOCALE_MAP.en;
+    const { default: messages } = await loader();
+    return messages;
+}
+
+// Pattern 3: Intersection Observer lazy loading
+function lazyLoadOnVisible(importFn, elementId) {
+    const observer = new IntersectionObserver((entries) =&gt; {
+        if (entries[0].isIntersecting) {
+            importFn().then(module =&gt; {
+                module.default.init(document.getElementById(elementId));
+            });
+            observer.disconnect();
+        }
+    });
+
+    observer.observe(document.getElementById(elementId));
+}</code></pre>
+
+                <h3>Webpack Chunk Optimization Config</h3>
+                <pre><code class="language-javascript">// Production-optimized webpack.config.js
+module.exports = {
+    optimization: {
+        splitChunks: {
+            chunks: 'all',
+            maxInitialRequests: 25,
+            maxAsyncRequests: 25,
+            minSize: 20000,      // Min 20KB to create a chunk
+            maxSize: 244000,     // Try to keep chunks &lt; 244KB
+            cacheGroups: {
+                framework: {
+                    test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+                    name: 'framework',
+                    priority: 40,
+                    enforce: true,
+                },
+                lib: {
+                    test: /[\\/]node_modules[\\/]/,
+                    name(module) {
+                        const match = module.context.match(
+                            /[\\/]node_modules[\\/](.*?)([\\/]|$)/
+                        );
+                        return `npm.${match[1].replace('@', '')}`;
+                    },
+                    priority: 30,
+                    minChunks: 1,
+                    reuseExistingChunk: true,
+                },
+                commons: {
+                    minChunks: 2,
+                    priority: 20,
+                    reuseExistingChunk: true,
+                },
+            },
+        },
+        runtimeChunk: 'single', // Separate runtime for long-term caching
+        moduleIds: 'deterministic', // Stable IDs across builds
+    },
+};</code></pre>
+            </details>
+        </section>
+
+        <!-- Section 17: Common Mistakes -->
+        <section id="common-mistakes">
+            <h2>Common Mistakes</h2>
+            <details>
+                <summary>5 critical mistakes that hurt bundle performance</summary>
+
+                <h3>Mistake 1: Barrel File Re-Export Bloat</h3>
+                <pre><code class="language-javascript">// ❌ BAD: Barrel file that re-exports everything
+// src/components/index.ts
+export { Button } from './Button';
+export { Modal } from './Modal';       // imports heavy animation lib
+export { DataGrid } from './DataGrid'; // imports ag-grid (500KB)
+export { Chart } from './Chart';       // imports d3 (200KB)
+
+// Consumer only wants Button, but gets everything:
+import { Button } from '@/components';
+// Without proper sideEffects: false, entire barrel is included!
+
+// ✅ GOOD: Direct imports
+import { Button } from '@/components/Button';
+
+// ✅ GOOD: If using barrel, ensure library has:
+// package.json: "sideEffects": false
+// AND use named exports (not default) for better tree-shaking</code></pre>
+
+                <h3>Mistake 2: Not Marking sideEffects in package.json</h3>
+                <pre><code class="language-javascript">// ❌ BAD: Library without sideEffects declaration
+{
+    "name": "my-utils-library",
+    "main": "dist/index.js",
+    "module": "dist/index.esm.js"
+    // No sideEffects field!
+    // Bundler assumes ANY module might have side effects
+    // Cannot safely eliminate unused modules
+}
+
+// ✅ GOOD: Explicit sideEffects declaration
+{
+    "name": "my-utils-library",
+    "main": "dist/index.js",
+    "module": "dist/index.esm.js",
+    "sideEffects": false
+    // Now bundler knows: if an export isn't used,
+    // the entire module can be safely removed
+}
+
+// ✅ GOOD: With side-effectful exceptions
+{
+    "sideEffects": ["./dist/polyfills.js", "**/*.css"]
+}</code></pre>
+
+                <h3>Mistake 3: Default Exports Preventing Tree-Shaking</h3>
+                <pre><code class="language-javascript">// ❌ BAD: Default export of an object
+// utils.js
+export default {
+    formatDate(d) { /* ... */ },
+    formatCurrency(n) { /* ... */ },
+    formatPercentage(n) { /* ... */ },
+    // 20 more utility functions...
+};
+
+// Consumer:
+import utils from './utils';
+utils.formatDate(new Date());
+// Bundler can't tree-shake! The entire object is the "default" export
+// It can't know which properties are accessed at compile time
+
+// ✅ GOOD: Named exports
+export function formatDate(d) { /* ... */ }
+export function formatCurrency(n) { /* ... */ }
+export function formatPercentage(n) { /* ... */ }
+
+// Consumer:
+import { formatDate } from './utils';
+// Only formatDate is included in the bundle</code></pre>
+
+                <h3>Mistake 4: Importing Entire lodash</h3>
+                <pre><code class="language-javascript">// ❌ BAD: Import entire lodash (71KB gzipped!)
+import _ from 'lodash';
+_.debounce(fn, 300);
+
+// ❌ STILL BAD: Named import from CJS lodash
+import { debounce } from 'lodash';
+// lodash is CJS — this still pulls the entire library!
+
+// ✅ GOOD: Cherry-pick from path
+import debounce from 'lodash/debounce';
+// Only gets the debounce module (~1KB)
+
+// ✅ BETTER: Use lodash-es (ESM version, tree-shakeable)
+import { debounce } from 'lodash-es';
+// With sideEffects: false, only debounce is bundled
+
+// ✅ BEST: Use native or lightweight alternatives
+// Instead of lodash.debounce:
+function debounce(fn, ms) {
+    let timer;
+    return (...args) =&gt; {
+        clearTimeout(timer);
+        timer = setTimeout(() =&gt; fn(...args), ms);
+    };
+}</code></pre>
+
+                <h3>Mistake 5: Ignoring Chunk Duplication</h3>
+                <pre><code class="language-javascript">// ❌ BAD: Same dependency in multiple async chunks
+// Page A: import('chart.js') → chunk-a.js includes chart.js
+// Page B: import('chart.js') → chunk-b.js ALSO includes chart.js
+// User downloads chart.js TWICE if visiting both pages!
+
+// Cause: splitChunks.minChunks defaults to 1 for async chunks
+// Each dynamic import creates an isolated chunk
+
+// ✅ GOOD: Configure shared chunk extraction
+optimization: {
+    splitChunks: {
+        chunks: 'all', // Apply to both sync and async chunks
+        cacheGroups: {
+            shared: {
+                minChunks: 2,        // Used by 2+ chunks
+                name: 'shared',
+                chunks: 'all',
+                reuseExistingChunk: true,
+                enforce: true,
+            },
+        },
+    },
+}
+
+// ✅ ALSO: Use bundle analyzer to detect duplication
+// Look for the same module appearing in multiple chunks
+// npx webpack-bundle-analyzer dist/stats.json</code></pre>
+
+                <div class="callout callout-warning">
+                    <p><strong>Interview tip:</strong> Being able to identify these anti-patterns in existing codebases demonstrates real-world production experience. Mention specific bundle size wins you've achieved (e.g., "I reduced our main bundle from 800KB to 200KB by fixing barrel imports and adding sideEffects").</p>
+                </div>
+            </details>
+        </section>
+
+        <!-- Section 18: Trade-offs -->
+        <section id="trade-offs">
+            <h2>Trade-offs</h2>
+            <details>
+                <summary>Comparing bundlers and module strategies</summary>
+
+                <h3>Bundler Selection Trade-offs</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Scenario</th>
+                            <th>Recommended</th>
+                            <th>Rationale</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>New React/Vue app</td>
+                            <td>Vite</td>
+                            <td>Fast dev server, good defaults, growing ecosystem</td>
+                        </tr>
+                        <tr>
+                            <td>Complex enterprise app</td>
+                            <td>Webpack 5</td>
+                            <td>Module Federation, mature plugins, proven at scale</td>
+                        </tr>
+                        <tr>
+                            <td>Library/package authoring</td>
+                            <td>Rollup or tsup</td>
+                            <td>Clean ESM output, excellent tree-shaking, multiple format support</td>
+                        </tr>
+                        <tr>
+                            <td>CLI tool / simple bundling</td>
+                            <td>esbuild</td>
+                            <td>Fastest build speed, minimal config needed</td>
+                        </tr>
+                        <tr>
+                            <td>Next.js application</td>
+                            <td>Turbopack</td>
+                            <td>Integrated with Next.js, Rust-based incremental builds</td>
+                        </tr>
+                        <tr>
+                            <td>Micro-frontends</td>
+                            <td>Webpack 5 + MF</td>
+                            <td>Only mature Module Federation implementation</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3>Module Strategy Trade-offs</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Strategy</th>
+                            <th>Pros</th>
+                            <th>Cons</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Single bundle</td>
+                            <td>Simple, no waterfall</td>
+                            <td>Large initial load, poor caching</td>
+                        </tr>
+                        <tr>
+                            <td>Route-based splitting</td>
+                            <td>Fast initial load, intuitive</td>
+                            <td>Navigation delay, duplication risk</td>
+                        </tr>
+                        <tr>
+                            <td>Granular splitting (per-npm)</td>
+                            <td>Optimal caching, no duplication</td>
+                            <td>Many requests, HTTP/2 needed, complex</td>
+                        </tr>
+                        <tr>
+                            <td>Module Federation</td>
+                            <td>Independent deploy, team autonomy</td>
+                            <td>Runtime complexity, version conflicts, larger bundles</td>
+                        </tr>
+                        <tr>
+                            <td>Native ESM (no bundler)</td>
+                            <td>No build step, simple</td>
+                            <td>No tree-shaking, network waterfall, no CJS compat</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3>ESM vs CJS Decision Matrix</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Factor</th>
+                            <th>Choose ESM</th>
+                            <th>Choose CJS (or dual)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>New project</td>
+                            <td>✅ Always</td>
+                            <td>Only if CJS deps can't be avoided</td>
+                        </tr>
+                        <tr>
+                            <td>Library package</td>
+                            <td>✅ Primary format</td>
+                            <td>Also publish CJS for legacy consumers</td>
+                        </tr>
+                        <tr>
+                            <td>Tree-shaking needed</td>
+                            <td>✅ Required</td>
+                            <td>N/A (CJS can't be tree-shaken)</td>
+                        </tr>
+                        <tr>
+                            <td>Dynamic loading</td>
+                            <td>✅ import() is standard</td>
+                            <td>require() works but blocks</td>
+                        </tr>
+                        <tr>
+                            <td>Node.js tooling</td>
+                            <td>Requires "type": "module"</td>
+                            <td>Default in Node.js, no config needed</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </details>
+        </section>
+
+        <!-- Section 19: Follow-up Questions -->
+        <section id="follow-up-questions">
+            <h2>Follow-up Questions</h2>
+            <details>
+                <summary>6 common follow-up questions with senior-level answers</summary>
+
+                <h3>Q1: "How would you migrate a large CJS codebase to ESM?"</h3>
+                <div class="callout callout-tip">
+                    <p><strong>Answer:</strong> Incrementally, not all at once. Start by adding <code>"type": "module"</code> to package.json and renaming CJS files to <code>.cjs</code>. Use a codemod (e.g., <code>cjs-to-esm</code>) for mechanical transforms. Key challenges: <code>__dirname</code>/<code>__filename</code> don't exist in ESM (use <code>import.meta.url</code>), dynamic requires need <code>createRequire()</code>, and JSON imports need assertions. Migrate leaf modules first, then work inward. Keep dual-publish support via the <code>exports</code> field.</p>
+                </div>
+
+                <h3>Q2: "Why can't you tree-shake CommonJS even with bundler plugins?"</h3>
+                <div class="callout callout-tip">
+                    <p><strong>Answer:</strong> CJS's fundamental problem is that <code>require()</code> is a runtime function — its argument can be any expression computed at runtime. The <code>module.exports</code> object can be mutated, reassigned, or computed dynamically. Static analysis would need to solve the halting problem to determine which exports are used. Some bundlers (Webpack) attempt partial CJS tree-shaking for simple patterns like <code>exports.foo = ...</code>, but it's fundamentally limited and never complete.</p>
+                </div>
+
+                <h3>Q3: "Explain how Vite achieves fast HMR."</h3>
+                <div class="callout callout-tip">
+                    <p><strong>Answer:</strong> Vite's HMR is fast because it operates at the ESM module level, not the bundle level. When a file changes: (1) Only that specific module is re-transformed via esbuild. (2) The HMR update is sent via WebSocket with just the module's URL. (3) The browser fetches only the changed module. (4) The HMR runtime invalidates the module and its immediate importers. No re-bundling occurs — the update is proportional to the change, not the app size. Webpack must rebuild entire chunks.</p>
+                </div>
+
+                <h3>Q4: "How do you handle a library that doesn't support tree-shaking?"</h3>
+                <div class="callout callout-tip">
+                    <p><strong>Answer:</strong> Multiple strategies: (1) Use cherry-pick imports if available (<code>import x from 'lib/x'</code>). (2) Use <code>babel-plugin-transform-imports</code> to rewrite barrel imports to direct paths. (3) Use Webpack's <code>resolve.alias</code> to point to ESM builds if they exist. (4) Fork and add <code>sideEffects: false</code> + ESM exports. (5) As a last resort, use <code>externals</code> and load from CDN, or find a lighter alternative. Always measure with bundle analyzer first.</p>
+                </div>
+
+                <h3>Q5: "What's the difference between code splitting and lazy loading?"</h3>
+                <div class="callout callout-tip">
+                    <p><strong>Answer:</strong> Code splitting is the <em>bundler technique</em> of dividing output into multiple chunks based on configuration (splitChunks, entry points). Lazy loading is the <em>runtime pattern</em> of deferring chunk download until it's needed. Code splitting doesn't imply lazy loading — you can split chunks but still load them all eagerly. Dynamic <code>import()</code> combines both: it creates a split point AND defers loading. Route-based splitting with React.lazy is the most common combination of both.</p>
+                </div>
+
+                <h3>Q6: "How would you optimize initial load for a dashboard with 50+ charts?"</h3>
+                <div class="callout callout-tip">
+                    <p><strong>Answer:</strong> Layer the loading strategy: (1) Server-render or static-generate the shell/layout. (2) Load only above-the-fold chart components initially. (3) Use IntersectionObserver to lazy-load charts as they scroll into view. (4) Share the charting library in a vendor chunk (loaded once, cached). (5) Use <code>requestIdleCallback</code> to prefetch below-fold chunks. (6) Consider server-side rendering charts as SVG/PNG for initial paint, then hydrate with interactive versions. (7) Use <code>React.memo</code> + virtualization to avoid re-rendering off-screen charts.</p>
+                </div>
+            </details>
+        </section>
+
+        <!-- Section 20: Summary -->
+        <section id="summary">
+            <h2>Summary</h2>
+            <details open>
+                <summary>Mental models and what NOT to say</summary>
+
+                <h3>Mental Models to Carry Into Interviews</h3>
+                <pre class="diagram">
+┌────────────────────────────────────────────────────────┐
+│              Module Systems Mental Model                │
+├────────────────────────────────────────────────────────┤
+│                                                         │
+│  CJS = "Runtime script execution"                       │
+│  • require() is a function call (dynamic)               │
+│  • Evaluates synchronously, caches result              │
+│  • Exports are value copies (snapshot)                  │
+│  • Cannot be statically analyzed → no tree-shaking     │
+│                                                         │
+│  ESM = "Compile-time module linking"                    │
+│  • import/export are declarations (static)             │
+│  • Three phases: parse → instantiate → evaluate        │
+│  • Exports are live bindings (references)              │
+│  • Static structure → tree-shaking possible            │
+│                                                         │
+│  Tree-shaking = "Only ship what's reachable"           │
+│  • Requires static imports (ESM)                       │
+│  • Requires sideEffects: false for module elimination  │
+│  • Named exports &gt; default exports for shakability    │
+│  • Bundler traces from entry → marks used → drops rest │
+│                                                         │
+│  Bundle optimization = "Right code, right time"        │
+│  • Split by route (initial load)                       │
+│  • Split by usage frequency (caching)                  │
+│  • Prefetch on intent (perceived performance)          │
+│  • Compress + scope hoist (transfer size)              │
+│                                                         │
+└────────────────────────────────────────────────────────┘
+                </pre>
+
+                <h3>What NOT to Say in Interviews</h3>
+                <div class="callout callout-warning">
+                    <ul>
+                        <li>❌ "CJS and ESM are basically the same, just different syntax" — They have fundamentally different semantics</li>
+                        <li>❌ "Tree-shaking removes unused code" — Be specific: it removes <em>unused exports</em> via static analysis; DCE removes unreachable code</li>
+                        <li>❌ "Just use import instead of require" — Switching syntax doesn't give tree-shaking if the library is CJS internally</li>
+                        <li>❌ "Webpack is slow, just use Vite" — This ignores Webpack's strengths (Module Federation, mature ecosystem, complex configurations)</li>
+                        <li>❌ "Code splitting is free" — Every split point adds a network request, increases complexity, and requires error handling for chunk failures</li>
+                        <li>❌ "Bundle size doesn't matter with fast networks" — 53% of mobile users abandon sites that take &gt;3s to load; many markets have slow connections</li>
+                    </ul>
+                </div>
+
+                <h3>Key Numbers to Remember</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>Target</th>
+                            <th>Why</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Initial JS bundle</td>
+                            <td>&lt; 170–250KB gzipped</td>
+                            <td>170KB from Addy Osmani (~2018, based on Moto G4). Modern mid-range devices (2024) support ~200-250KB. Use 170KB as aggressive target, 250KB as upper bound.</td>
+                        </tr>
+                        <tr>
+                            <td>Individual async chunk</td>
+                            <td>&lt; 50KB gzipped</td>
+                            <td>Fast subsequent navigation</td>
+                        </tr>
+                        <tr>
+                            <td>Scope hoisting savings</td>
+                            <td>5-10%</td>
+                            <td>Eliminates module wrapper overhead</td>
+                        </tr>
+                        <tr>
+                            <td>Brotli vs gzip</td>
+                            <td>15-20% smaller</td>
+                            <td>Better compression for text assets</td>
+                        </tr>
+                        <tr>
+                            <td>Modern vs legacy bundle</td>
+                            <td>30-40% smaller</td>
+                            <td>No polyfills + native syntax for 95%+ users</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </details>
+        </section>
+
+    </main>
+
+    <script src="../assets/js/main.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+</body>
+</html>

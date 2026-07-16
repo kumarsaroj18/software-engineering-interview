@@ -1,0 +1,2092 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 9: Advanced Type System | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <a href="../index.html">
+        <span class="chapter-num">Ch 9</span>
+        <span class="chapter-title">Advanced Type System</span>
+      </a>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#structural-vs-nominal">Structural vs Nominal</a></li>
+        <li><a href="#type-compatibility">Type Compatibility Rules</a></li>
+        <li><a href="#excess-property-checking">Excess Property Checking</a></li>
+        <li><a href="#freshness-widening">Freshness &amp; Widening</a></li>
+        <li><a href="#type-inference">Type Inference Algorithm</a></li>
+        <li><a href="#variance">Variance</a></li>
+        <li><a href="#branded-types">Branded/Opaque Types</a></li>
+        <li><a href="#declaration-files">Declaration Files</a></li>
+        <li><a href="#type-resolution">Type Resolution</a></li>
+        <li><a href="#type-checker-performance">Type Checker Performance</a></li>
+        <li><a href="#tsconfig-strict">tsconfig Strict Mode</a></li>
+        <li><a href="#production-patterns">Production Patterns</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <span>Part II — TypeScript Advanced Patterns</span> &gt;
+      <span>Chapter 9</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-lang">TypeScript</span>
+        <span class="badge badge-topic">Structural Typing</span>
+        <span class="badge badge-topic">Variance</span>
+        <span class="badge badge-topic">Branded Types</span>
+      </div>
+      <h1>Chapter 9: Advanced Type System</h1>
+      <blockquote class="chapter-takeaway">
+        TypeScript uses structural typing — types are compatible if their shapes match, regardless of name or declaration site. This enables flexibility but creates problems: accidental type compatibility between semantically different types (e.g., UserId and OrderId both being string), excess property checking only at assignment, and variance bugs in function parameters. Branded types and the satisfies operator are the primary tools for adding nominal-like safety.
+      </blockquote>
+    </header>
+
+    <div class="search-container">
+      <input type="text" class="search-input" placeholder="Search this chapter..." aria-label="Search">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details>
+        <summary>What is the interviewer really asking?</summary>
+        <p>When an interviewer asks <em>"How does TypeScript's structural type system differ from nominal typing, and what problems does it create at scale?"</em>, they are probing for:</p>
+        <ul>
+          <li><strong>Foundational understanding</strong> — Do you know that TypeScript's type system is fundamentally different from Java/C#? Can you articulate <em>why</em> the language designers chose structural typing?</li>
+          <li><strong>Scale awareness</strong> — Have you hit the wall where structural typing becomes a liability? Can you describe the failure modes?</li>
+          <li><strong>Mitigation strategies</strong> — Do you know how to add nominal-like safety (branded types) without fighting the language?</li>
+          <li><strong>Variance literacy</strong> — Can you explain why <code>Array&lt;Dog&gt;</code> assignable to <code>Array&lt;Animal&gt;</code> is unsound and what <code>--strictFunctionTypes</code> fixes?</li>
+          <li><strong>Performance intuition</strong> — Do you understand what makes the type checker slow and how to mitigate it in large codebases?</li>
+        </ul>
+        <div class="callout callout-info">
+          <p><strong>Signal they're looking for:</strong> A senior engineer who has internalized the type system deeply enough to make architectural decisions about type safety vs. velocity, and who can guide a team through strict-mode migrations.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details>
+        <summary>Concise interview response</summary>
+        <blockquote>
+          <p>"TypeScript uses structural typing — two types are compatible if their shapes match, regardless of where or how they were declared. This is the opposite of Java/C# nominal typing where a class must explicitly implement an interface.</p>
+          <p>Structural typing is powerful for JavaScript interop — it models duck typing at the type level. But at scale it creates three problems:</p>
+          <ol>
+            <li><strong>Accidental compatibility</strong> — A <code>UserId</code> type alias for <code>string</code> is freely assignable to an <code>OrderId</code> that's also <code>string</code>. You can pass the wrong ID to any function.</li>
+            <li><strong>Excess property bugs</strong> — TypeScript only checks for extra properties on fresh object literals. Assign to a variable first, and the extra properties silently pass through.</li>
+            <li><strong>Variance unsoundness</strong> — Without <code>--strictFunctionTypes</code>, function parameters are bivariant, meaning you can assign incompatible handlers without error.</li>
+          </ol>
+          <p>The mitigations are: branded types (intersecting with a unique symbol to create nominal-like behavior), the <code>satisfies</code> operator for contextual checking, and strict compiler flags. In production, I combine branded types with runtime validation at system boundaries."</p>
+        </blockquote>
+      </details>
+    </section>
+
+    <!-- Section 3: Structural vs Nominal Type Systems -->
+    <section id="structural-vs-nominal">
+      <h2>Structural vs Nominal Type Systems</h2>
+      <details>
+        <summary>Deep dive into type system foundations</summary>
+
+        <h3>What is Structural Typing?</h3>
+        <p>In a structural type system, type compatibility is determined by the <em>structure</em> (shape) of a type — its properties and their types — not by its name or declaration site. Two types are compatible if one has at least all the properties of the other with compatible types.</p>
+
+<pre><code class="language-typescript">interface Point2D {
+  x: number;
+  y: number;
+}
+
+interface Vector2D {
+  x: number;
+  y: number;
+}
+
+// These are FULLY compatible despite different names
+const point: Point2D = { x: 1, y: 2 };
+const vector: Vector2D = point; // ✅ No error — same shape
+
+// Even a class is compatible if shape matches
+class Coordinate {
+  constructor(public x: number, public y: number) {}
+}
+
+const coord: Point2D = new Coordinate(3, 4); // ✅ Works
+</code></pre>
+
+        <h3>Comparison with Nominal Typing (Java/C#)</h3>
+        <p>In nominal type systems, compatibility requires an explicit declaration relationship:</p>
+
+<pre><code class="language-typescript">// Java (nominal) — pseudocode for comparison
+// interface Printable { void print(); }
+// class Report { void print() { ... } }
+// Printable p = new Report(); // ❌ ERROR: Report doesn't implement Printable
+
+// TypeScript (structural) — equivalent
+interface Printable {
+  print(): void;
+}
+
+class Report {
+  print(): void { console.log("Report"); }
+}
+
+const p: Printable = new Report(); // ✅ Works — shape matches
+</code></pre>
+
+<pre class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│              NOMINAL vs STRUCTURAL                            │
+├─────────────────────────────┬───────────────────────────────┤
+│         NOMINAL             │         STRUCTURAL            │
+│    (Java, C#, Rust)         │    (TypeScript, Go, OCaml)    │
+├─────────────────────────────┼───────────────────────────────┤
+│ class Dog implements Animal │ type Dog = { name: string }   │
+│ Explicit relationship       │ Implicit — shape matches      │
+│ Identity matters            │ Structure matters             │
+│ Safe by default             │ Flexible by default           │
+│ Verbose                     │ Concise                       │
+│ Refactoring: rename breaks  │ Refactoring: rename is safe   │
+└─────────────────────────────┴───────────────────────────────┘
+</pre>
+
+        <h3>Duck Typing Relationship</h3>
+        <p>Structural typing is the static (compile-time) equivalent of duck typing ("if it walks like a duck and quacks like a duck..."). TypeScript's design goal was to type-check existing JavaScript patterns, and JavaScript is inherently duck-typed at runtime.</p>
+
+        <h3>When Structural Typing Causes Bugs</h3>
+
+<pre><code class="language-typescript">// The classic accidental compatibility bug
+type UserId = string;
+type OrderId = string;
+
+function getOrder(orderId: OrderId): Order { /* ... */ }
+
+const userId: UserId = "user_123";
+getOrder(userId); // ✅ No error! Both are just 'string'
+
+// More dangerous: objects with similar shapes
+interface DatabaseConfig {
+  host: string;
+  port: number;
+  password: string;
+}
+
+interface ApiEndpoint {
+  host: string;
+  port: number;
+  password: string; // API key, not DB password
+}
+
+function connectToDatabase(config: DatabaseConfig): void { /* ... */ }
+
+const api: ApiEndpoint = { host: "api.example.com", port: 443, password: "api-key" };
+connectToDatabase(api); // ✅ No error — shape matches, semantics don't
+</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Scale problem:</strong> In a codebase with 500+ type definitions, accidental structural compatibility becomes statistically likely. Two teams independently defining types with similar shapes will create silent assignment bugs that only manifest at runtime.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: Type Compatibility Rules -->
+    <section id="type-compatibility">
+      <h2>Type Compatibility Rules</h2>
+      <details>
+        <summary>Assignment compatibility, bivariance, and subtyping</summary>
+
+        <h3>Assignment Compatibility</h3>
+        <p>TypeScript uses a <em>structural subtyping</em> rule: type S is assignable to type T if S has at least all properties of T with compatible types. Extra properties are allowed (width subtyping).</p>
+
+<pre><code class="language-typescript">interface Animal {
+  name: string;
+}
+
+interface Dog extends Animal {
+  breed: string;
+}
+
+// Dog is a subtype of Animal (has all Animal properties + more)
+let animal: Animal;
+const dog: Dog = { name: "Rex", breed: "Labrador" };
+animal = dog; // ✅ Dog has everything Animal needs
+
+// But not the reverse:
+// let dog2: Dog = animal; // ❌ Error: 'breed' missing
+</code></pre>
+
+        <h3>Function Compatibility</h3>
+        <p>Functions are compatible based on parameter and return type compatibility:</p>
+
+<pre><code class="language-typescript">type Handler = (event: MouseEvent) =&gt; void;
+
+// Fewer parameters are OK (extra params ignored)
+const clickHandler: Handler = () =&gt; {}; // ✅ zero params
+
+// Parameters are checked contravariantly (with --strictFunctionTypes)
+type AnimalHandler = (a: Animal) =&gt; void;
+type DogHandler = (d: Dog) =&gt; void;
+
+let animalFn: AnimalHandler = (a) =&gt; console.log(a.name);
+let dogFn: DogHandler = (d) =&gt; console.log(d.breed);
+
+// With --strictFunctionTypes:
+// animalFn = dogFn; // ❌ Error: Dog handler can't handle all Animals
+dogFn = animalFn;    // ✅ Animal handler can handle Dogs (contravariance)
+</code></pre>
+
+        <h3>Bivariance (without --strictFunctionTypes)</h3>
+        <p>Without the strict flag, TypeScript allows function parameters to be bivariant — both covariant and contravariant. This is unsound but was necessary for DOM event handler patterns:</p>
+
+<pre><code class="language-typescript">// Without --strictFunctionTypes (bivariant):
+interface EventMap {
+  click: MouseEvent;
+  keydown: KeyboardEvent;
+}
+
+// addEventListener expects (e: Event) =&gt; void
+// But we pass (e: MouseEvent) =&gt; void — technically unsound
+// Bivariance allows this common pattern
+element.addEventListener("click", (e: MouseEvent) =&gt; {
+  console.log(e.clientX); // Works in practice
+});
+</code></pre>
+
+        <h3>Subtype vs Supertype Mental Model</h3>
+<pre class="diagram">
+┌───────────────────────────────────────┐
+│           TYPE HIERARCHY              │
+│                                       │
+│   unknown  (top type — supertype)     │
+│      │                                │
+│   object / string / number            │
+│      │                                │
+│   { name: string }                    │
+│      │                                │
+│   { name: string, age: number }       │
+│      │                                │
+│   never  (bottom type — subtype)      │
+│                                       │
+│   More properties = narrower type     │
+│   Fewer properties = wider type       │
+└───────────────────────────────────────┘
+</pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Excess Property Checking -->
+    <section id="excess-property-checking">
+      <h2>Excess Property Checking</h2>
+      <details>
+        <summary>When TypeScript checks for extra properties (and when it doesn't)</summary>
+
+        <h3>When It Applies: Fresh Object Literals Only</h3>
+        <p>Excess property checking is a <em>special</em> check that only triggers on "fresh" object literals — objects created inline at the point of assignment:</p>
+
+<pre><code class="language-typescript">interface Config {
+  host: string;
+  port: number;
+}
+
+// ✅ Excess property checking catches the typo
+const config: Config = {
+  host: "localhost",
+  port: 3000,
+  prot: 8080  // ❌ Error: 'prot' does not exist in type 'Config'
+};
+</code></pre>
+
+        <h3>When It Doesn't Apply: Variable Assignment</h3>
+<pre><code class="language-typescript">// The SAME object, assigned via variable — NO excess checking
+const rawConfig = {
+  host: "localhost",
+  port: 3000,
+  prot: 8080  // Typo goes unnoticed
+};
+
+const config: Config = rawConfig; // ✅ No error!
+// TypeScript only checks: does rawConfig have host:string and port:number?
+// Extra properties are silently allowed via width subtyping
+</code></pre>
+
+        <h3>Why This Design Choice?</h3>
+        <p>Structural typing means a subtype can always have extra properties. The excess property check is a pragmatic <em>linting</em> heuristic layered on top:</p>
+        <ul>
+          <li>Fresh literals are likely <em>intended</em> to match the target type exactly — extra props are probably typos</li>
+          <li>Variables may come from other code paths where extra properties are legitimate</li>
+          <li>Without this distinction, too much valid JavaScript would be rejected</li>
+        </ul>
+
+        <h3>Workarounds for Strict Checking</h3>
+<pre><code class="language-typescript">// 1. Use satisfies (TypeScript 4.9+) — excess checking without widening
+const config = {
+  host: "localhost",
+  port: 3000,
+  prot: 8080  // ❌ Error with satisfies
+} satisfies Config;
+
+// 2. Type the variable explicitly at declaration
+const config: Config = {
+  host: "localhost",
+  port: 3000,
+  // Extra properties caught here
+};
+
+// 3. Helper function that enforces exact types
+function exactConfig&lt;T extends Config&gt;(
+  config: T &amp; Record&lt;Exclude&lt;keyof T, keyof Config&gt;, never&gt;
+): Config {
+  return config;
+}
+
+// 4. Branded approach for critical configs
+type StrictConfig = Config &amp; { readonly __brand: unique symbol };
+</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Interview tip:</strong> Explaining the "freshness" concept — that excess property checking is NOT part of the structural type system but a separate heuristic — demonstrates deep understanding that separates senior from mid-level candidates.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 6: Freshness & Widening -->
+    <section id="freshness-widening">
+      <h2>Freshness &amp; Widening</h2>
+      <details>
+        <summary>Literal type widening, const assertions, and inference behavior</summary>
+
+        <h3>Literal Type Widening</h3>
+        <p>When TypeScript infers a type from a value, it "widens" literal types to their base type for mutable bindings:</p>
+
+<pre><code class="language-typescript">// Widening: let bindings widen literals
+let status = "active";      // Type: string (widened)
+let count = 42;             // Type: number (widened)
+let flag = true;            // Type: boolean (widened)
+
+// No widening: const bindings preserve literals
+const status2 = "active";  // Type: "active" (literal)
+const count2 = 42;         // Type: 42 (literal)
+const flag2 = true;        // Type: true (literal)
+</code></pre>
+
+        <h3>Why Widening Exists</h3>
+        <p>Mutable variables can be reassigned, so TypeScript widens to allow future assignments:</p>
+
+<pre><code class="language-typescript">let direction = "north"; // Type: string — because you might do:
+direction = "south";     // ✅ Valid reassignment
+
+// If TS inferred "north" literal, this would fail:
+// direction = "south"; // ❌ Type '"south"' not assignable to '"north"'
+</code></pre>
+
+        <h3>Const Assertions</h3>
+        <p>Use <code>as const</code> to prevent widening on complex structures:</p>
+
+<pre><code class="language-typescript">// Without as const — types are widened
+const config = {
+  endpoint: "https://api.example.com",  // string
+  retries: 3,                            // number
+  methods: ["GET", "POST"]               // string[]
+};
+
+// With as const — everything becomes readonly literal types
+const config2 = {
+  endpoint: "https://api.example.com",  // "https://api.example.com"
+  retries: 3,                            // 3
+  methods: ["GET", "POST"]               // readonly ["GET", "POST"]
+} as const;
+
+// Type of config2:
+// {
+//   readonly endpoint: "https://api.example.com";
+//   readonly retries: 3;
+//   readonly methods: readonly ["GET", "POST"];
+// }
+</code></pre>
+
+        <h3>Mutable vs Immutable Inference</h3>
+<pre><code class="language-typescript">// Array widening behavior
+const mutableArr = [1, 2, 3];           // number[]
+const readonlyArr = [1, 2, 3] as const; // readonly [1, 2, 3]
+
+// Object property widening
+function getConfig() {
+  return { mode: "production" }; // { mode: string } — widened!
+}
+
+function getConfig2() {
+  return { mode: "production" } as const; // { readonly mode: "production" }
+}
+
+// The satisfies + as const pattern (TS 4.9+)
+const routes = {
+  home: "/",
+  about: "/about",
+  user: "/user/:id"
+} as const satisfies Record&lt;string, string&gt;;
+// Validates shape AND preserves literal types
+</code></pre>
+
+        <h3>When TypeScript Widens 'hello' to string</h3>
+<pre><code class="language-typescript">// Widening contexts:
+let x = "hello";                    // string (mutable binding)
+const obj = { greeting: "hello" };  // { greeting: string } (mutable property)
+const arr = ["hello"];              // string[] (mutable array)
+
+// Non-widening contexts:
+const x2 = "hello";                // "hello" (const binding)
+const obj2 = { greeting: "hello" } as const; // literal
+function fn(x: "hello") {}         // parameter annotation prevents widening
+
+// Explicit annotation prevents widening
+let x3: "hello" = "hello";         // "hello" (annotation wins)
+</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Key insight:</strong> Widening is TypeScript's way of balancing type precision with usability. <code>as const</code> opts out of widening entirely, making every value its literal type and every structure deeply readonly.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 7: Type Inference Algorithm -->
+    <section id="type-inference">
+      <h2>Type Inference Algorithm</h2>
+      <details>
+        <summary>Bottom-up inference, contextual typing, and control flow analysis</summary>
+
+        <h3>Bottom-Up Inference (Synthesis)</h3>
+        <p>TypeScript's primary inference direction is bottom-up: it starts from leaf expressions and synthesizes types upward:</p>
+
+<pre><code class="language-typescript">// Bottom-up: TS infers from values
+const x = 5;                    // number (from literal)
+const y = x + 1;                // number (from operator)
+const arr = [1, "two", true];   // (number | string | boolean)[]
+
+// Function return type inference
+function add(a: number, b: number) {
+  return a + b; // Return type inferred as number
+}
+
+// Complex inference through call chains
+const result = [1, 2, 3]
+  .map(x =&gt; x * 2)      // number[] (inferred)
+  .filter(x =&gt; x &gt; 2)   // number[] (inferred)
+  .reduce((a, b) =&gt; a + b, 0); // number (inferred)
+</code></pre>
+
+        <h3>Contextual Typing (Top-Down)</h3>
+        <p>In certain positions, TypeScript pushes type information <em>downward</em> from the expected type:</p>
+
+<pre><code class="language-typescript">// The parameter type is inferred from context
+const numbers = [1, 2, 3];
+numbers.forEach((item) =&gt; {
+  // item is inferred as number from Array&lt;number&gt;.forEach signature
+  console.log(item.toFixed(2));
+});
+
+// Event handler contextual typing
+document.addEventListener("click", (event) =&gt; {
+  // event is MouseEvent — inferred from addEventListener overload
+  console.log(event.clientX);
+});
+
+// Variable with type annotation provides context
+const handler: (x: number) =&gt; string = (x) =&gt; {
+  // x is number, return must be string — from annotation
+  return x.toString();
+};
+</code></pre>
+
+        <h3>Best Common Type</h3>
+        <p>When inferring a type from multiple expressions (array literals, conditional branches), TypeScript finds the "best common type":</p>
+
+<pre><code class="language-typescript">// Best common type from array elements
+const mixed = [1, "two", null];
+// Type: (string | number | null)[] — union of all elements
+
+// Conditional expression
+function getValue(flag: boolean) {
+  return flag ? 42 : "hello";
+  // Return type: number | string
+}
+
+// Class hierarchy — picks the most specific common ancestor
+class Animal { name = ""; }
+class Dog extends Animal { breed = ""; }
+class Cat extends Animal { indoor = true; }
+
+const pets = [new Dog(), new Cat()];
+// Type: (Dog | Cat)[] — NOT Animal[]
+// TS uses union, not common base class
+</code></pre>
+
+        <h3>Control Flow Narrowing Interaction</h3>
+<pre><code class="language-typescript">// Control flow analysis narrows types after checks
+function process(input: string | number | null) {
+  if (input === null) {
+    return; // input: null in this branch
+  }
+  // input: string | number (narrowed — null eliminated)
+
+  if (typeof input === "string") {
+    console.log(input.toUpperCase()); // input: string
+  } else {
+    console.log(input.toFixed(2));    // input: number
+  }
+}
+
+// Discriminated unions + narrowing
+type Result&lt;T&gt; =
+  | { success: true; data: T }
+  | { success: false; error: Error };
+
+function handle&lt;T&gt;(result: Result&lt;T&gt;) {
+  if (result.success) {
+    // result: { success: true; data: T }
+    console.log(result.data);
+  } else {
+    // result: { success: false; error: Error }
+    console.log(result.error.message);
+  }
+}
+
+// Type predicates for custom narrowing
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Performance note:</strong> Control flow narrowing is one of the most expensive operations in the type checker. Deeply nested conditionals with complex union types can cause exponential type-checking time.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 8: Variance -->
+    <section id="variance">
+      <h2>Variance</h2>
+      <details>
+        <summary>Covariance, contravariance, bivariance, invariance — with practical examples</summary>
+
+        <h3>What is Variance?</h3>
+        <p>Variance describes how subtyping of type parameters relates to subtyping of the container type. If <code>Dog extends Animal</code>, what's the relationship between <code>Container&lt;Dog&gt;</code> and <code>Container&lt;Animal&gt;</code>?</p>
+
+<pre class="diagram">
+Given: Dog extends Animal (Dog is a subtype of Animal)
+
+┌────────────────────────────────────────────────────────────────┐
+│  VARIANCE KINDS                                                 │
+├──────────────┬─────────────────────────────────────────────────┤
+│ Covariant    │ Container&lt;Dog&gt; ⊆ Container&lt;Animal&gt;             │
+│ (out T)      │ Subtyping preserved — same direction             │
+├──────────────┼─────────────────────────────────────────────────┤
+│ Contravariant│ Container&lt;Animal&gt; ⊆ Container&lt;Dog&gt;             │
+│ (in T)       │ Subtyping reversed — opposite direction          │
+├──────────────┼─────────────────────────────────────────────────┤
+│ Invariant    │ No subtyping relationship                        │
+│ (in out T)   │ Must be exact match                              │
+├──────────────┼─────────────────────────────────────────────────┤
+│ Bivariant    │ Both directions allowed (unsound)                │
+│              │ TypeScript's default for methods                  │
+└──────────────┴─────────────────────────────────────────────────┘
+</pre>
+
+        <h3>Covariance (Arrays, Return Types)</h3>
+        <p>Arrays are covariant in TypeScript (this is actually unsound but practical):</p>
+
+<pre><code class="language-typescript">class Animal { name: string = ""; }
+class Dog extends Animal { breed: string = ""; }
+class Cat extends Animal { indoor: boolean = true; }
+
+// Arrays are covariant: Dog[] assignable to Animal[]
+const dogs: Dog[] = [{ name: "Rex", breed: "Lab" }];
+const animals: Animal[] = dogs; // ✅ Covariant — allowed
+
+// But this is UNSOUND:
+animals.push(new Cat()); // ✅ Compiles! But dogs array now has a Cat!
+// dogs[1].breed — runtime error, Cat has no .breed
+
+// ⚠️ This unsoundness is DELIBERATE — TypeScript intentionally makes arrays
+// covariant for pragmatic reasons (Java/C# made the same choice). Making arrays
+// invariant would break too many common patterns (passing Dog[] to a function
+// that reads Animal[]). The --strictFunctionTypes flag fixes function parameter
+// bivariance but does NOT affect array covariance.
+
+// Return types are covariant (safe):
+type AnimalFactory = () =&gt; Animal;
+type DogFactory = () =&gt; Dog;
+
+const makeDog: DogFactory = () =&gt; ({ name: "Rex", breed: "Lab" });
+const makeAnimal: AnimalFactory = makeDog; // ✅ Covariant return
+// If you expect an Animal, getting a Dog is fine
+</code></pre>
+
+        <h3>Contravariance (Function Parameters with --strict)</h3>
+        <p>Function parameters are contravariant under <code>--strictFunctionTypes</code>:</p>
+
+<pre><code class="language-typescript">type AnimalHandler = (animal: Animal) =&gt; void;
+type DogHandler = (dog: Dog) =&gt; void;
+
+const handleAnimal: AnimalHandler = (a) =&gt; console.log(a.name);
+const handleDog: DogHandler = (d) =&gt; console.log(d.breed);
+
+// Contravariant: AnimalHandler assignable to DogHandler
+const dogCallback: DogHandler = handleAnimal; // ✅
+// Why? If you need a function that handles Dogs,
+// a function that handles ALL Animals certainly handles Dogs
+
+// The reverse is NOT safe:
+// const animalCallback: AnimalHandler = handleDog; // ❌ Error
+// Why? handleDog accesses .breed — what if passed a Cat?
+</code></pre>
+
+        <h3>Bivariance (Methods, Event Handlers)</h3>
+        <p>Method syntax in interfaces is bivariant (both co- and contra- allowed) — this is TypeScript's pragmatic unsoundness for DOM compatibility:</p>
+
+<pre><code class="language-typescript">interface EventSource {
+  // Method syntax — BIVARIANT (unsound but practical)
+  addEventListener(handler: (event: Event) =&gt; void): void;
+}
+
+// This compiles even though MouseEvent is a subtype of Event:
+const source: EventSource = {
+  addEventListener(handler: (event: MouseEvent) =&gt; void) {
+    // Bivariant: MouseEvent handler accepted where Event handler expected
+  }
+};
+
+// To get strict checking, use property syntax:
+interface StrictEventSource {
+  // Property syntax — CONTRAVARIANT with --strictFunctionTypes
+  addEventListener: (handler: (event: Event) =&gt; void) =&gt; void;
+}
+</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Critical distinction:</strong> Method syntax (<code>fn(): void</code>) is bivariant. Property syntax (<code>fn: () =&gt; void</code>) is strictly checked. This is why React's type definitions use property syntax for callbacks.</p>
+        </div>
+
+        <h3>Invariance</h3>
+        <p>A type parameter is invariant when it appears in both input and output positions:</p>
+
+<pre><code class="language-typescript">// Invariant: used in both read and write positions
+interface MutableBox&lt;T&gt; {
+  get(): T;    // Output (covariant) position
+  set(v: T): void;  // Input (contravariant) position
+}
+
+// Neither assignment works:
+declare let animalBox: MutableBox&lt;Animal&gt;;
+declare let dogBox: MutableBox&lt;Dog&gt;;
+
+// animalBox = dogBox; // ❌ — could call animalBox.set(new Cat())
+// dogBox = animalBox; // ❌ — dogBox.get().breed would fail
+</code></pre>
+
+        <h3>in/out Keywords (TypeScript 4.7+)</h3>
+        <p>Explicit variance annotations for performance and correctness:</p>
+
+<pre><code class="language-typescript">// Explicit variance annotations
+interface Producer&lt;out T&gt; {
+  get(): T;
+}
+
+interface Consumer&lt;in T&gt; {
+  accept(value: T): void;
+}
+
+interface Invariant&lt;in out T&gt; {
+  get(): T;
+  set(value: T): void;
+}
+
+// Benefits:
+// 1. Performance — TS doesn't need to structurally compute variance
+// 2. Correctness — TS errors if your usage contradicts the annotation
+// 3. Documentation — intent is explicit
+
+// Error if annotation contradicts usage:
+interface Wrong&lt;out T&gt; {
+  accept(value: T): void; // ❌ Error: T is used in 'in' position
+}
+</code></pre>
+
+        <h3>Practical Variance Example: State Management</h3>
+<pre><code class="language-typescript">// Real-world variance in a state management context
+interface ReadonlyStore&lt;out T&gt; {
+  getState(): T;
+  subscribe(listener: () =&gt; void): () =&gt; void;
+}
+
+interface WritableStore&lt;in out T&gt; extends ReadonlyStore&lt;T&gt; {
+  setState(value: T): void;
+}
+
+interface AppState { user: User; posts: Post[] }
+interface AdminState extends AppState { adminPanel: AdminConfig }
+
+// Covariant read: ReadonlyStore&lt;AdminState&gt; → ReadonlyStore&lt;AppState&gt;
+declare const adminStore: ReadonlyStore&lt;AdminState&gt;;
+const appStore: ReadonlyStore&lt;AppState&gt; = adminStore; // ✅
+
+// Invariant read+write: WritableStore doesn't allow this
+declare const writableAdmin: WritableStore&lt;AdminState&gt;;
+// const writableApp: WritableStore&lt;AppState&gt; = writableAdmin; // ❌
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 9: Branded/Opaque Types -->
+    <section id="branded-types">
+      <h2>Branded/Opaque Types for Nominal Behavior</h2>
+      <details>
+        <summary>Adding nominal-like safety to TypeScript's structural system</summary>
+
+        <h3>The Brand Pattern</h3>
+        <p>A branded type intersects a base type with a unique phantom property that exists only at the type level:</p>
+
+<pre><code class="language-typescript">// The brand pattern: intersection with a phantom unique symbol
+declare const __brand: unique symbol;
+
+type Brand&lt;T, B extends string&gt; = T &amp; { readonly [__brand]: B };
+
+// Now these are incompatible despite both being string at runtime:
+type UserId = Brand&lt;string, "UserId"&gt;;
+type OrderId = Brand&lt;string, "OrderId"&gt;;
+type Email = Brand&lt;string, "Email"&gt;;
+
+// These are now nominal — shape alone doesn't satisfy the brand
+declare const userId: UserId;
+declare const orderId: OrderId;
+
+function getOrder(id: OrderId): void { /* ... */ }
+
+// getOrder(userId); // ❌ Error: UserId not assignable to OrderId
+getOrder(orderId);   // ✅ Only OrderId works
+</code></pre>
+
+        <h3>Implementing Branded Types with Validation</h3>
+<pre><code class="language-typescript">// Complete branded type library
+declare const __brand: unique symbol;
+type Brand&lt;T, B extends string&gt; = T &amp; { readonly [__brand]: B };
+
+// Smart constructors with runtime validation
+type Email = Brand&lt;string, "Email"&gt;;
+type PositiveInt = Brand&lt;number, "PositiveInt"&gt;;
+type NonEmptyString = Brand&lt;string, "NonEmptyString"&gt;;
+type Url = Brand&lt;string, "Url"&gt;;
+
+// Validation function that narrows to branded type
+function createEmail(input: string): Email {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(input)) {
+    throw new Error(`Invalid email: ${input}`);
+  }
+  return input as Email; // Type assertion at validation boundary
+}
+
+function createPositiveInt(input: number): PositiveInt {
+  if (!Number.isInteger(input) || input &lt;= 0) {
+    throw new Error(`Not a positive integer: ${input}`);
+  }
+  return input as PositiveInt;
+}
+
+// Result-based validation (no throws)
+type ValidationResult&lt;T&gt; =
+  | { success: true; value: T }
+  | { success: false; error: string };
+
+function parseEmail(input: string): ValidationResult&lt;Email&gt; {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(input)) {
+    return { success: false, error: `Invalid email: ${input}` };
+  }
+  return { success: true, value: input as Email };
+}
+</code></pre>
+
+        <h3>Real-World Use Cases</h3>
+<pre><code class="language-typescript">// Financial calculations with Money type
+type Currency = "USD" | "EUR" | "GBP";
+type Money&lt;C extends Currency&gt; = Brand&lt;number, `Money_${C}`&gt;;
+
+type USD = Money&lt;"USD"&gt;;
+type EUR = Money&lt;"EUR"&gt;;
+
+function addMoney&lt;C extends Currency&gt;(a: Money&lt;C&gt;, b: Money&lt;C&gt;): Money&lt;C&gt; {
+  return (a + b) as Money&lt;C&gt;;
+}
+
+declare const dollars: USD;
+declare const euros: EUR;
+
+// addMoney(dollars, euros); // ❌ Can't mix currencies!
+addMoney(dollars, dollars);   // ✅
+
+// Database IDs — prevent mixing entity IDs
+type UserId = Brand&lt;string, "UserId"&gt;;
+type PostId = Brand&lt;string, "PostId"&gt;;
+type CommentId = Brand&lt;string, "CommentId"&gt;;
+
+interface Post {
+  id: PostId;
+  authorId: UserId;
+  title: string;
+}
+
+function getPostsByAuthor(authorId: UserId): Post[] { /* ... */ }
+
+declare const postId: PostId;
+// getPostsByAuthor(postId); // ❌ PostId is not a UserId
+</code></pre>
+
+        <h3>Comparison with Haskell's newtype</h3>
+<pre class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│  NOMINAL TYPE APPROACHES ACROSS LANGUAGES                        │
+├──────────────┬──────────────────────────────────────────────────┤
+│ Haskell      │ newtype UserId = UserId String                    │
+│              │ Zero-cost wrapper, fully nominal, pattern match   │
+├──────────────┼──────────────────────────────────────────────────┤
+│ Rust         │ struct UserId(String);                            │
+│              │ Newtype pattern, .0 to access inner              │
+├──────────────┼──────────────────────────────────────────────────┤
+│ TypeScript   │ type UserId = string &amp; { __brand: "UserId" }    │
+│              │ Phantom brand, erased at runtime, assertion req'd │
+├──────────────┼──────────────────────────────────────────────────┤
+│ Key diff     │ TS brands are erased — no runtime overhead        │
+│              │ But also no runtime safety without validation     │
+└──────────────┴──────────────────────────────────────────────────┘
+</pre>
+
+        <div class="callout callout-info">
+          <p><strong>Architecture insight:</strong> Place branded type constructors at system boundaries (API responses, database reads, user input). Once data enters your system as a branded type, all internal code gets compile-time safety without runtime cost.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: Declaration Files -->
+    <section id="declaration-files">
+      <h2>Declaration Files (.d.ts) Internals</h2>
+      <details>
+        <summary>Ambient declarations, generation, and lib.d.ts</summary>
+
+        <h3>How .d.ts Files Are Generated</h3>
+        <p>Declaration files are TypeScript's mechanism for describing the shape of JavaScript code without implementation:</p>
+
+<pre><code class="language-typescript">// Source: utils.ts
+export function debounce&lt;T extends (...args: any[]) =&gt; any&gt;(
+  fn: T,
+  delay: number
+): (...args: Parameters&lt;T&gt;) =&gt; void {
+  let timer: ReturnType&lt;typeof setTimeout&gt;;
+  return (...args) =&gt; {
+    clearTimeout(timer);
+    timer = setTimeout(() =&gt; fn(...args), delay);
+  };
+}
+
+// Generated: utils.d.ts (via tsc --declaration)
+export declare function debounce&lt;T extends (...args: any[]) =&gt; any&gt;(
+  fn: T,
+  delay: number
+): (...args: Parameters&lt;T&gt;) =&gt; void;
+</code></pre>
+
+        <h3>Ambient Declarations &amp; declare Keyword</h3>
+<pre><code class="language-typescript">// declare tells TS "this exists at runtime, trust me"
+// No implementation — just type information
+
+// Global variable (e.g., injected by script tag)
+declare const __APP_VERSION__: string;
+declare const __DEV__: boolean;
+
+// Global function
+declare function gtag(command: string, ...args: any[]): void;
+
+// Ambient module (for untyped npm packages)
+declare module "legacy-library" {
+  export function doThing(x: string): number;
+  export default class LegacyClient {
+    connect(url: string): Promise&lt;void&gt;;
+  }
+}
+
+// Wildcard module declarations (CSS modules, images)
+declare module "*.css" {
+  const classes: Record&lt;string, string&gt;;
+  export default classes;
+}
+
+declare module "*.svg" {
+  const content: string;
+  export default content;
+}
+</code></pre>
+
+        <h3>Triple-Slash References</h3>
+<pre><code class="language-typescript">// Reference another declaration file
+/// &lt;reference path="./global.d.ts" /&gt;
+
+// Reference a @types package
+/// &lt;reference types="node" /&gt;
+
+// Reference a lib (e.g., add DOM types)
+/// &lt;reference lib="dom" /&gt;
+/// &lt;reference lib="es2022" /&gt;
+
+// These are mostly replaced by tsconfig.json "types" and "lib"
+// but still needed for:
+// 1. Declaration files that reference other declarations
+// 2. Augmenting global scope from a module file
+</code></pre>
+
+        <h3>lib.d.ts and DOM Typings</h3>
+<pre><code class="language-typescript">// TypeScript ships built-in declarations in lib.*.d.ts
+// Controlled by tsconfig "lib" array:
+{
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+  }
+}
+
+// lib.es2022.d.ts provides: Promise, Map, Set, Array methods
+// lib.dom.d.ts provides: Document, Element, Event, HTMLElement
+// lib.dom.iterable.d.ts provides: NodeList iteration
+
+// You can augment built-in lib types:
+interface Array&lt;T&gt; {
+  // Add a custom method to all arrays (module augmentation)
+  customFilter(predicate: (item: T) =&gt; boolean): T[];
+}
+</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Pro tip:</strong> Use <code>skipLibCheck: true</code> in tsconfig to skip type-checking .d.ts files. This dramatically speeds up compilation in large projects where you trust your dependencies' type definitions.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 11: Type Resolution & Module Augmentation -->
+    <section id="type-resolution">
+      <h2>Type Resolution &amp; Module Augmentation</h2>
+      <details>
+        <summary>How TypeScript finds and resolves types</summary>
+
+        <h3>Module Resolution Algorithms</h3>
+        <p>TypeScript supports multiple strategies for resolving import paths to files:</p>
+
+<pre><code class="language-typescript">// tsconfig.json resolution configuration
+{
+  "compilerOptions": {
+    // Resolution strategy
+    "moduleResolution": "bundler", // TS 5.0+ for Vite/webpack
+    // "moduleResolution": "node16", // For Node.js ESM
+    // "moduleResolution": "node",   // Legacy CommonJS
+
+    // Base URL for non-relative imports
+    "baseUrl": "./src",
+
+    // Path mapping (monorepo aliases)
+    "paths": {
+      "@shared/*": ["../shared/src/*"],
+      "@ui/*": ["./components/ui/*"],
+      "@utils/*": ["./lib/utils/*"]
+    },
+
+    // Where to look for @types packages
+    "typeRoots": ["./types", "./node_modules/@types"]
+  }
+}
+</code></pre>
+
+        <h3>Resolution Order</h3>
+<pre class="diagram">
+import { foo } from "@shared/utils"
+
+Resolution steps (moduleResolution: "bundler"):
+┌────────────────────────────────────────────────────┐
+│ 1. Check paths mapping: @shared/* → ../shared/src/*│
+│    → Try ../shared/src/utils.ts                    │
+│    → Try ../shared/src/utils/index.ts              │
+│                                                    │
+│ 2. If no paths match, check baseUrl:               │
+│    → Try ./src/@shared/utils.ts                    │
+│                                                    │
+│ 3. Check node_modules:                             │
+│    → node_modules/@shared/utils/package.json       │
+│    → node_modules/@shared/utils/index.d.ts         │
+│                                                    │
+│ 4. Check @types:                                   │
+│    → node_modules/@types/shared__utils/index.d.ts  │
+└────────────────────────────────────────────────────┘
+</pre>
+
+        <h3>Module Augmentation</h3>
+        <p>Extend existing module types without modifying the original source:</p>
+
+<pre><code class="language-typescript">// Augment Express Request (add custom properties)
+// file: types/express.d.ts
+import "express";
+
+declare module "express" {
+  interface Request {
+    user?: {
+      id: string;
+      role: "admin" | "user";
+    };
+    requestId: string;
+  }
+}
+
+// Augment a library's types
+declare module "react" {
+  interface CSSProperties {
+    // Allow CSS custom properties
+    [key: `--${string}`]: string | number;
+  }
+}
+
+// Global augmentation from a module file
+export {}; // Makes this file a module
+
+declare global {
+  interface Window {
+    analytics: AnalyticsClient;
+    featureFlags: Record&lt;string, boolean&gt;;
+  }
+
+  // Add to global namespace
+  function __debug(msg: string): void;
+}
+</code></pre>
+
+        <h3>Path Mapping for Monorepos</h3>
+<pre><code class="language-typescript">// Root tsconfig.json (monorepo)
+{
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "baseUrl": ".",
+    "paths": {
+      "@myorg/shared": ["packages/shared/src/index.ts"],
+      "@myorg/ui": ["packages/ui/src/index.ts"],
+      "@myorg/api-types": ["packages/api-types/src/index.ts"]
+    }
+  },
+  "references": [
+    { "path": "packages/shared" },
+    { "path": "packages/ui" },
+    { "path": "packages/api-types" }
+  ]
+}
+
+// packages/shared/tsconfig.json
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "include": ["src/**/*"]
+}
+</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Common pitfall:</strong> <code>paths</code> only affects TypeScript's type resolution — it does NOT rewrite imports in emitted JavaScript. You still need your bundler (webpack/Vite) or <code>tsc-alias</code> to resolve these paths at runtime.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 12: Type Checker Performance -->
+    <section id="type-checker-performance">
+      <h2>Performance of the Type Checker</h2>
+      <details>
+        <summary>What makes types slow, and how to fix it</summary>
+
+        <h3>What Makes Types Slow</h3>
+        <p>TypeScript's type checker is Turing-complete — complex types can cause exponential checking time:</p>
+
+<pre><code class="language-typescript">// ❌ SLOW: Deep recursive conditional types
+type DeepPartial&lt;T&gt; = T extends object
+  ? { [K in keyof T]?: DeepPartial&lt;T[K]&gt; }
+  : T;
+
+// ❌ SLOW: Large union distributions
+type AllPermutations&lt;T extends string&gt; = T extends any
+  ? T | `${T}_${AllPermutations&lt;Exclude&lt;T, T&gt;&gt;}`
+  : never;
+
+// ❌ SLOW: Complex mapped types over large objects
+type Validate&lt;T&gt; = {
+  [K in keyof T]: T[K] extends string
+    ? T[K] extends `${infer _}`
+      ? ValidateString&lt;T[K]&gt;
+      : T[K]
+    : T[K] extends number
+      ? ValidateNumber&lt;T[K]&gt;
+      : T[K];
+};
+
+// ✅ FAST: Simple interfaces and type aliases
+interface UserDTO {
+  id: string;
+  name: string;
+  email: string;
+}
+</code></pre>
+
+        <h3>Common Performance Killers</h3>
+        <table>
+          <thead>
+            <tr><th>Pattern</th><th>Why It's Slow</th><th>Mitigation</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Deep recursive types (>5 levels)</td><td>Exponential expansion</td><td>Add recursion depth limits</td></tr>
+            <tr><td>Large unions (50+ members)</td><td>Distributive comparison</td><td>Use discriminated unions, maps</td></tr>
+            <tr><td>Complex conditional chains</td><td>Each branch evaluated</td><td>Simplify, use overloads</td></tr>
+            <tr><td>Excessive type inference</td><td>Full expression tree walk</td><td>Add explicit annotations</td></tr>
+            <tr><td>Template literal types</td><td>Combinatorial explosion</td><td>Constrain inputs</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Project References</h3>
+<pre><code class="language-typescript">// tsconfig.json with project references
+{
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "incremental": true,
+    "tsBuildInfoFile": "./.tsbuildinfo"
+  },
+  "references": [
+    { "path": "../shared" },
+    { "path": "../api-types" }
+  ]
+}
+
+// Build only what changed:
+// tsc --build --watch
+// tsc -b --clean (rebuild all)
+</code></pre>
+
+        <h3>Incremental Compilation</h3>
+<pre><code class="language-typescript">// Enable incremental builds
+{
+  "compilerOptions": {
+    "incremental": true,
+    "tsBuildInfoFile": "./dist/.tsbuildinfo"
+  }
+}
+
+// The .tsbuildinfo file stores:
+// - File hashes (detect changes)
+// - Dependency graph (what to re-check)
+// - Semantic diagnostics cache
+
+// Result: subsequent builds only check changed files + dependents
+</code></pre>
+
+        <h3>Diagnosing Performance with --generateTrace</h3>
+<pre><code class="language-typescript">// Generate a trace for Chrome's about:tracing
+// tsc --generateTrace ./trace-output
+
+// This creates:
+// trace-output/trace.json  — Chrome DevTools Performance format
+// trace-output/types.json  — All instantiated types
+
+// Analyze in Chrome: chrome://tracing → Load trace.json
+// Look for:
+// - "checkExpression" spans &gt; 100ms
+// - "getTypeOfExpression" with high self-time
+// - Recursive type instantiation depth
+
+// Alternative: use @typescript/analyze-trace
+// npx analyze-trace ./trace-output
+</code></pre>
+
+        <h3>isolatedModules</h3>
+<pre><code class="language-typescript">// Forces single-file transpilation compatibility
+{
+  "compilerOptions": {
+    "isolatedModules": true  // Required for esbuild, swc, Babel
+  }
+}
+
+// Disallows patterns that need cross-file info:
+// ❌ const enum (inlined values need full program)
+const enum Direction { Up, Down } // Error with isolatedModules
+
+// ❌ Re-exporting types without 'type' keyword
+export { MyType } from "./types"; // Error
+export type { MyType } from "./types"; // ✅
+
+// ❌ Namespace merging across files
+// These require whole-program analysis
+</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Performance rule of thumb:</strong> If your IDE's TypeScript language service takes &gt;3s to respond, investigate with <code>--generateTrace</code>. The usual suspects: deeply nested generic types, large auto-generated API types, and excessive type-level computation in utility libraries.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 13: tsconfig Strict Mode Deep Dive -->
+    <section id="tsconfig-strict">
+      <h2>tsconfig Strict Mode Deep Dive</h2>
+      <details>
+        <summary>What strict enables, and how to migrate incrementally</summary>
+
+        <h3>What <code>"strict": true</code> Enables</h3>
+        <p>The <code>strict</code> flag is a shorthand that enables all strict-family flags:</p>
+
+<pre><code class="language-typescript">{
+  "compilerOptions": {
+    "strict": true
+    // Equivalent to ALL of these:
+    // "strictNullChecks": true,
+    // "strictFunctionTypes": true,
+    // "strictBindCallApply": true,
+    // "strictPropertyInitialization": true,
+    // "noImplicitAny": true,
+    // "noImplicitThis": true,
+    // "useUnknownInCatchVariables": true,
+    // "alwaysStrict": true
+  }
+}
+</code></pre>
+
+        <h3>Flag-by-Flag Breakdown</h3>
+        <table>
+          <thead>
+            <tr><th>Flag</th><th>What It Does</th><th>Common Errors It Catches</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>strictNullChecks</code></td><td>null/undefined not assignable to other types</td><td>Cannot read property of undefined</td></tr>
+            <tr><td><code>noImplicitAny</code></td><td>Parameters must have explicit types</td><td>Untyped function params</td></tr>
+            <tr><td><code>strictFunctionTypes</code></td><td>Function params checked contravariantly</td><td>Unsafe event handler assignments</td></tr>
+            <tr><td><code>strictPropertyInitialization</code></td><td>Class properties must be initialized</td><td>Accessing undefined class members</td></tr>
+            <tr><td><code>strictBindCallApply</code></td><td>Strict types for bind, call, apply</td><td>Wrong argument types in .call()</td></tr>
+            <tr><td><code>noImplicitThis</code></td><td>Must type 'this' in functions</td><td>Wrong 'this' context</td></tr>
+            <tr><td><code>useUnknownInCatchVariables</code></td><td>catch(e) is unknown, not any</td><td>Accessing .message without check</td></tr>
+            <tr><td><code>alwaysStrict</code></td><td>Emit "use strict" in all files</td><td>Sloppy mode behaviors</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Enabling Flags Individually (Migration Strategy)</h3>
+<pre><code class="language-typescript">// Phase 1: Start with least disruptive
+{
+  "compilerOptions": {
+    "noImplicitAny": true,        // Fix: add explicit types
+    "alwaysStrict": true           // Usually no code changes needed
+  }
+}
+
+// Phase 2: Null safety
+{
+  "compilerOptions": {
+    "strictNullChecks": true       // Biggest impact — many errors
+    // Strategy: use non-null assertion (!) temporarily, then fix
+  }
+}
+
+// Phase 3: Function and class strictness
+{
+  "compilerOptions": {
+    "strictFunctionTypes": true,
+    "strictPropertyInitialization": true,
+    "strictBindCallApply": true,
+    "noImplicitThis": true
+  }
+}
+
+// Phase 4: Full strict (add remaining)
+{
+  "compilerOptions": {
+    "strict": true,
+    "useUnknownInCatchVariables": true
+  }
+}
+</code></pre>
+
+        <h3>Migration Strategies for Large Codebases</h3>
+<pre><code class="language-typescript">// Strategy 1: Directory-by-directory with project references
+// tsconfig.strict.json (strict subdirectory)
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "strict": true },
+  "include": ["src/core/**/*", "src/utils/**/*"]
+}
+
+// Strategy 2: @ts-expect-error for known violations
+function legacy(x) { // @ts-expect-error — migrating to strict
+  return x.foo;
+}
+
+// Strategy 3: Gradual adoption with typescript-strict-plugin
+// Marks new files as strict, legacy files exempt
+// npm install typescript-strict-plugin
+
+// Strategy 4: Per-file opt-in with // @ts-strict comment
+// (Requires custom tooling or specific TS forks)
+</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Migration metric:</strong> Track <code>tsc --noEmit | wc -l</code> over time. A successful migration shows this number trending to zero. Budget ~1 error/5 minutes for experienced developers, ~1 error/15 minutes for those new to strict mode.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 13b: satisfies Operator & TS 5.x Features -->
+    <section id="satisfies-and-modern-ts">
+      <h2>The <code>satisfies</code> Operator &amp; TS 5.x Features</h2>
+      <details>
+        <summary>satisfies (TS 4.9), const type parameters, NoInfer, using, isolatedDeclarations</summary>
+
+        <h3><code>satisfies</code> — Type Checking Without Widening</h3>
+        <p>The key insight: type annotations <em>widen</em> (you lose narrowed types), while <code>satisfies</code> <em>validates</em> without widening:</p>
+
+<pre><code class="language-typescript">type Route = { path: string; element: string };
+type Routes = Record&lt;string, Route&gt;;
+
+// ❌ Type annotation — loses literal key types
+const routes: Routes = {
+  home: { path: "/", element: "Home" },
+  about: { path: "/about", element: "About" },
+};
+routes.home;  // ✅ Works, but key type is just 'string'
+routes.typo;  // ✅ No error — any string key is valid!
+
+// ✅ satisfies — validates shape BUT preserves literal types
+const routes = {
+  home: { path: "/", element: "Home" },
+  about: { path: "/about", element: "About" },
+} satisfies Routes;
+routes.home;  // ✅ Works — 'home' is a known literal key
+routes.typo;  // ❌ Error: 'typo' doesn't exist — literal keys preserved!
+
+// Also catches typos in the definition:
+const routes = {
+  home: { pathh: "/", element: "Home" }, // ❌ Error: 'pathh' not in Route
+} satisfies Routes;
+</code></pre>
+
+        <h3><code>const</code> Type Parameters (TS 5.0)</h3>
+        <p>Forces literal inference without requiring <code>as const</code> at call sites:</p>
+<pre><code class="language-typescript">// Without const: infers string[]
+function createRoutes&lt;T extends readonly string[]&gt;(routes: T) { return routes; }
+const r = createRoutes(["home", "about"]); // string[]
+
+// With const: infers readonly ["home", "about"]
+function createRoutes&lt;const T extends readonly string[]&gt;(routes: T) { return routes; }
+const r = createRoutes(["home", "about"]); // readonly ["home", "about"]
+
+// Eliminates the need for callers to write `as const` everywhere
+</code></pre>
+
+        <h3><code>NoInfer&lt;T&gt;</code> (TS 5.4)</h3>
+        <p>Prevents a type parameter from being inferred from a specific position — forces inference from elsewhere:</p>
+<pre><code class="language-typescript">// Without NoInfer: T inferred from BOTH params (ambiguous)
+function createFSM&lt;T extends string&gt;(initial: T, states: T[]) {}
+createFSM("loading", ["idle", "loading", "error"]); // T = "idle" | "loading" | "error"
+// Problem: initial can be any state — no validation that it's one of the defined states
+
+// With NoInfer: T inferred only from 'states', 'initial' checked against it
+function createFSM&lt;T extends string&gt;(initial: NoInfer&lt;T&gt;, states: T[]) {}
+createFSM("loading", ["idle", "loading", "error"]); // ✅
+createFSM("typo", ["idle", "loading", "error"]);    // ❌ Error!
+</code></pre>
+
+        <h3><code>using</code> / Explicit Resource Management (TS 5.2)</h3>
+<pre><code class="language-typescript">// Deterministic cleanup without try/finally
+class DatabaseConnection {
+  [Symbol.dispose]() {
+    this.close(); // Automatically called at block exit
+  }
+}
+
+function query() {
+  using conn = new DatabaseConnection();
+  return conn.execute("SELECT ...");
+  // conn[Symbol.dispose]() called here — even on throw
+}
+
+// Async version:
+async function readFile(path: string) {
+  await using handle = await fs.open(path);
+  return await handle.read();
+  // handle[Symbol.asyncDispose]() called automatically
+}
+</code></pre>
+
+        <h3><code>--isolatedDeclarations</code> (TS 5.5)</h3>
+        <p>Enables parallel declaration emit — each file's <code>.d.ts</code> output depends only on its own explicit type annotations, not cross-file inference. Required for tools like <code>oxc</code> and <code>swc</code> to emit declarations without running the full type checker. In practice: exported functions/variables must have explicit return types.</p>
+
+        <div class="callout callout-tip">
+          <p><strong>Interview tip:</strong> For large monorepos, combine <code>--isolatedDeclarations</code> with project references and incremental compilation. Project references (<code>references</code> in tsconfig) let the type checker process subprojects independently, and <code>--build</code> mode only re-checks changed projects. This is the primary tool for large monorepo type-checking speed.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 14: Production Architecture Patterns -->
+    <section id="production-patterns">
+      <h2>Production Architecture Patterns</h2>
+      <details>
+        <summary>Type-first design, shared packages, validation boundaries</summary>
+
+        <h3>Type-First Design</h3>
+        <p>Design types before implementation — types become the specification:</p>
+
+<pre><code class="language-typescript">// Step 1: Define the domain types
+type OrderStatus = "pending" | "confirmed" | "shipped" | "delivered";
+
+interface Order {
+  id: OrderId;
+  customerId: UserId;
+  items: ReadonlyArray&lt;OrderItem&gt;;
+  status: OrderStatus;
+  createdAt: Date;
+  total: Money&lt;"USD"&gt;;
+}
+
+interface OrderItem {
+  productId: ProductId;
+  quantity: PositiveInt;
+  unitPrice: Money&lt;"USD"&gt;;
+}
+
+// Step 2: Define the operations as types
+interface OrderService {
+  create(customerId: UserId, items: OrderItem[]): Promise&lt;Order&gt;;
+  confirm(orderId: OrderId): Promise&lt;Order&gt;;
+  ship(orderId: OrderId, trackingId: string): Promise&lt;Order&gt;;
+  getByCustomer(customerId: UserId): Promise&lt;ReadonlyArray&lt;Order&gt;&gt;;
+}
+
+// Step 3: Implementation satisfies the type
+const orderService: OrderService = {
+  async create(customerId, items) {
+    // Implementation is guided by the type contract
+  },
+  // ... other methods
+};
+</code></pre>
+
+        <h3>Shared Type Packages in Monorepos</h3>
+<pre><code class="language-typescript">// packages/api-types/src/index.ts — shared between frontend &amp; backend
+export interface ApiResponse&lt;T&gt; {
+  data: T;
+  meta: { requestId: string; timestamp: number };
+}
+
+export interface PaginatedResponse&lt;T&gt; extends ApiResponse&lt;T[]&gt; {
+  pagination: {
+    page: number;
+    pageSize: number;
+    total: number;
+    hasNext: boolean;
+  };
+}
+
+// Endpoint type definitions (shared contract)
+export interface Endpoints {
+  "GET /users": {
+    params: { id: string };
+    response: ApiResponse&lt;User&gt;;
+  };
+  "GET /users/list": {
+    query: { page?: number; search?: string };
+    response: PaginatedResponse&lt;User&gt;;
+  };
+  "POST /users": {
+    body: CreateUserDTO;
+    response: ApiResponse&lt;User&gt;;
+  };
+}
+
+// Type-safe API client (frontend)
+async function apiCall&lt;E extends keyof Endpoints&gt;(
+  endpoint: E,
+  ...args: Endpoints[E] extends { body: infer B } ? [B] : []
+): Promise&lt;Endpoints[E]["response"]&gt; {
+  // Implementation
+}
+</code></pre>
+
+        <h3>Runtime Validation Boundaries</h3>
+<pre><code class="language-typescript">// The boundary pattern: validate at edges, trust internally
+import { z } from "zod";
+
+// Define schema (source of truth for both runtime + types)
+const UserSchema = z.object({
+  id: z.string().uuid(),
+  email: z.string().email(),
+  name: z.string().min(1).max(100),
+  role: z.enum(["admin", "user", "viewer"]),
+  createdAt: z.string().datetime(),
+});
+
+// Derive TypeScript type FROM the schema
+type User = z.infer&lt;typeof UserSchema&gt;;
+
+// Validation boundary: API handler
+async function handleGetUser(req: Request): Promise&lt;Response&gt; {
+  const rawData = await fetchFromDatabase(req.params.id);
+
+  // BOUNDARY: runtime validation + type narrowing
+  const result = UserSchema.safeParse(rawData);
+  if (!result.success) {
+    return new Response(JSON.stringify(result.error), { status: 400 });
+  }
+
+  // result.data is now fully typed as User
+  return new Response(JSON.stringify(result.data));
+}
+
+// Branded types + Zod integration
+const EmailSchema = z.string().email().transform((e) =&gt; e as Email);
+const UserIdSchema = z.string().uuid().transform((id) =&gt; id as UserId);
+</code></pre>
+
+        <h3>Gradual Typing Strategies</h3>
+<pre><code class="language-typescript">// For migrating large JavaScript codebases:
+
+// 1. allowJs + checkJs — type-check JS with JSDoc
+// tsconfig.json
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "strict": false  // Start loose
+  }
+}
+
+// 2. JSDoc annotations in JS files
+/**
+ * @param {string} name
+ * @param {number} age
+ * @returns {{ name: string, age: number }}
+ */
+function createUser(name, age) {
+  return { name, age };
+}
+
+// 3. Rename .js → .ts file-by-file
+// 4. Add explicit types, fix errors
+// 5. Enable strict flags incrementally
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 15: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Complete implementations: branded types, variance, event system</summary>
+
+        <h3>Branded Type Library</h3>
+<pre><code class="language-typescript">// Complete production-ready branded type library
+declare const __brand: unique symbol;
+
+// Core brand type
+type Brand&lt;T, B extends string&gt; = T &amp; { readonly [__brand]: B };
+
+// Utility: extract base type from branded
+type Unbrand&lt;T&gt; = T extends Brand&lt;infer Base, any&gt; ? Base : T;
+
+// Common branded types
+type UserId = Brand&lt;string, "UserId"&gt;;
+type Email = Brand&lt;string, "Email"&gt;;
+type Url = Brand&lt;string, "Url"&gt;;
+type PositiveInt = Brand&lt;number, "PositiveInt"&gt;;
+type NonEmptyString = Brand&lt;string, "NonEmptyString"&gt;;
+type Timestamp = Brand&lt;number, "Timestamp"&gt;;
+
+// Validation result type
+type Result&lt;T, E = string&gt; =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// Smart constructor factory
+function createBrandedType&lt;T, B extends string&gt;(
+  validate: (input: T) =&gt; boolean,
+  errorMessage: string
+) {
+  return (input: T): Result&lt;Brand&lt;T, B&gt;&gt; =&gt; {
+    if (validate(input)) {
+      return { ok: true, value: input as Brand&lt;T, B&gt; };
+    }
+    return { ok: false, error: errorMessage };
+  };
+}
+
+// Usage
+const parseEmail = createBrandedType&lt;string, "Email"&gt;(
+  (s) =&gt; /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s),
+  "Invalid email format"
+);
+
+const parsePositiveInt = createBrandedType&lt;number, "PositiveInt"&gt;(
+  (n) =&gt; Number.isInteger(n) &amp;&amp; n &gt; 0,
+  "Must be a positive integer"
+);
+
+// Type-safe usage
+const emailResult = parseEmail("user@example.com");
+if (emailResult.ok) {
+  sendEmail(emailResult.value); // Type: Email
+}
+</code></pre>
+
+        <h3>Variance Demonstration</h3>
+<pre><code class="language-typescript">// Complete variance demonstration
+
+class Animal {
+  constructor(public name: string) {}
+}
+class Dog extends Animal {
+  constructor(name: string, public breed: string) { super(name); }
+}
+class GoldenRetriever extends Dog {
+  constructor(name: string) { super(name, "Golden Retriever"); }
+}
+
+// --- COVARIANCE (out position) ---
+interface ReadonlyList&lt;out T&gt; {
+  get(index: number): T;
+  readonly length: number;
+}
+
+declare const dogs: ReadonlyList&lt;Dog&gt;;
+const animals: ReadonlyList&lt;Animal&gt; = dogs; // ✅ Covariant
+
+// --- CONTRAVARIANCE (in position) ---
+interface Comparator&lt;in T&gt; {
+  compare(a: T, b: T): number;
+}
+
+declare const animalComparator: Comparator&lt;Animal&gt;;
+const dogComparator: Comparator&lt;Dog&gt; = animalComparator; // ✅ Contravariant
+
+// --- INVARIANCE (in + out position) ---
+interface MutableList&lt;in out T&gt; {
+  get(index: number): T;
+  push(item: T): void;
+}
+
+declare const mutableDogs: MutableList&lt;Dog&gt;;
+// const mutableAnimals: MutableList&lt;Animal&gt; = mutableDogs; // ❌ Invariant
+// const mutableGoldens: MutableList&lt;GoldenRetriever&gt; = mutableDogs; // ❌
+
+// --- WHY THIS MATTERS ---
+// Unsound covariant array (TypeScript's actual behavior):
+const dogArray: Dog[] = [new Dog("Rex", "Lab")];
+const animalArray: Animal[] = dogArray; // ✅ But unsound!
+animalArray.push(new Animal("Fish")); // Compiles but breaks dogArray
+// dogArray[1].breed → runtime error: Animal has no .breed
+</code></pre>
+
+        <h3>Type-Safe Event System</h3>
+<pre><code class="language-typescript">// Type-safe event emitter using structural typing + generics
+type EventMap = Record&lt;string, any&gt;;
+
+interface TypedEventEmitter&lt;Events extends EventMap&gt; {
+  on&lt;K extends keyof Events&gt;(
+    event: K,
+    handler: (payload: Events[K]) =&gt; void
+  ): () =&gt; void; // Returns unsubscribe function
+
+  emit&lt;K extends keyof Events&gt;(event: K, payload: Events[K]): void;
+
+  once&lt;K extends keyof Events&gt;(
+    event: K,
+    handler: (payload: Events[K]) =&gt; void
+  ): () =&gt; void;
+}
+
+function createEventEmitter&lt;Events extends EventMap&gt;(): TypedEventEmitter&lt;Events&gt; {
+  const handlers = new Map&lt;keyof Events, Set&lt;Function&gt;&gt;();
+
+  return {
+    on(event, handler) {
+      if (!handlers.has(event)) handlers.set(event, new Set());
+      handlers.get(event)!.add(handler);
+      return () =&gt; { handlers.get(event)?.delete(handler); };
+    },
+
+    emit(event, payload) {
+      handlers.get(event)?.forEach((handler) =&gt; handler(payload));
+    },
+
+    once(event, handler) {
+      const unsub = this.on(event, (payload) =&gt; {
+        unsub();
+        handler(payload);
+      });
+      return unsub;
+    },
+  };
+}
+
+// Usage with full type safety
+interface AppEvents {
+  "user:login": { userId: UserId; timestamp: number };
+  "user:logout": { userId: UserId };
+  "order:created": { order: Order };
+  "error": { message: string; code: number };
+}
+
+const events = createEventEmitter&lt;AppEvents&gt;();
+
+// ✅ Fully typed — payload matches event
+events.on("user:login", ({ userId, timestamp }) =&gt; {
+  console.log(`User ${userId} logged in at ${timestamp}`);
+});
+
+// ❌ Type error — wrong payload shape
+// events.emit("user:login", { wrong: "payload" });
+</code></pre>
+
+        <h3>Structural Typing Gotchas</h3>
+<pre><code class="language-typescript">// Gotcha 1: Classes with only private members ARE nominal
+class Foo {
+  private value: number = 0;
+}
+class Bar {
+  private value: number = 0;
+}
+// const foo: Foo = new Bar(); // ❌ Error! Private members create nominal behavior
+
+// Gotcha 2: Interfaces merge, types don't
+interface Config { host: string; }
+interface Config { port: number; } // Merges! Config = { host: string; port: number }
+
+type Config2 = { host: string };
+// type Config2 = { port: number }; // ❌ Error: Duplicate identifier
+
+// Gotcha 3: Function arity — fewer params always OK
+type Callback = (a: number, b: string, c: boolean) =&gt; void;
+const cb: Callback = () =&gt; {}; // ✅ Zero params — fine!
+// Because: extra args are just ignored in JS
+
+// Gotcha 4: Object literal type vs inferred type
+function processConfig(config: { host: string; port: number }) {}
+
+const valid = { host: "localhost", port: 3000, extra: true };
+processConfig(valid); // ✅ No excess checking (not fresh literal)
+
+processConfig({ host: "localhost", port: 3000, extra: true });
+// ❌ Error: 'extra' does not exist (fresh literal = excess check)
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 16: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>5 critical mistakes senior engineers still make</summary>
+
+        <h3>Mistake 1: Using <code>any</code> Instead of <code>unknown</code></h3>
+<pre><code class="language-typescript">// ❌ BAD: any disables ALL type checking
+function parseJSON(text: string): any {
+  return JSON.parse(text);
+}
+const data = parseJSON('{"x": 1}');
+data.nonExistent.deeply.nested; // No error — runtime crash
+
+// ✅ GOOD: unknown forces validation before use
+function parseJSON(text: string): unknown {
+  return JSON.parse(text);
+}
+const data = parseJSON('{"x": 1}');
+// data.x; // ❌ Error: Object is of type 'unknown'
+
+if (typeof data === "object" &amp;&amp; data !== null &amp;&amp; "x" in data) {
+  console.log(data.x); // ✅ Narrowed safely
+}
+</code></pre>
+
+        <h3>Mistake 2: Ignoring strictNullChecks Implications</h3>
+<pre><code class="language-typescript">// ❌ BAD: assuming values are always defined
+interface User { name: string; address?: Address }
+interface Address { street: string; city: string }
+
+function getCity(user: User): string {
+  return user.address.city; // 💥 Crash if address is undefined
+}
+
+// ✅ GOOD: handle the undefined case
+function getCity(user: User): string | undefined {
+  return user.address?.city;
+}
+
+// ✅ BETTER: use a default or throw explicitly
+function getCityOrThrow(user: User): string {
+  if (!user.address) {
+    throw new Error(`User ${user.name} has no address`);
+  }
+  return user.address.city; // Narrowed to Address
+}
+</code></pre>
+
+        <h3>Mistake 3: Not Understanding Variance in Callbacks</h3>
+<pre><code class="language-typescript">// ❌ BAD: assuming callback types are freely assignable
+interface EventBus {
+  subscribe(handler: (event: BaseEvent) =&gt; void): void;
+}
+
+interface ClickEvent extends BaseEvent {
+  x: number;
+  y: number;
+}
+
+// This handler ONLY works with ClickEvent
+const clickHandler = (event: ClickEvent) =&gt; {
+  console.log(event.x, event.y);
+};
+
+// With --strictFunctionTypes, this correctly errors:
+// bus.subscribe(clickHandler); // ❌ ClickEvent handler can't handle all BaseEvents
+
+// ✅ GOOD: use type guards or generic handlers
+bus.subscribe((event) =&gt; {
+  if (isClickEvent(event)) {
+    console.log(event.x, event.y); // Narrowed
+  }
+});
+</code></pre>
+
+        <h3>Mistake 4: Excessive Type Assertions</h3>
+<pre><code class="language-typescript">// ❌ BAD: assertions everywhere = type system is lying to you
+const data = fetchData() as UserData;
+const element = document.querySelector(".btn") as HTMLButtonElement;
+const config = getConfig() as Required&lt;AppConfig&gt;;
+
+// Each 'as' is a potential runtime crash waiting to happen
+
+// ✅ GOOD: use type guards and narrowing
+const element = document.querySelector(".btn");
+if (element instanceof HTMLButtonElement) {
+  element.disabled = true; // Safely narrowed
+}
+
+// ✅ GOOD: use satisfies for validation without assertion
+const config = {
+  host: "localhost",
+  port: 3000,
+} satisfies Partial&lt;AppConfig&gt;;
+
+// ✅ GOOD: use Zod/io-ts for runtime validation
+const userData = UserSchema.parse(await fetchData());
+</code></pre>
+
+        <h3>Mistake 5: Over-Engineering Types</h3>
+<pre><code class="language-typescript">// ❌ BAD: type gymnastics that nobody can read
+type DeepReadonly&lt;T&gt; = T extends Primitive
+  ? T
+  : T extends Array&lt;infer U&gt;
+    ? DeepReadonlyArray&lt;U&gt;
+    : T extends Map&lt;infer K, infer V&gt;
+      ? DeepReadonlyMap&lt;K, V&gt;
+      : T extends Set&lt;infer U&gt;
+        ? DeepReadonlySet&lt;U&gt;
+        : DeepReadonlyObject&lt;T&gt;;
+
+// ✅ GOOD: simple, readable, use Readonly or library types
+type Config = Readonly&lt;{
+  host: string;
+  port: number;
+  database: Readonly&lt;{
+    url: string;
+    pool: number;
+  }&gt;;
+}&gt;;
+
+// Rule of thumb: if a colleague can't understand your type
+// in 30 seconds, it's too complex. Use runtime validation instead.
+</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Senior signal:</strong> Knowing when NOT to use advanced types is more impressive than knowing how. The best type-level code is simple, readable, and has clear error messages when misused.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 17: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Key architectural decisions and their consequences</summary>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Decision</th>
+              <th>Option A</th>
+              <th>Option B</th>
+              <th>When to Choose A</th>
+              <th>When to Choose B</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Strictness vs Velocity</strong></td>
+              <td>Full strict mode from day 1</td>
+              <td>Gradual strict migration</td>
+              <td>Greenfield project, team knows TS well</td>
+              <td>Large JS→TS migration, mixed experience team</td>
+            </tr>
+            <tr>
+              <td><strong>Branded vs Plain Types</strong></td>
+              <td>Brand all domain IDs and values</td>
+              <td>Use plain string/number aliases</td>
+              <td>Financial/medical/auth domain, many ID types</td>
+              <td>Small project, few domain types, prototyping</td>
+            </tr>
+            <tr>
+              <td><strong>Complex Types vs Readability</strong></td>
+              <td>Advanced conditional/mapped types</td>
+              <td>Simple interfaces + runtime checks</td>
+              <td>Library code, heavily reused utilities</td>
+              <td>Application code, team readability priority</td>
+            </tr>
+            <tr>
+              <td><strong>Type Assertions vs Type Guards</strong></td>
+              <td>assert at boundaries (as Type)</td>
+              <td>Guard everywhere (is Type)</td>
+              <td>Trusted data source, performance-critical path</td>
+              <td>Untrusted input, safety-critical code</td>
+            </tr>
+            <tr>
+              <td><strong>Inference vs Annotation</strong></td>
+              <td>Let TS infer everything</td>
+              <td>Annotate all function signatures</td>
+              <td>Internal code, rapid prototyping</td>
+              <td>Public API, library code, CI performance</td>
+            </tr>
+            <tr>
+              <td><strong>Zod/io-ts vs Manual Validation</strong></td>
+              <td>Schema-first with runtime library</td>
+              <td>Manual type guards + assertions</td>
+              <td>API boundaries, user input, external data</td>
+              <td>Internal transforms, hot paths, bundle size</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout-info">
+          <p><strong>Architecture principle:</strong> The cost of type safety is not uniform. Apply maximum strictness at system boundaries (API, database, user input) and pragmatic flexibility in internal implementation code. This gives you 90% of the safety benefit with 20% of the complexity cost.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 18: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>7 deep follow-up questions with senior-level answers</summary>
+
+        <h3>Q1: "Can you make TypeScript fully nominal without third-party libraries?"</h3>
+        <p><strong>Answer:</strong> Yes, using the intersection brand pattern with <code>unique symbol</code>. Each branded type uses <code>declare const __brand: unique symbol</code> to create a type-level property that can never be accidentally satisfied. Classes with private members also give nominal behavior. The key insight is that you only need nominal semantics at domain boundaries — structural typing works fine for internal data transformations.</p>
+
+        <h3>Q2: "Why are arrays covariant in TypeScript when that's unsound?"</h3>
+        <p><strong>Answer:</strong> Pragmatism. Making arrays invariant would break almost every real-world program — you couldn't pass <code>Dog[]</code> to a function expecting <code>Animal[]</code> for reading. The TypeScript team chose to be unsound here because the mutation case (pushing a Cat into a Dog[]) is rare in practice and would require a readonly/mutable split in the type system that would dramatically increase complexity. The mitigation is to use <code>ReadonlyArray&lt;T&gt;</code> when you want safe covariance.</p>
+
+        <h3>Q3: "How do you diagnose a slow TypeScript build?"</h3>
+        <p><strong>Answer:</strong> Three steps: (1) <code>tsc --generateTrace ./trace</code> and analyze in Chrome's tracing tool — look for type instantiations &gt;100ms. (2) <code>tsc --extendedDiagnostics</code> to see time spent in each phase (parse, bind, check, emit). (3) Check for known slow patterns: deeply recursive conditional types, large discriminated unions (&gt;50 members), and template literal types with unconstrained inputs. Solutions: add explicit type annotations on complex expressions, use project references to parallelize, enable incremental compilation, and consider <code>skipLibCheck: true</code>.</p>
+
+        <h3>Q4: "What's the difference between <code>type</code> and <code>interface</code> for structural typing?"</h3>
+        <p><strong>Answer:</strong> Both define structural types, but with important differences: (1) Interfaces support declaration merging — multiple declarations with the same name merge into one. Types error on duplicates. (2) Interfaces are "open" — third-party code can extend them. This is why lib.d.ts uses interfaces for <code>Array</code>, <code>Promise</code>, etc. (3) Interfaces generate better error messages and have slightly faster type-checking (cached by name). (4) Types support unions, intersections, and mapped types that interfaces cannot express. Rule: use interfaces for public APIs and extensible contracts; use types for unions, intersections, and computed types.</p>
+
+        <h3>Q5: "How does <code>satisfies</code> relate to structural typing?"</h3>
+        <p><strong>Answer:</strong> <code>satisfies</code> (TS 4.9) performs structural compatibility checking without widening. It validates that a value's type is assignable to the target type, but preserves the narrower inferred type. This gives you excess property checking (catching typos), type validation (ensuring shape compliance), AND literal type preservation — something neither <code>as</code> nor type annotations alone provide. It's the best tool for config objects, route maps, and constants that need both validation and precise types.</p>
+
+        <h3>Q6: "How do branded types interact with serialization (JSON)?"</h3>
+        <p><strong>Answer:</strong> Brands are erased at runtime — <code>JSON.stringify</code> produces regular strings/numbers. The challenge is <em>deserialization</em>: when you parse JSON, you get <code>unknown</code> (or <code>any</code>) and must re-validate to recover the brand. The pattern is: (1) Parse JSON to unknown, (2) Validate with Zod/io-ts schema that includes brand constructors, (3) Output is typed with brands. For API responses, create a typed fetch wrapper that automatically validates and brands the response data.</p>
+
+        <h3>Q7: "When would you choose runtime type checking over compile-time types?"</h3>
+        <p><strong>Answer:</strong> At every system boundary where data crosses a trust threshold: (1) API responses — the server could return anything, types don't guarantee runtime shape. (2) User input — form data, URL params, localStorage. (3) Third-party integrations — webhooks, SSE, WebSocket messages. (4) Configuration files — JSON/YAML loaded at runtime. (5) Database queries — especially with raw SQL or dynamic queries. Compile-time types are sufficient for internal code transformations where you control both producer and consumer. The boundary is where "trust ends."</p>
+      </details>
+    </section>
+
+    <!-- Section 19: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Mental models and what NOT to say in an interview</summary>
+
+        <h3>Mental Models to Remember</h3>
+        <ul>
+          <li><strong>Structural = Shape:</strong> "If it looks like a duck, it IS a duck" — at the type level</li>
+          <li><strong>Brands = Name tags:</strong> Phantom properties that exist only at compile time, creating nominal behavior without runtime cost</li>
+          <li><strong>Variance = Direction:</strong> Does subtyping flow in the same direction (covariant), opposite (contravariant), both (bivariant), or neither (invariant)?</li>
+          <li><strong>Widening = Mutability assumption:</strong> <code>let</code> widens because reassignment is expected; <code>const</code> preserves because the value is fixed</li>
+          <li><strong>Excess checking = Freshness heuristic:</strong> Not part of the type system — it's a linting rule that only fires on inline objects</li>
+          <li><strong>Boundaries = Trust boundaries:</strong> Apply maximum type safety where data enters your system; relax internally</li>
+        </ul>
+
+        <h3>The One-Line Summary</h3>
+        <p><em>TypeScript's structural type system trades nominal safety for JavaScript compatibility; branded types and strict flags recover that safety where it matters most.</em></p>
+
+        <h3>What NOT to Say in an Interview</h3>
+        <div class="callout callout-warning">
+          <ul>
+            <li>❌ "TypeScript is just JavaScript with types" — shows no understanding of the type system's power and limitations</li>
+            <li>❌ "I just use <code>any</code> when types get complicated" — immediate red flag for senior roles</li>
+            <li>❌ "Structural typing is the same as duck typing" — structural is static/compile-time, duck typing is dynamic/runtime</li>
+            <li>❌ "TypeScript guarantees runtime type safety" — it doesn't; types are erased. Only compile-time checking.</li>
+            <li>❌ "Interfaces and types are the same thing" — ignores declaration merging, performance, and extensibility differences</li>
+            <li>❌ "You should always use the strictest possible types" — over-engineering is as much a problem as under-engineering</li>
+            <li>❌ Confusing variance terms — if you mention covariance, be prepared to explain contravariance and give examples of each</li>
+          </ul>
+        </div>
+
+        <h3>Key Takeaways for the Interview</h3>
+        <ol>
+          <li>TypeScript chose structural typing to model JavaScript's duck-typing patterns at compile time</li>
+          <li>This creates accidental compatibility bugs at scale — branded types are the primary mitigation</li>
+          <li>Excess property checking is NOT part of structural typing — it's a separate heuristic on fresh literals</li>
+          <li>Variance determines how generic type relationships propagate — use <code>in</code>/<code>out</code> keywords for clarity</li>
+          <li>Apply strictness at boundaries, pragmatism internally</li>
+          <li>Performance matters at scale — know <code>--generateTrace</code> and common type-level performance killers</li>
+        </ol>
+      </details>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+</body>
+</html>

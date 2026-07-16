@@ -1,0 +1,1571 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 1: How does the JavaScript event loop actually work? | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <!-- Sidebar Navigation -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 1</span>
+      <span class="chapter-title">Event Loop & Microtasks</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#v8-execution-model">V8 Execution Model</a></li>
+        <li><a href="#call-stack">Call Stack & Execution Contexts</a></li>
+        <li><a href="#task-queue">Task Queue (Macrotasks)</a></li>
+        <li><a href="#microtask-queue">Microtask Queue</a></li>
+        <li><a href="#event-loop-phases">Event Loop Phases</a></li>
+        <li><a href="#raf-timing">requestAnimationFrame Timing</a></li>
+        <li><a href="#request-idle-callback">requestIdleCallback</a></li>
+        <li><a href="#microtask-starvation">Microtask Starvation</a></li>
+        <li><a href="#scheduling-apis">setTimeout vs queueMicrotask vs Promise</a></li>
+        <li><a href="#web-workers">Web Workers & Off-Main-Thread</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#debugging">Debugging with DevTools</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-i">Part I — JavaScript Engine Internals</a> &rsaquo;
+      <span>Chapter 1</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Event Loop</span>
+        <span class="badge badge-topic">Microtasks</span>
+        <span class="badge badge-topic">V8</span>
+        <span class="badge badge-topic">Performance</span>
+      </div>
+      <h1>How does the JavaScript event loop actually work, and why can a microtask starve the rendering pipeline?</h1>
+      <p class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> The event loop processes all microtasks before yielding to the rendering pipeline. A synchronous microtask loop (e.g., recursive Promise resolution) will indefinitely block painting, rAF callbacks, and user input — even though the code is "asynchronous."
+      </p>
+    </header>
+
+    <!-- Search -->
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter... (Ctrl+K or /)" aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <div class="callout callout-info">
+        <p><strong>What they're really testing:</strong></p>
+        <ul>
+          <li>Do you understand the event loop at the specification level, not just "JavaScript is single-threaded"?</li>
+          <li>Can you explain the difference between microtasks and macrotasks and their scheduling implications?</li>
+          <li>Do you know why asynchronous code can still block the UI?</li>
+          <li>Have you debugged rendering jank caused by microtask starvation in production?</li>
+          <li>Can you reason about scheduling priorities (user input > animation > background work)?</li>
+        </ul>
+      </div>
+      <p>This question separates engineers who say "JavaScript is async and non-blocking" from those who understand that JavaScript is fundamentally synchronous, single-threaded, and relies on a cooperative scheduling model where the event loop orchestrates task execution, microtask draining, and rendering opportunities.</p>
+      <p>At the senior level, interviewers expect you to explain <em>when</em> the browser can paint, <em>why</em> Promises execute before setTimeout, and <em>how</em> to structure code so that heavy computation doesn't freeze the UI.</p>
+    </section>
+
+    <!-- Section 2: 60-Second Interview Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Interview Answer</h2>
+      <div class="callout callout-tip">
+        <p><strong>Use this in the interview:</strong></p>
+        <blockquote>
+          "The JavaScript event loop is a continuous cycle that processes work in a specific order. Each iteration:
+          <br><br>
+          <strong>1. Execute one macrotask</strong> — from the task queue (setTimeout, I/O, user events).<br>
+          <strong>2. Drain the entire microtask queue</strong> — all Promises, queueMicrotask, MutationObserver callbacks run to completion before anything else.<br>
+          <strong>3. Render if needed</strong> — the browser checks if it's time to repaint (~16ms for 60fps), runs requestAnimationFrame callbacks, then performs style/layout/paint.<br>
+          <strong>4. Optionally run requestIdleCallback</strong> — if there's time remaining in the frame.
+          <br><br>
+          The critical insight is step 2: microtasks are drained <em>completely</em> before rendering. If a microtask schedules another microtask recursively, the rendering pipeline starves — the page freezes even though the code appears asynchronous. This is why <code>Promise.resolve().then()</code> in a loop can block the UI just as badly as a synchronous while loop.
+          <br><br>
+          For heavy computation, I use <code>setTimeout</code> or <code>scheduler.yield()</code> to break work into macrotasks, giving the browser rendering opportunities between chunks. For animation, I use <code>requestAnimationFrame</code> which runs right before paint. For background work, <code>requestIdleCallback</code> runs only when the main thread is idle."
+        </blockquote>
+      </div>
+    </section>
+
+    <!-- Section 3: V8 Execution Model -->
+    <section id="v8-execution-model">
+      <h2>V8 Execution Model</h2>
+
+      <details>
+        <summary>How V8 fits within the browser's event loop</summary>
+        <p>V8 is a JavaScript engine, not a runtime. It provides:</p>
+        <ul>
+          <li><strong>Call Stack</strong> — executes JavaScript synchronously</li>
+          <li><strong>Heap</strong> — memory allocation for objects</li>
+          <li><strong>Microtask Queue</strong> — V8 manages this directly</li>
+        </ul>
+        <p>The <em>browser</em> (or Node.js) provides the event loop, task queues, timers, and I/O. V8 exposes hooks that the embedder uses to drain microtasks after each call stack empties.</p>
+        <pre class="diagram">
+┌───────────────────────────────────────────────────────────┐
+│                    Browser Process                         │
+│                                                           │
+│  ┌─────────────────────────────────────────────────────┐ │
+│  │              Renderer Thread (Main Thread)           │ │
+│  │                                                     │ │
+│  │  ┌──────────┐   ┌──────────────┐   ┌───────────┐  │ │
+│  │  │   V8     │   │  Event Loop  │   │ Rendering │  │ │
+│  │  │          │   │              │   │  Pipeline │  │ │
+│  │  │ Call     │   │ Task Queue   │   │           │  │ │
+│  │  │ Stack    │◄──│ Microtask Q  │──►│ Style     │  │ │
+│  │  │          │   │ rAF Queue    │   │ Layout    │  │ │
+│  │  │ Heap     │   │ Idle Queue   │   │ Paint     │  │ │
+│  │  └──────────┘   └──────────────┘   │ Composite │  │ │
+│  │                                     └───────────┘  │ │
+│  └─────────────────────────────────────────────────────┘ │
+│                                                           │
+│  ┌─────────────────┐  ┌───────────────┐                 │
+│  │  Web APIs        │  │  Compositor   │                 │
+│  │  (setTimeout,    │  │  Thread       │                 │
+│  │   fetch, DOM)    │  │               │                 │
+│  └─────────────────┘  └───────────────┘                 │
+└───────────────────────────────────────────────────────────┘
+        </pre>
+      </details>
+
+      <details>
+        <summary>V8's JIT Pipeline — Why execution speed matters for the event loop</summary>
+        <p>V8 compiles JavaScript through multiple tiers:</p>
+        <ol>
+          <li><strong>Ignition (Interpreter)</strong> — bytecode execution, fast startup</li>
+          <li><strong>Sparkplug</strong> — fast baseline compiler (no optimization)</li>
+          <li><strong>Maglev</strong> — mid-tier optimizing compiler</li>
+          <li><strong>TurboFan</strong> — full optimizing compiler with speculative optimization</li>
+        </ol>
+        <p>Long-running synchronous functions block the event loop regardless of how optimized they are. The only way to yield control is to return from the current call stack. No amount of JIT optimization fixes a fundamentally blocking algorithm.</p>
+        <pre class="diagram">
+Source Code
+     │
+     ▼
+  Parser (AST)
+     │
+     ▼
+  Ignition (Bytecode) ──── Hot functions ────┐
+     │                                        │
+     ▼                                        ▼
+  Sparkplug (Baseline)               Maglev (Mid-tier)
+                                              │
+                                              ▼
+                                     TurboFan (Optimized)
+                                              │
+                                     Deopt ───┘ (bail out if
+                                              assumptions invalidated)
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 4: Call Stack & Execution Contexts -->
+    <section id="call-stack">
+      <h2>Call Stack & Execution Contexts</h2>
+
+      <details>
+        <summary>Execution Context structure</summary>
+        <p>Every function invocation creates an Execution Context pushed onto the call stack:</p>
+        <ul>
+          <li><strong>Variable Environment</strong> — let, const, var bindings</li>
+          <li><strong>Lexical Environment</strong> — block-scoped bindings + outer reference</li>
+          <li><strong>this binding</strong> — determined by call site</li>
+        </ul>
+        <p>The call stack is LIFO. JavaScript can only run one function at a time. The event loop <em>cannot</em> process the next task until the call stack is completely empty.</p>
+        <pre><code class="language-javascript">function main() {
+  console.log('1');       // Pushed to stack, executes, popped
+  setTimeout(() => {
+    console.log('2');     // Callback queued as macrotask
+  }, 0);
+  Promise.resolve().then(() => {
+    console.log('3');     // Callback queued as microtask
+  });
+  console.log('4');       // Pushed to stack, executes, popped
+}
+
+main();
+// Output: 1, 4, 3, 2
+// Explanation:
+// - main() runs synchronously: logs 1, schedules setTimeout, schedules Promise, logs 4
+// - Call stack empties → microtask queue drains → logs 3
+// - Event loop picks next macrotask → logs 2</code></pre>
+      </details>
+
+      <details>
+        <summary>Stack overflow and the event loop</summary>
+        <p>A stack overflow (<code>RangeError: Maximum call stack size exceeded</code>) is a synchronous problem — it means you've pushed too many frames without returning. The event loop never gets a chance to intervene because the call stack never empties.</p>
+        <pre><code class="language-javascript">// This overflows the stack synchronously — event loop cannot help
+function infinite() {
+  return infinite(); // No yield point, stack grows unbounded
+}
+
+// This does NOT overflow — each call is a separate macrotask
+function safeRecursion(n) {
+  if (n <= 0) return;
+  console.log(n);
+  setTimeout(() => safeRecursion(n - 1), 0); // Yields to event loop
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Task Queue (Macrotask Queue) -->
+    <section id="task-queue">
+      <h2>Task Queue (Macrotasks)</h2>
+
+      <details>
+        <summary>What are macrotasks and where do they come from?</summary>
+        <p>Macrotasks (officially just "tasks" in the HTML spec) are queued by the browser when external events occur or when APIs like <code>setTimeout</code> fire. Each event loop iteration processes <strong>exactly one</strong> macrotask before checking for rendering opportunities.</p>
+        <p><strong>Sources of macrotasks:</strong></p>
+        <table>
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>Example</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Timer APIs</td>
+              <td><code>setTimeout</code>, <code>setInterval</code></td>
+              <td>Minimum 4ms delay after nested calls (HTML spec)</td>
+            </tr>
+            <tr>
+              <td>User interaction</td>
+              <td>click, keydown, scroll</td>
+              <td>Each event dispatch is a separate task</td>
+            </tr>
+            <tr>
+              <td>I/O completion</td>
+              <td>XMLHttpRequest load, fetch response</td>
+              <td>Callback queued when response arrives</td>
+            </tr>
+            <tr>
+              <td>MessageChannel</td>
+              <td><code>port.postMessage()</code></td>
+              <td>Used by React's scheduler for yielding</td>
+            </tr>
+            <tr>
+              <td>History API</td>
+              <td><code>popstate</code></td>
+              <td>Navigation events</td>
+            </tr>
+            <tr>
+              <td>postMessage</td>
+              <td><code>window.postMessage()</code></td>
+              <td>Cross-origin or self-messaging</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout-warning">
+          <p><strong>Key Insight:</strong> The HTML spec allows the browser to choose which task queue to service next, but does not mandate priority ordering. In practice, Chromium's implementation prioritizes user interaction tasks over timer tasks — this is an implementation detail, not a specification guarantee. This is why in Chrome a <code>setTimeout</code> callback may be delayed if click events are queued, but other browsers may schedule differently.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Why only one macrotask per loop iteration?</summary>
+        <p>The HTML specification states that each event loop iteration picks one task, then runs microtasks, then optionally renders. This ensures the browser gets regular opportunities to:</p>
+        <ul>
+          <li>Run requestAnimationFrame callbacks</li>
+          <li>Recalculate styles and layout</li>
+          <li>Paint pixels to the screen</li>
+        </ul>
+        <p>If the browser processed all queued macrotasks before rendering, a burst of setTimeout callbacks could freeze the UI just like synchronous code.</p>
+      </details>
+    </section>
+
+    <!-- Section 6: Microtask Queue -->
+    <section id="microtask-queue">
+      <h2>Microtask Queue</h2>
+
+      <details>
+        <summary>What are microtasks and why are they drained completely?</summary>
+        <p>Microtasks are higher-priority callbacks that execute <strong>after the current task completes</strong> but <strong>before the browser yields to rendering</strong>. The entire microtask queue is drained before anything else happens.</p>
+        <p><strong>Sources of microtasks:</strong></p>
+        <ul>
+          <li><code>Promise.then()</code>, <code>Promise.catch()</code>, <code>Promise.finally()</code></li>
+          <li><code>queueMicrotask()</code></li>
+          <li><code>MutationObserver</code> callbacks</li>
+          <li><code>async/await</code> continuations (after await)</li>
+        </ul>
+        <pre><code class="language-javascript">console.log('script start');
+
+setTimeout(() => console.log('setTimeout'), 0);
+
+Promise.resolve()
+  .then(() => console.log('promise 1'))
+  .then(() => console.log('promise 2'));
+
+queueMicrotask(() => console.log('queueMicrotask'));
+
+console.log('script end');
+
+// Output:
+// script start
+// script end
+// promise 1
+// queueMicrotask
+// promise 2
+// setTimeout
+
+// Why: script runs (macrotask) → microtask queue drains fully → next macrotask</code></pre>
+      </details>
+
+      <details>
+        <summary>Microtask checkpoint — when exactly does it run?</summary>
+        <p>The microtask checkpoint runs in multiple places, not just "after a macrotask":</p>
+        <ol>
+          <li><strong>After a macrotask completes</strong> (call stack empties)</li>
+          <li><strong>After a microtask completes</strong> (to handle newly queued microtasks)</li>
+          <li><strong>After each callback in certain APIs</strong> (e.g., after each MutationObserver delivery)</li>
+        </ol>
+        <p>This means microtasks queued <em>during</em> microtask processing are executed in the same drain cycle. The ordering can be subtle — it depends on <em>when</em> each microtask is enqueued relative to others:</p>
+        <pre><code class="language-javascript">// Subtle ordering — queueMicrotask vs chained .then()
+Promise.resolve()
+  .then(() => {
+    console.log('micro 1');
+    // queueMicrotask appends to the queue RIGHT NOW
+    queueMicrotask(() => console.log('micro 1.1'));
+  })
+  .then(() => console.log('micro 2'));
+
+// Output: micro 1, micro 1.1, micro 2
+// All complete before any rendering opportunity
+//
+// Why this order?
+// 1. The first .then(cb1) is queued as a microtask
+// 2. cb1 runs → logs 'micro 1' → queueMicrotask appends 'micro 1.1' to the queue
+// 3. cb1 returns → the intermediate Promise resolves → NOW .then(cb2) is enqueued
+// 4. Queue state: ['micro 1.1', 'micro 2'] — 1.1 was enqueued first
+// 5. Drain continues: logs 'micro 1.1', then 'micro 2'
+//
+// Key insight: queueMicrotask() enqueues immediately during cb1 execution,
+// but the chained .then(cb2) only enqueues AFTER cb1 returns and the
+// Promise resolution machinery runs.</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Danger Zone:</strong> If a microtask always queues another microtask, the drain never completes. The browser can never render. The page is frozen.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 7: Event Loop Phases -->
+    <section id="event-loop-phases">
+      <h2>Event Loop Phases (Browser vs Node.js)</h2>
+
+      <details>
+        <summary>Browser Event Loop — The complete cycle</summary>
+        <p>The HTML specification defines the event loop processing model as:</p>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│                   EVENT LOOP ITERATION                       │
+│                                                             │
+│  1. Pick one task from a task queue                         │
+│     ┌──────────────────────────────┐                       │
+│     │  Execute task (call stack)    │                       │
+│     └──────────────┬───────────────┘                       │
+│                    │                                        │
+│  2. Drain microtask queue (completely)                      │
+│     ┌──────────────────────────────┐                       │
+│     │  Run ALL microtasks           │◄──── loops until     │
+│     │  (including newly queued)     │      queue is empty  │
+│     └──────────────┬───────────────┘                       │
+│                    │                                        │
+│  3. Rendering opportunity? (approx every 16.6ms)           │
+│     ┌──────────────────────────────┐                       │
+│     │  a. Run requestAnimationFrame │                       │
+│     │  b. Recalculate Style         │                       │
+│     │  c. Layout                    │                       │
+│     │  d. Paint                     │                       │
+│     │  e. Composite                 │                       │
+│     └──────────────┬───────────────┘                       │
+│                    │                                        │
+│  4. If idle time remains in frame:                         │
+│     ┌──────────────────────────────┐                       │
+│     │  Run requestIdleCallback      │                       │
+│     └──────────────────────────────┘                       │
+│                                                             │
+│  ──── Repeat ────                                          │
+└─────────────────────────────────────────────────────────────┘
+        </pre>
+        <div class="callout callout-info">
+          <p><strong>Important:</strong> Step 3 is NOT guaranteed every iteration. The browser decides when to render based on display refresh rate, page visibility, and whether visual changes occurred. A background tab may never get rendering opportunities.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Node.js Event Loop — libuv phases</summary>
+        <p>Node.js uses libuv and has a different phase structure. Since Node 11+, microtasks drain after <em>every individual callback</em> within a phase — not just at phase boundaries. This makes Node's behavior much closer to the browser's model:</p>
+        <pre class="diagram">
+┌───────────────────────────────────────────────────────────┐
+│                   Node.js Event Loop                       │
+│                                                           │
+│  ┌─────────────────────────────────────────────────────┐ │
+│  │  Timers Phase: setTimeout, setInterval              │ │
+│  │                                                     │ │
+│  │  callback1 → [drain microtasks] →                   │ │
+│  │  callback2 → [drain microtasks] → ...               │ │
+│  └─────────────────────┬───────────────────────────────┘ │
+│                        ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐ │
+│  │  Pending I/O: system-level callbacks                │ │
+│  │  callback → [drain microtasks] → ...                │ │
+│  └─────────────────────┬───────────────────────────────┘ │
+│                        ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐ │
+│  │  Idle / Prepare (internal use)                      │ │
+│  └─────────────────────┬───────────────────────────────┘ │
+│                        ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐ │
+│  │  Poll: I/O events, new connections                  │ │
+│  │  callback → [drain microtasks] → ...                │ │
+│  └─────────────────────┬───────────────────────────────┘ │
+│                        ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐ │
+│  │  Check: setImmediate                                │ │
+│  │  callback → [drain microtasks] → ...                │ │
+│  └─────────────────────┬───────────────────────────────┘ │
+│                        ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐ │
+│  │  Close callbacks: socket.on('close')                │ │
+│  │  callback → [drain microtasks] → ...                │ │
+│  └─────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────┘
+        </pre>
+        <p><strong>Key difference from pre-Node 11:</strong> Before Node 11, microtasks only drained between phases — meaning two timer callbacks in the same phase would both execute before any microtask ran. Since Node 11+, microtasks drain after <em>each individual callback</em>, matching browser semantics. <code>process.nextTick()</code> is a separate queue that drains before Promise microtasks at each checkpoint.</p>
+        <pre><code class="language-javascript">// Demonstrates Node 11+ per-callback microtask draining
+setTimeout(() => {
+  console.log('timer1');
+  Promise.resolve().then(() => console.log('microtask from timer1'));
+}, 0);
+setTimeout(() => {
+  console.log('timer2');
+}, 0);
+
+// Node 11+ output (same as browser):
+//   timer1
+//   microtask from timer1
+//   timer2
+//
+// Pre-Node 11 output (drained between phases, not callbacks):
+//   timer1
+//   timer2
+//   microtask from timer1</code></pre>
+      </details>
+
+      <details>
+        <summary>Browser vs Node.js — practical differences</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>Browser</th>
+              <th>Node.js</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Rendering</td>
+              <td>Integrated into event loop</td>
+              <td>N/A (no rendering)</td>
+            </tr>
+            <tr>
+              <td>Microtask timing</td>
+              <td>After each macrotask</td>
+              <td>Between each libuv phase</td>
+            </tr>
+            <tr>
+              <td>Timer precision</td>
+              <td>Clamped to 4ms (nested), 1ms (top-level)</td>
+              <td>1ms minimum</td>
+            </tr>
+            <tr>
+              <td>I/O model</td>
+              <td>Web APIs (fetch, XHR)</td>
+              <td>libuv (epoll, kqueue, IOCP)</td>
+            </tr>
+            <tr>
+              <td>Extra queues</td>
+              <td>rAF, rIC</td>
+              <td>process.nextTick, setImmediate</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 8: requestAnimationFrame Timing -->
+    <section id="raf-timing">
+      <h2>requestAnimationFrame Timing</h2>
+
+      <details>
+        <summary>Where rAF sits in the event loop</summary>
+        <p><code>requestAnimationFrame</code> callbacks run just before the browser performs style recalculation, layout, and paint — in the rendering step of the event loop. They do NOT go into the task queue or microtask queue.</p>
+        <pre><code class="language-javascript">// rAF is called once per frame, right before paint
+requestAnimationFrame(() => {
+  console.log('rAF');  // Runs at rendering time, ~16.6ms intervals
+});
+
+setTimeout(() => {
+  console.log('timeout');  // Runs as a macrotask
+}, 0);
+
+Promise.resolve().then(() => {
+  console.log('microtask');  // Runs after current task, before render
+});
+
+// Typical output: microtask → timeout → rAF
+// (rAF waits for next render opportunity; timeout runs in next event loop iteration)</code></pre>
+        <div class="callout callout-info">
+          <p><strong>Frame budget:</strong> At 60fps, each frame has ~16.6ms. Your JavaScript (macrotask + microtasks) plus rendering must complete within this budget. If JavaScript takes 20ms, the frame is dropped — the user perceives jank.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>rAF scheduling guarantees and gotchas</summary>
+        <ul>
+          <li><strong>One call per frame:</strong> rAF callbacks run once per rendering opportunity, not per event loop iteration.</li>
+          <li><strong>Batched execution:</strong> All rAF callbacks queued before the current frame are executed together. A rAF callback that schedules another rAF runs it in the <em>next</em> frame.</li>
+          <li><strong>Not fired in background tabs:</strong> To save resources, browsers pause rAF when the tab is hidden.</li>
+          <li><strong>Timestamp parameter:</strong> The callback receives a <code>DOMHighResTimeStamp</code> — use it instead of <code>Date.now()</code> for animation timing.</li>
+        </ul>
+        <pre><code class="language-javascript">// Smooth animation pattern
+function animate(timestamp) {
+  // Use timestamp for frame-independent animation
+  const elapsed = timestamp - startTime;
+  const progress = Math.min(elapsed / duration, 1);
+  
+  element.style.transform = `translateX(${progress * 300}px)`;
+  
+  if (progress < 1) {
+    requestAnimationFrame(animate); // Schedule next frame
+  }
+}
+
+const startTime = performance.now();
+const duration = 1000; // 1 second animation
+requestAnimationFrame(animate);</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 9: requestIdleCallback -->
+    <section id="request-idle-callback">
+      <h2>requestIdleCallback</h2>
+
+      <details>
+        <summary>Scheduling non-urgent work during idle periods</summary>
+        <p><code>requestIdleCallback</code> runs when the browser has idle time — after all tasks, microtasks, and rendering are complete, and there's still time before the next frame deadline.</p>
+        <pre class="diagram">
+│◄────────────── Frame (16.6ms) ──────────────►│
+│                                               │
+│ Task │ Microtasks │ rAF │ Style/Layout/Paint │ Idle │
+│  5ms │    2ms     │ 1ms │       4ms          │ 4.6ms│
+│                                               │      │
+│                                          requestIdleCallback
+│                                          runs here
+        </pre>
+        <pre><code class="language-javascript">// Schedule low-priority work
+requestIdleCallback((deadline) => {
+  // deadline.timeRemaining() tells you how much idle time is left
+  while (deadline.timeRemaining() > 0 && tasks.length > 0) {
+    processTask(tasks.shift());
+  }
+  
+  // If more work remains, schedule for next idle period
+  if (tasks.length > 0) {
+    requestIdleCallback(processRemainingTasks);
+  }
+}, { timeout: 2000 }); // Force execution within 2s even if no idle time</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Caution:</strong> <code>requestIdleCallback</code> is NOT suitable for urgent UI updates. It may be delayed indefinitely if the main thread stays busy. Safari has never shipped <code>requestIdleCallback</code> (as of 2024, it remains unimplemented). Use a polyfill based on <code>requestAnimationFrame</code> + <code>MessageChannel</code>, or use <code>scheduler.yield()</code> (shipped in Chrome 129+, Sept 2024) for cooperative yielding.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>React's Scheduler — inspired by requestIdleCallback</summary>
+        <p>React's internal scheduler was initially based on <code>requestIdleCallback</code> but switched to <code>MessageChannel</code> for more consistent scheduling. It implements its own priority queue with 5 levels:</p>
+        <ul>
+          <li><strong>Immediate</strong> — synchronous-like (user input)</li>
+          <li><strong>UserBlocking</strong> — 250ms expiration</li>
+          <li><strong>Normal</strong> — 5000ms expiration</li>
+          <li><strong>Low</strong> — 10000ms expiration</li>
+          <li><strong>Idle</strong> — never expires (until nothing else to do)</li>
+        </ul>
+        <p>This approach allows React to yield to the browser between work units while maintaining control over scheduling priorities — something <code>requestIdleCallback</code> alone couldn't provide.</p>
+      </details>
+    </section>
+
+    <!-- Section 10: Microtask Starvation -->
+    <section id="microtask-starvation">
+      <h2>Microtask Starvation</h2>
+
+      <details>
+        <summary>How microtasks can freeze the entire page</summary>
+        <p>Because the microtask queue must fully drain before the browser can render, a recursive microtask chain prevents painting, user interaction, and even macrotask processing:</p>
+        <pre><code class="language-javascript">// ⚠️ THIS FREEZES THE PAGE
+function recursiveMicrotask() {
+  Promise.resolve().then(() => {
+    // Do some work...
+    doExpensiveComputation();
+    
+    // Schedule more work as a microtask — BAD!
+    recursiveMicrotask(); // Rendering never gets a chance
+  });
+}
+recursiveMicrotask();
+// The page is now frozen. No clicks, no scrolling, no painting.</code></pre>
+        <p>This is functionally equivalent to:</p>
+        <pre><code class="language-javascript">// Equally bad — but more obviously wrong
+while (true) {
+  doExpensiveComputation();
+}</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>The trap:</strong> Developers assume that because Promises are "asynchronous," recursive Promise chains won't block. But microtasks are only async in the sense that they defer until the current synchronous code completes — they still block the rendering pipeline.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>The fix — yielding to the macrotask queue</summary>
+        <p>To prevent starvation, break work into macrotasks so the browser gets rendering opportunities between chunks:</p>
+        <pre><code class="language-javascript">// ✅ CORRECT — yields to the event loop between chunks
+function processItemsYielding(items) {
+  let index = 0;
+  
+  function processChunk() {
+    const deadline = performance.now() + 5; // 5ms time budget per chunk
+    
+    while (index < items.length && performance.now() < deadline) {
+      processItem(items[index]);
+      index++;
+    }
+    
+    if (index < items.length) {
+      // Use setTimeout (macrotask) to yield — browser can render between chunks
+      setTimeout(processChunk, 0);
+    }
+  }
+  
+  processChunk();
+}
+
+// ✅ Modern approach — scheduler.yield() (Chrome 129+, Sept 2024)
+async function processItemsModern(items) {
+  for (const item of items) {
+    processItem(item);
+    
+    // Yield to the event loop, letting browser render
+    if (needsYield()) {
+      await scheduler.yield(); // or: await new Promise(r => setTimeout(r, 0));
+    }
+  }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Real-world starvation scenario — MutationObserver feedback loop</summary>
+        <pre><code class="language-javascript">// ⚠️ MutationObserver microtask that triggers DOM mutation,
+//    which triggers another MutationObserver microtask...
+const observer = new MutationObserver((mutations) => {
+  // This callback is a microtask
+  for (const mutation of mutations) {
+    // Modifying the DOM inside the observer callback
+    // triggers another MutationObserver delivery (microtask)
+    mutation.target.dataset.processed = 'true'; // Triggers observer again!
+  }
+});
+
+observer.observe(element, { attributes: true, subtree: true });
+element.setAttribute('data-init', 'true'); // Starts infinite microtask loop</code></pre>
+        <p><strong>Fix:</strong> Use a flag to prevent re-entrant processing, or disconnect/reconnect the observer:</p>
+        <pre><code class="language-javascript">let isProcessing = false;
+const observer = new MutationObserver((mutations) => {
+  if (isProcessing) return; // Prevent re-entrant calls
+  isProcessing = true;
+  
+  for (const mutation of mutations) {
+    mutation.target.dataset.processed = 'true';
+  }
+  
+  isProcessing = false;
+});</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 11: setTimeout vs queueMicrotask vs Promise -->
+    <section id="scheduling-apis">
+      <h2>setTimeout vs queueMicrotask vs Promise.resolve</h2>
+
+      <details>
+        <summary>Scheduling API comparison table</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>API</th>
+              <th>Queue Type</th>
+              <th>Timing</th>
+              <th>Rendering</th>
+              <th>Use Case</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>queueMicrotask(fn)</code></td>
+              <td>Microtask</td>
+              <td>After current task, before render</td>
+              <td>Blocks rendering</td>
+              <td>Cleanup, batching state changes</td>
+            </tr>
+            <tr>
+              <td><code>Promise.resolve().then(fn)</code></td>
+              <td>Microtask</td>
+              <td>Same as queueMicrotask</td>
+              <td>Blocks rendering</td>
+              <td>Async chains</td>
+            </tr>
+            <tr>
+              <td><code>setTimeout(fn, 0)</code></td>
+              <td>Macrotask</td>
+              <td>Next event loop iteration (≥1ms, ≥4ms nested)</td>
+              <td>Allows rendering</td>
+              <td>Yielding to browser, chunking work</td>
+            </tr>
+            <tr>
+              <td><code>requestAnimationFrame(fn)</code></td>
+              <td>rAF queue</td>
+              <td>Before next paint (~16.6ms)</td>
+              <td>Part of render step</td>
+              <td>Visual updates, animations</td>
+            </tr>
+            <tr>
+              <td><code>requestIdleCallback(fn)</code></td>
+              <td>Idle queue</td>
+              <td>When idle time available</td>
+              <td>After rendering</td>
+              <td>Analytics, prefetching, non-urgent</td>
+            </tr>
+            <tr>
+              <td><code>MessageChannel</code></td>
+              <td>Macrotask</td>
+              <td>Next iteration (no 4ms clamp)</td>
+              <td>Allows rendering</td>
+              <td>Scheduler implementations (React)</td>
+            </tr>
+            <tr>
+              <td><code>scheduler.postTask(fn)</code></td>
+              <td>Priority task</td>
+              <td>Based on priority</td>
+              <td>Allows rendering</td>
+              <td>Priority-aware scheduling (new API)</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>When to use each — decision guide</summary>
+        <pre><code class="language-javascript">// ✅ Use queueMicrotask for synchronous-like cleanup
+// that must run before the browser does anything else
+element.addEventListener('click', () => {
+  updateState();
+  queueMicrotask(() => {
+    // Runs immediately after this handler, before any rendering
+    // Good for: batching DOM reads, notifying subscribers
+    notifySubscribers();
+  });
+});
+
+// ✅ Use setTimeout(fn, 0) to yield to the browser
+// Allows rendering between chunks of work
+function processLargeArray(items) {
+  const CHUNK_SIZE = 100;
+  let i = 0;
+  function chunk() {
+    const end = Math.min(i + CHUNK_SIZE, items.length);
+    while (i < end) process(items[i++]);
+    if (i < items.length) setTimeout(chunk, 0); // Yield!
+  }
+  chunk();
+}
+
+// ✅ Use MessageChannel for faster yielding (no 4ms clamp)
+const channel = new MessageChannel();
+channel.port1.onmessage = () => { /* next chunk of work */ };
+channel.port2.postMessage(null); // Schedules macrotask without timer delay
+
+// ✅ Use rAF for anything that changes visual state
+requestAnimationFrame(() => {
+  element.style.transform = `translateX(${x}px)`;
+});</code></pre>
+      </details>
+
+      <details>
+        <summary>The 4ms timer clamping — why setTimeout(fn, 0) isn't instant</summary>
+        <p>The HTML spec mandates that after 5 levels of nested setTimeout calls, the minimum delay is clamped to 4ms. This is why <code>setTimeout(fn, 0)</code> doesn't actually run after 0ms in practice.</p>
+        <pre><code class="language-javascript">// Demonstration of timer clamping
+function measureTimerDelay(depth = 0) {
+  const start = performance.now();
+  setTimeout(() => {
+    console.log(`Depth ${depth}: ${(performance.now() - start).toFixed(2)}ms`);
+    if (depth < 10) measureTimerDelay(depth + 1);
+  }, 0);
+}
+measureTimerDelay();
+// Depth 0: ~0.1ms
+// Depth 1: ~0.1ms
+// ...
+// Depth 5+: ~4ms (clamping kicks in)</code></pre>
+        <p>This is why React uses <code>MessageChannel</code> instead of <code>setTimeout</code> — MessageChannel doesn't have the 4ms clamping, providing more responsive scheduling.</p>
+      </details>
+    </section>
+
+    <!-- Section 12: Web Workers & Off-Main-Thread -->
+    <section id="web-workers">
+      <h2>Web Workers & Off-Main-Thread</h2>
+
+      <details>
+        <summary>When the event loop isn't enough — true parallelism</summary>
+        <p>The event loop is cooperative — all JavaScript on the main thread shares one call stack. For CPU-intensive work that can't be chunked (e.g., image processing, complex calculations, data parsing), Web Workers provide true parallel execution on separate threads.</p>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│                      Browser                                 │
+│                                                             │
+│  ┌──────────────────────┐      ┌──────────────────────┐   │
+│  │     Main Thread       │      │    Worker Thread      │   │
+│  │                      │      │                      │   │
+│  │  Event Loop          │      │  Own Event Loop      │   │
+│  │  DOM Access ✅        │      │  DOM Access ❌        │   │
+│  │  UI Rendering ✅      │◄────►│  Computation ✅       │   │
+│  │  User Events ✅       │ msg  │  importScripts ✅     │   │
+│  │                      │      │  fetch ✅             │   │
+│  └──────────────────────┘      └──────────────────────┘   │
+│           │                              │                  │
+│           │        postMessage /         │                  │
+│           └──────── Transferable ────────┘                  │
+│                     Objects                                  │
+└─────────────────────────────────────────────────────────────┘
+        </pre>
+      </details>
+
+      <details>
+        <summary>Worker types and their use cases</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Worker Type</th>
+              <th>Scope</th>
+              <th>Use Case</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Dedicated Worker</strong></td>
+              <td>Single page</td>
+              <td>Heavy computation, data processing</td>
+            </tr>
+            <tr>
+              <td><strong>Shared Worker</strong></td>
+              <td>Multiple tabs/iframes</td>
+              <td>Shared state, connection pooling</td>
+            </tr>
+            <tr>
+              <td><strong>Service Worker</strong></td>
+              <td>Origin-wide, persistent</td>
+              <td>Caching, push notifications, offline</td>
+            </tr>
+          </tbody>
+        </table>
+        <pre><code class="language-javascript">// Main thread — offload heavy work
+const worker = new Worker('./heavy-computation.js');
+
+worker.postMessage({ type: 'PROCESS', data: largeDataset });
+
+worker.onmessage = (event) => {
+  // Back on main thread — safe to update DOM
+  renderResults(event.data);
+};
+
+// heavy-computation.js (Worker)
+self.onmessage = (event) => {
+  if (event.data.type === 'PROCESS') {
+    const result = expensiveAlgorithm(event.data.data);
+    self.postMessage(result); // Send back to main thread
+  }
+};
+
+// Modern approach — using Transferable objects for zero-copy transfer
+const buffer = new ArrayBuffer(1024 * 1024); // 1MB
+worker.postMessage({ buffer }, [buffer]); // Transfer ownership (zero-copy)
+// buffer.byteLength === 0 after transfer (ownership moved to worker)</code></pre>
+      </details>
+
+      <details>
+        <summary>Comlink — ergonomic Worker communication</summary>
+        <pre><code class="language-javascript">// Using Comlink to simplify worker communication
+// worker.js
+import * as Comlink from 'comlink';
+
+const api = {
+  async processImage(imageData) {
+    // Heavy computation runs on worker thread
+    return applyFilters(imageData);
+  },
+  fibonacci(n) {
+    if (n <= 1) return n;
+    return api.fibonacci(n - 1) + api.fibonacci(n - 2);
+  }
+};
+
+Comlink.expose(api);
+
+// main.js
+import * as Comlink from 'comlink';
+
+const worker = new Worker('./worker.js', { type: 'module' });
+const api = Comlink.wrap(worker);
+
+// Call worker functions as if they were local (returns Promise)
+const result = await api.processImage(imageData);
+const fib = await api.fibonacci(40); // Doesn't block main thread!</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 13: Production Performance Incident -->
+    <section id="production-incident">
+      <h2>Production Incident — Promise Chain Starvation in a Real-Time Dashboard</h2>
+
+      <details>
+        <summary>Symptoms</summary>
+        <ul>
+          <li>Real-time trading dashboard becomes unresponsive after 10-15 minutes of use</li>
+          <li>Click handlers stop firing; animations freeze</li>
+          <li>Browser tab eventually shows "Page Unresponsive" dialog</li>
+          <li>CPU shows 100% on the main thread</li>
+          <li>Only happens in production (high data volume), not development</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>Root Cause</summary>
+        <p>A WebSocket message handler processed incoming market data using <code>async/await</code> in a tight loop. Under low volume, each iteration completed before new messages arrived. Under production load (1000+ messages/second), the pattern caused microtask starvation:</p>
+        <pre><code class="language-javascript">// ⚠️ THE PROBLEMATIC CODE
+webSocket.onmessage = async (event) => {
+  const updates = JSON.parse(event.data);
+  
+  // Each update processed as microtask chain
+  for (const update of updates) {
+    await processUpdate(update);    // Microtask
+    await updateStore(update);      // Microtask
+    await notifySubscribers(update); // Microtask — schedules React re-renders
+  }
+};
+
+// With 1000+ messages/sec, each containing 50+ updates,
+// the microtask queue grows faster than it drains.
+// The browser NEVER gets a chance to paint or process user input.</code></pre>
+      </details>
+
+      <details>
+        <summary>Investigation</summary>
+        <ol>
+          <li><strong>Performance tab:</strong> Recorded a 5-second trace. Saw a single massive "Task" lasting 4800ms with no rendering frames.</li>
+          <li><strong>Call tree:</strong> 98% of time in microtask processing — thousands of Promise resolutions stacked.</li>
+          <li><strong>Network tab:</strong> WebSocket messages arriving faster than they could be processed.</li>
+          <li><strong>Performance.measure():</strong> Added timing around the message handler — individual messages took 2-5ms, but accumulated without yielding.</li>
+        </ol>
+      </details>
+
+      <details>
+        <summary>Resolution</summary>
+        <pre><code class="language-javascript">// ✅ THE FIX — Batch + yield pattern
+class MessageProcessor {
+  #queue = [];
+  #isProcessing = false;
+  #frameDeadline = 8; // ms — leave headroom for rendering
+
+  enqueue(messages) {
+    this.#queue.push(...messages);
+    if (!this.#isProcessing) this.#scheduleProcessing();
+  }
+
+  #scheduleProcessing() {
+    this.#isProcessing = true;
+    // Use MessageChannel for fast yielding without 4ms clamp
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => this.#processChunk();
+    channel.port2.postMessage(null);
+  }
+
+  #processChunk() {
+    const start = performance.now();
+    
+    while (this.#queue.length > 0) {
+      if (performance.now() - start > this.#frameDeadline) {
+        // Yield to browser — allow rendering and input
+        this.#scheduleProcessing();
+        return;
+      }
+      
+      const update = this.#queue.shift();
+      this.#processSynchronously(update); // No await — synchronous batch
+    }
+    
+    // All caught up — flush React updates in one batch
+    flushSync(() => notifySubscribers());
+    this.#isProcessing = false;
+  }
+
+  #processSynchronously(update) {
+    // Process without async — no microtask overhead
+    store.set(update.symbol, update.price);
+  }
+}
+
+webSocket.onmessage = (event) => {
+  const updates = JSON.parse(event.data);
+  processor.enqueue(updates);
+};</code></pre>
+      </details>
+
+      <details>
+        <summary>Lessons Learned</summary>
+        <ul>
+          <li><strong>async/await in hot paths is dangerous.</strong> Each <code>await</code> creates a microtask. In high-throughput scenarios, the microtask queue grows unbounded.</li>
+          <li><strong>Always budget your frame time.</strong> If you can't guarantee completion within 8-10ms, implement a yielding strategy.</li>
+          <li><strong>Batch before notifying.</strong> Don't trigger React re-renders for each individual data point. Collect changes, then flush once.</li>
+          <li><strong>Use MessageChannel, not setTimeout.</strong> It yields without the 4ms clamping penalty.</li>
+          <li><strong>Test with production data volumes.</strong> Event loop starvation often only manifests at scale.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 14: Debugging with Performance DevTools -->
+    <section id="debugging">
+      <h2>Debugging with Performance DevTools</h2>
+
+      <details>
+        <summary>Chrome Performance panel — reading the event loop</summary>
+        <p>The Performance panel visualizes the event loop's behavior. Here's how to identify event loop issues:</p>
+        <ol>
+          <li><strong>Record a trace</strong> (Cmd+Shift+E) during the problematic behavior</li>
+          <li><strong>Look for long tasks</strong> — red triangles on the Main thread indicate tasks > 50ms</li>
+          <li><strong>Identify the composition:</strong>
+            <ul>
+              <li>Yellow = JavaScript execution</li>
+              <li>Purple = Style/Layout recalculation</li>
+              <li>Green = Paint/Composite</li>
+              <li>Gray = Idle</li>
+            </ul>
+          </li>
+          <li><strong>Zoom into long tasks</strong> — check if they're one function or microtask cascades</li>
+          <li><strong>Check "Timings" row</strong> — shows when frames were produced. Gaps = dropped frames</li>
+        </ol>
+      </details>
+
+      <details>
+        <summary>Programmatic detection of long tasks</summary>
+        <pre><code class="language-javascript">// Detect long tasks at runtime using PerformanceObserver
+const observer = new PerformanceObserver((list) => {
+  for (const entry of list.getEntries()) {
+    if (entry.duration > 50) {
+      console.warn(`Long task detected: ${entry.duration.toFixed(1)}ms`, {
+        name: entry.name,
+        startTime: entry.startTime,
+        // attribution tells you which script caused it
+        attribution: entry.attribution
+      });
+      
+      // Send to analytics
+      analytics.track('long_task', {
+        duration: entry.duration,
+        url: window.location.href
+      });
+    }
+  }
+});
+
+observer.observe({ type: 'longtask', buffered: true });
+
+// Detect layout shifts
+const clsObserver = new PerformanceObserver((list) => {
+  for (const entry of list.getEntries()) {
+    if (!entry.hadRecentInput) {
+      console.warn('Layout shift:', entry.value, entry.sources);
+    }
+  }
+});
+clsObserver.observe({ type: 'layout-shift', buffered: true });</code></pre>
+      </details>
+
+      <details>
+        <summary>Using performance.measure() to instrument the event loop</summary>
+        <pre><code class="language-javascript">// Measure time between scheduling and execution
+function measureEventLoopLag() {
+  const start = performance.now();
+  
+  setTimeout(() => {
+    const lag = performance.now() - start;
+    // If lag >> 0ms, the event loop was busy
+    if (lag > 50) {
+      console.warn(`Event loop lag: ${lag.toFixed(1)}ms`);
+    }
+    measureEventLoopLag(); // Continue monitoring
+  }, 0);
+}
+
+measureEventLoopLag();
+
+// More precise: measure microtask vs macrotask timing
+performance.mark('before-microtask');
+queueMicrotask(() => {
+  performance.mark('after-microtask');
+  performance.measure('microtask-delay', 'before-microtask', 'after-microtask');
+});
+
+performance.mark('before-macrotask');
+setTimeout(() => {
+  performance.mark('after-macrotask');
+  performance.measure('macrotask-delay', 'before-macrotask', 'after-macrotask');
+}, 0);</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 15: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+
+      <details>
+        <summary>Classic interview puzzle — predict the output</summary>
+        <pre><code class="language-javascript">console.log('1');
+
+setTimeout(() => console.log('2'), 0);
+
+Promise.resolve().then(() => {
+  console.log('3');
+  setTimeout(() => console.log('4'), 0);
+  Promise.resolve().then(() => console.log('5'));
+});
+
+setTimeout(() => {
+  console.log('6');
+  Promise.resolve().then(() => console.log('7'));
+}, 0);
+
+console.log('8');
+
+// Output: 1, 8, 3, 5, 2, 6, 7, 4
+//
+// Explanation:
+// Synchronous: 1, 8
+// Microtask drain: 3 (queues setTimeout '4' and Promise '5')
+// Microtask drain continues: 5
+// Macrotask: 2 (first setTimeout)
+// Macrotask: 6 (second setTimeout, queues Promise '7')
+// Microtask drain after '6': 7
+// Macrotask: 4 (setTimeout queued inside first .then)</code></pre>
+      </details>
+
+      <details>
+        <summary>Advanced puzzle — async/await ordering</summary>
+        <pre><code class="language-javascript">async function foo() {
+  console.log('foo start');
+  await bar();
+  console.log('foo end'); // This is a microtask (continuation after await)
+}
+
+async function bar() {
+  console.log('bar start');
+  await Promise.resolve();
+  console.log('bar end'); // Microtask
+}
+
+console.log('script start');
+foo();
+console.log('script end');
+
+// Output:
+// script start
+// foo start
+// bar start
+// script end
+// bar end
+// foo end
+//
+// Why:
+// - 'script start' — synchronous
+// - foo() called → 'foo start' — synchronous
+// - await bar() → bar() called → 'bar start' — synchronous
+// - await Promise.resolve() inside bar — bar suspends, returns to foo
+// - foo hits await (waiting for bar), suspends, returns to global
+// - 'script end' — synchronous
+// - Call stack empty → drain microtasks
+// - bar's continuation: 'bar end'
+// - foo's continuation (bar resolved): 'foo end'</code></pre>
+      </details>
+
+      <details>
+        <summary>Yielding strategy — cooperative multitasking pattern</summary>
+        <pre><code class="language-javascript">/**
+ * Process a large dataset without blocking the main thread.
+ * Uses cooperative scheduling — processes items in time-boxed chunks.
+ */
+function processInChunks(items, processFn, options = {}) {
+  const {
+    chunkTimeMs = 8,     // Time budget per chunk (leave room for 60fps rendering)
+    onProgress = null,    // Progress callback
+    onComplete = null,    // Completion callback
+    signal = null         // AbortSignal for cancellation
+  } = options;
+  
+  return new Promise((resolve, reject) => {
+    let index = 0;
+    const results = [];
+    const total = items.length;
+    
+    function processChunk() {
+      // Check for cancellation
+      if (signal?.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
+      
+      const chunkStart = performance.now();
+      
+      while (index < total) {
+        // Check if we've exceeded our time budget
+        if (performance.now() - chunkStart > chunkTimeMs) {
+          // Yield to the browser via macrotask
+          onProgress?.(index / total);
+          setTimeout(processChunk, 0);
+          return;
+        }
+        
+        results.push(processFn(items[index], index));
+        index++;
+      }
+      
+      // All done
+      onProgress?.(1);
+      onComplete?.(results);
+      resolve(results);
+    }
+    
+    processChunk();
+  });
+}
+
+// Usage
+const controller = new AbortController();
+
+const results = await processInChunks(
+  largeArray,
+  (item) => expensiveTransform(item),
+  {
+    chunkTimeMs: 8,
+    onProgress: (pct) => updateProgressBar(pct),
+    signal: controller.signal
+  }
+);
+
+// Cancel if needed
+controller.abort();</code></pre>
+      </details>
+
+      <details>
+        <summary>isInputPending — browser-native yield point detection</summary>
+        <pre><code class="language-javascript">/**
+ * Uses navigator.scheduling.isInputPending() to detect
+ * when user input is waiting — yield immediately in that case.
+ * (Chrome 87+)
+ */
+function processWithInputAwareness(items, processFn) {
+  let index = 0;
+  
+  function processChunk() {
+    while (index < items.length) {
+      // Check if user has pending input — yield immediately
+      if (navigator.scheduling?.isInputPending?.({ includeContinuous: true })) {
+        // User is trying to interact — yield NOW
+        setTimeout(processChunk, 0);
+        return;
+      }
+      
+      processFn(items[index]);
+      index++;
+    }
+  }
+  
+  processChunk();
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 16: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>Mistake 1: Assuming async/await is non-blocking</summary>
+        <p><strong>The mistake:</strong> "I used async/await so it won't block the UI."</p>
+        <p><strong>Reality:</strong> <code>async/await</code> is syntactic sugar over Promises. The code between <code>await</code> points runs synchronously. A CPU-intensive function doesn't become non-blocking just because you <code>await</code> it.</p>
+        <pre><code class="language-javascript">// ⚠️ STILL BLOCKS — the expensive work runs synchronously
+async function processData(data) {
+  const result = await heavyComputation(data); // Blocks until heavyComputation returns!
+  return result;
+}
+
+// heavyComputation runs synchronously on the main thread.
+// The "await" only helps if the function returns a Promise that
+// resolves later (e.g., after a network request or Worker message).</code></pre>
+      </details>
+
+      <details>
+        <summary>Mistake 2: Using setInterval for animations</summary>
+        <p><strong>The mistake:</strong> Using <code>setInterval(fn, 16)</code> for smooth animations.</p>
+        <p><strong>Reality:</strong> Timer callbacks are macrotasks — they don't align with the browser's refresh rate. They can drift, stack up, or fire at the wrong time relative to paint.</p>
+        <pre><code class="language-javascript">// ⚠️ BAD — not synchronized with display refresh
+setInterval(() => {
+  element.style.left = `${x++}px`; // May cause jank
+}, 16);
+
+// ✅ GOOD — synchronized with paint cycle
+function animate() {
+  element.style.left = `${x++}px`;
+  requestAnimationFrame(animate); // Fires at display refresh rate
+}
+requestAnimationFrame(animate);</code></pre>
+      </details>
+
+      <details>
+        <summary>Mistake 3: Reading layout after writing (layout thrashing)</summary>
+        <p><strong>The mistake:</strong> Interleaving DOM writes and reads forces the browser to synchronously recalculate layout mid-script.</p>
+        <pre><code class="language-javascript">// ⚠️ FORCES SYNCHRONOUS LAYOUT — extremely expensive
+items.forEach(item => {
+  item.style.width = '100px';           // Write (invalidates layout)
+  const height = item.offsetHeight;      // Read (forces synchronous layout!)
+  item.style.height = `${height * 2}px`; // Write (invalidates again)
+});
+
+// ✅ BATCH READS, THEN WRITES
+const heights = items.map(item => item.offsetHeight); // All reads first
+items.forEach((item, i) => {
+  item.style.width = '100px';
+  item.style.height = `${heights[i] * 2}px`; // All writes together
+});</code></pre>
+      </details>
+
+      <details>
+        <summary>Mistake 4: Not cleaning up recurring microtask sources</summary>
+        <p><strong>The mistake:</strong> MutationObservers or Promise-based polling that outlives its intended scope.</p>
+        <pre><code class="language-javascript">// ⚠️ Memory leak + unnecessary microtask processing
+useEffect(() => {
+  const observer = new MutationObserver(callback);
+  observer.observe(ref.current, { childList: true, subtree: true });
+  // Missing cleanup!
+});
+
+// ✅ Always disconnect
+useEffect(() => {
+  const observer = new MutationObserver(callback);
+  observer.observe(ref.current, { childList: true, subtree: true });
+  return () => observer.disconnect(); // Cleanup on unmount
+}, []);</code></pre>
+      </details>
+
+      <details>
+        <summary>Mistake 5: Confusing concurrency with parallelism</summary>
+        <p><strong>The mistake:</strong> "Promise.all runs things in parallel."</p>
+        <p><strong>Reality:</strong> <code>Promise.all</code> provides concurrency (multiple operations in-flight) but NOT parallelism (simultaneous CPU execution). All JavaScript still runs on one thread. The "parallelism" is only for I/O waiting — the network requests go out simultaneously, but their callbacks execute one at a time.</p>
+        <pre><code class="language-javascript">// These network requests are concurrent (in-flight simultaneously)
+// but their response handlers execute sequentially on the main thread
+const [users, posts] = await Promise.all([
+  fetch('/users').then(r => r.json()),  // Concurrent I/O
+  fetch('/posts').then(r => r.json())   // Concurrent I/O
+]);
+
+// For TRUE CPU parallelism, use Workers
+const results = await Promise.all([
+  worker1.process(chunk1), // Actual parallel execution
+  worker2.process(chunk2)  // on separate threads
+]);</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 17: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+
+      <details>
+        <summary>Scheduling strategy trade-offs</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Responsiveness</th>
+              <th>Throughput</th>
+              <th>Complexity</th>
+              <th>When to Use</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Synchronous (no yielding)</td>
+              <td>❌ Poor</td>
+              <td>✅ Maximum</td>
+              <td>✅ Simple</td>
+              <td>Work < 5ms, non-interactive contexts</td>
+            </tr>
+            <tr>
+              <td>Microtask batching</td>
+              <td>❌ Poor (same drain)</td>
+              <td>✅ High</td>
+              <td>✅ Simple</td>
+              <td>Batching state changes within one task</td>
+            </tr>
+            <tr>
+              <td>setTimeout chunking</td>
+              <td>✅ Good</td>
+              <td>⚠️ Reduced (4ms gaps)</td>
+              <td>⚠️ Medium</td>
+              <td>General-purpose yielding</td>
+            </tr>
+            <tr>
+              <td>MessageChannel chunking</td>
+              <td>✅ Good</td>
+              <td>✅ Good (no 4ms clamp)</td>
+              <td>⚠️ Medium</td>
+              <td>High-frequency yielding (React)</td>
+            </tr>
+            <tr>
+              <td>requestIdleCallback</td>
+              <td>✅ Excellent</td>
+              <td>❌ Unpredictable</td>
+              <td>⚠️ Medium</td>
+              <td>Non-urgent background work</td>
+            </tr>
+            <tr>
+              <td>Web Worker</td>
+              <td>✅ Excellent</td>
+              <td>✅ High (parallel)</td>
+              <td>❌ High (serialization)</td>
+              <td>CPU-heavy work (images, crypto)</td>
+            </tr>
+            <tr>
+              <td>WASM + Worker</td>
+              <td>✅ Excellent</td>
+              <td>✅ Maximum</td>
+              <td>❌ Very High</td>
+              <td>Performance-critical computation</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Microtask vs Macrotask — choosing the right queue</summary>
+        <ul>
+          <li><strong>Use microtask (queueMicrotask)</strong> when you need code to run after the current synchronous work but before any rendering or other tasks. Example: batching multiple synchronous state updates into a single notification.</li>
+          <li><strong>Use macrotask (setTimeout)</strong> when you need to yield to the browser. Example: processing a large array in chunks while keeping the page responsive.</li>
+          <li><strong>The trap:</strong> Using microtasks for "defer this work" when you actually need "yield to the browser" — they look similar but behave very differently.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 18: Follow-up Interview Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Q1: What's the difference between setTimeout(fn, 0) and queueMicrotask(fn)?</summary>
+        <p><strong>Strong answer:</strong> <code>setTimeout(fn, 0)</code> schedules a macrotask — the callback runs in a future event loop iteration, after the browser has had a chance to render. <code>queueMicrotask(fn)</code> schedules a microtask — the callback runs before the event loop yields to the browser, in the current microtask drain. This means microtasks run sooner but can delay rendering if overused.</p>
+      </details>
+
+      <details>
+        <summary>Q2: Can you starve the rendering pipeline with async/await? How?</summary>
+        <p><strong>Strong answer:</strong> Yes. If an async function <code>await</code>s a synchronously resolving Promise (like <code>Promise.resolve()</code>) in a loop, each iteration is a microtask. Since all microtasks drain before rendering, a tight async loop starves the paint cycle. The fix is to yield to a macrotask (setTimeout or MessageChannel) periodically.</p>
+      </details>
+
+      <details>
+        <summary>Q3: Why does React use MessageChannel instead of setTimeout or requestIdleCallback?</summary>
+        <p><strong>Strong answer:</strong> <code>setTimeout</code> has a minimum 4ms delay when nested beyond 5 levels (per HTML spec), making it too slow for React's scheduling needs. <code>requestIdleCallback</code> has unpredictable timing and isn't supported in all environments. <code>MessageChannel</code> provides immediate macrotask scheduling without timer clamping — it yields to the browser for rendering but resumes work as quickly as possible.</p>
+      </details>
+
+      <details>
+        <summary>Q4: Explain the difference between concurrency and parallelism in JavaScript.</summary>
+        <p><strong>Strong answer:</strong> JavaScript's main thread provides concurrency through the event loop — multiple asynchronous operations can be in-flight simultaneously (network requests, timers), but their JavaScript callbacks execute one at a time on the single thread. True parallelism (simultaneous execution) requires Web Workers, each with their own event loop and call stack. <code>Promise.all</code> is concurrent I/O, not parallel computation.</p>
+      </details>
+
+      <details>
+        <summary>Q5: How would you ensure smooth 60fps animations while processing data?</summary>
+        <p><strong>Strong answer:</strong> Use <code>requestAnimationFrame</code> for all visual updates — it synchronizes with the display refresh rate. For data processing, use time-boxed chunking: process items in a loop until a time budget (e.g., 8ms) is exceeded, then yield via <code>setTimeout</code> or <code>MessageChannel</code>. For heavy computation, move it to a Web Worker. CSS animations (transforms, opacity) can run on the compositor thread without JavaScript involvement.</p>
+      </details>
+
+      <details>
+        <summary>Q6: What happens if you call setState in a microtask vs a macrotask in React 18?</summary>
+        <p><strong>Strong answer:</strong> In React 18, automatic batching means both are batched — regardless of whether updates originate in a React event handler, setTimeout, Promise, or native event. In React 17, only updates within React synthetic event handlers and lifecycle methods were batched; updates in setTimeout, Promises, or native event handlers triggered separate re-renders.</p>
+        <p>React 18's mechanism works by tracking an execution context: when <code>setState</code> is called, React marks the update on the fiber but doesn't immediately schedule a re-render. Instead, it schedules a single flush (via its internal scheduler using <code>MessageChannel</code>) that processes all pending updates together. For urgent (sync-lane) updates this flush is scheduled as a microtask; for transitions, React's scheduler handles the timing with lower priority. The key point: React doesn't literally wait for "the microtask queue to drain" — it uses its own scheduling infrastructure to coalesce updates, which may or may not align with microtask boundaries depending on the update's lane priority.</p>
+      </details>
+
+      <details>
+        <summary>Q7: How does the browser decide when to render?</summary>
+        <p><strong>Strong answer:</strong> The browser aims for 60fps (one frame every 16.6ms) but rendering is not guaranteed every iteration. The browser decides to render when: (1) there are pending style/layout changes, (2) there are rAF callbacks waiting, (3) enough time has passed since the last paint, and (4) the page is visible. Background tabs, display:none content, and pages with no visual changes may skip rendering entirely.</p>
+      </details>
+    </section>
+
+    <!-- Section 19: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Key mental models for the interview:</strong></p>
+        <ul>
+          <li><strong>One macrotask → drain all microtasks → maybe render → repeat.</strong> This is the event loop in one sentence.</li>
+          <li><strong>Microtasks are greedy.</strong> They run to completion and prevent rendering. Use them for batching, not for deferring heavy work.</li>
+          <li><strong>Yielding = scheduling a macrotask.</strong> <code>setTimeout</code>, <code>MessageChannel</code>, or <code>postMessage</code> give the browser a rendering opportunity.</li>
+          <li><strong>rAF is for visual changes.</strong> It runs at the right time relative to paint — not "approximately 16ms" like setTimeout.</li>
+          <li><strong>The event loop doesn't provide parallelism.</strong> For true parallel computation, use Web Workers.</li>
+          <li><strong>React's scheduler is a userland event loop.</strong> It implements priority queues and cooperative yielding on top of the browser's event loop using MessageChannel.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout-warning">
+        <p><strong>What NOT to say in an interview:</strong></p>
+        <ul>
+          <li>❌ "JavaScript is asynchronous" — it's not. The event loop provides an asynchronous programming model, but JS execution is synchronous.</li>
+          <li>❌ "setTimeout(fn, 0) runs immediately" — it doesn't. It runs in the next macrotask, after microtasks drain and potentially after rendering.</li>
+          <li>❌ "Promises run in parallel" — they don't. They provide concurrent I/O, not parallel computation.</li>
+          <li>❌ "async/await makes code non-blocking" — only if the awaited operation is truly asynchronous (network, timer, Worker). CPU-bound work still blocks.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+</body>
+</html>

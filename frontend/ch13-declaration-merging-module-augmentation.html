@@ -1,0 +1,1794 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 13: Declaration Merging &amp; Module Augmentation | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">&#9728;&#65039;</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">&#9776;</button>
+
+  <aside class="sidebar">
+    <a href="../index.html" class="sidebar-brand">
+      <span class="chapter-num">Ch 13</span>
+      <span class="chapter-title">Declaration Merging</span>
+    </a>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#merging-rules">Declaration Merging Rules</a></li>
+        <li><a href="#interface-merging">Interface Merging</a></li>
+        <li><a href="#namespace-merging">Namespace Merging</a></li>
+        <li><a href="#enum-merging">Enum Merging</a></li>
+        <li><a href="#module-augmentation">Module Augmentation</a></li>
+        <li><a href="#global-augmentation">Global Augmentation</a></li>
+        <li><a href="#ambient-declarations">Ambient Declarations</a></li>
+        <li><a href="#triple-slash-directives">Triple-Slash Directives</a></li>
+        <li><a href="#types-packages">@types Packages</a></li>
+        <li><a href="#extending-libraries">Extending Libraries</a></li>
+        <li><a href="#monorepo-types">Monorepo Type Sharing</a></li>
+        <li><a href="#type-only-imports">Type-Only Imports</a></li>
+        <li><a href="#production-architecture">Production Architecture</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <span>Part II — TypeScript Advanced Patterns</span> &gt;
+      <span>Chapter 13</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-typescript">TypeScript</span>
+        <span class="badge badge-topic">Declaration Merging</span>
+        <span class="badge badge-topic">Module Augmentation</span>
+        <span class="badge badge-topic">Ambient</span>
+      </div>
+      <h1>Chapter 13: Declaration Merging &amp; Module Augmentation</h1>
+      <p class="chapter-question"><em>&ldquo;How do declaration merging and module augmentation work? When would you extend third-party types?&rdquo;</em></p>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Declaration merging is TypeScript&rsquo;s mechanism for combining multiple declarations of the same name into a single definition. Interface merging adds properties, namespace merging adds exports, and module augmentation (<code>declare module</code>) extends third-party types without forking. Understanding these mechanisms is essential for extending libraries (Express Request, React&rsquo;s HTMLAttributes), creating plugin systems, and managing type definitions in large monorepos.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search" />
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer&rsquo;s Intent</h2>
+      <details>
+        <summary>What the interviewer is really asking</summary>
+        <ul>
+          <li>Can you extend third-party library types without modifying <code>node_modules</code>?</li>
+          <li>Do you understand how TypeScript merges multiple declarations of the same name?</li>
+          <li>Can you author and maintain <code>.d.ts</code> files for untyped code or custom augmentations?</li>
+          <li>Do you know the difference between module augmentation and global augmentation?</li>
+          <li>Can you set up type-safe environment configurations in production apps?</li>
+          <li>Do you understand how <code>@types</code> packages, triple-slash directives, and <code>tsconfig</code> interact?</li>
+        </ul>
+        <div class="callout callout-info">
+          <strong>Signal:</strong> This question separates developers who <em>use</em> TypeScript from those who can <em>architect</em> TypeScript solutions for teams. It reveals mastery of the type system&rsquo;s extensibility model.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details>
+        <summary>Quick interview response</summary>
+        <p>Declaration merging lets TypeScript combine multiple declarations sharing the same name into one definition. The most common form is <strong>interface merging</strong>&mdash;two interface declarations with the same name automatically combine their members. This is how you extend <code>Window</code>, <code>Express.Request</code>, or any global/library interface.</p>
+        <p><strong>Module augmentation</strong> uses <code>declare module &quot;module-name&quot;</code> to add types to an existing module without modifying its source. The file performing the augmentation must itself be a module (have an <code>import</code> or <code>export</code>). <em>Exception:</em> in <code>.d.ts</code> files without imports/exports (script files), <code>declare module</code> creates an <strong>ambient module declaration</strong> rather than augmenting — this is how <code>@types</code> packages work. The distinction: augmentation <em>extends</em> an existing module; ambient declaration <em>defines</em> one from scratch.</p>
+        <p><strong>Global augmentation</strong> uses <code>declare global { }</code> inside a module file to add to the global scope.</p>
+        <p>Key rules: interfaces merge freely, namespaces merge with classes/functions/enums to add static members, and you should prefer module-scoped augmentation over global to minimize collision risk.</p>
+        <pre><code class="language-typescript">// Module augmentation example
+import 'express';
+
+declare module 'express' {
+  interface Request {
+    userId?: string;
+    correlationId?: string;
+  }
+}
+
+// Global augmentation example
+export {}; // makes this a module
+
+declare global {
+  interface Window {
+    analytics: AnalyticsSDK;
+  }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 3: Declaration Merging Rules -->
+    <section id="merging-rules">
+      <h2>Declaration Merging Rules</h2>
+      <details>
+        <summary>What can merge with what &mdash; precedence &amp; conflict resolution</summary>
+        <h3>Merging Compatibility Matrix</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Declaration A</th>
+              <th>Declaration B</th>
+              <th>Merges?</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Interface</td><td>Interface</td><td>&#10004;</td><td>Members accumulate</td></tr>
+            <tr><td>Namespace</td><td>Namespace</td><td>&#10004;</td><td>Exported members accumulate</td></tr>
+            <tr><td>Class</td><td>Namespace</td><td>&#10004;</td><td>Adds static members to class</td></tr>
+            <tr><td>Function</td><td>Namespace</td><td>&#10004;</td><td>Adds properties to function</td></tr>
+            <tr><td>Enum</td><td>Namespace</td><td>&#10004;</td><td>Adds extra members/methods</td></tr>
+            <tr><td>Class</td><td>Class</td><td>&#10008;</td><td>Error: duplicate identifier</td></tr>
+            <tr><td>Variable</td><td>Variable</td><td>&#10008;</td><td>Error: duplicate identifier</td></tr>
+            <tr><td>Type Alias</td><td>Type Alias</td><td>&#10008;</td><td>Error: duplicate identifier</td></tr>
+            <tr><td>Interface</td><td>Type Alias</td><td>&#10008;</td><td>Error: duplicate identifier</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Precedence Rules</h3>
+        <pre class="diagram">
+  Declaration Spaces in TypeScript:
+  ┌──────────────────────────────────────────┐
+  │  Value Space     │  Type Space    │  Namespace Space  │
+  │  - var/let/const │  - interface   │  - namespace      │
+  │  - function      │  - type alias  │  - module         │
+  │  - class         │  - class       │  - enum           │
+  │  - enum          │  - enum        │                   │
+  │                  │  - namespace   │                   │
+  └──────────────────────────────────────────┘
+
+  A single name can occupy multiple spaces simultaneously.
+  Merging occurs within and across spaces.
+        </pre>
+
+        <h3>Conflict Resolution</h3>
+        <pre><code class="language-typescript">// Non-function members: MUST be identical types
+interface Box {
+  size: number;
+}
+interface Box {
+  size: number; // OK - same type
+  // size: string; // ERROR - conflicts with previous
+}
+
+// Function members: become overloads
+interface Serializer {
+  serialize(input: string): string;
+}
+interface Serializer {
+  serialize(input: number): string; // OK - adds overload
+}
+// Later declarations get HIGHER priority in overload resolution
+
+// Single string literal parameter gets even higher priority
+interface Document {
+  createElement(tagName: string): HTMLElement;
+}
+interface Document {
+  createElement(tagName: "div"): HTMLDivElement;  // Higher priority
+  createElement(tagName: "span"): HTMLSpanElement; // Higher priority
+}</code></pre>
+        <div class="callout callout-warning">
+          <strong>Warning:</strong> Non-function members with the same name but different types cause a compile error. There is no &ldquo;last wins&rdquo; for properties&mdash;they must be type-compatible.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 4: Interface Merging -->
+    <section id="interface-merging">
+      <h2>Interface Merging</h2>
+      <details>
+        <summary>Properties accumulate, method overloads, generics, practical use</summary>
+        <h3>Basic Property Accumulation</h3>
+        <pre><code class="language-typescript">interface User {
+  id: string;
+  name: string;
+}
+
+interface User {
+  email: string;
+  role: 'admin' | 'user';
+}
+
+// Merged result:
+// interface User {
+//   id: string;
+//   name: string;
+//   email: string;
+//   role: 'admin' | 'user';
+// }</code></pre>
+
+        <h3>Method Overload Merging</h3>
+        <pre><code class="language-typescript">interface Logger {
+  log(message: string): void;
+}
+
+interface Logger {
+  log(message: string, level: 'info' | 'warn' | 'error'): void;
+  log(message: Error): void;
+}
+
+// Merged (later declarations get higher overload priority):
+// interface Logger {
+//   log(message: string, level: 'info' | 'warn' | 'error'): void;
+//   log(message: Error): void;
+//   log(message: string): void;
+// }</code></pre>
+
+        <h3>Generics in Merged Interfaces</h3>
+        <pre><code class="language-typescript">// Generic parameters must match exactly
+interface Container&lt;T&gt; {
+  value: T;
+}
+
+interface Container&lt;T&gt; {
+  clone(): Container&lt;T&gt;;
+}
+// OK: same number of generic parameters with compatible constraints
+// Note: parameter NAMES don't need to match (T vs U is fine),
+// but the NUMBER of parameters must be the same</code></pre>
+
+        <h3>Practical: Extending Window</h3>
+        <pre><code class="language-typescript">// globals.d.ts
+interface Window {
+  __REDUX_DEVTOOLS_EXTENSION__?: () =&gt; any;
+  dataLayer: Record&lt;string, unknown&gt;[];
+  gtag: (...args: any[]) =&gt; void;
+}
+
+// Usage - no type errors
+window.__REDUX_DEVTOOLS_EXTENSION__?.();
+window.dataLayer.push({ event: 'page_view' });</code></pre>
+
+        <h3>Extending lib.dom.d.ts</h3>
+        <pre><code class="language-typescript">// Extend HTMLElementTagNameMap for custom elements
+interface HTMLElementTagNameMap {
+  'my-component': MyComponentElement;
+  'app-header': AppHeaderElement;
+}
+
+// Now document.createElement knows about custom elements
+const el = document.createElement('my-component'); // MyComponentElement</code></pre>
+        <div class="callout callout-tip">
+          <strong>Tip:</strong> Interface merging is the primary mechanism behind <code>lib.dom.d.ts</code> extensibility. Libraries like Lit and Stencil use this to register custom element types.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 5: Namespace Merging -->
+    <section id="namespace-merging">
+      <h2>Namespace Merging</h2>
+      <details>
+        <summary>Adding static members, companion pattern, enum+namespace</summary>
+        <h3>Adding Static Members to Classes</h3>
+        <pre><code class="language-typescript">class Validator {
+  validate(input: string): boolean {
+    return input.length &gt; 0;
+  }
+}
+
+namespace Validator {
+  export const VERSION = '2.0.0';
+  export function create(): Validator {
+    return new Validator();
+  }
+}
+
+// Usage
+Validator.VERSION; // "2.0.0"
+Validator.create().validate('hello'); // true</code></pre>
+
+        <h3>Adding Properties to Functions</h3>
+        <pre><code class="language-typescript">function request(url: string): Promise&lt;Response&gt; {
+  return fetch(url);
+}
+
+namespace request {
+  export function get(url: string) {
+    return request(url);
+  }
+  export function post(url: string, body: unknown) {
+    return fetch(url, { method: 'POST', body: JSON.stringify(body) });
+  }
+  export const defaults = {
+    baseURL: '',
+    timeout: 5000,
+  };
+}
+
+// Usage
+request('https://api.example.com');
+request.get('/users');
+request.post('/users', { name: 'Alice' });
+request.defaults.timeout; // 5000</code></pre>
+
+        <h3>Companion Namespace Pattern</h3>
+        <pre><code class="language-typescript">// The type and the value share the same name
+interface Color {
+  r: number;
+  g: number;
+  b: number;
+  a?: number;
+}
+
+namespace Color {
+  export function fromHex(hex: string): Color {
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    return { r, g, b };
+  }
+
+  export function toCSS(color: Color): string {
+    const { r, g, b, a = 1 } = color;
+    return `rgba(${r}, ${g}, ${b}, ${a})`;
+  }
+
+  export const RED: Color = { r: 255, g: 0, b: 0 };
+  export const GREEN: Color = { r: 0, g: 255, b: 0 };
+  export const BLUE: Color = { r: 0, g: 0, b: 255 };
+}
+
+// Used as both type and value
+const bg: Color = Color.fromHex('#ff8800');
+const css = Color.toCSS(bg);</code></pre>
+
+        <h3>Enum + Namespace Merging</h3>
+        <pre><code class="language-typescript">enum Direction {
+  Up = 'UP',
+  Down = 'DOWN',
+  Left = 'LEFT',
+  Right = 'RIGHT',
+}
+
+namespace Direction {
+  export function isHorizontal(dir: Direction): boolean {
+    return dir === Direction.Left || dir === Direction.Right;
+  }
+  export function opposite(dir: Direction): Direction {
+    const map: Record&lt;Direction, Direction&gt; = {
+      [Direction.Up]: Direction.Down,
+      [Direction.Down]: Direction.Up,
+      [Direction.Left]: Direction.Right,
+      [Direction.Right]: Direction.Left,
+    };
+    return map[dir];
+  }
+}
+
+Direction.isHorizontal(Direction.Left); // true
+Direction.opposite(Direction.Up); // Direction.Down</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 6: Enum Merging -->
+    <section id="enum-merging">
+      <h2>Enum Merging</h2>
+      <div class="callout callout-warning">
+        <p><strong>Rarely needed in practice:</strong> Modern TypeScript best practice strongly discourages enums in favor of <code>as const</code> objects (better tree-shaking, no runtime artifacts, clearer semantics). Enum merging is even more niche — most style guides ban it entirely. Know it exists for interview purposes, but lead with "I'd use <code>as const</code> instead" if asked about extending enum-like types.</p>
+      </div>
+      <details>
+        <summary>How enums merge, const enum limitations, when to use</summary>
+        <h3>Basic Enum Merging</h3>
+        <pre><code class="language-typescript">// First declaration must contain initializers for numeric enums
+enum Status {
+  Active = 0,
+  Inactive = 1,
+}
+
+enum Status {
+  Pending = 2,
+  Archived = 3,
+}
+
+// Merged: Status.Active, Status.Inactive, Status.Pending, Status.Archived</code></pre>
+
+        <h3>Const Enum Limitations</h3>
+        <pre><code class="language-typescript">// const enums CANNOT be merged across declarations
+const enum Color {
+  Red,
+  Green,
+}
+
+// ERROR: In 'const' enum declarations member initializer
+// must be constant expression
+// const enum Color {
+//   Blue = 2,
+// }
+
+// Workaround: use regular enum or union types instead
+type ExtendedColor = Color | 'Blue' | 'Purple';</code></pre>
+
+        <h3>When to Use vs. When to Avoid</h3>
+        <table>
+          <thead>
+            <tr><th>Use Enum Merging When</th><th>Avoid When</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Extending a library&rsquo;s enum with plugin-specific values</td>
+              <td>You need tree-shaking (use union types)</td>
+            </tr>
+            <tr>
+              <td>Adding utility methods via namespace merging</td>
+              <td>You&rsquo;re using <code>const enum</code> (can&rsquo;t merge)</td>
+            </tr>
+            <tr>
+              <td>Organizing related constants that grow over time</td>
+              <td>Cross-file merging causes confusion</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout-warning">
+          <strong>Warning:</strong> Enum merging across files can cause maintenance headaches. Prefer union types or a single enum definition with namespace companions for utility methods.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 7: Module Augmentation -->
+    <section id="module-augmentation">
+      <h2>Module Augmentation (declare module)</h2>
+      <details>
+        <summary>Syntax, rules, extending third-party modules</summary>
+        <h3>Basic Syntax</h3>
+        <pre><code class="language-typescript">// file: augmentations.ts
+// MUST have a top-level import or export to be a module
+import { AxiosRequestConfig } from 'axios';
+
+declare module 'axios' {
+  interface AxiosRequestConfig {
+    retryCount?: number;
+    cacheTTL?: number;
+  }
+}
+
+// Now all axios configs accept retryCount and cacheTTL
+const config: AxiosRequestConfig = {
+  url: '/api/users',
+  retryCount: 3,
+  cacheTTL: 60_000,
+};</code></pre>
+
+        <h3>Critical Rule: Must Be in a Module</h3>
+        <pre><code class="language-typescript">// ❌ WRONG - this is a script file (no import/export)
+declare module 'express' {
+  interface Request {
+    userId: string; // This becomes a NEW module, not augmentation!
+  }
+}
+
+// ✅ CORRECT - file is a module
+export {}; // This single line makes it a module
+
+declare module 'express' {
+  interface Request {
+    userId: string; // Now this augments the existing module
+  }
+}</code></pre>
+        <div class="callout callout-warning">
+          <strong>Warning:</strong> Without <code>import</code> or <code>export</code> at the top level, <code>declare module</code> creates an <em>ambient module declaration</em> instead of augmenting an existing module. This is the #1 mistake developers make.
+        </div>
+
+        <h3>Extending Third-Party Modules</h3>
+        <pre><code class="language-typescript">// Extend Vue Router's RouteMeta
+import 'vue-router';
+
+declare module 'vue-router' {
+  interface RouteMeta {
+    requiresAuth?: boolean;
+    roles?: string[];
+    title?: string;
+  }
+}
+
+// Extend Zod
+import { z } from 'zod';
+
+declare module 'zod' {
+  interface ZodString {
+    phone(): ZodString;
+  }
+}</code></pre>
+
+        <h3>Adding New Exports</h3>
+        <pre><code class="language-typescript">// You can add entirely new exports to a module
+import 'lodash';
+
+declare module 'lodash' {
+  export function customHelper(input: string): string;
+}
+
+// ⚠️ Note: This only adds the TYPE - you must still
+// provide the runtime implementation separately</code></pre>
+
+        <h3>Overriding Existing Types</h3>
+        <pre><code class="language-typescript">// Override a specific export's type (use with caution)
+import 'some-library';
+
+declare module 'some-library' {
+  // Re-declare the interface with corrected types
+  export interface Config {
+    port: number;        // was incorrectly typed as string
+    host: string;
+    debug?: boolean;     // add missing optional property
+  }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 8: Global Augmentation -->
+    <section id="global-augmentation">
+      <h2>Global Augmentation (declare global)</h2>
+      <details>
+        <summary>Window, ProcessEnv, globalThis, when appropriate vs dangerous</summary>
+        <h3>Adding to Window</h3>
+        <pre><code class="language-typescript">// types/global.d.ts
+export {};
+
+declare global {
+  interface Window {
+    // Analytics
+    analytics: {
+      track(event: string, properties?: Record&lt;string, unknown&gt;): void;
+      identify(userId: string, traits?: Record&lt;string, unknown&gt;): void;
+      page(name?: string): void;
+    };
+    // Feature flags
+    __FEATURE_FLAGS__: Record&lt;string, boolean&gt;;
+    // Runtime config injected by server
+    __APP_CONFIG__: {
+      apiUrl: string;
+      environment: 'development' | 'staging' | 'production';
+      version: string;
+    };
+  }
+}</code></pre>
+
+        <h3>Adding to NodeJS.ProcessEnv</h3>
+        <pre><code class="language-typescript">// types/env.d.ts
+export {};
+
+declare global {
+  namespace NodeJS {
+    interface ProcessEnv {
+      NODE_ENV: 'development' | 'production' | 'test';
+      PORT: string;
+      DATABASE_URL: string;
+      REDIS_URL: string;
+      JWT_SECRET: string;
+      AWS_REGION: string;
+      AWS_ACCESS_KEY_ID: string;
+      AWS_SECRET_ACCESS_KEY: string;
+      // Make optional ones explicit
+      SENTRY_DSN?: string;
+      FEATURE_NEW_UI?: 'true' | 'false';
+    }
+  }
+}
+
+// Now process.env.DATABASE_URL is typed as string (not string | undefined)</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Safety caveat:</strong> Typing env vars as <code>string</code> (not <code>string | undefined</code>) via augmentation gives a false sense of safety — the variable might not actually be set at runtime. Pair this augmentation with runtime validation at startup (e.g., Zod schema parsing <code>process.env</code>, as shown in <a href="ch14-type-safe-api-design.html">Ch14</a>). The augmentation makes <em>usage sites</em> ergonomic; the validation ensures correctness.</p>
+        </div>
+
+        <h3>Extending globalThis</h3>
+        <pre><code class="language-typescript">export {};
+
+declare global {
+  // Works in both browser and Node
+  var logger: {
+    info(msg: string, meta?: object): void;
+    error(msg: string, error?: Error): void;
+    warn(msg: string): void;
+  };
+
+  // Add to all array instances
+  interface Array&lt;T&gt; {
+    last(): T | undefined;
+  }
+}</code></pre>
+
+        <h3>When Appropriate vs. Dangerous</h3>
+        <table>
+          <thead>
+            <tr><th>Appropriate</th><th>Dangerous</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Typing injected runtime config (<code>__APP_CONFIG__</code>)</td>
+              <td>Adding methods to built-in prototypes</td>
+            </tr>
+            <tr>
+              <td>Typing environment variables</td>
+              <td>Overriding existing DOM types</td>
+            </tr>
+            <tr>
+              <td>Third-party scripts loaded via <code>&lt;script&gt;</code> tags</td>
+              <td>Making the global scope a dumping ground</td>
+            </tr>
+            <tr>
+              <td>Polyfill type definitions</td>
+              <td>Adding mutable shared state types</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout-warning">
+          <strong>Warning:</strong> Every global augmentation is visible to the entire project. Use module-scoped types wherever possible and reserve <code>declare global</code> for genuinely global APIs.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 9: Ambient Declarations -->
+    <section id="ambient-declarations">
+      <h2>Ambient Declarations</h2>
+      <details>
+        <summary>declare keyword, .d.ts authoring, emit behavior</summary>
+        <h3>The <code>declare</code> Keyword Semantics</h3>
+        <p>The <code>declare</code> keyword tells TypeScript: &ldquo;this exists at runtime, but I&rsquo;m only describing its shape&mdash;don&rsquo;t emit any code for it.&rdquo;</p>
+        <pre><code class="language-typescript">// declare var - describe an existing global variable
+declare var jQuery: (selector: string) =&gt; any;
+
+// declare function - describe a global function
+declare function require(module: string): any;
+
+// declare class - describe a class that exists at runtime
+declare class Stripe {
+  constructor(apiKey: string);
+  charges: {
+    create(params: ChargeParams): Promise&lt;Charge&gt;;
+  };
+}
+
+// declare module - describe a module's shape
+declare module '*.css' {
+  const styles: Record&lt;string, string&gt;;
+  export default styles;
+}
+
+declare module '*.svg' {
+  const content: string;
+  export default content;
+}
+
+// declare namespace - group related declarations
+declare namespace google.maps {
+  class Map {
+    constructor(el: HTMLElement, opts?: MapOptions);
+  }
+  interface MapOptions {
+    center: LatLng;
+    zoom: number;
+  }
+  class LatLng {
+    constructor(lat: number, lng: number);
+  }
+}</code></pre>
+
+        <h3>When TypeScript Emits vs. Doesn&rsquo;t Emit</h3>
+        <pre class="diagram">
+  ┌──────────────────────────────────────────────────────┐
+  │              EMITS JavaScript              │  NO EMIT │
+  ├──────────────────────────────────────────────────────┤
+  │  class Foo { }                            │  declare class Foo { }
+  │  function bar() { }                       │  declare function bar(): void
+  │  const x = 5;                             │  declare const x: number
+  │  enum Color { Red }                       │  declare enum Color { Red }
+  │  namespace N { export const a = 1; }      │  declare namespace N { ... }
+  │                                           │  interface I { }
+  │                                           │  type T = string
+  └──────────────────────────────────────────────────────┘
+
+  Rule: declare = type-only description, no runtime code generated.
+  All content in .d.ts files is implicitly "declare".
+        </pre>
+
+        <h3>.d.ts File Authoring</h3>
+        <pre><code class="language-typescript">// my-library.d.ts
+// Everything here is implicitly ambient (declare not needed)
+export interface Config {
+  apiKey: string;
+  region: string;
+  timeout?: number;
+}
+
+export function initialize(config: Config): Client;
+
+export class Client {
+  get&lt;T&gt;(path: string): Promise&lt;T&gt;;
+  post&lt;T&gt;(path: string, body: unknown): Promise&lt;T&gt;;
+  close(): void;
+}
+
+export type EventName = 'connect' | 'disconnect' | 'error';
+export type EventHandler = (data: unknown) =&gt; void;</code></pre>
+        <div class="callout callout-info">
+          <strong>Note:</strong> In <code>.d.ts</code> files, all declarations are implicitly ambient. You don&rsquo;t need the <code>declare</code> keyword inside <code>.d.ts</code> files, though it&rsquo;s harmless to include it.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: Triple-Slash Directives -->
+    <section id="triple-slash-directives">
+      <h2>Triple-Slash Directives</h2>
+      <details>
+        <summary>reference types, path, lib &mdash; when needed vs tsconfig includes</summary>
+        <h3>Types of Triple-Slash Directives</h3>
+        <pre><code class="language-typescript">/// &lt;reference types="node" /&gt;
+// Includes @types/node declarations — equivalent to
+// adding "node" to tsconfig's "types" array
+
+/// &lt;reference path="./legacy-types.d.ts" /&gt;
+// Includes another file's declarations — creates a
+// dependency ordering for compilation
+
+/// &lt;reference lib="es2022" /&gt;
+// Includes a built-in lib — like adding "es2022" to
+// tsconfig's "lib" array</code></pre>
+
+        <h3>When They&rsquo;re Needed</h3>
+        <pre><code class="language-typescript">// 1. In .d.ts files that need to reference other type packages
+/// &lt;reference types="express" /&gt;
+declare namespace MyMiddleware {
+  interface Options {
+    req: Express.Request;
+  }
+}
+
+// 2. When publishing type packages that depend on other types
+// my-package/index.d.ts
+/// &lt;reference types="node" /&gt;
+export function readConfig(path: string): Promise&lt;Buffer&gt;;
+
+// 3. In global script files (non-module) that need types
+/// &lt;reference types="jest" /&gt;
+// Now describe, it, expect are available</code></pre>
+
+        <h3>When tsconfig Is Preferred</h3>
+        <pre><code class="language-typescript">// tsconfig.json — preferred for project-wide settings
+{
+  "compilerOptions": {
+    "types": ["node", "jest"],    // replaces /// &lt;reference types&gt;
+    "lib": ["ES2022", "DOM"],     // replaces /// &lt;reference lib&gt;
+  },
+  "include": ["src/**/*", "types/**/*"]  // replaces /// &lt;reference path&gt;
+}</code></pre>
+        <div class="callout callout-tip">
+          <strong>Tip:</strong> Prefer <code>tsconfig.json</code> settings over triple-slash directives for application code. Reserve triple-slash directives for <code>.d.ts</code> files you publish as packages, where you can&rsquo;t control the consumer&rsquo;s tsconfig.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 11: @types Packages & DefinitelyTyped -->
+    <section id="types-packages">
+      <h2>@types Packages &amp; DefinitelyTyped</h2>
+      <details>
+        <summary>Resolution, typeRoots, creating type packages, versioning</summary>
+        <h3>How @types Resolution Works</h3>
+        <pre class="diagram">
+  import express from 'express';
+
+  TypeScript resolution order:
+  1. Check node_modules/express/package.json → "types" or "typings" field
+  2. Check node_modules/express/index.d.ts
+  3. Check node_modules/@types/express/index.d.ts  ← DefinitelyTyped
+  4. If none found → implicitly "any" (with noImplicitAny: error)
+        </pre>
+
+        <h3>typeRoots and types in tsconfig</h3>
+        <pre><code class="language-typescript">// tsconfig.json
+{
+  "compilerOptions": {
+    // typeRoots: WHERE to look for type packages
+    // Default: ["./node_modules/@types"]
+    "typeRoots": [
+      "./node_modules/@types",
+      "./types"              // custom local types directory
+    ],
+
+    // types: WHICH packages to include (whitelist)
+    // Default: all packages in typeRoots
+    "types": ["node", "jest", "express"]
+    // Only these three @types packages will be included
+    // Useful to prevent pollution from unrelated types
+  }
+}</code></pre>
+
+        <h3>Creating a Type Package</h3>
+        <pre><code class="language-typescript">// packages/types-my-sdk/package.json
+{
+  "name": "@company/types-my-sdk",
+  "version": "1.0.0",
+  "types": "index.d.ts",
+  "files": ["index.d.ts", "global.d.ts"]
+}
+
+// packages/types-my-sdk/index.d.ts
+export interface SDKConfig {
+  appId: string;
+  environment: 'sandbox' | 'production';
+}
+
+export interface SDKClient {
+  init(config: SDKConfig): Promise&lt;void&gt;;
+  track(event: string, data?: Record&lt;string, unknown&gt;): void;
+  shutdown(): Promise&lt;void&gt;;
+}</code></pre>
+
+        <h3>Versioning Alignment</h3>
+        <table>
+          <thead>
+            <tr><th>Library</th><th>Types Package</th><th>Version Strategy</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>express@4.18.2</td><td>@types/express@4.17.21</td><td>Major.minor aligns</td></tr>
+            <tr><td>react@18.2.0</td><td>@types/react@18.2.45</td><td>Major.minor aligns</td></tr>
+            <tr><td>lodash@4.17.21</td><td>@types/lodash@4.17.1</td><td>Major.minor aligns</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout-info">
+          <strong>Note:</strong> When a library bundles its own types (has a <code>&quot;types&quot;</code> field in package.json), you do NOT need a separate <code>@types</code> package. Most modern libraries (zod, tRPC, Prisma) bundle types.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 12: Extending Express, React, Window -->
+    <section id="extending-libraries">
+      <h2>Extending Express, React, Window</h2>
+      <details>
+        <summary>Practical examples for real-world library extension</summary>
+        <h3>Adding Custom Properties to Express Request</h3>
+        <pre><code class="language-typescript">// types/express.d.ts
+import 'express';
+
+declare module 'express' {
+  interface Request {
+    userId?: string;
+    organizationId?: string;
+    correlationId: string;
+    permissions: string[];
+    startTime: number;
+  }
+}
+
+// middleware/auth.ts
+import { Request, Response, NextFunction } from 'express';
+
+export function authMiddleware(req: Request, res: Response, next: NextFunction) {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+  const decoded = verifyToken(token);
+  req.userId = decoded.sub;
+  req.organizationId = decoded.org;
+  req.permissions = decoded.permissions;
+  next();
+}</code></pre>
+
+        <h3>Extending React&rsquo;s HTMLAttributes</h3>
+        <pre><code class="language-typescript">// types/react.d.ts
+import 'react';
+
+declare module 'react' {
+  interface HTMLAttributes&lt;T&gt; {
+    // Custom data attributes for analytics
+    'data-testid'?: string;
+    'data-tracking'?: string;
+    'data-section'?: string;
+  }
+
+  interface CSSProperties {
+    // CSS custom properties
+    '--primary-color'?: string;
+    '--spacing-unit'?: string;
+    [key: `--${string}`]: string | number | undefined;
+  }
+}
+
+// Usage - no type errors
+&lt;div
+  data-testid="user-card"
+  data-tracking="profile_view"
+  style={{ '--primary-color': '#007bff' }}
+/&gt;</code></pre>
+
+        <h3>Adding to Window for Global Scripts</h3>
+        <pre><code class="language-typescript">// types/vendor.d.ts
+export {};
+
+declare global {
+  interface Window {
+    Intercom: {
+      (command: 'boot', settings: IntercomSettings): void;
+      (command: 'show' | 'hide' | 'shutdown'): void;
+      (command: 'update', data: Partial&lt;IntercomSettings&gt;): void;
+    };
+    Stripe: (publishableKey: string) =&gt; StripeInstance;
+    hj: (command: string, ...args: unknown[]) =&gt; void;
+  }
+
+  interface IntercomSettings {
+    app_id: string;
+    user_id?: string;
+    email?: string;
+    name?: string;
+  }
+}</code></pre>
+
+        <h3>Extending Next.js Types</h3>
+        <pre><code class="language-typescript">// types/next.d.ts
+import 'next';
+
+declare module 'next' {
+  interface NextApiRequest {
+    userId?: string;
+    session?: {
+      user: { id: string; email: string; role: string };
+      expires: string;
+    };
+  }
+}
+
+// Extend Next.js Image component props
+declare module 'next/image' {
+  interface ImageProps {
+    'data-testid'?: string;
+  }
+}</code></pre>
+
+        <h3>Adding Environment Variables to ProcessEnv</h3>
+        <pre><code class="language-typescript">// types/env.d.ts
+/// &lt;reference types="vite/client" /&gt;
+
+interface ImportMetaEnv {
+  readonly VITE_API_URL: string;
+  readonly VITE_APP_TITLE: string;
+  readonly VITE_SENTRY_DSN: string;
+  readonly VITE_STRIPE_PUBLIC_KEY: string;
+  readonly VITE_FEATURE_NEW_CHECKOUT: 'true' | 'false';
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+
+// Usage
+const apiUrl = import.meta.env.VITE_API_URL; // string, not string | undefined</code></pre>
+        <div class="callout callout-tip">
+          <strong>Tip:</strong> Place all augmentation files in a <code>types/</code> directory and ensure it&rsquo;s included in your tsconfig&rsquo;s <code>&quot;include&quot;</code> array. This keeps augmentations discoverable and organized.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 13: Monorepo Type Sharing Strategies -->
+    <section id="monorepo-types">
+      <h2>Monorepo Type Sharing Strategies</h2>
+      <details>
+        <summary>Project references, shared packages, path aliases, exports</summary>
+        <h3>Project References</h3>
+        <pre><code class="language-typescript">// tsconfig.json (root)
+{
+  "references": [
+    { "path": "./packages/shared-types" },
+    { "path": "./packages/api" },
+    { "path": "./packages/web" }
+  ]
+}
+
+// packages/shared-types/tsconfig.json
+{
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "include": ["src/**/*"]
+}</code></pre>
+
+        <h3>Shared Type Packages</h3>
+        <pre><code class="language-typescript">// packages/shared-types/src/index.ts
+export interface User {
+  id: string;
+  email: string;
+  name: string;
+  role: 'admin' | 'editor' | 'viewer';
+  createdAt: string;
+}
+
+export interface ApiResponse&lt;T&gt; {
+  data: T;
+  meta: {
+    page: number;
+    totalPages: number;
+    totalCount: number;
+  };
+}
+
+export interface PaginationParams {
+  page?: number;
+  limit?: number;
+  sortBy?: string;
+  order?: 'asc' | 'desc';
+}
+
+// packages/shared-types/package.json
+{
+  "name": "@monorepo/shared-types",
+  "version": "1.0.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  }
+}</code></pre>
+
+        <h3>Path Aliases</h3>
+        <pre><code class="language-typescript">// tsconfig.json
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@shared/*": ["packages/shared-types/src/*"],
+      "@api/*": ["packages/api/src/*"],
+      "@web/*": ["packages/web/src/*"]
+    }
+  }
+}
+
+// Usage in any package
+import type { User, ApiResponse } from '@shared/index';
+import type { RouteHandler } from '@api/types';</code></pre>
+
+        <h3>Package Exports Types Field</h3>
+        <pre><code class="language-typescript">// Modern "exports" with types condition (Node 16+)
+{
+  "name": "@company/ui-kit",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",        // TypeScript resolves this
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./button": {
+      "types": "./dist/button.d.ts",
+      "import": "./dist/button.mjs"
+    },
+    "./theme": {
+      "types": "./dist/theme.d.ts",
+      "import": "./dist/theme.mjs"
+    }
+  },
+  "typesVersions": {
+    "&gt;=5.0": { "*": ["./dist/ts5/*"] },
+    "*": { "*": ["./dist/*"] }
+  }
+}</code></pre>
+        <div class="callout callout-info">
+          <strong>Note:</strong> The <code>&quot;types&quot;</code> condition in <code>exports</code> must come <em>first</em> in each entry. TypeScript&rsquo;s <code>moduleResolution: &quot;bundler&quot;</code> or <code>&quot;node16&quot;</code> is required to resolve package exports.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 14: Type-Only Imports/Exports -->
+    <section id="type-only-imports">
+      <h2>Type-Only Imports/Exports</h2>
+      <details>
+        <summary>import type, export type, verbatimModuleSyntax, bundler compatibility</summary>
+        <h3>import type Syntax</h3>
+        <pre><code class="language-typescript">// Import only the type — erased completely at compile time
+import type { User, ApiResponse } from './types';
+import type { FC, ReactNode } from 'react';
+
+// Mixed import: some values, some types
+import { useState, useEffect } from 'react';
+import type { Dispatch, SetStateAction } from 'react';
+
+// Inline type qualifier (TS 4.5+)
+import { Component, type ComponentProps, type ReactNode } from 'react';</code></pre>
+
+        <h3>export type</h3>
+        <pre><code class="language-typescript">// Re-export only as a type
+export type { User, Role } from './models';
+
+// Export a type-only declaration
+export type EventMap = {
+  click: MouseEvent;
+  keydown: KeyboardEvent;
+  scroll: Event;
+};
+
+// Inline type qualifier in re-exports
+export { UserService, type UserDTO } from './user-service';</code></pre>
+
+        <h3>verbatimModuleSyntax (TypeScript 5.0+)</h3>
+        <pre><code class="language-typescript">// tsconfig.json
+{
+  "compilerOptions": {
+    "verbatimModuleSyntax": true
+    // Replaces: importsNotUsedAsValues, preserveValueImports
+  }
+}
+
+// With verbatimModuleSyntax: true
+// ❌ ERROR: This import will be erased but isn't marked as type-only
+import { User } from './types'; // if User is only a type
+
+// ✅ CORRECT
+import type { User } from './types';
+
+// The rule: if an import is erased in the output,
+// it MUST be marked as type-only</code></pre>
+
+        <h3>Why It Matters for Bundlers</h3>
+        <pre class="diagram">
+  Without type-only imports:
+  ┌─────────────────┐     ┌──────────────────┐
+  │ import { User } │ ──→ │ Bundler includes  │ → Dead code, side effects
+  │ from './types'  │     │ the module        │   may be triggered
+  └─────────────────┘     └──────────────────┘
+
+  With type-only imports:
+  ┌──────────────────────┐     ┌──────────────────┐
+  │ import type { User } │ ──→ │ Bundler skips    │ → Smaller bundle,
+  │ from './types'       │     │ the module       │   no side effects
+  └──────────────────────┘     └──────────────────┘
+        </pre>
+
+        <h3>isolatedModules Compatibility</h3>
+        <pre><code class="language-typescript">// With isolatedModules: true (required for Babel, esbuild, swc)
+// These tools process one file at a time — they can't determine
+// if an import is type-only without explicit annotation
+
+// ❌ Ambiguous with isolatedModules
+export { MyType } from './types'; // Is MyType a value or type?
+
+// ✅ Explicit
+export type { MyType } from './types';</code></pre>
+        <div class="callout callout-tip">
+          <strong>Tip:</strong> Enable <code>verbatimModuleSyntax</code> in new projects. It enforces clarity and ensures compatibility with all bundlers and transpilers. For even stricter control, TS 5.8 adds <code>erasableSyntaxOnly</code> — which ensures no TypeScript-specific <em>runtime</em> syntax (enums, namespaces with values, parameter properties) is used, enabling tools like <code>--experimental-strip-types</code> in Node.js to directly run .ts files.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 15: Production Architecture -->
+    <section id="production-architecture">
+      <h2>Production Architecture</h2>
+      <details>
+        <summary>Plugin systems, feature flags, multi-tenant types, env config</summary>
+        <h3>Plugin System Typing</h3>
+        <pre><code class="language-typescript">// Core plugin interface
+interface PluginContext {
+  config: AppConfig;
+  logger: Logger;
+  store: DataStore;
+}
+
+interface Plugin {
+  name: string;
+  version: string;
+  initialize(ctx: PluginContext): Promise&lt;void&gt;;
+  destroy?(): Promise&lt;void&gt;;
+}
+
+// Plugin registry with declaration merging
+interface PluginRegistry {}
+
+// Each plugin augments the registry
+// plugins/analytics/types.ts
+declare module '../../core' {
+  interface PluginRegistry {
+    analytics: {
+      track(event: string, data?: object): void;
+      identify(userId: string): void;
+    };
+  }
+}
+
+// plugins/auth/types.ts
+declare module '../../core' {
+  interface PluginRegistry {
+    auth: {
+      login(credentials: Credentials): Promise&lt;Session&gt;;
+      logout(): Promise&lt;void&gt;;
+      getSession(): Session | null;
+    };
+  }
+}
+
+// Type-safe plugin access
+function usePlugin&lt;K extends keyof PluginRegistry&gt;(
+  name: K
+): PluginRegistry[K] {
+  return app.plugins.get(name) as PluginRegistry[K];
+}
+
+const analytics = usePlugin('analytics');
+analytics.track('page_view'); // fully typed</code></pre>
+
+        <h3>Feature Flag Types</h3>
+        <pre><code class="language-typescript">// types/features.d.ts
+interface FeatureFlags {
+  'new-checkout': boolean;
+  'dark-mode': boolean;
+  'ai-assistant': boolean;
+  'beta-dashboard': boolean;
+}
+
+type FeatureFlagName = keyof FeatureFlags;
+
+// Feature flag hook
+function useFeatureFlag&lt;K extends FeatureFlagName&gt;(
+  flag: K
+): FeatureFlags[K] {
+  return flags[flag];
+}
+
+// Usage - type-safe flag names
+const showNewCheckout = useFeatureFlag('new-checkout');
+// useFeatureFlag('nonexistent'); // TS Error!</code></pre>
+
+        <h3>Multi-Tenant Type Customization</h3>
+        <pre><code class="language-typescript">// Base tenant config
+interface TenantConfig {
+  id: string;
+  name: string;
+  theme: ThemeConfig;
+  features: FeatureFlags;
+}
+
+// Tenant-specific augmentations
+interface TenantCustomFields {}
+
+// Each tenant can augment
+declare module '../core/tenant' {
+  interface TenantCustomFields {
+    // Tenant A adds custom CRM fields
+    crmId?: string;
+    salesforceOrg?: string;
+  }
+}
+
+type FullTenantConfig = TenantConfig &amp; TenantCustomFields;</code></pre>
+
+        <h3>Type-Safe Environment Config</h3>
+        <pre><code class="language-typescript">// config/schema.ts
+import { z } from 'zod';
+
+const envSchema = z.object({
+  NODE_ENV: z.enum(['development', 'production', 'test']),
+  PORT: z.string().transform(Number),
+  DATABASE_URL: z.string().url(),
+  REDIS_URL: z.string().url(),
+  JWT_SECRET: z.string().min(32),
+  JWT_EXPIRY: z.string().default('7d'),
+  CORS_ORIGINS: z.string().transform(s =&gt; s.split(',')),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+});
+
+// Validate at startup — fail fast
+export const env = envSchema.parse(process.env);
+export type Env = z.infer&lt;typeof envSchema&gt;;
+
+// Now env.PORT is number, env.CORS_ORIGINS is string[]
+// No need for manual casting or undefined checks</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 16: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Express middleware, React library extension, env config, plugin system</summary>
+        <h3>Express Middleware Types</h3>
+        <pre><code class="language-typescript">// types/express.d.ts
+import 'express';
+import { JwtPayload } from 'jsonwebtoken';
+
+declare module 'express' {
+  interface Request {
+    user?: JwtPayload &amp; {
+      id: string;
+      email: string;
+      roles: string[];
+    };
+    requestId: string;
+    startTime: number;
+  }
+}
+
+// middleware/request-context.ts
+import { Request, Response, NextFunction } from 'express';
+import { randomUUID } from 'crypto';
+
+export function requestContext(req: Request, _res: Response, next: NextFunction) {
+  req.requestId = req.headers['x-request-id'] as string ?? randomUUID();
+  req.startTime = Date.now();
+  next();
+}
+
+// middleware/auth.ts
+import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
+
+export function authenticate(req: Request, res: Response, next: NextFunction) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Missing token' });
+
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET!) as Request['user'];
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// middleware/authorize.ts
+export function authorize(...roles: string[]) {
+  return (req: Request, res: Response, next: NextFunction) =&gt; {
+    if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+    const hasRole = req.user.roles.some(r =&gt; roles.includes(r));
+    if (!hasRole) return res.status(403).json({ error: 'Forbidden' });
+    next();
+  };
+}</code></pre>
+
+        <h3>React Component Library Extension</h3>
+        <pre><code class="language-typescript">// types/design-system.d.ts
+import 'react';
+
+declare module 'react' {
+  interface CSSProperties {
+    // Design system tokens as CSS variables
+    '--ds-color-primary'?: string;
+    '--ds-color-secondary'?: string;
+    '--ds-spacing-xs'?: string;
+    '--ds-spacing-sm'?: string;
+    '--ds-spacing-md'?: string;
+    '--ds-spacing-lg'?: string;
+    '--ds-radius'?: string;
+    '--ds-shadow'?: string;
+  }
+}
+
+// components/Card.tsx
+import { FC, ReactNode, CSSProperties } from 'react';
+
+interface CardProps {
+  children: ReactNode;
+  elevation?: 1 | 2 | 3;
+  padding?: 'sm' | 'md' | 'lg';
+}
+
+export const Card: FC&lt;CardProps&gt; = ({ children, elevation = 1, padding = 'md' }) =&gt; {
+  const style: CSSProperties = {
+    '--ds-shadow': `var(--shadow-${elevation})`,
+    '--ds-spacing-md': `var(--spacing-${padding})`,
+  };
+
+  return &lt;div className="card" style={style}&gt;{children}&lt;/div&gt;;
+};</code></pre>
+
+        <h3>Environment Config Typing</h3>
+        <pre><code class="language-typescript">// config/index.ts
+import { z } from 'zod';
+
+const configSchema = z.object({
+  server: z.object({
+    port: z.number().default(3000),
+    host: z.string().default('0.0.0.0'),
+    cors: z.object({
+      origins: z.array(z.string()),
+      credentials: z.boolean().default(true),
+    }),
+  }),
+  database: z.object({
+    url: z.string().url(),
+    pool: z.object({
+      min: z.number().default(2),
+      max: z.number().default(10),
+    }),
+  }),
+  auth: z.object({
+    jwtSecret: z.string().min(32),
+    jwtExpiry: z.string().default('7d'),
+    refreshExpiry: z.string().default('30d'),
+  }),
+  features: z.object({
+    newCheckout: z.boolean().default(false),
+    aiAssistant: z.boolean().default(false),
+  }),
+});
+
+export type AppConfig = z.infer&lt;typeof configSchema&gt;;
+
+export const config: AppConfig = configSchema.parse({
+  server: {
+    port: Number(process.env.PORT),
+    host: process.env.HOST,
+    cors: {
+      origins: process.env.CORS_ORIGINS?.split(',') ?? [],
+      credentials: true,
+    },
+  },
+  database: {
+    url: process.env.DATABASE_URL,
+    pool: { min: 2, max: 10 },
+  },
+  auth: {
+    jwtSecret: process.env.JWT_SECRET,
+    jwtExpiry: process.env.JWT_EXPIRY,
+    refreshExpiry: process.env.REFRESH_EXPIRY,
+  },
+  features: {
+    newCheckout: process.env.FEATURE_NEW_CHECKOUT === 'true',
+    aiAssistant: process.env.FEATURE_AI_ASSISTANT === 'true',
+  },
+});</code></pre>
+
+        <h3>Plugin System</h3>
+        <pre><code class="language-typescript">// core/plugin-system.ts
+interface PluginHooks {
+  'app:init': () =&gt; Promise&lt;void&gt;;
+  'app:destroy': () =&gt; Promise&lt;void&gt;;
+  'request:before': (req: Request) =&gt; void;
+  'request:after': (req: Request, res: Response) =&gt; void;
+}
+
+// Extensible via declaration merging
+interface PluginHooks {}
+
+interface PluginDefinition&lt;T = unknown&gt; {
+  name: string;
+  version: string;
+  config?: T;
+  hooks?: Partial&lt;{ [K in keyof PluginHooks]: PluginHooks[K] }&gt;;
+}
+
+class PluginManager {
+  private plugins = new Map&lt;string, PluginDefinition&gt;();
+
+  register&lt;T&gt;(plugin: PluginDefinition&lt;T&gt;): void {
+    this.plugins.set(plugin.name, plugin);
+  }
+
+  async emit&lt;K extends keyof PluginHooks&gt;(
+    hook: K,
+    ...args: Parameters&lt;PluginHooks[K]&gt;
+  ): Promise&lt;void&gt; {
+    for (const plugin of this.plugins.values()) {
+      const handler = plugin.hooks?.[hook];
+      if (handler) await (handler as Function)(...args);
+    }
+  }
+}
+
+// Plugin augments hooks
+declare module '../core/plugin-system' {
+  interface PluginHooks {
+    'cache:invalidate': (keys: string[]) =&gt; void;
+    'auth:login': (userId: string) =&gt; void;
+    'auth:logout': (userId: string) =&gt; void;
+  }
+}</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 17: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>5 critical mistakes to avoid</summary>
+        <h3>Mistake 1: Augmenting in a Non-Module File</h3>
+        <pre><code class="language-typescript">// ❌ WRONG — no import/export makes this a script file
+// This creates a NEW ambient module, not an augmentation
+declare module 'express' {
+  interface Request {
+    userId: string;
+  }
+}
+
+// ✅ FIX — add an import or export
+import 'express'; // or: export {};
+
+declare module 'express' {
+  interface Request {
+    userId: string;
+  }
+}</code></pre>
+
+        <h3>Mistake 2: Conflicting Augmentations</h3>
+        <pre><code class="language-typescript">// File A: types/express-auth.d.ts
+import 'express';
+declare module 'express' {
+  interface Request {
+    user: { id: string; name: string };
+  }
+}
+
+// File B: types/express-tenant.d.ts
+import 'express';
+declare module 'express' {
+  interface Request {
+    user: { id: string; tenantId: string }; // ❌ CONFLICT!
+  }
+}
+
+// ✅ FIX — combine into one declaration or use compatible types
+import 'express';
+declare module 'express' {
+  interface Request {
+    user: {
+      id: string;
+      name: string;
+      tenantId: string;
+    };
+  }
+}</code></pre>
+
+        <h3>Mistake 3: Forgetting to Include .d.ts in tsconfig</h3>
+        <pre><code class="language-typescript">// tsconfig.json
+{
+  "include": ["src/**/*"]  // ❌ misses types/ directory
+}
+
+// ✅ FIX
+{
+  "include": ["src/**/*", "types/**/*"]
+}
+
+// Or use typeRoots for ambient declarations
+{
+  "compilerOptions": {
+    "typeRoots": ["./node_modules/@types", "./types"]
+  }
+}</code></pre>
+
+        <h3>Mistake 4: Over-Augmenting Global Scope</h3>
+        <pre><code class="language-typescript">// ❌ WRONG — polluting global with app-specific types
+declare global {
+  interface Window {
+    userService: UserService;
+    productService: ProductService;
+    orderService: OrderService;
+    notificationService: NotificationService;
+    // ... dozens more
+  }
+}
+
+// ✅ FIX — use dependency injection or module imports
+// Only put genuinely global things on Window
+declare global {
+  interface Window {
+    __APP_CONFIG__: AppConfig;  // injected by server
+  }
+}
+
+// Use module-scoped DI container for services
+import { container } from './di';
+const userService = container.get(UserService);</code></pre>
+
+        <h3>Mistake 5: Not Using import type</h3>
+        <pre><code class="language-typescript">// ❌ WRONG — imports the module at runtime (may cause side effects)
+import { User } from './models'; // User is only used as a type
+
+function processUser(user: User): void { ... }
+
+// ✅ FIX — use import type for type-only imports
+import type { User } from './models';
+
+function processUser(user: User): void { ... }
+
+// Benefits:
+// - No runtime import (smaller bundle)
+// - No side effects from the module
+// - Works with isolatedModules
+// - Clear intent for other developers</code></pre>
+        <div class="callout callout-warning">
+          <strong>Interview Red Flag:</strong> Not knowing the difference between <code>declare module</code> in a script file vs. a module file is a common indicator of superficial TypeScript knowledge.
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 18: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>Augmentation vs Wrapper, Global vs Module, @types vs bundled</summary>
+        <h3>Augmentation vs. Wrapper Types</h3>
+        <table>
+          <thead>
+            <tr><th>Aspect</th><th>Augmentation</th><th>Wrapper Types</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Approach</td><td><code>declare module</code> extends existing types</td><td>Create new interfaces that wrap/extend originals</td></tr>
+            <tr><td>Discoverability</td><td>Implicit &mdash; augmentations apply globally</td><td>Explicit &mdash; must import the wrapper</td></tr>
+            <tr><td>Conflicts</td><td>Can conflict if multiple files augment same property</td><td>No conflicts &mdash; each wrapper is independent</td></tr>
+            <tr><td>Refactoring</td><td>Harder to find all augmentation sites</td><td>Easy &mdash; follow imports</td></tr>
+            <tr><td>Best for</td><td>Extending library types (Express, React)</td><td>App-specific type extensions</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Global vs. Module Scope</h3>
+        <table>
+          <thead>
+            <tr><th>Aspect</th><th>Global (<code>declare global</code>)</th><th>Module (<code>declare module</code>)</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Visibility</td><td>Entire project</td><td>Only where imported</td></tr>
+            <tr><td>Collision risk</td><td>High &mdash; any file can conflict</td><td>Low &mdash; scoped to module</td></tr>
+            <tr><td>Use case</td><td>Window, ProcessEnv, polyfills</td><td>Library extensions, plugin types</td></tr>
+            <tr><td>Testing</td><td>Harder to mock</td><td>Easy to mock via module boundaries</td></tr>
+            <tr><td>Recommendation</td><td>Minimize usage</td><td>Prefer whenever possible</td></tr>
+          </tbody>
+        </table>
+
+        <h3>@types vs. Bundled Types</h3>
+        <table>
+          <thead>
+            <tr><th>Aspect</th><th>@types (DefinitelyTyped)</th><th>Bundled Types</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Maintenance</td><td>Community-maintained, may lag</td><td>Library author maintains</td></tr>
+            <tr><td>Version sync</td><td>Manual — can drift from library version</td><td>Always in sync</td></tr>
+            <tr><td>Accuracy</td><td>May have gaps or errors</td><td>Authoritative source</td></tr>
+            <tr><td>Install</td><td>Separate <code>npm i -D @types/x</code></td><td>Included automatically</td></tr>
+            <tr><td>Examples</td><td>express, lodash, node</td><td>zod, tRPC, Prisma, date-fns</td></tr>
+            <tr><td>Trend</td><td>Legacy pattern (still needed)</td><td>Modern libraries prefer bundled</td></tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 19: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>6 questions with answers</summary>
+        <h3>Q1: How would you type a plugin that adds methods to a third-party class?</h3>
+        <p><strong>A:</strong> Use module augmentation to extend the class&rsquo;s interface. For example, to add a method to Mongoose&rsquo;s Document:</p>
+        <pre><code class="language-typescript">import 'mongoose';
+
+declare module 'mongoose' {
+  interface Document {
+    softDelete(): Promise&lt;void&gt;;
+    restore(): Promise&lt;void&gt;;
+    isDeleted: boolean;
+  }
+}
+// Then implement via Mongoose plugin: schema.plugin(softDeletePlugin);</code></pre>
+
+        <h3>Q2: What happens if two augmentations define the same property with different types?</h3>
+        <p><strong>A:</strong> TypeScript will raise a compile error &mdash; &ldquo;Subsequent property declarations must have the same type.&rdquo; Non-function members must have identical types across all declarations. The fix is to consolidate into a single augmentation file or use a union/intersection type that satisfies both.</p>
+
+        <h3>Q3: How do you handle augmentations in a monorepo where packages shouldn&rsquo;t see each other&rsquo;s augmentations?</h3>
+        <p><strong>A:</strong> Use separate <code>tsconfig.json</code> per package with distinct <code>include</code> paths. Each package only includes its own <code>types/</code> directory. Use project references to share common types explicitly without leaking package-specific augmentations across boundaries.</p>
+        <pre><code class="language-typescript">// packages/api/tsconfig.json
+{
+  "include": ["src/**/*", "types/**/*"],  // only API types
+  "references": [{ "path": "../shared-types" }]
+}
+
+// packages/web/tsconfig.json
+{
+  "include": ["src/**/*", "types/**/*"],  // only web types
+  "references": [{ "path": "../shared-types" }]
+}</code></pre>
+
+        <h3>Q4: When should you use <code>declare module</code> vs. creating a wrapper type?</h3>
+        <p><strong>A:</strong> Use <code>declare module</code> when you need the augmentation to be visible everywhere the original module is used (e.g., Express Request across all middleware). Use wrapper types when the extension is app-specific and should be explicitly imported, or when you want to avoid global type pollution.</p>
+
+        <h3>Q5: How do ambient declarations interact with <code>isolatedModules</code>?</h3>
+        <p><strong>A:</strong> With <code>isolatedModules: true</code>, each file is transpiled independently. This means:</p>
+        <ul>
+          <li><code>const enum</code> from other files can&rsquo;t be inlined (use plain enum)</li>
+          <li>Re-exports of types must use <code>export type</code></li>
+          <li>Ambient <code>.d.ts</code> files still work normally (they&rsquo;re never transpiled)</li>
+          <li><code>declare global</code> in <code>.d.ts</code> files is unaffected</li>
+        </ul>
+
+        <h3>Q6: What&rsquo;s the difference between <code>typeRoots</code> and <code>types</code> in tsconfig?</h3>
+        <p><strong>A:</strong> <code>typeRoots</code> specifies <em>where</em> to look for type packages (directories). <code>types</code> specifies <em>which</em> packages to include from those roots (a whitelist). If <code>types</code> is omitted, all packages in all typeRoots are included. If <code>types</code> is specified, only those listed are included &mdash; this prevents unwanted global types from leaking in.</p>
+        <pre><code class="language-typescript">// Only include specific type packages
+{
+  "compilerOptions": {
+    "typeRoots": ["./node_modules/@types", "./types"],
+    "types": ["node", "jest"]  // Only these are auto-included
+  }
+}
+// Other @types packages (e.g., @types/mocha) won't pollute
+// unless explicitly imported in code</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 20: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Mental models &amp; what NOT to say</summary>
+        <h3>Mental Models</h3>
+        <pre class="diagram">
+  Declaration Merging Mental Model:
+  ┌─────────────────────────────────────────────────────┐
+  │  Same Name = Merge (if compatible declarations)     │
+  │                                                     │
+  │  Interface + Interface → Properties accumulate      │
+  │  Namespace + Class     → Static members added       │
+  │  Namespace + Function  → Properties on function     │
+  │  Namespace + Enum      → Utility methods added      │
+  │                                                     │
+  │  Module Augmentation:                               │
+  │  declare module 'x' { } in a MODULE file            │
+  │  = extends existing module                          │
+  │                                                     │
+  │  declare module 'x' { } in a SCRIPT file            │
+  │  = creates new ambient module (DIFFERENT!)          │
+  │                                                     │
+  │  Global Augmentation:                               │
+  │  declare global { } inside a module file            │
+  │  = adds to global scope                             │
+  └─────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Key Points to Hit in an Interview</h3>
+        <ul>
+          <li>Interface merging is the primary mechanism &mdash; properties accumulate, function members become overloads</li>
+          <li>Module augmentation requires the file to be a module (have import/export)</li>
+          <li>Global augmentation should be minimized &mdash; prefer module scope</li>
+          <li>Use <code>import type</code> for type-only imports to help bundlers tree-shake</li>
+          <li>Ambient declarations (<code>declare</code>) produce no runtime code</li>
+          <li>Modern libraries bundle types; <code>@types</code> is for older libraries</li>
+        </ul>
+
+        <h3>What NOT to Say</h3>
+        <div class="callout callout-warning">
+          <ul>
+            <li>&ldquo;I just put everything in a global.d.ts file&rdquo; &mdash; shows no understanding of module vs global scope</li>
+            <li>&ldquo;I copy the library types and modify them&rdquo; &mdash; forking types is unmaintainable</li>
+            <li>&ldquo;I use <code>any</code> when the types don&rsquo;t match&rdquo; &mdash; defeats the purpose of TypeScript</li>
+            <li>&ldquo;I don&rsquo;t know the difference between declare module in a script vs module&rdquo; &mdash; this is the #1 gotcha</li>
+            <li>&ldquo;Type aliases can be merged like interfaces&rdquo; &mdash; incorrect, only interfaces merge</li>
+            <li>&ldquo;I use <code>// @ts-ignore</code> when augmentations don&rsquo;t work&rdquo; &mdash; hides real errors</li>
+          </ul>
+        </div>
+
+        <h3>One-Liner Summary</h3>
+        <p><strong>Declaration merging combines same-named declarations; module augmentation (<code>declare module</code> in a module file) extends third-party types without forking; global augmentation (<code>declare global</code>) should be reserved for genuinely global APIs like Window and ProcessEnv.</strong></p>
+      </details>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+</body>
+</html>

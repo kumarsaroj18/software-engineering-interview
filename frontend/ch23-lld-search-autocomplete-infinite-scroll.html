@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 23: LLD — Search, Debounce &amp; Autocomplete | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <a href="../index.html">
+        <span class="chapter-num">Ch 23</span>
+        <span class="chapter-title">LLD — Search, Autocomplete, Infinite Scroll</span>
+      </a>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#component-search">Component 1: Search with Debouncing</a></li>
+        <li><a href="#component-autocomplete">Component 2: Autocomplete / Typeahead</a></li>
+        <li><a href="#component-infinite-scroll">Component 3: Infinite Scroll</a></li>
+        <li><a href="#common-mistakes">Common LLD Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-iv">Part IV — React Low-Level Design</a> &rsaquo;
+      <span>Chapter 23</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-medium">Medium</span>
+        <span class="badge badge-topic">LLD</span>
+        <span class="badge badge-topic">Debouncing</span>
+        <span class="badge badge-topic">Virtualization</span>
+        <span class="badge badge-topic">Accessibility</span>
+      </div>
+      <h1>LLD — Search with Debouncing, Autocomplete &amp; Infinite Scroll</h1>
+      <blockquote class="chapter-question">
+        "Build a production-quality Search with Debouncing, Autocomplete, and an Infinite Scroll list."
+      </blockquote>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> These three components are really one underlying skill wearing three outfits: managing an asynchronous, race-prone data fetch against user-driven input, without leaking requests, memory, or stale state. Debouncing controls <em>when</em> you fetch, cancellation controls <em>which</em> response you trust, and virtualization controls <em>how much</em> you render. Interviewers use these to see whether you reach for those three levers deliberately or accidentally get lucky.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="text" class="search-input" placeholder="Search this chapter..." aria-label="Search">
+    </div>
+
+    <!-- Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+
+      <details open>
+        <summary>What Interviewers Evaluate in LLD Rounds</summary>
+        <p>Low-Level Design (component design) rounds differ from algorithm rounds: there's rarely one "correct" answer, and the interviewer is scoring your <em>process</em> as much as your final code. Across every FAANG-style frontend LLD round, the evaluation clusters into four buckets:</p>
+        <table>
+          <thead>
+            <tr><th>Dimension</th><th>What's being assessed</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Requirements gathering</td><td>Did you clarify scale, edge cases, and constraints before writing code?</td></tr>
+            <tr><td>API &amp; state design</td><td>Is the component's public interface (props, hooks) clean? Is internal state minimal and non-redundant?</td></tr>
+            <tr><td>Correctness under real conditions</td><td>Race conditions, cleanup, empty/error/loading states — not just the happy path</td></tr>
+            <tr><td>Performance &amp; accessibility awareness</td><td>Re-render cost, network efficiency, keyboard/screen-reader support — raised without prompting</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout-warning">
+          <strong>Red flag pattern interviewers watch for:</strong> candidates who start typing code within the first 60 seconds. A senior candidate spends 3-5 minutes clarifying scope first — for a search box, that means asking about expected result volume, whether results come from a REST endpoint or a client-side dataset, and whether debounce delay is a product requirement or your own choice.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>LLD Round Strategy: Clarify → Design → Implement → Optimize</summary>
+        <ol>
+          <li><strong>Clarify (3-5 min):</strong> data source, expected scale, network conditions, target devices, accessibility requirements, whether this is a standalone component or part of a larger page.</li>
+          <li><strong>Design (5 min):</strong> sketch the component's props/state on a whiteboard or in comments before writing implementation code — name the hooks you'll extract (<code>useDebounce</code>, <code>useInfiniteScroll</code>) and what each owns.</li>
+          <li><strong>Implement (20-25 min):</strong> build the un-optimized-but-correct version first — loading/error/empty states, cancellation, cleanup — then layer in the trickier mechanics (debounce, virtualization) once the base case works.</li>
+          <li><strong>Optimize (5-10 min):</strong> the interviewer almost always adds a constraint here ("what if there are 100k results?", "what if the network is 3G?") — this is deliberate, not a trick; treat it as the real second half of the round.</li>
+        </ol>
+      </details>
+    </section>
+
+    <!-- Component 1: Search with Debouncing -->
+    <section id="component-search">
+      <h2>Component 1: Search with Debouncing</h2>
+
+      <details>
+        <summary>Requirements &amp; Constraints</summary>
+        <p><strong>Clarifying questions:</strong> Is search server-side (network round-trip per query) or client-side (filter an in-memory array)? What's an acceptable perceived latency — is 300ms debounce too slow for this use case (e.g., command palettes usually want ~150ms or less)? Should the previous request be cancelled or just ignored when a new one starts?</p>
+        <p><strong>Requirements:</strong> don't fire a network request per keystroke; always render the result set matching the <em>latest</em> query, never a stale one; show distinct loading/error/empty states; keep the input itself responsive regardless of network state; be screen-reader accessible via <code>aria-live</code> announcements of result counts.</p>
+      </details>
+
+      <details>
+        <summary>Custom useDebounce Hook</summary>
+        <p>Debouncing delays invoking a function until a pause in calls of at least <code>delay</code> ms has occurred — it collapses a burst of keystrokes into one trailing call. This is distinct from throttling, which guarantees invocation at a maximum <em>rate</em> regardless of pauses.</p>
+        <pre><code class="language-jsx">function useDebouncedValue(value, delay) {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() =&gt; {
+    const id = setTimeout(() =&gt; setDebounced(value), delay);
+    return () =&gt; clearTimeout(id); // Cancel the pending update if `value` changes again
+  }, [value, delay]);
+
+  return debounced;
+}
+
+// Callback-style variant, useful when you need to debounce a function
+// (not just a value) e.g. an imperative API call triggered by more than typing
+function useDebouncedCallback(callback, delay) {
+  const callbackRef = useRef(callback);
+  callbackRef.current = callback; // Always call the latest version — avoids stale closures
+
+  const timeoutRef = useRef(null);
+
+  const debounced = useCallback(
+    (...args) =&gt; {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = setTimeout(() =&gt; callbackRef.current(...args), delay);
+    },
+    [delay]
+  );
+
+  useEffect(() =&gt; () =&gt; clearTimeout(timeoutRef.current), []); // Cleanup on unmount
+
+  return debounced;
+}</code></pre>
+        <div class="callout callout-warning">
+          <p><strong>Edge case:</strong> If <code>delay</code> changes while a timer is pending, the old timeout still fires with the old delay (only the unmount cleanup clears it). For dynamic delays, add <code>clearTimeout(timeoutRef.current)</code> inside the useCallback when creating a new debounced function, or add delay to the useEffect cleanup deps. In practice, delay is usually static so this rarely matters.</p>
+        </div>
+        <div class="callout callout-tip">
+          <strong>Why debounce the value, not the input's <code>onChange</code> handler:</strong> keeping the raw keystroke state (<code>query</code>) updating instantly means the input never feels laggy, while a separate debounced derivative (<code>debouncedQuery</code>) is what actually triggers the fetch. This separation is the single most important design decision in this component.
+        </div>
+      </details>
+
+      <details>
+        <summary>AbortController for Request Cancellation &amp; Race Condition Prevention</summary>
+        <p>Even with debouncing, two requests can still race: request A (for "reac") is slow, request B (for "react") returns first. Without cancellation, A's response can overwrite B's more recent, more correct one when it finally arrives.</p>
+        <pre><code class="language-jsx">function useSearch(query) {
+  const [state, setState] = useState({ status: 'idle', results: [], error: null });
+
+  useEffect(() =&gt; {
+    if (!query) {
+      setState({ status: 'idle', results: [], error: null });
+      return;
+    }
+
+    const controller = new AbortController();
+    setState((s) =&gt; ({ ...s, status: 'loading' }));
+
+    fetch(`/api/search?q=${encodeURIComponent(query)}`, { signal: controller.signal })
+      .then((res) =&gt; {
+        if (!res.ok) throw new Error(`Search failed: ${res.status}`);
+        return res.json();
+      })
+      .then((results) =&gt; setState({ status: 'success', results, error: null }))
+      .catch((err) =&gt; {
+        if (err.name === 'AbortError') return; // Expected — a newer query superseded this one
+        setState({ status: 'error', results: [], error: err.message });
+      });
+
+    return () =&gt; controller.abort(); // Cancel on query change or unmount
+  }, [query]);
+
+  return state;
+}</code></pre>
+        <div class="callout callout-info">
+          <strong>AbortController vs a request-ID ref:</strong> when the underlying call is a real <code>fetch</code>, <code>AbortController</code> is strictly better — it actually cancels the network request, saving bandwidth and server load, not just ignoring the response client-side. Use a monotonic request-ID pattern only when the API you're calling doesn't support cancellation (e.g., some SDKs, WebSocket-based RPC).
+        </div>
+      </details>
+
+      <details>
+        <summary>Loading, Error, Empty States &amp; Accessibility</summary>
+        <pre><code class="language-jsx">function SearchResults({ status, results, error, query }) {
+  if (status === 'idle') return null;
+  if (status === 'loading') return &lt;p aria-live="polite"&gt;Searching…&lt;/p&gt;;
+  if (status === 'error') return &lt;p role="alert"&gt;Something went wrong: {error}&lt;/p&gt;;
+  if (results.length === 0) return &lt;p aria-live="polite"&gt;No results for "{query}"&lt;/p&gt;;
+
+  return (
+    &lt;ul aria-live="polite" aria-label={`${results.length} results`}&gt;
+      {results.map((r) =&gt; (
+        &lt;li key={r.id}&gt;{r.title}&lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+        <p><code>aria-live="polite"</code> announces the region's new content to screen readers without interrupting whatever the user is currently doing (e.g., still typing) — <code>role="alert"</code> is reserved for the error state because errors warrant more assertive announcement.</p>
+      </details>
+
+      <details>
+        <summary>Complete Implementation</summary>
+        <pre><code class="language-jsx">function SearchBox() {
+  const [query, setQuery] = useState('');
+  const debouncedQuery = useDebouncedValue(query, 300);
+  const { status, results, error } = useSearch(debouncedQuery);
+
+  return (
+    &lt;div&gt;
+      &lt;input
+        type="search"
+        value={query}
+        onChange={(e) =&gt; setQuery(e.target.value)}
+        placeholder="Search…"
+        aria-label="Search"
+        aria-controls="search-results"
+      /&gt;
+      &lt;div id="search-results"&gt;
+        &lt;SearchResults status={status} results={results} error={error} query={debouncedQuery} /&gt;
+      &lt;/div&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Edge Cases</summary>
+        <ul>
+          <li><strong>Clearing the input mid-flight:</strong> the effect's cleanup must abort the in-flight request even when the new "query" is empty, or a slow response for the last non-empty query can populate results after the user already cleared the box.</li>
+          <li><strong>Query with only whitespace:</strong> trim before deciding whether to fetch — otherwise every keystroke of leading spaces triggers a wasted request.</li>
+          <li><strong>Very fast typists exceeding the debounce window repeatedly:</strong> confirm the debounce timer resets (not accumulates) on each keystroke — a common off-by-one bug is scheduling additional timers instead of clearing the previous one.</li>
+          <li><strong>Backend returns results out of order relative to request order</strong> even without network racing (e.g., server-side load balancing): the <code>AbortController</code> approach sidesteps this because only the most recently-issued, non-aborted request can resolve into state.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Component 2: Autocomplete / Typeahead -->
+    <section id="component-autocomplete">
+      <h2>Component 2: Autocomplete / Typeahead</h2>
+
+      <details>
+        <summary>Requirements &amp; Constraints</summary>
+        <p><strong>Requirements:</strong> full keyboard navigation (no mouse required), announce the active option to screen readers, highlight the matched substring, remember recent searches, and remain performant with a debounced network call underneath — this component builds directly on Component 1's <code>useDebouncedValue</code> and <code>useSearch</code>.</p>
+        <p>The correct accessibility pattern for this UI shape is the ARIA <strong>combobox</strong> pattern — <em>not</em> a plain text input paired with a floating <code>&lt;ul&gt;</code> that has no semantic relationship to it.</p>
+      </details>
+
+      <details>
+        <summary>Combobox ARIA Pattern &amp; Keyboard Navigation</summary>
+        <pre><code class="language-jsx">function useComboboxKeyboard(itemCount, onSelect, isOpen, setIsOpen) {
+  const [activeIndex, setActiveIndex] = useState(-1);
+
+  const onKeyDown = (e) =&gt; {
+    if (!isOpen) {
+      if (e.key === 'ArrowDown') setIsOpen(true);
+      return;
+    }
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault();
+        setActiveIndex((i) =&gt; (i + 1) % itemCount);
+        break;
+      case 'ArrowUp':
+        e.preventDefault();
+        setActiveIndex((i) =&gt; (i - 1 + itemCount) % itemCount);
+        break;
+      case 'Enter':
+        if (activeIndex &gt;= 0) {
+          e.preventDefault();
+          onSelect(activeIndex);
+        }
+        break;
+      case 'Escape':
+        setIsOpen(false);
+        setActiveIndex(-1);
+        break;
+      default:
+        break;
+    }
+  };
+
+  useEffect(() =&gt; setActiveIndex(-1), [itemCount]); // Reset when the result set changes
+
+  return { activeIndex, onKeyDown };
+}</code></pre>
+        <pre><code class="language-jsx">&lt;div&gt; {/* wrapper — no role (ARIA 1.2: combobox goes on input, not wrapper) */}
+  &lt;input
+    role="combobox"
+    aria-expanded={isOpen}
+    aria-controls="ac-listbox"
+    aria-autocomplete="list"
+    aria-activedescendant={activeIndex &gt;= 0 ? `ac-option-${activeIndex}` : undefined}
+    onKeyDown={onKeyDown}
+  /&gt;
+  &lt;ul id="ac-listbox" role="listbox"&gt;
+    {results.map((r, i) =&gt; (
+      &lt;li
+        key={r.id}
+        id={`ac-option-${i}`}
+        role="option"
+        aria-selected={i === activeIndex}
+      &gt;
+        {r.label}
+      &lt;/li&gt;
+    ))}
+  &lt;/ul&gt;
+&lt;/div&gt;</code></pre>
+        <div class="callout callout-warning">
+          <strong>Why focus never moves to the <code>&lt;li&gt;</code> elements:</strong> in the combobox pattern, DOM focus stays on the <code>&lt;input&gt;</code> the entire time. "Active" option highlighting is communicated purely via <code>aria-activedescendant</code> pointing at the visually-highlighted option's id — moving real focus into the list would close the ability to keep typing.
+        </div>
+      </details>
+
+      <details>
+        <summary>Highlighting Matched Text &amp; Recent Searches</summary>
+        <pre><code class="language-jsx">function HighlightMatch({ text, query }) {
+  if (!query) return &lt;&gt;{text}&lt;/&gt;;
+  const idx = text.toLowerCase().indexOf(query.toLowerCase());
+  if (idx === -1) return &lt;&gt;{text}&lt;/&gt;;
+  return (
+    &lt;&gt;
+      {text.slice(0, idx)}
+      &lt;mark&gt;{text.slice(idx, idx + query.length)}&lt;/mark&gt;
+      {text.slice(idx + query.length)}
+    &lt;/&gt;
+  );
+}
+
+function useRecentSearches(key = 'recent-searches', limit = 5) {
+  const [recent, setRecent] = useState(() =&gt; {
+    try {
+      return JSON.parse(localStorage.getItem(key)) ?? [];
+    } catch {
+      return [];
+    }
+  });
+
+  const record = (term) =&gt; {
+    setRecent((prev) =&gt; {
+      const next = [term, ...prev.filter((t) =&gt; t !== term)].slice(0, limit);
+      try {
+        localStorage.setItem(key, JSON.stringify(next));
+      } catch {
+        // Storage unavailable — recent searches just won't persist this session
+      }
+      return next;
+    });
+  };
+
+  return { recent, record };
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Focus Management, Mobile Considerations &amp; Complete Implementation</summary>
+        <pre><code class="language-jsx">function Autocomplete() {
+  const [query, setQuery] = useState('');
+  const [isOpen, setIsOpen] = useState(false);
+  const debouncedQuery = useDebouncedValue(query, 250);
+  const { status, results } = useSearch(debouncedQuery);
+  const { recent, record } = useRecentSearches();
+  const listRef = useRef(null);
+
+  const items = query ? results : recent.map((term, i) =&gt; ({ id: `recent-${i}`, label: term }));
+
+  const handleSelect = (index) =&gt; {
+    const item = items[index];
+    setQuery(item.label);
+    record(item.label);
+    setIsOpen(false);
+  };
+
+  const { activeIndex, onKeyDown } = useComboboxKeyboard(items.length, handleSelect, isOpen, setIsOpen);
+
+  // Scroll the active option into view as it changes via keyboard
+  useEffect(() =&gt; {
+    if (activeIndex &lt; 0 || !listRef.current) return;
+    listRef.current.children[activeIndex]?.scrollIntoView({ block: 'nearest' });
+  }, [activeIndex]);
+
+  return (
+    &lt;div&gt;
+      &lt;input
+        role="combobox"
+        aria-expanded={isOpen}
+        aria-controls="ac-listbox"
+        aria-autocomplete="list"
+        aria-activedescendant={activeIndex &gt;= 0 ? `ac-option-${activeIndex}` : undefined}
+        value={query}
+        onChange={(e) =&gt; {
+          setQuery(e.target.value);
+          setIsOpen(true);
+        }}
+        onFocus={() =&gt; setIsOpen(true)}
+        onBlur={() =&gt; setTimeout(() =&gt; setIsOpen(false), 100)} // Delay so option click registers first
+        onKeyDown={onKeyDown}
+        // inputMode + autoCapitalize help mobile keyboards behave for search
+        inputMode="search"
+        autoCapitalize="none"
+        autoCorrect="off"
+      /&gt;
+      {isOpen &amp;&amp; (
+        &lt;ul id="ac-listbox" role="listbox" ref={listRef}&gt;
+          {status === 'loading' &amp;&amp; &lt;li aria-disabled="true"&gt;Loading…&lt;/li&gt;}
+          {items.map((item, i) =&gt; (
+            &lt;li
+              key={item.id}
+              id={`ac-option-${i}`}
+              role="option"
+              aria-selected={i === activeIndex}
+              onMouseDown={() =&gt; handleSelect(i)} // mousedown fires before input's blur
+            &gt;
+              &lt;HighlightMatch text={item.label} query={query} /&gt;
+            &lt;/li&gt;
+          ))}
+        &lt;/ul&gt;
+      )}
+    &lt;/div&gt;
+  );
+}</code></pre>
+        <p><strong>Mobile considerations:</strong> use <code>onMouseDown</code> (not <code>onClick</code>) for option selection because <code>onClick</code> fires after <code>onBlur</code>, which would already have closed the list; set <code>inputMode="search"</code> to surface a "search"-labeled key on virtual keyboards; avoid <code>onBlur</code>-triggered closing being too aggressive on touch devices where a tap can register as blur+focus in quick succession.</p>
+      </details>
+
+      <details>
+        <summary>Edge Cases</summary>
+        <ul>
+          <li><strong>Empty query showing recent searches</strong> vs a query with zero results: these are different empty states and must render distinct messaging (don't show "no results" when the box is simply empty and hasn't searched yet).</li>
+          <li><strong>Selecting an option programmatically re-triggers the search effect</strong> because <code>setQuery</code> changes: guard against re-opening the dropdown immediately after a selection (the <code>setIsOpen(false)</code> in <code>handleSelect</code> handles this, but it's an easy thing to regress when refactoring).</li>
+          <li><strong>Duplicate recent searches</strong> after re-searching the same term: dedupe by filtering the existing entry out before prepending, as shown in <code>useRecentSearches</code>.</li>
+          <li><strong>Screen magnifier / low-vision users</strong> relying on <code>aria-activedescendant</code>: verify the highlighted option actually scrolls into view (handled above via <code>scrollIntoView</code>) — without it, keyboard navigation can move focus semantically past the visible viewport.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Component 3: Infinite Scroll -->
+    <section id="component-infinite-scroll">
+      <h2>Component 3: Infinite Scroll</h2>
+
+      <details>
+        <summary>Requirements &amp; Constraints</summary>
+        <p><strong>Clarifying questions:</strong> cursor-based or offset/page-based pagination on the backend? Expected total item count (hundreds vs hundreds of thousands)? Should scroll position be restored when navigating back to this list? Is this a fixed-height list (virtualization-friendly) or variable-height content?</p>
+        <p><strong>Requirements:</strong> load the next page before the user hits the literal bottom (pre-fetch buffer); never fire duplicate requests for the same page; show a loading sentinel without layout shift; handle errors with retry; and — at scale — avoid keeping every fetched item mounted in the DOM simultaneously.</p>
+      </details>
+
+      <details>
+        <summary>IntersectionObserver Approach (vs Scroll Event Listeners)</summary>
+        <p><code>IntersectionObserver</code> is preferred over listening to <code>scroll</code> events because it runs off the main thread's synchronous scroll-handling path, doesn't require manual throttling, and directly answers the question you actually have ("is this sentinel element visible?") instead of requiring you to compute scroll position, viewport height, and element offsets by hand on every scroll tick.</p>
+        <pre><code class="language-jsx">function useInfiniteScroll({ hasMore, isLoading, onLoadMore, rootMargin = '400px' }) {
+  const sentinelRef = useRef(null);
+
+  useEffect(() =&gt; {
+    const node = sentinelRef.current;
+    if (!node || !hasMore) return;
+
+    const observer = new IntersectionObserver(
+      (entries) =&gt; {
+        if (entries[0].isIntersecting &amp;&amp; !isLoading) {
+          onLoadMore();
+        }
+      },
+      { rootMargin } // Trigger before the sentinel is literally on-screen
+    );
+
+    observer.observe(node);
+    return () =&gt; observer.disconnect();
+  }, [hasMore, isLoading, onLoadMore, rootMargin]);
+
+  return sentinelRef;
+}</code></pre>
+        <div class="callout callout-tip">
+          <strong><code>rootMargin: '400px'</code> is the pre-fetch buffer:</strong> it expands the observer's trigger boundary so the next page starts loading 400px before the sentinel actually enters the viewport, hiding network latency behind the remaining scroll distance instead of showing a loading spinner the user has to wait on.
+        </div>
+      </details>
+
+      <details>
+        <summary>Pagination Model, Loading Sentinel &amp; Error Handling with Retry</summary>
+        <pre><code class="language-jsx">function usePaginatedList(fetchPage) {
+  const [items, setItems] = useState([]);
+  const [cursor, setCursor] = useState(null);
+  const [status, setStatus] = useState('idle'); // idle | loading | error | done
+  const inFlight = useRef(false);
+  const abortRef = useRef(null);
+
+  const loadMore = useCallback(async () =&gt; {
+    if (inFlight.current || status === 'done') return;
+    inFlight.current = true;
+    setStatus('loading');
+
+    // Cancel any previous in-flight request
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      const page = await fetchPage(cursor, { signal: controller.signal });
+      setItems((prev) =&gt; [...prev, ...page.items]);
+      setCursor(page.nextCursor);
+      setStatus(page.nextCursor ? 'idle' : 'done');
+    } catch (e) {
+      if (e.name === 'AbortError') return; // Unmounted or superseded — ignore
+      setStatus('error');
+    } finally {
+      inFlight.current = false;
+    }
+  }, [cursor, fetchPage, status]);
+
+  useEffect(() =&gt; {
+    loadMore(); // Load the first page on mount
+    return () =&gt; abortRef.current?.abort(); // Cancel on unmount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return { items, status, loadMore, retry: loadMore };
+}</code></pre>
+        <div class="callout callout-warning">
+          <strong>Why <code>inFlight</code> is a ref, not state:</strong> the IntersectionObserver callback can fire multiple times in quick succession (e.g., a fast scroll or a resize) before a state update from the first call has re-rendered the component. A ref is read/written synchronously within the same tick, closing the race that a state-based flag would leave open.
+        </div>
+        <pre><code class="language-jsx">function ListSentinel({ status, retry }) {
+  if (status === 'loading') return &lt;li aria-live="polite"&gt;Loading more…&lt;/li&gt;;
+  if (status === 'error')
+    return (
+      &lt;li role="alert"&gt;
+        Couldn't load more. &lt;button onClick={retry}&gt;Retry&lt;/button&gt;
+      &lt;/li&gt;
+    );
+  return null; // 'done' or 'idle' render nothing
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Virtualization (react-window) &amp; Scroll Position Restoration</summary>
+        <p>Infinite scroll and virtualization solve different problems and are commonly conflated: infinite scroll controls <em>when you fetch more data</em>; virtualization controls <em>how much of the fetched data is actually mounted in the DOM</em>. At small scale (hundreds of items) you need only the former. Past a few thousand rows, mounting every item degrades scroll performance and memory regardless of how efficient the fetching is — that's when virtualization becomes necessary.</p>
+        <pre><code class="language-jsx">import { FixedSizeList } from 'react-window';
+
+function VirtualizedFeed({ items, status, loadMore, hasMore }) {
+  const itemCount = hasMore ? items.length + 1 : items.length; // +1 for the sentinel/loading row
+
+  const isItemLoaded = (index) =&gt; index &lt; items.length;
+
+  const Row = ({ index, style }) =&gt; {
+    if (!isItemLoaded(index)) {
+      return &lt;div style={style}&gt;Loading…&lt;/div&gt;;
+    }
+    return &lt;div style={style}&gt;{items[index].title}&lt;/div&gt;;
+  };
+
+  return (
+    &lt;FixedSizeList
+      height={600}
+      width="100%"
+      itemCount={itemCount}
+      itemSize={72}
+      onItemsRendered={({ visibleStopIndex }) =&gt; {
+        if (visibleStopIndex &gt;= items.length - 5 &amp;&amp; hasMore &amp;&amp; status !== 'loading') {
+          loadMore(); // Pre-fetch when nearing the end of currently-rendered rows
+        }
+      }}
+    &gt;
+      {Row}
+    &lt;/FixedSizeList&gt;
+  );
+}</code></pre>
+        <p><strong>Scroll position restoration</strong> (returning to a list after navigating into a detail view): store the scroll offset (or the last-visible item's id/index) in a ref or a router-level cache keyed by the list's identity, and on remount, either call <code>scrollTo</code> imperatively (fixed-height virtualization) or scroll the last-visible item's id into view with <code>scrollIntoView</code> (non-virtualized DOM).</p>
+      </details>
+
+      <details>
+        <summary>Complete Implementation (Non-Virtualized Baseline)</summary>
+        <pre><code class="language-jsx">function InfiniteFeed({ fetchPage }) {
+  const { items, status, retry, loadMore } = usePaginatedList(fetchPage);
+  const sentinelRef = useInfiniteScroll({
+    hasMore: status !== 'done',
+    isLoading: status === 'loading',
+    onLoadMore: loadMore,
+  });
+
+  return (
+    &lt;ul&gt;
+      {items.map((item) =&gt; (
+        &lt;li key={item.id}&gt;{item.title}&lt;/li&gt;
+      ))}
+      &lt;li ref={sentinelRef} style={{ height: 1 }} aria-hidden="true" /&gt;
+      &lt;ListSentinel status={status} retry={retry} /&gt;
+    &lt;/ul&gt;
+  );
+}</code></pre>
+        <p>Start with this version in an interview — it's correct, handles the required states, and takes a fraction of the time virtualization would. Only reach for <code>react-window</code>/<code>react-virtual</code> once the interviewer specifies scale that requires it, and say so explicitly.</p>
+      </details>
+
+      <details>
+        <summary>Memory Management for Large Lists &amp; Edge Cases</summary>
+        <ul>
+          <li><strong>Unbounded growth of the <code>items</code> array itself:</strong> even with virtualization limiting DOM nodes, the JS array of fetched items still grows unboundedly across a very long session. For a true "infinite" feed (social media style), periodically evict off-screen pages from the array, not just from the DOM, keeping a windowed slice around the current scroll position.</li>
+          <li><strong>Sentinel never intersects on a fast/large monitor</strong> where the initial page doesn't fill the viewport: trigger an initial <code>loadMore</code> check after the first page loads, in case the sentinel is already visible with no scrolling required.</li>
+          <li><strong>Duplicate items across pages</strong> if the underlying dataset mutates between page fetches (offset-based pagination shifting while new items are inserted): prefer cursor-based pagination, which is stable under concurrent inserts, and de-duplicate by id defensively when appending pages regardless.</li>
+          <li><strong>Component unmounts mid-fetch</strong> (user navigates away while a page is loading): guard the state-setting calls after the awaited fetch with a mounted-ref check, or use an <code>AbortController</code> tied to the component's cleanup, matching the pattern from Component 1.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Common LLD Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common LLD Mistakes</h2>
+      <details>
+        <summary>Mistakes that cost points across all three components</summary>
+        <ul>
+          <li><strong>Debouncing the wrong thing:</strong> debouncing the input's visual value (making typing itself feel laggy) instead of debouncing only the derived value that triggers the network call.</li>
+          <li><strong>No cancellation strategy:</strong> relying purely on debounce delay to prevent races, which fails whenever a fast response overtakes an even-faster-fired one under variable network latency.</li>
+          <li><strong>Using <code>scroll</code> event listeners instead of <code>IntersectionObserver</code>,</strong> then manually throttling — more code, worse performance, harder to get right.</li>
+          <li><strong>Conflating infinite scroll with virtualization,</strong> reaching for <code>react-window</code> immediately when the interviewer hasn't specified a scale that needs it.</li>
+          <li><strong>Ignoring the combobox ARIA pattern</strong> for autocomplete and building a plain input plus floating list with no semantic relationship — screen reader users get no indication a list even exists.</li>
+          <li><strong>Not handling duplicate/racing loadMore triggers</strong> from IntersectionObserver firing multiple times before a state update lands — missing the ref-based in-flight guard.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs (Debounce Delay, Virtualization Threshold)</h2>
+      <details>
+        <summary>Decisions worth stating out loud during the round</summary>
+        <ul>
+          <li><strong>Debounce delay — 150ms vs 300ms vs 500ms:</strong> shorter feels more responsive but sends more requests and risks more races under high latency; longer reduces load but the UI feels sluggish. 250-300ms is a reasonable default for search-as-you-type; command palettes and IDE-style autocomplete often go as low as 100-150ms since users expect near-instant feedback there.</li>
+          <li><strong>Debounce vs throttle:</strong> throttling guarantees periodic updates during continuous input (useful for e.g. live-updating a chart as a slider drags); debouncing waits for a pause (better for search, where only the final query matters).</li>
+          <li><strong>Client-side filter vs server-side search:</strong> client-side is instant and needs no debounce/cancellation machinery at all, but only works while the full dataset comfortably fits in memory and loads upfront — the two approaches aren't a spectrum, they're a fork based on data size.</li>
+          <li><strong>Virtualization threshold:</strong> under roughly a few hundred simultaneously-mounted rows, the DOM cost is negligible and virtualization adds complexity (fixed/variable row height management, harder to inspect in devtools) for no measurable benefit — introduce it only once profiling (or the interviewer's stated scale) justifies it.</li>
+          <li><strong>Cursor-based vs offset-based pagination:</strong> cursor-based is stable under concurrent writes to the underlying dataset and is the correct default for infinite scroll; offset-based is simpler to implement but can skip or duplicate items if the dataset changes between page fetches.</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Follow-up Interview Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Q1: How would you add "search-as-you-type" highlighting when the match is case-insensitive and includes diacritics (e.g., searching "cafe" should match "café")?</summary>
+        <p><strong>Strong answer:</strong> normalize both the query and the candidate text using <code>String.prototype.normalize('NFD')</code> combined with a regex that strips combining diacritical marks (<code>/[̀-ͯ]/g</code>) before comparing indices, then map the matched range back onto the <em>original</em> (non-normalized) string for display — highlighting must operate on original character offsets, not the normalized copy, or the highlighted substring will be visually wrong.</p>
+      </details>
+
+      <details>
+        <summary>Q2: The search endpoint has no cancellation support (a legacy SOAP-style RPC client). How do you prevent stale results without AbortController?</summary>
+        <p><strong>Strong answer:</strong> fall back to the monotonic request-ID pattern — increment a ref-held counter before each call, capture the current value in the closure, and only commit the response to state if the captured id still matches the ref's current value when the response resolves. This doesn't cancel the actual in-flight call (wasting network/server work) but does guarantee state correctness.</p>
+      </details>
+
+      <details>
+        <summary>Q3: How would you unit test the debounce behavior without waiting real milliseconds in your test suite?</summary>
+        <p><strong>Strong answer:</strong> use fake timers (<code>vi.useFakeTimers()</code> / <code>jest.useFakeTimers()</code>), type simulated input, then advance time programmatically (<code>vi.advanceTimersByTime(300)</code>) and assert the fetch mock was called exactly once with the final value — asserting it was <em>not</em> called before advancing past the delay, and confirming intermediate keystrokes never triggered a call, are the two assertions that actually prove debouncing works rather than just "eventually calling the API."</p>
+      </details>
+
+      <details>
+        <summary>Q4: The infinite scroll list needs to support "jump to top" without losing the currently-loaded pages. How do you implement it efficiently?</summary>
+        <p><strong>Strong answer:</strong> keep the already-fetched <code>items</code> array intact in state — "jump to top" is purely a scroll-position operation, not a data-refetch. For a non-virtualized list, call <code>window.scrollTo({ top: 0, behavior: 'smooth' })</code> or scroll the container ref; for a virtualized list (react-window), call the list ref's imperative <code>scrollTo(0)</code> method, since the library doesn't expose scroll position through regular DOM APIs on a windowed container.</p>
+      </details>
+
+      <details>
+        <summary>Q5: How does automatic batching in React 18 change the behavior of the debounced search hook if the fetch resolves inside a non-React-event context (e.g., a raw <code>setTimeout</code>)?</summary>
+        <p><strong>Strong answer:</strong> before React 18, state updates inside a plain <code>setTimeout</code> callback (outside any React event handler) were <em>not</em> batched — each <code>setState</code> call triggered its own synchronous re-render. Since React 18's automatic batching, updates inside <code>setTimeout</code>, promises, and native event handlers are batched by default via <code>createRoot</code>. For the search hook, that means multiple state writes inside the fetch's <code>.then()</code>/<code>.catch()</code> chain (e.g., setting both <code>status</code> and <code>results</code> in two calls) now commit as a single render instead of two, which is strictly better and requires no code change to benefit from.</p>
+      </details>
+    </section>
+
+    <!-- Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <div class="callout callout-tip">
+        <p><strong>Key mental models for the interview:</strong></p>
+        <ul>
+          <li><strong>Debounce the derived value, not the input.</strong> The text box must always feel instant; only the thing that triggers network/expensive work should lag behind typing.</li>
+          <li><strong>Cancellation is not optional at scale.</strong> Any async operation triggered by fast-changing input needs a defined "which response wins" rule — <code>AbortController</code> when available, a request-ID ref otherwise.</li>
+          <li><strong>Combobox, not "input + floating div."</strong> Autocomplete has a standard ARIA pattern; using it is the difference between an accessible component and one that merely looks like one.</li>
+          <li><strong><code>IntersectionObserver</code> answers "is it visible," not "where did the user scroll."</strong> It's the right tool because it matches the actual question infinite scroll needs answered.</li>
+          <li><strong>Infinite scroll ≠ virtualization.</strong> One controls fetch timing, the other controls DOM mounting — introduce the second only once scale demands it.</li>
+        </ul>
+      </div>
+      <div class="callout callout-warning">
+        <p><strong>What NOT to say in an interview:</strong></p>
+        <ul>
+          <li>❌ "I'll debounce the <code>onChange</code> so the input updates slowly too" — this makes typing feel broken; only the fetch trigger should be debounced.</li>
+          <li>❌ "Race conditions are rare enough to ignore" — under real network variance they are one of the most common production bugs in search UIs.</li>
+          <li>❌ "I'll just reach for <code>react-window</code> by default" — without a stated scale requirement, this is solving a problem that may not exist and adds real complexity.</li>
+          <li>❌ "Accessibility can be a follow-up if they ask" — the combobox pattern, live regions, and keyboard support are graded as part of the base implementation in most senior loops.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-jsx.min.js"></script>
+</body>
+</html>

@@ -1,0 +1,2111 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 12: Mapped &amp; Template Literal Types | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar">
+    <a href="../index.html" class="sidebar-brand">
+      <span class="chapter-num">Ch 12</span>
+      <span class="chapter-title">Mapped &amp; Template Literal Types</span>
+    </a>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#mapped-types-internals">Mapped Types Internals</a></li>
+        <li><a href="#key-remapping">Key Remapping (as clause)</a></li>
+        <li><a href="#template-literal-types">Template Literal Types</a></li>
+        <li><a href="#string-manipulation">String Manipulation Types</a></li>
+        <li><a href="#combined-patterns">Combining Mapped + Template Literal</a></li>
+        <li><a href="#api-route-typing">Typing REST API Routes</a></li>
+        <li><a href="#event-handler-typing">Typing Event Handlers</a></li>
+        <li><a href="#css-in-js-typing">Typing CSS-in-JS</a></li>
+        <li><a href="#utility-type-internals">Record, Pick, Omit — Internals</a></li>
+        <li><a href="#deep-utility-types">Readonly, Required, Partial — Deep</a></li>
+        <li><a href="#performance">Performance Considerations</a></li>
+        <li><a href="#production-patterns">Production Patterns</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <span>Part II — TypeScript Advanced Patterns</span> &gt;
+      <span>Chapter 12</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-ts">TypeScript</span>
+        <span class="badge badge-topic">Mapped Types</span>
+        <span class="badge badge-topic">Template Literals</span>
+        <span class="badge badge-topic">Type Transformations</span>
+      </div>
+      <h1>Chapter 12: Mapped &amp; Template Literal Types</h1>
+      <p class="chapter-question">&ldquo;What are mapped types and template literal types? How would you use them to type a REST API client?&rdquo;</p>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> Mapped types iterate over keys to transform one type into another (<code>{[K in keyof T]: ...}</code>). Template literal types enable string manipulation at the type level. Combined, they can generate typed API clients from route definitions, transform event handler types from event names, and create CSS-in-JS type safety &mdash; all at compile time with zero runtime cost.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content" />
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer's Intent</h2>
+      <details>
+        <summary>What the interviewer is really asking</summary>
+        <div class="callout callout-info">
+          <p>The interviewer wants to verify you can:</p>
+        </div>
+        <ul>
+          <li><strong>Understand type-level computation</strong> — Can you think of types as programs that run at compile time?</li>
+          <li><strong>Transform types systematically</strong> — Can you derive one type from another without manual duplication?</li>
+          <li><strong>Apply template literals beyond simple strings</strong> — Can you parse, validate, and transform string patterns at the type level?</li>
+          <li><strong>Build real abstractions</strong> — Can you type complex patterns like REST clients, event systems, or CSS-in-JS?</li>
+          <li><strong>Know the limits</strong> — Do you understand when type-level complexity hurts more than it helps?</li>
+        </ul>
+        <pre class="diagram">
+┌─────────────────────────────────────────────────┐
+│         Type-Level Programming Spectrum          │
+├─────────────────────────────────────────────────┤
+│                                                 │
+│  Simple              Medium             Advanced │
+│  ──────              ──────             ──────── │
+│  Partial&lt;T&gt;         Mapped +           REST     │
+│  Required&lt;T&gt;        Modifiers          Client   │
+│  Pick&lt;T,K&gt;          Key Remap          Generator│
+│  Omit&lt;T,K&gt;          Template Lit       Path     │
+│                                        Parser   │
+│                                                 │
+│  ◄── You should know all of these ──►           │
+└─────────────────────────────────────────────────┘
+        </pre>
+      </details>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer">
+      <h2>60-Second Answer</h2>
+      <details>
+        <summary>Quick answer for time-pressured interviews</summary>
+        <p><strong>Mapped types</strong> iterate over a set of keys to produce a new type. The syntax is <code>{[K in Keys]: ValueType}</code>. They power built-in utilities like <code>Partial</code>, <code>Required</code>, <code>Pick</code>, and <code>Record</code>.</p>
+        <p><strong>Template literal types</strong> use backtick syntax at the type level to create string patterns: <code>`on${Capitalize&lt;Event&gt;}`</code>. They distribute over unions and support <code>infer</code> for extraction.</p>
+        <p><strong>Combined</strong>, they enable typing a REST client from route definitions:</p>
+<pre><code class="language-typescript">// Define routes as a type
+type Routes = {
+  '/users': { GET: User[]; POST: User };
+  '/users/:id': { GET: User; PUT: User; DELETE: void };
+};
+
+// Extract path params from string pattern
+type ExtractParams&lt;T extends string&gt; =
+  T extends `${string}:${infer Param}/${infer Rest}`
+    ? { [K in Param | keyof ExtractParams&lt;Rest&gt;]: string }
+    : T extends `${string}:${infer Param}`
+      ? { [K in Param]: string }
+      : {};
+
+// Generate typed client using mapped + template literal types
+type ApiClient = {
+  [Path in keyof Routes]: {
+    [Method in keyof Routes[Path]]:
+      ExtractParams&lt;Path &amp; string&gt; extends infer P
+        ? keyof P extends never
+          ? () =&gt; Promise&lt;Routes[Path][Method]&gt;
+          : (params: P) =&gt; Promise&lt;Routes[Path][Method]&gt;
+        : never;
+  };
+};</code></pre>
+        <div class="callout callout-tip">
+          <p><strong>Interview tip:</strong> Lead with the mental model (iteration + string manipulation), give one concrete use case (API client or event handlers), then mention performance awareness.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 3: Mapped Types Internals -->
+    <section id="mapped-types-internals">
+      <h2>Mapped Types Internals</h2>
+      <details>
+        <summary>How mapped types work under the hood</summary>
+
+        <h3>Basic Syntax</h3>
+<pre><code class="language-typescript">// The fundamental mapped type pattern
+type MappedType = {
+  [K in Keys]: ValueType;
+};
+
+// Concrete example: make all properties optional
+type MyPartial&lt;T&gt; = {
+  [K in keyof T]?: T[K];
+};
+
+// Make all properties readonly
+type MyReadonly&lt;T&gt; = {
+  readonly [K in keyof T]: T[K];
+};</code></pre>
+
+        <h3>How Iteration Works</h3>
+<pre class="diagram">
+Given: type User = { name: string; age: number; email: string }
+
+MyPartial&lt;User&gt; iterates:
+  Step 1: K = "name"  → name?: string
+  Step 2: K = "age"   → age?: number
+  Step 3: K = "email" → email?: string
+
+Result: { name?: string; age?: number; email?: string }
+</pre>
+
+        <h3>Modifiers: + and -</h3>
+<pre><code class="language-typescript">// Adding modifiers (+ is implicit)
+type ReadonlyOptional&lt;T&gt; = {
+  +readonly [K in keyof T]+?: T[K];
+};
+
+// Removing modifiers
+type Mutable&lt;T&gt; = {
+  -readonly [K in keyof T]: T[K];
+};
+
+type Required&lt;T&gt; = {
+  [K in keyof T]-?: T[K];
+};
+
+// Remove both readonly AND optional
+type Concrete&lt;T&gt; = {
+  -readonly [K in keyof T]-?: T[K];
+};</code></pre>
+
+        <h3>Homomorphic vs Non-Homomorphic</h3>
+<pre><code class="language-typescript">// Homomorphic: preserves modifiers from the original type
+// (iterates over keyof T — preserves structure)
+type HomomorphicExample&lt;T&gt; = {
+  [K in keyof T]: T[K] | null;
+};
+
+// Non-homomorphic: creates new structure
+// (iterates over arbitrary keys — no modifier preservation)
+type NonHomomorphic = {
+  [K in 'a' | 'b' | 'c']: boolean;
+};
+
+// Why it matters:
+interface Original {
+  readonly name: string;
+  age?: number;
+}
+
+// Homomorphic preserves readonly and optional
+type Wrapped = HomomorphicExample&lt;Original&gt;;
+// { readonly name: string | null; age?: number | null }
+
+// Record is non-homomorphic — no modifier preservation
+type Fresh = Record&lt;keyof Original, boolean&gt;;
+// { name: boolean; age: boolean } — no readonly, no optional</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Key insight:</strong> Homomorphic mapped types (those iterating over <code>keyof T</code> where T is a type parameter) distribute over union types. This is why <code>Partial&lt;T&gt;</code> works correctly with unions — each union member is mapped independently, preserving the discriminated union structure.</p>
+        </div>
+<pre><code class="language-typescript">// Homomorphic distribution example:
+type Circle = { kind: 'circle'; radius: number };
+type Square = { kind: 'square'; side: number };
+type Shape = Circle | Square;
+
+// Partial is homomorphic (iterates keyof T where T is a param):
+type PartialShape = Partial&lt;Shape&gt;;
+// = Partial&lt;Circle&gt; | Partial&lt;Square&gt;
+// = { kind?: 'circle'; radius?: number } | { kind?: 'square'; side?: number }
+// Discriminated union preserved!
+
+// Non-homomorphic (iterating over a concrete key set):
+type NonHomomorphic = { [K in keyof Shape]?: Shape[K] };
+// = { kind?: 'circle' | 'square' }  — only common keys, union structure lost!
+</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 4: Key Remapping -->
+    <section id="key-remapping">
+      <h2>Key Remapping (as clause)</h2>
+      <details>
+        <summary>TS 4.1+ as clause for renaming and filtering keys</summary>
+
+        <h3>Basic Key Remapping</h3>
+<pre><code class="language-typescript">// Syntax: [K in Keys as NewKey]: ValueType
+type Getters&lt;T&gt; = {
+  [K in keyof T as `get${Capitalize&lt;string &amp; K&gt;}`]: () =&gt; T[K];
+};
+
+interface Person {
+  name: string;
+  age: number;
+}
+
+type PersonGetters = Getters&lt;Person&gt;;
+// { getName: () =&gt; string; getAge: () =&gt; number }</code></pre>
+
+        <h3>Filtering Keys with never</h3>
+<pre><code class="language-typescript">// Return never from as clause to filter out keys
+type FilterByType&lt;T, U&gt; = {
+  [K in keyof T as T[K] extends U ? K : never]: T[K];
+};
+
+interface Mixed {
+  name: string;
+  age: number;
+  active: boolean;
+  email: string;
+}
+
+type StringProps = FilterByType&lt;Mixed, string&gt;;
+// { name: string; email: string }
+
+type NumericProps = FilterByType&lt;Mixed, number&gt;;
+// { age: number }
+
+// Remove specific keys
+type RemovePrefix&lt;T, Prefix extends string&gt; = {
+  [K in keyof T as K extends `${Prefix}${string}` ? never : K]: T[K];
+};
+
+interface Config {
+  _internal: boolean;
+  _debug: boolean;
+  apiUrl: string;
+  timeout: number;
+}
+
+type PublicConfig = RemovePrefix&lt;Config, '_'&gt;;
+// { apiUrl: string; timeout: number }</code></pre>
+
+        <h3>Transforming Key Names</h3>
+<pre><code class="language-typescript">// camelCase to snake_case
+type CamelToSnake&lt;S extends string&gt; =
+  S extends `${infer Head}${infer Tail}`
+    ? Tail extends Uncapitalize&lt;Tail&gt;
+      ? `${Lowercase&lt;Head&gt;}${CamelToSnake&lt;Tail&gt;}`
+      : `${Lowercase&lt;Head&gt;}_${CamelToSnake&lt;Tail&gt;}`
+    : S;
+
+type SnakeCaseKeys&lt;T&gt; = {
+  [K in keyof T as CamelToSnake&lt;string &amp; K&gt;]: T[K];
+};
+
+interface ApiResponse {
+  userName: string;
+  createdAt: Date;
+  isActive: boolean;
+}
+
+type SnakeResponse = SnakeCaseKeys&lt;ApiResponse&gt;;
+// { user_name: string; created_at: Date; is_active: boolean }</code></pre>
+
+        <h3>Practical: Event Map Generation</h3>
+<pre><code class="language-typescript">type EventMap&lt;T&gt; = {
+  [K in keyof T as `on${Capitalize&lt;string &amp; K&gt;}`]:
+    (event: T[K]) =&gt; void;
+};
+
+interface Events {
+  click: MouseEvent;
+  keydown: KeyboardEvent;
+  scroll: Event;
+}
+
+type EventHandlers = EventMap&lt;Events&gt;;
+// {
+//   onClick: (event: MouseEvent) =&gt; void;
+//   onKeydown: (event: KeyboardEvent) =&gt; void;
+//   onScroll: (event: Event) =&gt; void;
+// }</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Remember:</strong> The <code>as</code> clause was introduced in TypeScript 4.1. Before that, key transformation required intermediate types and <code>Pick</code>/<code>Omit</code> combinations.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 5: Template Literal Types -->
+    <section id="template-literal-types">
+      <h2>Template Literal Types</h2>
+      <details>
+        <summary>String manipulation at the type level</summary>
+
+        <h3>Basic Syntax</h3>
+<pre><code class="language-typescript">// Template literal types use backtick syntax
+type Greeting = `Hello, ${string}`;
+
+const valid: Greeting = "Hello, world";  // ✓
+const invalid: Greeting = "Hi, world";   // ✗ Error
+
+// With specific unions
+type Color = 'red' | 'blue' | 'green';
+type Size = 'sm' | 'md' | 'lg';
+
+type ClassName = `${Size}-${Color}`;
+// "sm-red" | "sm-blue" | "sm-green" |
+// "md-red" | "md-blue" | "md-green" |
+// "lg-red" | "lg-blue" | "lg-green"</code></pre>
+
+        <h3>Distributive Behavior with Unions</h3>
+<pre><code class="language-typescript">// Template literals distribute over unions (cross product)
+type Vertical = 'top' | 'bottom';
+type Horizontal = 'left' | 'right';
+
+type Position = `${Vertical}-${Horizontal}`;
+// "top-left" | "top-right" | "bottom-left" | "bottom-right"
+
+// Multiple unions multiply
+type A = 'a' | 'b';     // 2 members
+type B = '1' | '2';     // 2 members
+type C = 'x' | 'y' | 'z'; // 3 members
+
+type Combined = `${A}-${B}-${C}`;
+// 2 × 2 × 3 = 12 members</code></pre>
+
+        <h3>Extracting Parts with infer</h3>
+<pre><code class="language-typescript">// Parse route parameters
+type ExtractParam&lt;T extends string&gt; =
+  T extends `${string}:${infer Param}/${infer Rest}`
+    ? Param | ExtractParam&lt;Rest&gt;
+    : T extends `${string}:${infer Param}`
+      ? Param
+      : never;
+
+type Params = ExtractParam&lt;'/users/:userId/posts/:postId'&gt;;
+// "userId" | "postId"
+
+// Split string into tuple
+type Split&lt;S extends string, D extends string&gt; =
+  S extends `${infer Head}${D}${infer Tail}`
+    ? [Head, ...Split&lt;Tail, D&gt;]
+    : [S];
+
+type Parts = Split&lt;'a.b.c.d', '.'&gt;;
+// ["a", "b", "c", "d"]
+
+// Extract domain from email
+type ExtractDomain&lt;T extends string&gt; =
+  T extends `${string}@${infer Domain}`
+    ? Domain
+    : never;
+
+type Domain = ExtractDomain&lt;'user@example.com'&gt;;
+// "example.com"</code></pre>
+
+        <h3>Recursive Template Literals</h3>
+<pre><code class="language-typescript">// Replace all occurrences of a substring
+type ReplaceAll&lt;
+  S extends string,
+  From extends string,
+  To extends string
+&gt; = From extends ''
+  ? S
+  : S extends `${infer Before}${From}${infer After}`
+    ? `${Before}${To}${ReplaceAll&lt;After, From, To&gt;}`
+    : S;
+
+type Result = ReplaceAll&lt;'foo-bar-baz', '-', '_'&gt;;
+// "foo_bar_baz"
+
+// Trim whitespace
+type TrimLeft&lt;S extends string&gt; =
+  S extends ` ${infer Rest}` ? TrimLeft&lt;Rest&gt; : S;
+
+type TrimRight&lt;S extends string&gt; =
+  S extends `${infer Rest} ` ? TrimRight&lt;Rest&gt; : S;
+
+type Trim&lt;S extends string&gt; = TrimLeft&lt;TrimRight&lt;S&gt;&gt;;
+
+type Trimmed = Trim&lt;'  hello  '&gt;;
+// "hello"</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Recursion depth:</strong> TypeScript limits type recursion depth to ~50 levels by default. With tail-call optimization (tail-recursive conditional types, TS 4.5+), the limit increases to ~1000. Keep non-tail-recursive template types shallow; restructure deep recursion to be tail-recursive.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 6: String Manipulation Types -->
+    <section id="string-manipulation">
+      <h2>String Manipulation Types</h2>
+      <details>
+        <summary>Built-in and custom string type utilities</summary>
+
+        <h3>Built-in Intrinsic Types</h3>
+<pre><code class="language-typescript">// These are compiler intrinsics — not implementable in userland
+type Upper = Uppercase&lt;'hello'&gt;;       // "HELLO"
+type Lower = Lowercase&lt;'HELLO'&gt;;       // "hello"
+type Cap = Capitalize&lt;'hello'&gt;;        // "Hello"
+type Uncap = Uncapitalize&lt;'Hello'&gt;;    // "hello"
+
+// They distribute over unions
+type Events = 'click' | 'focus' | 'blur';
+type PrefixedEvents = `on${Capitalize&lt;Events&gt;}`;
+// "onClick" | "onFocus" | "onBlur"</code></pre>
+
+        <h3>Custom String Manipulation</h3>
+<pre><code class="language-typescript">// kebab-case to camelCase
+type KebabToCamel&lt;S extends string&gt; =
+  S extends `${infer Head}-${infer Tail}`
+    ? `${Head}${KebabToCamel&lt;Capitalize&lt;Tail&gt;&gt;}`
+    : S;
+
+type Camel = KebabToCamel&lt;'background-color'&gt;;
+// "backgroundColor"
+
+// camelCase to kebab-case
+type CamelToKebab&lt;S extends string&gt; =
+  S extends `${infer Head}${infer Tail}`
+    ? Tail extends Uncapitalize&lt;Tail&gt;
+      ? `${Lowercase&lt;Head&gt;}${CamelToKebab&lt;Tail&gt;}`
+      : `${Lowercase&lt;Head&gt;}-${CamelToKebab&lt;Tail&gt;}`
+    : S;
+
+type Kebab = CamelToKebab&lt;'backgroundColor'&gt;;
+// "background-color"
+
+// PascalCase to words
+type PascalToWords&lt;S extends string&gt; =
+  S extends `${infer Head}${infer Tail}`
+    ? Tail extends Uncapitalize&lt;Tail&gt;
+      ? `${Head}${PascalToWords&lt;Tail&gt;}`
+      : `${Head} ${PascalToWords&lt;Tail&gt;}`
+    : S;
+
+type Words = PascalToWords&lt;'MyComponentName'&gt;;
+// "My Component Name"</code></pre>
+
+        <h3>Parsing Patterns</h3>
+<pre><code class="language-typescript">// Parse a semver string
+type ParseSemver&lt;T extends string&gt; =
+  T extends `${infer Major}.${infer Minor}.${infer Patch}`
+    ? { major: Major; minor: Minor; patch: Patch }
+    : never;
+
+type Version = ParseSemver&lt;'1.2.3'&gt;;
+// { major: "1"; minor: "2"; patch: "3" }
+
+// Parse URL pattern
+type ParseURL&lt;T extends string&gt; =
+  T extends `${infer Protocol}://${infer Host}/${infer Path}`
+    ? { protocol: Protocol; host: Host; path: Path }
+    : T extends `${infer Protocol}://${infer Host}`
+      ? { protocol: Protocol; host: Host; path: '' }
+      : never;
+
+type URL = ParseURL&lt;'https://api.example.com/v1/users'&gt;;
+// { protocol: "https"; host: "api.example.com"; path: "v1/users" }</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Pro tip:</strong> String manipulation types shine for validating string formats at compile time — API routes, CSS class names, environment variable names, and configuration keys.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 7: Combining Mapped + Template Literal Types -->
+    <section id="combined-patterns">
+      <h2>Combining Mapped + Template Literal Types</h2>
+      <details>
+        <summary>The power combo: iteration meets string manipulation</summary>
+
+        <h3>Generating Event Handler Types</h3>
+<pre><code class="language-typescript">type EventConfig = {
+  click: { x: number; y: number };
+  focus: { target: HTMLElement };
+  change: { value: string; previousValue: string };
+};
+
+// Generate on + Capitalize handlers
+type EventHandlers&lt;T&gt; = {
+  [K in keyof T as `on${Capitalize&lt;string &amp; K&gt;}`]:
+    (payload: T[K]) =&gt; void;
+};
+
+type Handlers = EventHandlers&lt;EventConfig&gt;;
+// {
+//   onClick: (payload: { x: number; y: number }) =&gt; void;
+//   onFocus: (payload: { target: HTMLElement }) =&gt; void;
+//   onChange: (payload: { value: string; previousValue: string }) =&gt; void;
+// }
+
+// Also generate has + Capitalize checkers
+type EventCheckers&lt;T&gt; = {
+  [K in keyof T as `has${Capitalize&lt;string &amp; K&gt;}Listener`]: boolean;
+};
+
+type Checkers = EventCheckers&lt;EventConfig&gt;;
+// { hasClickListener: boolean; hasFocusListener: boolean; hasChangeListener: boolean }</code></pre>
+
+        <h3>Transforming API Routes to Methods</h3>
+<pre><code class="language-typescript">type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
+
+type ApiRoutes = {
+  'GET /users': { response: User[] };
+  'POST /users': { body: CreateUserDto; response: User };
+  'GET /users/:id': { response: User };
+  'PUT /users/:id': { body: UpdateUserDto; response: User };
+  'DELETE /users/:id': { response: void };
+};
+
+// Parse "METHOD /path" into structured type
+type ParseRoute&lt;T extends string&gt; =
+  T extends `${infer Method} ${infer Path}`
+    ? { method: Method; path: Path }
+    : never;
+
+// Generate method names from routes
+type RouteToMethodName&lt;T extends string&gt; =
+  T extends `${infer Method} /${infer Path}`
+    ? `${Lowercase&lt;Method&gt;}${Capitalize&lt;PathToName&lt;Path&gt;&gt;}`
+    : never;
+
+type PathToName&lt;T extends string&gt; =
+  T extends `${infer Segment}/${infer Rest}`
+    ? `${Segment}${Capitalize&lt;PathToName&lt;Rest&gt;&gt;}`
+    : T extends `:${infer Param}`
+      ? `By${Capitalize&lt;Param&gt;}`
+      : T;</code></pre>
+
+        <h3>CSS Property Typing</h3>
+<pre><code class="language-typescript">type CSSProperty = 'margin' | 'padding' | 'border';
+type Direction = 'top' | 'right' | 'bottom' | 'left';
+
+// Generate directional CSS properties
+type DirectionalCSS = {
+  [P in CSSProperty as `${P}-${Direction}`]: string;
+};
+// { "margin-top": string; "margin-right": string; ... }
+
+// Responsive breakpoint variants
+type Breakpoint = 'sm' | 'md' | 'lg' | 'xl';
+type SpacingProp = 'p' | 'px' | 'py' | 'm' | 'mx' | 'my';
+
+type ResponsiveProps = {
+  [K in SpacingProp | `${Breakpoint}:${SpacingProp}`]?: number;
+};
+// { p?: number; px?: number; "sm:p"?: number; "sm:px"?: number; ... }</code></pre>
+
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────┐
+│         Mapped + Template Literal Pipeline            │
+├──────────────────────────────────────────────────────┤
+│                                                      │
+│  Source Type ─── keyof ──► Key Union                 │
+│                              │                       │
+│                          as clause                   │
+│                              │                       │
+│                    Template Literal                   │
+│                    Transformation                     │
+│                              │                       │
+│                         New Keys                     │
+│                              │                       │
+│                     Value Type Lookup                 │
+│                              │                       │
+│                    ▼ New Mapped Type                  │
+└──────────────────────────────────────────────────────┘
+        </pre>
+
+        <div class="callout callout-info">
+          <p><strong>Mental model:</strong> Think of mapped types as <code>Array.map()</code> for type properties, and template literals as string interpolation for type-level strings. Combined, they're like <code>Object.entries().map(([key, value]) =&gt; [transform(key), transform(value)])</code>.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 8: Typing REST API Routes -->
+    <section id="api-route-typing">
+      <h2>Typing REST API Routes</h2>
+      <details>
+        <summary>Full implementation: route string → typed params → typed client</summary>
+
+        <h3>Step 1: Extract Path Parameters</h3>
+<pre><code class="language-typescript">// Parse :param segments from a route string
+type ExtractPathParams&lt;T extends string&gt; =
+  T extends `${string}:${infer Param}/${infer Rest}`
+    ? { [K in Param | keyof ExtractPathParams&lt;`/${Rest}`&gt;]: string }
+    : T extends `${string}:${infer Param}`
+      ? { [K in Param]: string }
+      : {};
+
+// Test it
+type UserParams = ExtractPathParams&lt;'/users/:userId'&gt;;
+// { userId: string }
+
+type PostParams = ExtractPathParams&lt;'/users/:userId/posts/:postId'&gt;;
+// { userId: string; postId: string }
+
+type NoParams = ExtractPathParams&lt;'/users'&gt;;
+// {}</code></pre>
+
+        <h3>Step 2: Define Route Configuration</h3>
+<pre><code class="language-typescript">interface RouteConfig {
+  response: unknown;
+  body?: unknown;
+  query?: Record&lt;string, string&gt;;
+}
+
+// Define your API routes
+interface ApiRouteMap {
+  'GET /users': {
+    response: User[];
+    query: { page?: string; limit?: string };
+  };
+  'POST /users': {
+    response: User;
+    body: { name: string; email: string };
+  };
+  'GET /users/:id': {
+    response: User;
+  };
+  'PUT /users/:id': {
+    response: User;
+    body: Partial&lt;User&gt;;
+  };
+  'DELETE /users/:id': {
+    response: void;
+  };
+  'GET /users/:userId/posts/:postId': {
+    response: Post;
+  };
+}</code></pre>
+
+        <h3>Step 3: Build the Typed Client</h3>
+<pre><code class="language-typescript">// Parse route key into method + path
+type ParseRouteKey&lt;T extends string&gt; =
+  T extends `${infer Method extends string} ${infer Path}`
+    ? { method: Method; path: Path }
+    : never;
+
+// Build request options based on route config
+type RequestOptions&lt;
+  Path extends string,
+  Config extends RouteConfig
+&gt; = (ExtractPathParams&lt;Path&gt; extends infer P
+  ? keyof P extends never ? {} : { params: P }
+  : {}) &amp;
+  (Config extends { body: infer B } ? { body: B } : {}) &amp;
+  (Config extends { query: infer Q } ? { query: Q } : {});
+
+// The typed API client
+type TypedApiClient&lt;Routes extends Record&lt;string, RouteConfig&gt;&gt; = {
+  request&lt;K extends keyof Routes &amp; string&gt;(
+    route: K,
+    ...args: keyof RequestOptions&lt;
+      ParseRouteKey&lt;K&gt;['path'],
+      Routes[K]
+    &gt; extends never
+      ? []
+      : [options: RequestOptions&lt;ParseRouteKey&lt;K&gt;['path'], Routes[K]&gt;]
+  ): Promise&lt;Routes[K]['response']&gt;;
+};
+
+// Usage
+declare const api: TypedApiClient&lt;ApiRouteMap&gt;;
+
+// ✓ No params needed
+await api.request('GET /users');
+
+// ✓ Params required
+await api.request('GET /users/:id', { params: { id: '123' } });
+
+// ✓ Body required
+await api.request('POST /users', {
+  body: { name: 'John', email: 'john@example.com' }
+});
+
+// ✗ Error: missing params
+await api.request('GET /users/:id');  // Error!</code></pre>
+
+        <h3>Step 4: Method-Based Client (Alternative)</h3>
+<pre><code class="language-typescript">// Group by HTTP method for a more ergonomic API
+type MethodClient&lt;Routes extends Record&lt;string, RouteConfig&gt;&gt; = {
+  get&lt;P extends ExtractByMethod&lt;Routes, 'GET'&gt;&gt;(
+    path: P,
+    ...args: BuildArgs&lt;P, Routes[`GET ${P}`]&gt;
+  ): Promise&lt;Routes[`GET ${P}`]['response']&gt;;
+
+  post&lt;P extends ExtractByMethod&lt;Routes, 'POST'&gt;&gt;(
+    path: P,
+    ...args: BuildArgs&lt;P, Routes[`POST ${P}`]&gt;
+  ): Promise&lt;Routes[`POST ${P}`]['response']&gt;;
+
+  put&lt;P extends ExtractByMethod&lt;Routes, 'PUT'&gt;&gt;(
+    path: P,
+    ...args: BuildArgs&lt;P, Routes[`PUT ${P}`]&gt;
+  ): Promise&lt;Routes[`PUT ${P}`]['response']&gt;;
+
+  delete&lt;P extends ExtractByMethod&lt;Routes, 'DELETE'&gt;&gt;(
+    path: P,
+    ...args: BuildArgs&lt;P, Routes[`DELETE ${P}`]&gt;
+  ): Promise&lt;Routes[`DELETE ${P}`]['response']&gt;;
+};
+
+type ExtractByMethod&lt;
+  Routes extends Record&lt;string, RouteConfig&gt;,
+  Method extends string
+&gt; = {
+  [K in keyof Routes]: K extends `${Method} ${infer Path}` ? Path : never;
+}[keyof Routes];
+
+type BuildArgs&lt;Path extends string, Config&gt; =
+  Config extends RouteConfig
+    ? keyof RequestOptions&lt;Path, Config&gt; extends never
+      ? []
+      : [options: RequestOptions&lt;Path, Config&gt;]
+    : never;</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Real-world usage:</strong> Libraries like <code>ts-rest</code> and <code>zodios</code> use this pattern to generate fully typed API clients from contract definitions. The pattern scales well up to ~100 routes before hitting performance limits.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 9: Typing Event Handlers from String Patterns -->
+    <section id="event-handler-typing">
+      <h2>Typing Event Handlers from String Patterns</h2>
+      <details>
+        <summary>on('click', handler) with full type safety</summary>
+
+        <h3>Basic Typed Event Emitter</h3>
+<pre><code class="language-typescript">interface EventMap {
+  click: { x: number; y: number; button: number };
+  keydown: { key: string; code: string; ctrlKey: boolean };
+  resize: { width: number; height: number };
+  'custom:update': { data: unknown; timestamp: number };
+}
+
+// Typed EventEmitter
+class TypedEmitter&lt;Events extends Record&lt;string, unknown&gt;&gt; {
+  private listeners = new Map&lt;string, Set&lt;Function&gt;&gt;();
+
+  on&lt;K extends keyof Events &amp; string&gt;(
+    event: K,
+    handler: (payload: Events[K]) =&gt; void
+  ): this {
+    if (!this.listeners.has(event)) {
+      this.listeners.set(event, new Set());
+    }
+    this.listeners.get(event)!.add(handler);
+    return this;
+  }
+
+  off&lt;K extends keyof Events &amp; string&gt;(
+    event: K,
+    handler: (payload: Events[K]) =&gt; void
+  ): this {
+    this.listeners.get(event)?.delete(handler);
+    return this;
+  }
+
+  emit&lt;K extends keyof Events &amp; string&gt;(
+    event: K,
+    payload: Events[K]
+  ): this {
+    this.listeners.get(event)?.forEach(fn =&gt; fn(payload));
+    return this;
+  }
+}
+
+// Usage — fully typed
+const emitter = new TypedEmitter&lt;EventMap&gt;();
+
+emitter.on('click', ({ x, y }) =&gt; {});       // ✓ x, y inferred
+emitter.on('keydown', ({ key }) =&gt; {});       // ✓ key inferred
+emitter.emit('resize', { width: 100, height: 50 }); // ✓</code></pre>
+
+        <h3>Wildcard and Namespaced Events</h3>
+<pre><code class="language-typescript">// Support namespaced events: "module:event"
+type NamespacedEvents = {
+  'auth:login': { userId: string };
+  'auth:logout': { reason: string };
+  'data:update': { entity: string; id: string };
+  'data:delete': { entity: string; id: string };
+};
+
+// Extract events by namespace
+type EventsByNamespace&lt;
+  Events extends Record&lt;string, unknown&gt;,
+  NS extends string
+&gt; = {
+  [K in keyof Events as K extends `${NS}:${infer Name}`
+    ? Name
+    : never
+  ]: Events[K];
+};
+
+type AuthEvents = EventsByNamespace&lt;NamespacedEvents, 'auth'&gt;;
+// { login: { userId: string }; logout: { reason: string } }
+
+type DataEvents = EventsByNamespace&lt;NamespacedEvents, 'data'&gt;;
+// { update: { entity: string; id: string }; delete: { ... } }</code></pre>
+
+        <h3>DOM Event Map Typing</h3>
+<pre><code class="language-typescript">// Type-safe DOM event delegation
+type DOMEventHandler&lt;
+  E extends keyof HTMLElementEventMap
+&gt; = (event: HTMLElementEventMap[E]) =&gt; void;
+
+// Generate prop types for React-like components
+type DOMEventProps = {
+  [K in keyof HTMLElementEventMap as `on${Capitalize&lt;K&gt;}`]?:
+    DOMEventHandler&lt;K&gt;;
+};
+
+// Usage in component props
+interface ButtonProps extends DOMEventProps {
+  label: string;
+  variant: 'primary' | 'secondary';
+}
+
+// Now ButtonProps has onClick, onKeydown, onFocus, etc.
+// all properly typed with correct event types</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Pattern recognition:</strong> The <code>on${Capitalize&lt;K&gt;}</code> pattern appears in React, Vue, Svelte, and many UI libraries. Understanding how it works at the type level helps you extend it for custom event systems.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 10: Typing CSS-in-JS -->
+    <section id="css-in-js-typing">
+      <h2>Typing CSS-in-JS</h2>
+      <details>
+        <summary>CSS property names as template literals, responsive variants, theme tokens</summary>
+
+        <h3>CSS Property Names</h3>
+<pre><code class="language-typescript">// Map camelCase JS properties to kebab-case CSS
+type CSSProperties = {
+  backgroundColor: string;
+  fontSize: string;
+  borderRadius: string;
+  marginTop: string;
+};
+
+type KebabCase&lt;S extends string&gt; =
+  S extends `${infer Head}${infer Tail}`
+    ? Tail extends Uncapitalize&lt;Tail&gt;
+      ? `${Lowercase&lt;Head&gt;}${KebabCase&lt;Tail&gt;}`
+      : `${Lowercase&lt;Head&gt;}-${KebabCase&lt;Tail&gt;}`
+    : S;
+
+type CSSPropertyMap = {
+  [K in keyof CSSProperties as KebabCase&lt;string &amp; K&gt;]: CSSProperties[K];
+};
+// { "background-color": string; "font-size": string; ... }</code></pre>
+
+        <h3>Responsive Variants</h3>
+<pre><code class="language-typescript">type Breakpoint = 'sm' | 'md' | 'lg' | 'xl' | '2xl';
+
+type BaseProps = {
+  display: 'block' | 'flex' | 'grid' | 'none';
+  gap: number;
+  columns: number;
+  padding: number;
+};
+
+// Generate responsive prop variants
+type ResponsiveProps&lt;T&gt; = T &amp; {
+  [K in keyof T as `${Breakpoint}:${string &amp; K}`]?: T[K];
+};
+
+type LayoutProps = ResponsiveProps&lt;BaseProps&gt;;
+// {
+//   display: 'block' | 'flex' | 'grid' | 'none';
+//   gap: number;
+//   "sm:display"?: 'block' | 'flex' | 'grid' | 'none';
+//   "sm:gap"?: number;
+//   "md:display"?: ...
+//   ...
+// }
+
+// Usage (Tailwind-inspired)
+const layout: LayoutProps = {
+  display: 'block',
+  gap: 4,
+  columns: 1,
+  padding: 4,
+  'md:display': 'grid',
+  'md:columns': 2,
+  'lg:columns': 3,
+};</code></pre>
+
+        <h3>Theme Token Paths</h3>
+<pre><code class="language-typescript">// Deeply nested theme with dot-notation access
+interface Theme {
+  colors: {
+    primary: { 50: string; 100: string; 500: string; 900: string };
+    secondary: { 50: string; 100: string; 500: string; 900: string };
+    gray: { 50: string; 100: string; 500: string; 900: string };
+  };
+  spacing: {
+    xs: string; sm: string; md: string; lg: string; xl: string;
+  };
+  fontSize: {
+    sm: string; base: string; lg: string; xl: string; '2xl': string;
+  };
+}
+
+// Generate all valid dot-notation paths
+type PathsOf&lt;T, Prefix extends string = ''&gt; = {
+  [K in keyof T]: T[K] extends Record&lt;string, unknown&gt;
+    ? PathsOf&lt;T[K], `${Prefix}${string &amp; K}.`&gt;
+    : `${Prefix}${string &amp; K}`;
+}[keyof T];
+
+type ThemeToken = PathsOf&lt;Theme&gt;;
+// "colors.primary.50" | "colors.primary.100" | ... | "spacing.xs" | ...
+
+// Type-safe theme getter
+function token(path: ThemeToken): string {
+  // implementation
+  return '';
+}
+
+token('colors.primary.500'); // ✓
+token('colors.invalid');      // ✗ Error</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Libraries using this:</strong> Stitches, Vanilla Extract, and Panda CSS all use template literal types for type-safe CSS property generation and theme token access.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 11: Record, Pick, Omit — Internals -->
+    <section id="utility-type-internals">
+      <h2>Record, Pick, Omit — Internals</h2>
+      <details>
+        <summary>How standard utility types are implemented as mapped types</summary>
+
+        <h3>Record Implementation</h3>
+<pre><code class="language-typescript">// Record creates a non-homomorphic mapped type
+type Record&lt;K extends keyof any, T&gt; = {
+  [P in K]: T;
+};
+
+// It does NOT preserve modifiers because it's non-homomorphic
+type Example = Record&lt;'a' | 'b', number&gt;;
+// { a: number; b: number } — no readonly, no optional
+
+// Common use cases
+type StatusMap = Record&lt;'loading' | 'success' | 'error', boolean&gt;;
+type EntityStore&lt;T&gt; = Record&lt;string, T&gt;;</code></pre>
+
+        <h3>Pick Implementation</h3>
+<pre><code class="language-typescript">// Pick is homomorphic — preserves modifiers
+type Pick&lt;T, K extends keyof T&gt; = {
+  [P in K]: T[P];
+};
+
+interface User {
+  readonly id: string;
+  name: string;
+  email?: string;
+}
+
+type Picked = Pick&lt;User, 'id' | 'email'&gt;;
+// { readonly id: string; email?: string }
+// ↑ readonly preserved   ↑ optional preserved</code></pre>
+
+        <h3>Omit Implementation</h3>
+<pre><code class="language-typescript">// Omit uses Exclude + Pick (or direct mapped type)
+type Omit&lt;T, K extends keyof any&gt; = Pick&lt;T, Exclude&lt;keyof T, K&gt;&gt;;
+
+// Alternative direct implementation
+type OmitDirect&lt;T, K extends keyof any&gt; = {
+  [P in keyof T as P extends K ? never : P]: T[P];
+};
+
+// Important: Omit does NOT constrain K to keyof T
+type Test = Omit&lt;User, 'nonexistent'&gt;; // No error! Returns User
+
+// Strict version that catches typos
+type StrictOmit&lt;T, K extends keyof T&gt; = {
+  [P in keyof T as P extends K ? never : P]: T[P];
+};
+
+type Bad = StrictOmit&lt;User, 'nonexistent'&gt;; // ✗ Error!</code></pre>
+
+        <h3>Limitations and Strict Alternatives</h3>
+<pre><code class="language-typescript">// Problem: Omit loses index signature information
+interface Indexed {
+  [key: string]: unknown;
+  name: string;
+  age: number;
+}
+
+type Omitted = Omit&lt;Indexed, 'name'&gt;;
+// { [key: string]: unknown; age: number } — index preserved
+
+// Problem: Pick/Omit with discriminated unions
+type Shape =
+  | { kind: 'circle'; radius: number }
+  | { kind: 'square'; side: number };
+
+type Broken = Omit&lt;Shape, 'kind'&gt;;
+// { radius: number } | { side: number }? NO!
+// Actually: {} — keyof Shape is only 'kind' (common keys),
+// so Exclude&lt;'kind', 'kind'&gt; = never, giving Pick&lt;Shape, never&gt; = {}
+
+// Solution: distributive Omit
+type DistributiveOmit&lt;T, K extends keyof any&gt; =
+  T extends any ? Omit&lt;T, K&gt; : never;
+
+type Fixed = DistributiveOmit&lt;Shape, 'kind'&gt;;
+// { radius: number } | { side: number } — correct!</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Common pitfall:</strong> <code>Omit</code> and <code>Pick</code> flatten discriminated unions. Always use distributive versions (<code>T extends any ? ... : never</code>) when working with unions.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 12: Readonly, Required, Partial — Deep Variants -->
+    <section id="deep-utility-types">
+      <h2>Readonly, Required, Partial — Deep Variants</h2>
+      <details>
+        <summary>How modifiers work and deep recursive implementations</summary>
+
+        <h3>Modifier Mechanics</h3>
+<pre><code class="language-typescript">// + adds modifier (implicit — rarely written)
+type AddReadonly&lt;T&gt; = { +readonly [K in keyof T]: T[K] };
+type AddOptional&lt;T&gt; = { [K in keyof T]+?: T[K] };
+
+// - removes modifier
+type RemoveReadonly&lt;T&gt; = { -readonly [K in keyof T]: T[K] };
+type RemoveOptional&lt;T&gt; = { [K in keyof T]-?: T[K] };
+
+// Combine both
+type Mutable&lt;T&gt; = { -readonly [K in keyof T]: T[K] };
+type Complete&lt;T&gt; = { -readonly [K in keyof T]-?: T[K] };</code></pre>
+
+        <h3>DeepReadonly</h3>
+<pre><code class="language-typescript">type DeepReadonly&lt;T&gt; =
+  T extends Function
+    ? T
+    : T extends Map&lt;infer K, infer V&gt;
+      ? ReadonlyMap&lt;DeepReadonly&lt;K&gt;, DeepReadonly&lt;V&gt;&gt;
+      : T extends Set&lt;infer U&gt;
+        ? ReadonlySet&lt;DeepReadonly&lt;U&gt;&gt;
+        : T extends Array&lt;infer U&gt;
+          ? ReadonlyArray&lt;DeepReadonly&lt;U&gt;&gt;
+          : T extends object
+            ? { readonly [K in keyof T]: DeepReadonly&lt;T[K]&gt; }
+            : T;
+
+// Usage
+interface AppState {
+  user: { name: string; settings: { theme: string } };
+  items: Array&lt;{ id: string; data: { value: number } }&gt;;
+}
+
+type FrozenState = DeepReadonly&lt;AppState&gt;;
+// All nested properties are readonly
+// Arrays become ReadonlyArray
+// Maps become ReadonlyMap</code></pre>
+
+        <h3>DeepPartial</h3>
+<pre><code class="language-typescript">type DeepPartial&lt;T&gt; =
+  T extends Function
+    ? T
+    : T extends Array&lt;infer U&gt;
+      ? Array&lt;DeepPartial&lt;U&gt;&gt;
+      : T extends object
+        ? { [K in keyof T]?: DeepPartial&lt;T[K]&gt; }
+        : T;
+
+// Useful for config merging and test fixtures
+interface Config {
+  database: { host: string; port: number; ssl: { cert: string } };
+  server: { port: number; cors: { origins: string[] } };
+}
+
+function mergeConfig(
+  base: Config,
+  override: DeepPartial&lt;Config&gt;
+): Config {
+  // deep merge implementation
+  return {} as Config;
+}
+
+// Only override what you need
+mergeConfig(defaultConfig, {
+  database: { ssl: { cert: '/new/path' } }
+});</code></pre>
+
+        <h3>DeepRequired</h3>
+<pre><code class="language-typescript">type DeepRequired&lt;T&gt; =
+  T extends Function
+    ? T
+    : T extends Array&lt;infer U&gt;
+      ? Array&lt;DeepRequired&lt;U&gt;&gt;
+      : T extends object
+        ? { [K in keyof T]-?: DeepRequired&lt;T[K]&gt; }
+        : T;
+
+// Useful for validated/resolved config
+type ResolvedConfig = DeepRequired&lt;DeepPartial&lt;Config&gt;&gt;;
+// All properties guaranteed present after resolution</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Production note:</strong> Libraries like <code>type-fest</code> provide battle-tested deep utility types. Prefer them over hand-rolling unless you need custom behavior.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 13: Performance Considerations -->
+    <section id="performance">
+      <h2>Performance Considerations</h2>
+      <details>
+        <summary>When mapped/template types slow the compiler</summary>
+
+        <h3>Complexity Explosion</h3>
+<pre><code class="language-typescript">// ⚠️ Template literal unions multiply combinatorially
+type A = 'a' | 'b' | 'c' | 'd' | 'e'; // 5
+type B = '1' | '2' | '3' | '4' | '5'; // 5
+type C = 'x' | 'y' | 'z';             // 3
+
+// 5 × 5 × 3 = 75 union members — still fine
+type Combined = `${A}-${B}-${C}`;
+
+// ⚠️ But this explodes:
+type AllCSS = keyof CSSStyleDeclaration;  // ~500 members
+type Responsive = `${'sm' | 'md' | 'lg' | 'xl'}:${AllCSS}`;
+// 4 × 500 = 2000 union members — compiler slows down!
+
+// TypeScript caps at 100,000 union members and errors</code></pre>
+
+        <h3>When Performance Degrades</h3>
+<pre class="diagram">
+Performance Impact Scale:
+──────────────────────────────────────────────────
+10 keys      │ █         Instant
+50 keys      │ ██        Fast
+100 keys     │ ████      Noticeable in IDE
+500 keys     │ ████████████  Slow completions
+1000+ keys   │ ████████████████████  Unusable
+──────────────────────────────────────────────────
+
+Deep recursion impact:
+──────────────────────────────────────────────────
+Depth 5      │ █         Fine
+Depth 10     │ ███       Acceptable
+Depth 20     │ ██████    Slow
+Depth 45+    │ ████████████████  Hits TS limit (without tail-call opt; 1000 with)
+──────────────────────────────────────────────────
+</pre>
+
+        <h3>Optimization Strategies</h3>
+<pre><code class="language-typescript">// ❌ Bad: Recomputes on every use
+type BadClient = {
+  [K in keyof HugeRouteMap]: ComputeExpensiveType&lt;K&gt;;
+};
+
+// ✓ Good: Cache intermediate results with interface merging
+interface RouteCache {}
+
+// Compute once, reference many times
+type ComputeOnce = {
+  [K in keyof HugeRouteMap]: CachedResult&lt;K&gt;;
+};
+
+// ✓ Good: Use interface extends instead of intersection
+// ❌ Slow: type Props = A &amp; B &amp; C &amp; D &amp; E;
+// ✓ Fast: interface Props extends A, B, C, D, E {}
+
+// ✓ Good: Limit template literal union size
+type LimitedBreakpoints = 'sm' | 'md' | 'lg'; // 3, not 5
+type CoreProps = 'p' | 'm' | 'w' | 'h';       // 4, not 20
+
+type ManageableResponsive = `${LimitedBreakpoints}:${CoreProps}`;
+// 3 × 4 = 12 members — fast</code></pre>
+
+        <h3>--generateTrace Analysis</h3>
+<pre><code class="language-typescript">// Run: tsc --generateTrace ./trace-output
+// Then open in chrome://tracing or edge://tracing
+
+// Common findings:
+// 1. Instantiation count too high → simplify mapped types
+// 2. Check time in specific files → find the complex types
+// 3. Union normalization → reduce union sizes
+
+// Diagnostic: show instantiation count
+// tsconfig.json
+{
+  "compilerOptions": {
+    "extendedDiagnostics": true
+    // Shows: "Instantiations: 1,234,567"
+    // Target: under 5 million for reasonable perf
+  }
+}</code></pre>
+
+        <div class="callout callout-warning">
+          <p><strong>Rule of thumb:</strong> If your mapped type operates on more than 100 keys, or your template literal produces unions with more than 500 members, profile with <code>--generateTrace</code> and consider code generation as an alternative.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 14: Production Patterns -->
+    <section id="production-patterns">
+      <h2>Production Patterns</h2>
+      <details>
+        <summary>Real-world applications of mapped + template literal types</summary>
+
+        <h3>Type-Safe i18n Keys</h3>
+<pre><code class="language-typescript">// Define translation structure
+interface Translations {
+  common: {
+    save: string;
+    cancel: string;
+    delete: string;
+  };
+  auth: {
+    login: { title: string; submit: string };
+    register: { title: string; submit: string };
+  };
+  errors: {
+    notFound: string;
+    unauthorized: string;
+  };
+}
+
+// Generate dot-notation keys
+type NestedKeyOf&lt;T, Prefix extends string = ''&gt; = {
+  [K in keyof T &amp; string]: T[K] extends Record&lt;string, unknown&gt;
+    ? NestedKeyOf&lt;T[K], `${Prefix}${K}.`&gt;
+    : `${Prefix}${K}`;
+}[keyof T &amp; string];
+
+type TranslationKey = NestedKeyOf&lt;Translations&gt;;
+// "common.save" | "common.cancel" | "auth.login.title" | ...
+
+// Type-safe translation function
+function t(key: TranslationKey): string {
+  // lookup implementation
+  return '';
+}
+
+t('common.save');       // ✓
+t('common.typo');       // ✗ Error
+t('auth.login.title');  // ✓</code></pre>
+
+        <h3>Form Field Mapping</h3>
+<pre><code class="language-typescript">// Define form schema
+interface UserForm {
+  name: string;
+  email: string;
+  age: number;
+  newsletter: boolean;
+}
+
+// Generate form state type
+type FormState&lt;T&gt; = {
+  values: T;
+  errors: { [K in keyof T]?: string };
+  touched: { [K in keyof T]?: boolean };
+  dirty: { [K in keyof T]?: boolean };
+};
+
+// Generate field handlers
+type FormHandlers&lt;T&gt; = {
+  [K in keyof T as `set${Capitalize&lt;string &amp; K&gt;}`]:
+    (value: T[K]) =&gt; void;
+} &amp; {
+  [K in keyof T as `validate${Capitalize&lt;string &amp; K&gt;}`]:
+    () =&gt; string | undefined;
+} &amp; {
+  [K in keyof T as `reset${Capitalize&lt;string &amp; K&gt;}`]:
+    () =&gt; void;
+};
+
+type UserFormHandlers = FormHandlers&lt;UserForm&gt;;
+// {
+//   setName: (value: string) =&gt; void;
+//   setEmail: (value: string) =&gt; void;
+//   validateName: () =&gt; string | undefined;
+//   validateEmail: () =&gt; string | undefined;
+//   resetName: () =&gt; void;
+//   ...
+// }</code></pre>
+
+        <h3>Database Schema to TypeScript</h3>
+<pre><code class="language-typescript">// Define DB schema as types
+interface DBSchema {
+  users: {
+    id: number;
+    name: string;
+    email: string;
+    created_at: Date;
+  };
+  posts: {
+    id: number;
+    title: string;
+    body: string;
+    author_id: number;
+    published: boolean;
+  };
+}
+
+// Generate query builder types
+type WhereClause&lt;T&gt; = {
+  [K in keyof T]?: T[K] | { $gt: T[K] } | { $lt: T[K] } | { $in: T[K][] };
+};
+
+type OrderBy&lt;T&gt; = {
+  [K in keyof T]?: 'asc' | 'desc';
+};
+
+type QueryBuilder&lt;Schema extends Record&lt;string, object&gt;&gt; = {
+  [Table in keyof Schema as `find${Capitalize&lt;string &amp; Table&gt;}`]: (opts: {
+    where?: WhereClause&lt;Schema[Table]&gt;;
+    orderBy?: OrderBy&lt;Schema[Table]&gt;;
+    limit?: number;
+  }) =&gt; Promise&lt;Schema[Table][]&gt;;
+};
+
+type DB = QueryBuilder&lt;DBSchema&gt;;
+// {
+//   findUsers: (opts: { where?: ..., orderBy?: ... }) =&gt; Promise&lt;...&gt;;
+//   findPosts: (opts: { where?: ..., orderBy?: ... }) =&gt; Promise&lt;...&gt;;
+// }</code></pre>
+
+        <h3>API Contract Typing</h3>
+<pre><code class="language-typescript">// Shared between frontend and backend
+interface ApiContract {
+  '/api/users': {
+    GET: { response: User[]; query: { page: number } };
+    POST: { response: User; body: CreateUserDto };
+  };
+  '/api/users/:id': {
+    GET: { response: User };
+    PUT: { response: User; body: UpdateUserDto };
+    DELETE: { response: void };
+  };
+}
+
+// Backend: generate route handlers
+type RouteHandlers&lt;Contract&gt; = {
+  [Path in keyof Contract]: {
+    [Method in keyof Contract[Path]]:
+      Contract[Path][Method] extends { body: infer B; response: infer R }
+        ? (body: B) =&gt; Promise&lt;R&gt;
+        : Contract[Path][Method] extends { response: infer R }
+          ? () =&gt; Promise&lt;R&gt;
+          : never;
+  };
+};
+
+// Frontend: generate fetch client (see Section 8)</code></pre>
+
+        <div class="callout callout-info">
+          <p><strong>Architecture tip:</strong> Define API contracts in a shared package. Both frontend and backend import the contract type, ensuring end-to-end type safety without code generation tools.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 15: Code Examples -->
+    <section id="code-examples">
+      <h2>Code Examples</h2>
+      <details>
+        <summary>Full implementations: REST client, event emitter, form state machine, path parser</summary>
+
+        <h3>Full REST Client Generator</h3>
+<pre><code class="language-typescript">// === Complete Type-Safe REST Client ===
+
+// Path parameter extraction
+type ExtractParams&lt;T extends string&gt; =
+  T extends `${string}:${infer Param}/${infer Rest}`
+    ? { [K in Param | keyof ExtractParams&lt;`/${Rest}`&gt;]: string }
+    : T extends `${string}:${infer Param}`
+      ? { [K in Param]: string }
+      : {};
+
+// Route definition
+interface RouteDefinition {
+  response: unknown;
+  body?: unknown;
+  query?: Record&lt;string, string | number | boolean&gt;;
+  headers?: Record&lt;string, string&gt;;
+}
+
+// API specification
+interface ApiSpec {
+  'GET /users': {
+    response: { id: string; name: string; email: string }[];
+    query: { page?: number; limit?: number; search?: string };
+  };
+  'POST /users': {
+    response: { id: string; name: string; email: string };
+    body: { name: string; email: string };
+  };
+  'GET /users/:id': {
+    response: { id: string; name: string; email: string };
+  };
+  'PUT /users/:id': {
+    response: { id: string; name: string; email: string };
+    body: { name?: string; email?: string };
+  };
+  'DELETE /users/:id': {
+    response: void;
+  };
+  'GET /users/:userId/posts/:postId/comments': {
+    response: { id: string; text: string }[];
+    query: { sort?: 'asc' | 'desc' };
+  };
+}
+
+// Build request configuration
+type RequestConfig&lt;
+  Path extends string,
+  Def extends RouteDefinition
+&gt; = (keyof ExtractParams&lt;Path&gt; extends never
+  ? {}
+  : { params: ExtractParams&lt;Path&gt; }) &amp;
+  (Def extends { body: infer B } ? { body: B } : {}) &amp;
+  (Def extends { query: infer Q } ? { query?: Q } : {}) &amp;
+  (Def extends { headers: infer H } ? { headers?: H } : {});
+
+// Parse "METHOD /path" string
+type ParseMethod&lt;T extends string&gt; =
+  T extends `${infer M} ${string}` ? M : never;
+type ParsePath&lt;T extends string&gt; =
+  T extends `${string} ${infer P}` ? P : never;
+
+// The client type
+type RestClient&lt;Spec extends Record&lt;string, RouteDefinition&gt;&gt; = {
+  request&lt;Route extends keyof Spec &amp; string&gt;(
+    route: Route,
+    ...config: keyof RequestConfig&lt;ParsePath&lt;Route&gt;, Spec[Route]&gt; extends never
+      ? [config?: {}]
+      : [config: RequestConfig&lt;ParsePath&lt;Route&gt;, Spec[Route]&gt;]
+  ): Promise&lt;Spec[Route]['response']&gt;;
+};
+
+// Implementation
+function createClient&lt;Spec extends Record&lt;string, RouteDefinition&gt;&gt;(
+  baseUrl: string
+): RestClient&lt;Spec&gt; {
+  return {
+    async request(route: string, config: any = {}) {
+      const [method, pathTemplate] = route.split(' ');
+      let path = pathTemplate;
+
+      // Replace path params
+      if (config.params) {
+        for (const [key, value] of Object.entries(config.params)) {
+          path = path.replace(`:${key}`, value as string);
+        }
+      }
+
+      // Build URL with query params
+      const url = new URL(path, baseUrl);
+      if (config.query) {
+        for (const [key, value] of Object.entries(config.query)) {
+          if (value !== undefined) url.searchParams.set(key, String(value));
+        }
+      }
+
+      const response = await fetch(url.toString(), {
+        method,
+        headers: { 'Content-Type': 'application/json', ...config.headers },
+        body: config.body ? JSON.stringify(config.body) : undefined,
+      });
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return method === 'DELETE' ? undefined : response.json();
+    },
+  } as RestClient&lt;Spec&gt;;
+}
+
+// Usage
+const api = createClient&lt;ApiSpec&gt;('https://api.example.com');
+
+// Fully typed — IDE autocomplete works!
+const users = await api.request('GET /users', {
+  query: { page: 1, limit: 10 },
+});
+// users: { id: string; name: string; email: string }[]
+
+const user = await api.request('GET /users/:id', {
+  params: { id: '123' },
+});
+// user: { id: string; name: string; email: string }
+
+await api.request('POST /users', {
+  body: { name: 'Alice', email: 'alice@test.com' },
+});</code></pre>
+
+        <h3>Event Emitter with Mapped Types</h3>
+<pre><code class="language-typescript">// === Type-Safe Event Emitter ===
+
+type EventHandler&lt;T&gt; = (payload: T) =&gt; void;
+type WildcardHandler = (event: string, payload: unknown) =&gt; void;
+
+class StrictEmitter&lt;Events extends Record&lt;string, unknown&gt;&gt; {
+  private handlers = new Map&lt;string, Set&lt;Function&gt;&gt;();
+  private wildcardHandlers = new Set&lt;WildcardHandler&gt;();
+
+  on&lt;K extends keyof Events &amp; string&gt;(
+    event: K,
+    handler: EventHandler&lt;Events[K]&gt;
+  ): () =&gt; void {
+    if (!this.handlers.has(event)) {
+      this.handlers.set(event, new Set());
+    }
+    this.handlers.get(event)!.add(handler);
+
+    // Return unsubscribe function
+    return () =&gt; {
+      this.handlers.get(event)?.delete(handler);
+    };
+  }
+
+  once&lt;K extends keyof Events &amp; string&gt;(
+    event: K,
+    handler: EventHandler&lt;Events[K]&gt;
+  ): () =&gt; void {
+    const wrapper: EventHandler&lt;Events[K]&gt; = (payload) =&gt; {
+      this.handlers.get(event)?.delete(wrapper);
+      handler(payload);
+    };
+    return this.on(event, wrapper);
+  }
+
+  onAny(handler: WildcardHandler): () =&gt; void {
+    this.wildcardHandlers.add(handler);
+    return () =&gt; { this.wildcardHandlers.delete(handler); };
+  }
+
+  emit&lt;K extends keyof Events &amp; string&gt;(
+    event: K,
+    payload: Events[K]
+  ): void {
+    this.handlers.get(event)?.forEach(fn =&gt; fn(payload));
+    this.wildcardHandlers.forEach(fn =&gt; fn(event, payload));
+  }
+
+  listenerCount&lt;K extends keyof Events &amp; string&gt;(event: K): number {
+    return this.handlers.get(event)?.size ?? 0;
+  }
+}
+
+// Usage
+interface AppEvents {
+  'user:login': { userId: string; timestamp: number };
+  'user:logout': { userId: string; reason: string };
+  'data:sync': { entities: string[]; duration: number };
+  'error': { code: string; message: string; stack?: string };
+}
+
+const bus = new StrictEmitter&lt;AppEvents&gt;();
+
+const unsub = bus.on('user:login', ({ userId, timestamp }) =&gt; {
+  console.log(`User ${userId} logged in at ${timestamp}`);
+});
+
+bus.emit('user:login', { userId: '123', timestamp: Date.now() });
+unsub(); // Clean up</code></pre>
+
+        <h3>Form State Machine</h3>
+<pre><code class="language-typescript">// === Type-Safe Form with Mapped Types ===
+
+type FieldState&lt;T&gt; = {
+  value: T;
+  error: string | null;
+  touched: boolean;
+  dirty: boolean;
+};
+
+type FormFields&lt;T&gt; = {
+  [K in keyof T]: FieldState&lt;T[K]&gt;;
+};
+
+type FormActions&lt;T&gt; = {
+  [K in keyof T as `set${Capitalize&lt;string &amp; K&gt;}`]:
+    (value: T[K]) =&gt; void;
+} &amp; {
+  [K in keyof T as `touch${Capitalize&lt;string &amp; K&gt;}`]:
+    () =&gt; void;
+} &amp; {
+  [K in keyof T as `reset${Capitalize&lt;string &amp; K&gt;}`]:
+    () =&gt; void;
+};
+
+type FormStatus = 'idle' | 'validating' | 'submitting' | 'success' | 'error';
+
+interface Form&lt;T&gt; {
+  fields: FormFields&lt;T&gt;;
+  status: FormStatus;
+  actions: FormActions&lt;T&gt;;
+  submit: () =&gt; Promise&lt;void&gt;;
+  reset: () =&gt; void;
+  isValid: boolean;
+  isDirty: boolean;
+}
+
+// Usage type
+interface LoginForm {
+  email: string;
+  password: string;
+  rememberMe: boolean;
+}
+
+// The resulting form type has:
+// fields.email: FieldState&lt;string&gt;
+// fields.password: FieldState&lt;string&gt;
+// actions.setEmail: (value: string) =&gt; void
+// actions.setPassword: (value: string) =&gt; void
+// actions.touchEmail: () =&gt; void
+// actions.resetPassword: () =&gt; void
+// etc.
+type LoginFormInstance = Form&lt;LoginForm&gt;;</code></pre>
+
+        <h3>Path Parameter Parser</h3>
+<pre><code class="language-typescript">// === Complete Path Parser ===
+
+// Split path into segments
+type SplitPath&lt;T extends string&gt; =
+  T extends `/${infer Rest}`
+    ? SplitSegments&lt;Rest&gt;
+    : SplitSegments&lt;T&gt;;
+
+type SplitSegments&lt;T extends string&gt; =
+  T extends `${infer Head}/${infer Tail}`
+    ? [Head, ...SplitSegments&lt;Tail&gt;]
+    : T extends ''
+      ? []
+      : [T];
+
+// Classify segments
+type IsParam&lt;T extends string&gt; = T extends `:${string}` ? true : false;
+type IsWildcard&lt;T extends string&gt; = T extends '*' ? true : false;
+
+// Extract param name
+type ParamName&lt;T extends string&gt; =
+  T extends `:${infer Name}` ? Name : never;
+
+// Build params object from path
+type PathParams&lt;T extends string&gt; = {
+  [Segment in SplitPath&lt;T&gt;[number] as ParamName&lt;Segment&gt;]: string;
+};
+
+// Test
+type Test1 = PathParams&lt;'/users/:id'&gt;;
+// { id: string }
+
+type Test2 = PathParams&lt;'/users/:userId/posts/:postId'&gt;;
+// { userId: string; postId: string }
+
+type Test3 = PathParams&lt;'/api/v1/static'&gt;;
+// {}
+
+// Route matching
+type MatchRoute&lt;
+  Pattern extends string,
+  Path extends string
+&gt; = SplitPath&lt;Pattern&gt; extends infer PatternParts extends string[]
+  ? SplitPath&lt;Path&gt; extends infer PathParts extends string[]
+    ? PatternParts['length'] extends PathParts['length']
+      ? PathParams&lt;Pattern&gt;
+      : never
+    : never
+  : never;</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 16: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+      <details>
+        <summary>5 mistakes to avoid with mapped and template literal types</summary>
+
+        <h3>Mistake 1: Infinite Recursion in Template Types</h3>
+<pre><code class="language-typescript">// ❌ Bad: Unbounded recursion
+type InfiniteReplace&lt;S extends string, From extends string, To extends string&gt; =
+  S extends `${infer Before}${From}${infer After}`
+    ? InfiniteReplace&lt;`${Before}${To}${After}`, From, To&gt;  // ⚠️ infinite!
+    : S;
+
+// If To contains From, this recurses forever:
+// InfiniteReplace&lt;"a", "a", "aa"&gt; → never terminates
+
+// ✓ Good: Only recurse on the remaining portion
+type SafeReplace&lt;S extends string, From extends string, To extends string&gt; =
+  From extends ''
+    ? S
+    : S extends `${infer Before}${From}${infer After}`
+      ? `${Before}${To}${SafeReplace&lt;After, From, To&gt;}`  // Only recurse on After
+      : S;</code></pre>
+
+        <h3>Mistake 2: Forgetting Distributive Behavior</h3>
+<pre><code class="language-typescript">// ❌ Unexpected: template literals distribute over unions
+type Status = 'loading' | 'success' | 'error';
+type Prefix = 'is' | 'was';
+
+type Combined = `${Prefix}${Capitalize&lt;Status&gt;}`;
+// "isLoading" | "isSuccess" | "isError" |
+// "wasLoading" | "wasSuccess" | "wasError"
+// → 6 members, not 2!
+
+// ❌ Unexpected with Omit on unions
+type Shape =
+  | { kind: 'circle'; radius: number }
+  | { kind: 'square'; side: number };
+
+type Bad = Omit&lt;Shape, 'kind'&gt;;
+// {} — keyof of a union gives only common keys ('kind'),
+// Exclude&lt;'kind','kind'&gt; = never, so Pick&lt;Shape, never&gt; = {}
+// NOT what you expected!
+
+// ✓ Good: Use distributive version
+type DistributiveOmit&lt;T, K extends keyof any&gt; =
+  T extends any ? Omit&lt;T, K&gt; : never;
+
+type Good = DistributiveOmit&lt;Shape, 'kind'&gt;;
+// { radius: number } | { side: number }</code></pre>
+
+        <h3>Mistake 3: Over-Complex Mapped Types</h3>
+<pre><code class="language-typescript">// ❌ Bad: Trying to do too much in one mapped type
+type OverEngineered&lt;T&gt; = {
+  [K in keyof T as T[K] extends Function
+    ? K extends `_${string}` ? never : `public${Capitalize&lt;string &amp; K&gt;}`
+    : T[K] extends string
+      ? `str${Capitalize&lt;string &amp; K&gt;}`
+      : K
+  ]: T[K] extends Function
+    ? (...args: Parameters&lt;T[K]&gt;) =&gt; ReturnType&lt;T[K]&gt;
+    : T[K] extends string ? T[K] | null : T[K];
+};
+
+// ✓ Good: Break into composable pieces
+type PublicMethods&lt;T&gt; = {
+  [K in keyof T as K extends `_${string}`
+    ? never
+    : T[K] extends Function ? K : never
+  ]: T[K];
+};
+
+type DataFields&lt;T&gt; = {
+  [K in keyof T as T[K] extends Function ? never : K]: T[K];
+};
+
+// Compose them
+type CleanInterface&lt;T&gt; = PublicMethods&lt;T&gt; &amp; DataFields&lt;T&gt;;</code></pre>
+
+        <h3>Mistake 4: Not Using Key Remapping for Filtering</h3>
+<pre><code class="language-typescript">// ❌ Bad: Using Pick + Extract (verbose, pre-4.1 pattern)
+type OnlyStrings&lt;T&gt; = Pick&lt;T, {
+  [K in keyof T]: T[K] extends string ? K : never;
+}[keyof T]&gt;;
+
+// ✓ Good: Direct filtering with as + never (TS 4.1+)
+type OnlyStrings&lt;T&gt; = {
+  [K in keyof T as T[K] extends string ? K : never]: T[K];
+};</code></pre>
+
+        <h3>Mistake 5: Confusing Homomorphic Behavior</h3>
+<pre><code class="language-typescript">// ❌ Confusion: Why does my type lose readonly/optional?
+interface Source {
+  readonly id: string;
+  name?: string;
+}
+
+// Non-homomorphic: loses modifiers
+type Lost = { [K in 'id' | 'name']: Source[K] };
+// { id: string; name: string | undefined } — no readonly, not optional!
+
+// ✓ Homomorphic: preserves modifiers
+type Preserved = { [K in keyof Source]: Source[K] };
+// { readonly id: string; name?: string } — modifiers preserved!
+
+// Rule: Use "K in keyof T" to preserve modifiers.
+// Using "K in SomeUnion" creates a fresh type without modifiers.</code></pre>
+
+        <div class="callout callout-tip">
+          <p><strong>Debugging tip:</strong> When a mapped type behaves unexpectedly, hover over it in your IDE to see the expanded type. Use <code>type Debug = MyType</code> and inspect the tooltip.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 17: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+      <details>
+        <summary>When to use mapped/template types vs alternatives</summary>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Pros</th>
+              <th>Cons</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Mapped Types</strong></td>
+              <td>Zero runtime cost, stays in sync, composable</td>
+              <td>Complex error messages, IDE performance</td>
+              <td>Transforming existing types, utility types</td>
+            </tr>
+            <tr>
+              <td><strong>Manual Declarations</strong></td>
+              <td>Clear, readable, good errors</td>
+              <td>Duplication, drift, maintenance burden</td>
+              <td>Small, stable APIs with few variants</td>
+            </tr>
+            <tr>
+              <td><strong>Code Generation</strong></td>
+              <td>No compiler overhead, full control</td>
+              <td>Build step needed, generated code in repo</td>
+              <td>Large schemas (OpenAPI, GraphQL, Prisma)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <br />
+
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Pros</th>
+              <th>Cons</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Template Literal Types</strong></td>
+              <td>Compile-time string validation, no runtime</td>
+              <td>Union explosion, recursion limits</td>
+              <td>Route typing, event names, CSS props</td>
+            </tr>
+            <tr>
+              <td><strong>Enums</strong></td>
+              <td>Simple, runtime values, reverse mapping</td>
+              <td>Not extensible, tree-shaking issues</td>
+              <td>Fixed sets of known values</td>
+            </tr>
+            <tr>
+              <td><strong>const objects + typeof</strong></td>
+              <td>Tree-shakeable, extensible, runtime + type</td>
+              <td>More boilerplate than enum</td>
+              <td>Configurable sets needing runtime values</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <pre class="diagram">
+Decision Tree:
+──────────────────────────────────────────────
+Need to transform an existing type?
+  ├── Yes → Mapped type
+  │     ├── Simple transform? → Direct mapped type
+  │     └── Key renaming needed? → as clause
+  └── No → Do you need string pattern types?
+        ├── Yes → Template literal type
+        │     ├── Small union (&lt;100)? → Direct template
+        │     └── Large union? → Code generation
+        └── No → Manual type declaration
+──────────────────────────────────────────────
+        </pre>
+
+        <div class="callout callout-info">
+          <p><strong>Pragmatic rule:</strong> Use mapped types for <strong>DRY type transformations</strong>. Use template literals for <strong>string-pattern validation</strong>. Use code generation when you hit <strong>performance walls</strong> or need <strong>runtime artifacts</strong>.</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Section 18: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Questions</h2>
+      <details>
+        <summary>6 follow-up questions with concise answers</summary>
+
+        <h3>Q1: How do you handle optional path parameters like /users/:id?</h3>
+<pre><code class="language-typescript">// Use conditional types to detect optional markers
+type ExtractOptionalParams&lt;T extends string&gt; =
+  T extends `${string}:${infer Param}?/${infer Rest}`
+    ? { [K in Param]?: string } &amp; ExtractOptionalParams&lt;`/${Rest}`&gt;
+    : T extends `${string}:${infer Param}?`
+      ? { [K in Param]?: string }
+      : {};
+
+// Combine required + optional
+type AllParams&lt;T extends string&gt; =
+  ExtractParams&lt;T&gt; &amp; ExtractOptionalParams&lt;T&gt;;</code></pre>
+
+        <h3>Q2: What's the difference between mapped types and conditional types?</h3>
+        <p><strong>Mapped types</strong> iterate over keys to build object types — they're like <code>map()</code> over properties. <strong>Conditional types</strong> branch based on type relationships — they're like <code>if/else</code>. They're complementary: mapped types often use conditional types in their value position to compute per-key types.</p>
+
+        <h3>Q3: How do you test complex mapped types?</h3>
+<pre><code class="language-typescript">// Use type-level assertions
+type Expect&lt;T extends true&gt; = T;
+type Equal&lt;A, B&gt; =
+  (&lt;T&gt;() =&gt; T extends A ? 1 : 2) extends
+  (&lt;T&gt;() =&gt; T extends B ? 1 : 2) ? true : false;
+
+// Write type tests
+type Cases = [
+  Expect&lt;Equal&lt;ExtractParams&lt;'/users/:id'&gt;, { id: string }&gt;&gt;,
+  Expect&lt;Equal&lt;ExtractParams&lt;'/static'&gt;, {}&gt;&gt;,
+  Expect&lt;Equal&lt;
+    ExtractParams&lt;'/a/:x/b/:y'&gt;,
+    { x: string; y: string }
+  &gt;&gt;,
+];
+
+// Tools: vitest's expectTypeOf, tsd, @type-challenges/utils</code></pre>
+
+        <h3>Q4: Can mapped types create methods, not just properties?</h3>
+<pre><code class="language-typescript">// Yes — the value type can be a function signature
+type Methods&lt;T&gt; = {
+  [K in keyof T as `get${Capitalize&lt;string &amp; K&gt;}`]: () =&gt; T[K];
+  [K in keyof T as `set${Capitalize&lt;string &amp; K&gt;}`]: (v: T[K]) =&gt; void;
+};
+
+// Note: You can't have multiple mapped types in one type literal.
+// Split them and intersect:
+type Getters&lt;T&gt; = {
+  [K in keyof T as `get${Capitalize&lt;string &amp; K&gt;}`]: () =&gt; T[K];
+};
+type Setters&lt;T&gt; = {
+  [K in keyof T as `set${Capitalize&lt;string &amp; K&gt;}`]: (v: T[K]) =&gt; void;
+};
+type Accessors&lt;T&gt; = Getters&lt;T&gt; &amp; Setters&lt;T&gt;;</code></pre>
+
+        <h3>Q5: How do template literal types interact with generics?</h3>
+<pre><code class="language-typescript">// Template literals are evaluated eagerly with concrete types,
+// deferred with generic types
+
+function makeHandler&lt;E extends string&gt;(
+  event: E
+): `on${Capitalize&lt;E&gt;}` {
+  return `on${event.charAt(0).toUpperCase() + event.slice(1)}` as any;
+}
+
+const handler = makeHandler('click');
+// type: "onClick" — resolved at call site!
+
+// Constraint narrowing works:
+function prefixed&lt;T extends 'get' | 'set'&gt;(
+  action: T
+): `${T}User` {
+  return `${action}User` as `${T}User`;
+}</code></pre>
+
+        <h3>Q6: When should you prefer code generation over mapped types?</h3>
+        <p>Prefer code generation when:</p>
+        <ul>
+          <li>The source is an external schema (OpenAPI, GraphQL, Protobuf)</li>
+          <li>You need runtime artifacts (validators, serializers) alongside types</li>
+          <li>The type computation exceeds 5M instantiations</li>
+          <li>Error messages become unreadable due to deep type nesting</li>
+          <li>Your IDE becomes unresponsive on the affected files</li>
+        </ul>
+        <p>Tools: <code>openapi-typescript</code>, <code>graphql-codegen</code>, <code>prisma generate</code>, <code>ts-json-schema-generator</code>.</p>
+
+        <h3>Q7: How do <code>const</code> type parameters (TS 5.0) help with mapped types?</h3>
+        <p><code>const</code> type parameters force literal type inference without requiring <code>as const</code> at call sites — particularly useful with mapped types and template literals:</p>
+<pre><code class="language-typescript">// Without const: routes inferred as string[] — loses literal types
+function defineRoutes&lt;T extends readonly string[]&gt;(routes: T) { return routes; }
+const r = defineRoutes(["/home", "/about"]); // string[]
+
+// With const: preserves literals — enables template literal derivation
+function defineRoutes&lt;const T extends readonly string[]&gt;(routes: T) { return routes; }
+const r = defineRoutes(["/home", "/about"]); // readonly ["/home", "/about"]
+
+// Now you can use mapped + template types on the inferred literals
+type RouteParams&lt;T extends string&gt; = T extends `/${infer Name}` ? Name : never;
+type Routes = RouteParams&lt;(typeof r)[number]&gt;; // "home" | "about"</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 19: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+      <details>
+        <summary>Mental models and what NOT to say</summary>
+
+        <h3>Mental Models</h3>
+        <ul>
+          <li><strong>Mapped types = Array.map() for type properties.</strong> Iterate over keys, transform each one.</li>
+          <li><strong>Template literal types = string interpolation at compile time.</strong> Combine, split, and validate string patterns.</li>
+          <li><strong>as clause = Array.filter() + Array.map() for keys.</strong> Rename or remove keys during iteration.</li>
+          <li><strong>Combined = type-level code generator.</strong> From a single source of truth, derive all related types.</li>
+        </ul>
+
+        <pre class="diagram">
+┌──────────────────────────────────────────────────────┐
+│                  Mental Model Summary                  │
+├──────────────────────────────────────────────────────┤
+│                                                      │
+│  Source Type ──────────────────────► Derived Types    │
+│       │                                    │         │
+│       │  Mapped Type                       ├─ API    │
+│       │  {[K in keyof T]: ...}             ├─ Events │
+│       │                                    ├─ Forms  │
+│       │  + Template Literal                ├─ CSS    │
+│       │  `on${Capitalize&lt;K&gt;}`             └─ i18n   │
+│       │                                              │
+│       │  + Key Remapping                             │
+│       │  as `new${Name}`                             │
+│       │                                              │
+│  = Zero-runtime type generation                      │
+└──────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Key Points to Hit</h3>
+        <ul>
+          <li>Mapped types use <code>{[K in Keys]: Type}</code> syntax to iterate over keys</li>
+          <li>Modifiers (<code>readonly</code>, <code>?</code>) can be added (+) or removed (-)</li>
+          <li>Homomorphic mapped types preserve the original type's modifiers</li>
+          <li>Template literal types use backtick syntax and distribute over unions</li>
+          <li><code>as</code> clause enables key renaming and filtering (TS 4.1+)</li>
+          <li>Combined, they enable typed REST clients, event systems, CSS-in-JS</li>
+          <li>Performance degrades with large unions (&gt;500) and deep recursion (&gt;50 without tail-call optimization, &gt;1000 with)</li>
+        </ul>
+
+        <h3>What NOT to Say</h3>
+        <div class="callout callout-warning">
+          <ul>
+            <li>❌ "Mapped types are just like generics" — They're a specific construct for iterating over keys, not a synonym for generics.</li>
+            <li>❌ "Template literal types are just template strings" — They're compile-time type constructs, not runtime values.</li>
+            <li>❌ "You should always use mapped types instead of manual types" — Over-engineering types hurts readability and IDE performance.</li>
+            <li>❌ "Record is the same as a mapped type over keyof T" — Record is non-homomorphic and doesn't preserve modifiers.</li>
+            <li>❌ "There's no limit to recursion in template types" — TypeScript enforces depth limits (~45-50 levels).</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+</body>
+</html>

@@ -1,0 +1,1974 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 15: React Fiber &amp; Concurrent Rendering | Senior Frontend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <a href="../index.html" class="sidebar-brand">
+      <span class="chapter-num">Ch 15</span>
+      <span class="chapter-title">React Fiber &amp; Concurrent</span>
+    </a>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer's Intent</a></li>
+        <li><a href="#quick-answer">60-Second Answer</a></li>
+        <li><a href="#legacy-reconciler">Legacy Stack Reconciler</a></li>
+        <li><a href="#fiber-node-structure">Fiber Node Structure</a></li>
+        <li><a href="#work-loop">Work Loop</a></li>
+        <li><a href="#interruptible-rendering">Interruptible Rendering</a></li>
+        <li><a href="#time-slicing">Time Slicing</a></li>
+        <li><a href="#double-buffering">Double Buffering</a></li>
+        <li><a href="#phases">Commit vs Render Phase</a></li>
+        <li><a href="#effects">Effect List &amp; Side Effects</a></li>
+        <li><a href="#concurrent-mode">Concurrent Mode Enabling</a></li>
+        <li><a href="#cooperative-scheduling">Cooperative Scheduling</a></li>
+        <li><a href="#scheduler-package">Scheduler Package</a></li>
+        <li><a href="#production-implications">Production Implications</a></li>
+        <li><a href="#architecture-diagrams">Architecture Diagrams</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-offs</a></li>
+        <li><a href="#follow-up-questions">Follow-up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-controls">
+      <button class="expand-all">Expand All</button>
+      <button class="collapse-all">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &gt;
+      <span>Part III — React Internals &amp; Architecture</span> &gt;
+      <span>Chapter 15</span>
+    </nav>
+
+    <header class="chapter-header">
+      <div class="badges">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-react">React</span>
+        <span class="badge badge-fiber">Fiber</span>
+        <span class="badge badge-concurrent">Concurrent</span>
+        <span class="badge badge-scheduler">Scheduler</span>
+      </div>
+      <h1>React Fiber &amp; Concurrent Rendering</h1>
+      <p class="chapter-question"><em>"Explain React Fiber architecture. How does concurrent rendering differ from the legacy synchronous model?"</em></p>
+      <div class="chapter-takeaway">
+        <strong>Key Takeaway:</strong> React Fiber is a complete rewrite of React's core reconciliation algorithm that replaces the recursive, uninterruptible stack reconciler with an incremental, interruptible work loop. Each component becomes a 'fiber' node in a linked tree that can be paused, resumed, or abandoned. This enables concurrent rendering: React can work on multiple versions of the UI simultaneously, prioritize urgent updates (user input) over non-urgent ones (data fetching results), and yield to the browser between work units to prevent frame drops.
+      </div>
+    </header>
+
+    <div class="search-container">
+      <input type="text" class="search-input" placeholder="Search this chapter..." aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer's Intent -->
+    <section id="interviewer-intent" class="content-section">
+      <h2>Interviewer's Intent</h2>
+      <p>When an interviewer asks about React Fiber and concurrent rendering, they are testing:</p>
+      <ul>
+        <li><strong>Deep understanding of React's rendering model</strong> — Can you explain what actually happens when setState is called, beyond "it re-renders"?</li>
+        <li><strong>Why Fiber was needed</strong> — Do you understand the fundamental limitations of the stack reconciler that motivated a complete rewrite?</li>
+        <li><strong>Practical implications for app architecture</strong> — Can you connect internal mechanics to real-world decisions: why side effects in render are dangerous, why keys matter, why external stores need synchronization?</li>
+        <li><strong>Systems thinking</strong> — Can you reason about scheduling, prioritization, and resource allocation in a UI context?</li>
+        <li><strong>Awareness of trade-offs</strong> — Do you understand what React gains and loses with concurrent rendering (memory overhead, complexity, eventual consistency)?</li>
+      </ul>
+      <div class="callout callout-info">
+        <p><strong>Signal they're looking for:</strong> A candidate who can trace a state update from dispatch through the scheduler, into the work loop, through reconciliation, and into the commit phase — and explain where interruption points exist along that path.</p>
+      </div>
+    </section>
+
+    <!-- Section 2: 60-Second Answer -->
+    <section id="quick-answer" class="content-section">
+      <h2>60-Second Answer</h2>
+      <div class="callout callout-tip">
+        <p><strong>Use this when time is short:</strong></p>
+        <p>React Fiber replaces the old recursive stack reconciler with an incremental work loop. Instead of processing the entire component tree in one synchronous pass, Fiber breaks work into units — one fiber node at a time. Each fiber is a plain object representing a component instance, linked via child/sibling/return pointers into a traversable tree.</p>
+        <p>The work loop calls <code>performUnitOfWork</code> repeatedly, checking <code>shouldYield()</code> after each unit. If the browser needs the main thread (e.g., for user input), React yields, and resumes later. This is "time slicing."</p>
+        <p>Concurrent rendering builds on this: React can prepare multiple UI trees simultaneously, assign priorities to updates (user input &gt; network response &gt; offscreen prefetch), and discard stale work without committing it. The render phase is interruptible and side-effect-free; only the commit phase touches the DOM, and it runs synchronously to prevent tearing.</p>
+        <p>Key consequence: your render function may be called multiple times for a single update, so it must be pure.</p>
+      </div>
+    </section>
+
+    <!-- Section 3: Legacy Stack Reconciler -->
+    <section id="legacy-reconciler" class="content-section">
+      <h2>Legacy Stack Reconciler — Why It Failed</h2>
+      <p>Before React 16, the reconciler used a recursive algorithm that mirrored the call stack:</p>
+
+      <pre><code class="language-javascript">// Simplified legacy reconciler (conceptual)
+function reconcile(parentDom, instance, element) {
+  if (instance == null) {
+    // Mount: create DOM, recurse into children
+    const newInstance = createInstance(element);
+    parentDom.appendChild(newInstance.dom);
+    element.props.children.forEach((child, i) =&gt; {
+      reconcile(newInstance.dom, null, child); // recursive!
+    });
+    return newInstance;
+  } else if (element == null) {
+    // Unmount
+    parentDom.removeChild(instance.dom);
+    return null;
+  } else if (instance.element.type === element.type) {
+    // Update: patch props, recurse into children
+    updateDomProperties(instance.dom, instance.element.props, element.props);
+    instance.childInstances = reconcileChildren(instance, element);
+    instance.element = element;
+    return instance;
+  } else {
+    // Replace
+    const newInstance = createInstance(element);
+    parentDom.replaceChild(newInstance.dom, instance.dom);
+    return newInstance;
+  }
+}
+
+// This is called recursively for EVERY child
+function reconcileChildren(instance, element) {
+  const newChildElements = element.props.children || [];
+  const oldChildInstances = instance.childInstances;
+  const newChildInstances = [];
+  const count = Math.max(newChildElements.length, oldChildInstances.length);
+  for (let i = 0; i &lt; count; i++) {
+    newChildInstances.push(
+      reconcile(instance.dom, oldChildInstances[i], newChildElements[i])
+    );
+  }
+  return newChildInstances;
+}</code></pre>
+
+      <h3>Fatal Flaws</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Problem</th>
+            <th>Impact</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Recursive tree traversal</td>
+            <td>Uses the JavaScript call stack; cannot be paused mid-tree</td>
+          </tr>
+          <tr>
+            <td>Synchronous &amp; uninterruptible</td>
+            <td>Once reconciliation starts, it must finish — blocking the main thread</td>
+          </tr>
+          <tr>
+            <td>No prioritization</td>
+            <td>A low-priority background update blocks high-priority user input</td>
+          </tr>
+          <tr>
+            <td>Dropped frames</td>
+            <td>Large trees (&gt;10K nodes) cause &gt;16ms renders, dropping below 60fps</td>
+          </tr>
+          <tr>
+            <td>No way to abort work</td>
+            <td>If a higher-priority update arrives, old work cannot be discarded</td>
+          </tr>
+          <tr>
+            <td>No incremental output</td>
+            <td>Users see nothing until the entire tree is processed</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-warning">
+        <p><strong>The core insight:</strong> Using the JavaScript call stack as your "work stack" means you inherit all its limitations. You can't serialize it, pause it, prioritize it, or resume it from where you left off. Fiber replaces the call stack with a <em>virtual stack</em> stored in heap-allocated objects.</p>
+      </div>
+
+      <pre class="diagram">
+Legacy Stack Reconciler — Blocking Timeline:
+
+    setState()
+        │
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│  Recursive Reconciliation (cannot be interrupted)       │
+│  ┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐┌──┐  │
+│  │A ││B ││C ││D ││E ││F ││G ││H ││I ││J ││K ││L │  │
+│  └──┘└──┘└──┘└──┘└──┘└──┘└──┘└──┘└──┘└──┘└──┘└──┘  │
+└─────────────────────────────────────────────────────────┘
+                                                          │
+    User clicks button here ──────────────────────────X   │
+    (blocked until reconciliation completes)              ▼
+                                                      DOM Update
+      </pre>
+    </section>
+
+    <!-- Section 4: Fiber Node Structure -->
+    <section id="fiber-node-structure" class="content-section">
+      <h2>Fiber Node Structure</h2>
+      <p>A fiber is a plain JavaScript object that represents a unit of work. Every React element gets a corresponding fiber. The fiber tree is a linked data structure using three pointer types: <code>child</code>, <code>sibling</code>, and <code>return</code> (parent).</p>
+
+      <details>
+        <summary><strong>Complete Fiber Node Fields</strong></summary>
+        <pre><code class="language-javascript">// Simplified FiberNode (from react-reconciler/src/ReactFiber.js)
+function FiberNode(tag, pendingProps, key, mode) {
+  // === Instance Identity ===
+  this.tag = tag;             // FunctionComponent, ClassComponent, HostComponent, etc.
+  this.key = key;             // Reconciliation key for list diffing
+  this.elementType = null;    // The resolved type (function/class/string)
+  this.type = null;           // For resolved lazy components
+  this.stateNode = null;      // DOM node (HostComponent) or class instance
+
+  // === Fiber Tree Structure (linked list) ===
+  this.return = null;         // Parent fiber
+  this.child = null;          // First child fiber
+  this.sibling = null;        // Next sibling fiber
+  this.index = 0;             // Position among siblings
+
+  // === Props &amp; State ===
+  this.ref = null;
+  this.pendingProps = pendingProps;  // Props for this render
+  this.memoizedProps = null;        // Props from last render (for bailout)
+  this.memoizedState = null;        // State from last render (hooks linked list)
+  this.updateQueue = null;          // Queue of state updates
+
+  // === Effects ===
+  this.flags = NoFlags;       // Bitmask: Placement | Update | Deletion | ...
+  this.subtreeFlags = NoFlags;// Aggregated flags from children (bubbled up)
+  this.deletions = null;      // Child fibers to be deleted
+
+  // === Scheduling / Priority ===
+  this.lanes = NoLanes;       // Priority lanes for this fiber's pending work
+  this.childLanes = NoLanes;  // Union of lanes in subtree
+
+  // === Double Buffering ===
+  this.alternate = null;      // Points to the other version (current ↔ workInProgress)
+}</code></pre>
+      </details>
+
+      <h3>Key Fields Explained</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Field</th>
+            <th>Purpose</th>
+            <th>Why It Matters</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>tag</code></td>
+            <td>Identifies fiber type (0=FunctionComponent, 5=HostComponent, etc.)</td>
+            <td>Determines which reconciliation path to take in beginWork</td>
+          </tr>
+          <tr>
+            <td><code>stateNode</code></td>
+            <td>Backing instance (DOM node or class instance)</td>
+            <td>Used during commit to apply mutations to the real DOM</td>
+          </tr>
+          <tr>
+            <td><code>return/child/sibling</code></td>
+            <td>Linked tree pointers</td>
+            <td>Enable iterative traversal without recursion (no call stack needed)</td>
+          </tr>
+          <tr>
+            <td><code>alternate</code></td>
+            <td>Points to the fiber's twin in the other tree</td>
+            <td>Enables double buffering: current tree vs work-in-progress tree</td>
+          </tr>
+          <tr>
+            <td><code>memoizedProps/State</code></td>
+            <td>Output from the last committed render</td>
+            <td>Used for bailout optimization (skip work if nothing changed)</td>
+          </tr>
+          <tr>
+            <td><code>flags</code></td>
+            <td>Bitmask of side effects (Placement, Update, Deletion)</td>
+            <td>Collected during render, executed during commit</td>
+          </tr>
+          <tr>
+            <td><code>lanes</code></td>
+            <td>Priority bitmask for pending updates</td>
+            <td>Determines which updates to process in this render pass</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Fiber Tree Linked Structure</h3>
+      <pre class="diagram">
+Fiber Tree for: &lt;App&gt; → &lt;Header&gt; + &lt;Main&gt; → &lt;Article&gt; + &lt;Sidebar&gt;
+
+           ┌─────────┐
+           │   App   │  (FiberNode)
+           │ tag: 0  │
+           └────┬────┘
+                │ child
+                ▼
+           ┌─────────┐   sibling   ┌─────────┐
+           │ Header  │ ──────────▶ │  Main   │
+           │ tag: 0  │             │ tag: 0  │
+           └─────────┘             └────┬────┘
+                ▲                       │ child
+                │ return                ▼
+                │                  ┌─────────┐  sibling  ┌─────────┐
+                └──────────────────│ Article │ ────────▶ │ Sidebar │
+                                   │ tag: 5  │           │ tag: 0  │
+                                   └─────────┘           └─────────┘
+
+Traversal Order (DFS via linked list):
+  App → Header → (no child, has sibling? no → return to App)
+  App → Main → Article → (no child → sibling) → Sidebar → (return to Main)
+
+Each node has:
+  .child    → first child
+  .sibling  → next sibling
+  .return   → parent
+      </pre>
+
+      <div class="callout callout-info">
+        <p><strong>Why a linked list instead of arrays?</strong> Arrays require knowing the count upfront and make insertion/deletion O(n). A linked list with child/sibling/return pointers allows O(1) navigation in any direction and makes the iterative work loop trivial: go to child, if no child go to sibling, if no sibling go to return's sibling.</p>
+      </div>
+    </section>
+
+    <!-- Section 5: Work Loop -->
+    <section id="work-loop" class="content-section">
+      <h2>Work Loop</h2>
+      <p>The work loop is the heart of Fiber. It processes one fiber at a time in an iterative loop, checking whether it should yield control back to the browser after each unit of work.</p>
+
+      <pre><code class="language-javascript">// Simplified from ReactFiberWorkLoop.js
+function workLoopConcurrent() {
+  // Process fibers until we run out or need to yield
+  while (workInProgress !== null &amp;&amp; !shouldYield()) {
+    performUnitOfWork(workInProgress);
+  }
+}
+
+// Synchronous version (used for discrete events like clicks)
+function workLoopSync() {
+  while (workInProgress !== null) {
+    performUnitOfWork(workInProgress);
+  }
+}
+
+function performUnitOfWork(unitOfWork) {
+  const current = unitOfWork.alternate; // The committed version
+
+  // Phase 1: "Begin" — process this fiber, return its first child
+  const next = beginWork(current, unitOfWork, renderLanes);
+
+  // Props are now finalized
+  unitOfWork.memoizedProps = unitOfWork.pendingProps;
+
+  if (next === null) {
+    // No children — complete this unit and find next work
+    completeUnitOfWork(unitOfWork);
+  } else {
+    // Descend into the first child
+    workInProgress = next;
+  }
+}
+
+function completeUnitOfWork(unitOfWork) {
+  let completedWork = unitOfWork;
+  do {
+    const current = completedWork.alternate;
+    const returnFiber = completedWork.return;
+
+    // Phase 2: "Complete" — create/update DOM nodes, bubble flags
+    completeWork(current, completedWork, renderLanes);
+
+    // Bubble subtreeFlags to parent
+    if (returnFiber !== null) {
+      returnFiber.subtreeFlags |= completedWork.subtreeFlags;
+      returnFiber.subtreeFlags |= completedWork.flags;
+    }
+
+    // Move to sibling if exists, else ascend to parent
+    const siblingFiber = completedWork.sibling;
+    if (siblingFiber !== null) {
+      workInProgress = siblingFiber;
+      return; // Exit — the work loop will call performUnitOfWork on sibling
+    }
+    completedWork = returnFiber;
+    workInProgress = completedWork;
+  } while (completedWork !== null);
+}</code></pre>
+
+      <h3>beginWork — Descending</h3>
+      <p><code>beginWork</code> processes a single fiber and returns its first child (or null). Its job depends on the fiber tag:</p>
+      <ul>
+        <li><strong>FunctionComponent:</strong> Calls the function, processes hooks, reconciles returned elements into child fibers</li>
+        <li><strong>ClassComponent:</strong> Calls render(), processes lifecycle, reconciles children</li>
+        <li><strong>HostComponent:</strong> Reconciles children (DOM diffing happens here conceptually)</li>
+        <li><strong>All types:</strong> Checks for bailout (props/state unchanged → skip subtree)</li>
+      </ul>
+
+      <h3>completeWork — Ascending</h3>
+      <p><code>completeWork</code> runs when a fiber has no more children to process. It:</p>
+      <ul>
+        <li>Creates actual DOM nodes for HostComponents (but doesn't attach them to the live tree yet)</li>
+        <li>Computes the diff of changed props for existing DOM nodes</li>
+        <li>Bubbles effect flags up to the parent via <code>subtreeFlags</code></li>
+        <li>Appends newly created DOM to a detached fragment (off-screen)</li>
+      </ul>
+
+      <div class="callout callout-tip">
+        <p><strong>Mental model:</strong> Think of the work loop as a depth-first walk. <code>beginWork</code> is going DOWN (entering a node), <code>completeWork</code> is going UP (leaving a node). The traversal is: down to first child, if no child then complete current and move to sibling, if no sibling then complete parent and move to parent's sibling, repeat.</p>
+      </div>
+    </section>
+
+    <!-- Section 6: Interruptible Rendering -->
+    <section id="interruptible-rendering" class="content-section">
+      <h2>Interruptible Rendering</h2>
+      <p>The fundamental innovation of Fiber: rendering can be paused mid-tree and resumed later, or abandoned entirely if a higher-priority update arrives.</p>
+
+      <h3>How React Can Pause Mid-Tree</h3>
+      <p>Because the work loop is iterative (not recursive), all traversal state lives in the <code>workInProgress</code> pointer and the fiber tree itself — not on the call stack. When <code>shouldYield()</code> returns true:</p>
+      <ol>
+        <li>The work loop simply exits (the <code>while</code> condition fails)</li>
+        <li>The <code>workInProgress</code> pointer remains on the last fiber being processed</li>
+        <li>The partially-built workInProgress tree remains in memory</li>
+        <li>React schedules a continuation via <code>MessageChannel</code></li>
+        <li>When the browser gives back control, the loop resumes from <code>workInProgress</code></li>
+      </ol>
+
+      <pre><code class="language-javascript">// What happens when React yields:
+function workLoopConcurrent() {
+  while (workInProgress !== null &amp;&amp; !shouldYield()) {
+    performUnitOfWork(workInProgress);
+  }
+  // Loop exits here when shouldYield() returns true
+  // workInProgress still points to the next fiber to process
+  // The scheduler will re-enter this function later
+}
+
+// What happens when a higher-priority update arrives mid-render:
+function ensureRootIsScheduled(root) {
+  const nextLanes = getNextLanes(root, root === workInProgressRoot ? workInProgressRootRenderLanes : NoLanes);
+
+  if (nextLanes === NoLanes) return;
+
+  const newCallbackPriority = getHighestPriorityLane(nextLanes);
+  const existingCallbackPriority = root.callbackPriority;
+
+  if (newCallbackPriority &gt; existingCallbackPriority) {
+    // Cancel in-progress render — it will be restarted
+    cancelCallback(root.callbackNode);
+    // Discard the partial workInProgress tree
+    prepareFreshStack(root, nextLanes);
+  }
+}</code></pre>
+
+      <h3>What Happens to Incomplete Work</h3>
+      <ul>
+        <li><strong>Paused (same priority):</strong> Work-in-progress tree stays in memory; resumed from the exact fiber where it stopped</li>
+        <li><strong>Preempted (higher priority arrives):</strong> The partial workInProgress tree is discarded (<code>prepareFreshStack</code>), and a new render begins. No DOM changes were made, so nothing needs to be rolled back.</li>
+        <li><strong>Expired (starvation):</strong> If a lower-priority update waits too long, its priority is escalated to synchronous to prevent indefinite starvation</li>
+      </ul>
+
+      <h3>Re-entrant Rendering</h3>
+      <p>Because the render phase is pure (no side effects, no DOM mutations), React can safely:</p>
+      <ul>
+        <li>Start rendering an update</li>
+        <li>Pause halfway through</li>
+        <li>Process a higher-priority update completely</li>
+        <li>Return to the original update (possibly restarting from scratch if the higher-priority update changed the base state)</li>
+      </ul>
+
+      <div class="callout callout-warning">
+        <p><strong>Critical implication:</strong> Your render functions, function component bodies, and any code called during rendering may execute multiple times for a single update. This is why side effects in render are forbidden — they would execute an unpredictable number of times.</p>
+      </div>
+    </section>
+
+    <!-- Section 7: Time Slicing -->
+    <section id="time-slicing" class="content-section">
+      <h2>Time Slicing</h2>
+      <p>Time slicing is the mechanism by which React breaks rendering work into small chunks and yields control to the browser between chunks, keeping the main thread responsive for user interactions and animations.</p>
+
+      <h3>5ms Work Chunks</h3>
+      <pre><code class="language-javascript">// From scheduler/src/forks/Scheduler.js
+let frameInterval = 5; // ms — the target time slice duration
+
+function shouldYieldToHost() {
+  const timeElapsed = getCurrentTime() - startTime;
+  if (timeElapsed &lt; frameInterval) {
+    // No need to yield yet — we're within our time budget
+    return false;
+  }
+  // We've exceeded our time slice — yield to the browser
+  return true;
+}
+
+// The frame interval can be adjusted (rarely needed):
+function forceFrameRate(fps) {
+  if (fps &lt; 0 || fps &gt; 125) return;
+  if (fps &gt; 0) {
+    frameInterval = Math.floor(1000 / fps);
+  } else {
+    frameInterval = 5; // Reset to default
+  }
+}</code></pre>
+
+      <div class="callout callout-info">
+        <p><strong>Why 5ms?</strong> The 5ms is a <em>yield threshold</em>, not a frame budget allocation. React checks elapsed time after each fiber unit — if ≥5ms has passed, it yields back to the browser. If work finishes in 3ms, React doesn't wait; it yields immediately. Multiple work slices can occur within a single frame. The 5ms value ensures React doesn't monopolize the main thread for too long, but the browser doesn't necessarily get a full paint opportunity between every slice (yields only guarantee a macrotask boundary via MessageChannel).</p>
+      </div>
+
+      <h3>MessageChannel for Scheduling</h3>
+      <pre><code class="language-javascript">// How React schedules continuations (simplified from SchedulerHostConfig.default.js)
+const channel = new MessageChannel();
+const port = channel.port2;
+
+channel.port1.onmessage = performWorkUntilDeadline;
+
+function requestHostCallback(callback) {
+  scheduledHostCallback = callback;
+  if (!isMessageLoopRunning) {
+    isMessageLoopRunning = true;
+    port.postMessage(null); // Schedule a macrotask
+  }
+}
+
+function performWorkUntilDeadline() {
+  if (scheduledHostCallback !== null) {
+    const currentTime = getCurrentTime();
+    startTime = currentTime; // Reset the time slice start
+    const hasMoreWork = scheduledHostCallback(currentTime);
+
+    if (hasMoreWork) {
+      // More work remains — schedule another slice
+      port.postMessage(null);
+    } else {
+      isMessageLoopRunning = false;
+      scheduledHostCallback = null;
+    }
+  }
+}</code></pre>
+
+      <h3>Why MessageChannel Over Alternatives?</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Mechanism</th>
+            <th>Problem</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>setTimeout(fn, 0)</code></td>
+            <td>Minimum 4ms delay in nested calls (HTML spec); too slow for continuations</td>
+          </tr>
+          <tr>
+            <td><code>requestAnimationFrame</code></td>
+            <td>Tied to paint frames (~16ms); not available in workers; doesn't fire in background tabs</td>
+          </tr>
+          <tr>
+            <td><code>requestIdleCallback</code></td>
+            <td>20ms+ granularity; not available in all browsers; fires unpredictably; no control over timing</td>
+          </tr>
+          <tr>
+            <td><code>MessageChannel</code></td>
+            <td>✅ ~0ms overhead; fires as macrotask after current task; consistent; available in workers</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <pre class="diagram">
+Time Slicing — Responsive Timeline:
+
+Frame 1 (16.6ms)          Frame 2 (16.6ms)          Frame 3 (16.6ms)
+┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+│ React │ Browser      │  │ React │ Browser      │  │ React │ Commit│Brwsr│
+│ Work  │ Layout/Paint │  │ Work  │ Layout/Paint │  │ Work  │ Phase │L/P  │
+│ 5ms   │    11ms      │  │ 5ms   │    11ms      │  │ 3ms   │ 4ms  │9ms  │
+└───────┴──────────────┘  └───────┴──────────────┘  └───────┴──────┴─────┘
+│←─A,B,C─→│              │←─D,E,F─→│              │←─G,H──→│
+                                                            ↑
+                                                    Render complete → commit
+      </pre>
+    </section>
+
+    <!-- Section 8: Double Buffering -->
+    <section id="double-buffering" class="content-section">
+      <h2>Double Buffering (current vs workInProgress)</h2>
+      <p>React maintains two fiber trees at any time, analogous to double buffering in graphics rendering:</p>
+
+      <ul>
+        <li><strong>current tree:</strong> The fiber tree that corresponds to what's currently rendered on screen. The DOM reflects this tree.</li>
+        <li><strong>workInProgress tree:</strong> The fiber tree being built during the current render. It represents the next version of the UI.</li>
+      </ul>
+
+      <h3>How Alternate Pointers Work</h3>
+      <pre><code class="language-javascript">// Each fiber has an 'alternate' pointing to its counterpart
+// in the other tree:
+currentFiber.alternate === workInProgressFiber;
+workInProgressFiber.alternate === currentFiber;
+
+// Creating a workInProgress fiber (simplified):
+function createWorkInProgress(current, pendingProps) {
+  let workInProgress = current.alternate;
+  if (workInProgress === null) {
+    // First time: create a new fiber, link as alternate
+    workInProgress = createFiber(current.tag, pendingProps, current.key, current.mode);
+    workInProgress.elementType = current.elementType;
+    workInProgress.type = current.type;
+    workInProgress.stateNode = current.stateNode; // Share the DOM node
+
+    workInProgress.alternate = current;
+    current.alternate = workInProgress;
+  } else {
+    // Reuse existing alternate, just update props
+    workInProgress.pendingProps = pendingProps;
+    workInProgress.flags = NoFlags;
+    workInProgress.subtreeFlags = NoFlags;
+    workInProgress.deletions = null;
+  }
+  // Copy fields from current
+  workInProgress.childLanes = current.childLanes;
+  workInProgress.lanes = current.lanes;
+  workInProgress.child = current.child;
+  workInProgress.memoizedProps = current.memoizedProps;
+  workInProgress.memoizedState = current.memoizedState;
+  workInProgress.updateQueue = current.updateQueue;
+  return workInProgress;
+}</code></pre>
+
+      <h3>Commit Swap</h3>
+      <p>When the render phase completes and the commit phase finishes applying mutations to the DOM:</p>
+      <pre><code class="language-javascript">// After commit, swap the root pointer:
+root.current = finishedWork; // workInProgress becomes current
+
+// The old current tree becomes the next workInProgress
+// (its fibers will be reused via alternate pointers)</code></pre>
+
+      <h3>Why Double Buffering Prevents Visual Tearing</h3>
+      <ul>
+        <li>During render, the current tree (what's on screen) remains untouched</li>
+        <li>All mutations are prepared on the workInProgress tree</li>
+        <li>Only during the synchronous commit phase are DOM changes applied</li>
+        <li>If rendering is interrupted and restarted, the current tree still represents a consistent state</li>
+        <li>Users never see a half-built UI — either the old version or the complete new version</li>
+      </ul>
+
+      <pre class="diagram">
+Double Buffering:
+
+Before Commit:                        After Commit:
+                                      
+  root.current                          root.current
+      │                                     │
+      ▼                                     ▼
+┌───────────┐    alternate    ┌───────────┐    ┌───────────┐    alternate    ┌───────────┐
+│  Current  │ ◄────────────▶ │    WIP    │    │  (old)    │ ◄────────────▶ │  Current  │
+│   Tree    │                 │   Tree    │    │   Tree    │                 │   Tree    │
+│ (on DOM)  │                 │ (in mem)  │    │ (reuse)   │                 │ (on DOM)  │
+└───────────┘                 └───────────┘    └───────────┘                 └───────────┘
+                                      
+The old current becomes the new workInProgress on the next render.
+Fiber objects are recycled — reducing GC pressure.
+      </pre>
+
+      <div class="callout callout-tip">
+        <p><strong>Memory optimization:</strong> React doesn't create entirely new fibers each render. Through <code>alternate</code> reuse, fibers ping-pong between being current and workInProgress, reducing allocation pressure on the garbage collector.</p>
+      </div>
+    </section>
+
+    <!-- Section 9: Commit Phase vs Render Phase -->
+    <section id="phases" class="content-section">
+      <h2>Commit Phase vs Render Phase</h2>
+      <p>React's work is divided into two fundamentally different phases with different guarantees:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Property</th>
+            <th>Render Phase</th>
+            <th>Commit Phase</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Purity</strong></td>
+            <td>Pure — no side effects</td>
+            <td>Effectful — mutates DOM, runs effects</td>
+          </tr>
+          <tr>
+            <td><strong>Interruptibility</strong></td>
+            <td>Can be paused, aborted, restarted</td>
+            <td>Synchronous, cannot be interrupted</td>
+          </tr>
+          <tr>
+            <td><strong>Execution count</strong></td>
+            <td>May run multiple times per update</td>
+            <td>Runs exactly once per committed update</td>
+          </tr>
+          <tr>
+            <td><strong>DOM access</strong></td>
+            <td>No DOM mutations</td>
+            <td>Applies all DOM mutations</td>
+          </tr>
+          <tr>
+            <td><strong>What runs here</strong></td>
+            <td>Component render, beginWork, completeWork</td>
+            <td>DOM mutations, refs, effects</td>
+          </tr>
+          <tr>
+            <td><strong>Lifecycle methods</strong></td>
+            <td>render(), getDerivedStateFromProps()</td>
+            <td>componentDidMount/Update, useEffect, useLayoutEffect</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Three Sub-Phases of Commit</h3>
+      <pre><code class="language-javascript">// Simplified commit phase (ReactFiberCommitWork.js)
+function commitRoot(root) {
+  const finishedWork = root.finishedWork;
+
+  // === Sub-phase 1: Before Mutation ===
+  // Read from DOM before changes (e.g., getSnapshotBeforeUpdate)
+  commitBeforeMutationEffects(root, finishedWork);
+
+  // === Sub-phase 2: Mutation ===
+  // Apply DOM insertions, updates, deletions
+  // Detach refs from removed nodes
+  commitMutationEffects(root, finishedWork, renderLanes);
+
+  // Swap the fiber trees BETWEEN mutation and layout
+  root.current = finishedWork;
+
+  // === Sub-phase 3: Layout ===
+  // Run useLayoutEffect callbacks
+  // Attach refs
+  // componentDidMount / componentDidUpdate
+  commitLayoutEffects(finishedWork, root, renderLanes);
+
+  // After layout effects, schedule passive effects (useEffect)
+  // These run asynchronously after paint
+  if (rootDoesHavePassiveEffects) {
+    scheduleCallback(NormalSchedulerPriority, flushPassiveEffects);
+  }
+}</code></pre>
+
+      <details>
+        <summary><strong>Why root.current swaps between mutation and layout</strong></summary>
+        <p>The swap happens after DOM mutations but before layout effects. This means:</p>
+        <ul>
+          <li><code>componentWillUnmount</code> (called during mutation) still sees the old tree as "current" — it can read the previous state</li>
+          <li><code>componentDidMount</code> / <code>useLayoutEffect</code> (called during layout) sees the new tree as "current" — refs point to new DOM nodes</li>
+        </ul>
+      </details>
+
+      <pre class="diagram">
+Render + Commit Pipeline:
+
+  ┌─────────────────────────────────────────────────────┐
+  │              RENDER PHASE (interruptible)            │
+  │                                                     │
+  │  beginWork → beginWork → ... → completeWork → ...   │
+  │       ↑                                             │
+  │       └── shouldYield() → pause → resume ──┘        │
+  └───────────────────────────┬─────────────────────────┘
+                              │ (all fibers processed)
+                              ▼
+  ┌─────────────────────────────────────────────────────┐
+  │            COMMIT PHASE (synchronous)               │
+  │                                                     │
+  │  ┌──────────────┐  ┌──────────┐  ┌──────────────┐  │
+  │  │beforeMutation│→ │ mutation │→ │   layout     │  │
+  │  │(read DOM)    │  │(write DOM)│  │(effects/refs)│  │
+  │  └──────────────┘  └──────────┘  └──────────────┘  │
+  └───────────────────────────┬─────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────┐
+  │         Browser paints new frame                    │
+  └───────────────────────────┬─────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────┐
+  │    Passive Effects (useEffect) — asynchronous       │
+  └─────────────────────────────────────────────────────┘
+      </pre>
+    </section>
+
+    <!-- Section 10: Effect List & Side Effects -->
+    <section id="effects" class="content-section">
+      <h2>Effect List &amp; Side Effects</h2>
+      <p>During the render phase, React flags fibers that need DOM operations. These flags are collected via <code>subtreeFlags</code> bubbling, and during commit, React traverses only fibers with flags set — skipping the vast majority of the tree.</p>
+
+      <h3>Effect Flags (Bitmask)</h3>
+      <pre><code class="language-javascript">// From ReactFiberFlags.js (simplified)
+const NoFlags        = 0b0000000000000000000000000000;
+const Placement      = 0b0000000000000000000000000010; // New node to insert
+const Update         = 0b0000000000000000000000000100; // Props/state changed
+const Deletion       = 0b0000000000000000000000001000; // Node to remove
+const ChildDeletion  = 0b0000000000000000000000010000;
+const ContentReset   = 0b0000000000000000000000100000;
+const Callback       = 0b0000000000000000000001000000;
+const Ref            = 0b0000000000000000001000000000;
+const Snapshot       = 0b0000000000000000010000000000;
+const Passive        = 0b0000000000000000100000000000; // Has useEffect
+const LayoutMask     = Update | Callback | Ref | Snapshot;
+const PassiveMask    = Passive | ChildDeletion;
+
+// Flags are combined with bitwise OR:
+fiber.flags |= Placement | Update;
+
+// Checked with bitwise AND:
+if (fiber.flags &amp; Placement) {
+  commitPlacement(fiber);
+}
+if (fiber.flags &amp; Update) {
+  commitWork(fiber);
+}</code></pre>
+
+      <h3>subtreeFlags Bubbling (React 18+ optimization)</h3>
+      <pre><code class="language-javascript">// In completeWork, flags bubble up:
+function bubbleProperties(completedWork) {
+  let subtreeFlags = NoFlags;
+  let child = completedWork.child;
+  while (child !== null) {
+    subtreeFlags |= child.subtreeFlags;
+    subtreeFlags |= child.flags;
+    child = child.sibling;
+  }
+  completedWork.subtreeFlags |= subtreeFlags;
+}
+
+// During commit, subtreeFlags enable skipping entire subtrees:
+function commitMutationEffects_begin(root, lanes) {
+  while (nextEffect !== null) {
+    const fiber = nextEffect;
+    const child = fiber.child;
+
+    if ((fiber.subtreeFlags &amp; MutationMask) !== NoFlags &amp;&amp; child !== null) {
+      // Subtree has effects — descend
+      nextEffect = child;
+    } else {
+      // No effects in subtree — skip entirely, process this node
+      commitMutationEffects_complete(root, lanes);
+    }
+  }
+}</code></pre>
+
+      <div class="callout callout-info">
+        <p><strong>Performance win:</strong> In React 16-17, an "effect list" linked list was maintained. React 18 replaced this with <code>subtreeFlags</code> bubbling, which enables skipping entire subtrees that have no effects — O(affected nodes) instead of O(total effects). For large trees with localized updates, this is significantly faster.</p>
+      </div>
+
+      <h3>useEffect vs useLayoutEffect Timing</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Hook</th>
+            <th>When It Runs</th>
+            <th>Blocks Paint?</th>
+            <th>Use Case</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>useLayoutEffect</code></td>
+            <td>Commit layout sub-phase (before paint)</td>
+            <td>Yes — synchronous</td>
+            <td>Measure DOM, synchronous mutations, tooltip positioning</td>
+          </tr>
+          <tr>
+            <td><code>useEffect</code></td>
+            <td>After paint (asynchronous, via scheduler)</td>
+            <td>No — deferred</td>
+            <td>Data fetching, subscriptions, logging, non-visual side effects</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <pre><code class="language-javascript">// Timing visualization:
+// 1. Render phase completes
+// 2. commitBeforeMutationEffects — getSnapshotBeforeUpdate
+// 3. commitMutationEffects — DOM writes
+// 4. root.current = finishedWork (swap trees)
+// 5. commitLayoutEffects — useLayoutEffect runs HERE (before paint)
+// 6. Browser paints
+// 7. flushPassiveEffects — useEffect runs HERE (after paint)
+
+// This is why useLayoutEffect can cause visual "flicker" if misused:
+// it runs synchronously before paint, blocking the frame.
+// useEffect is preferred because it doesn't delay painting.</code></pre>
+    </section>
+
+    <!-- Section 11: Concurrent Mode Enabling -->
+    <section id="concurrent-mode" class="content-section">
+      <h2>Concurrent Mode Enabling</h2>
+      <p>Concurrent rendering is not a "mode" you switch on globally — it's a set of features enabled by the new <code>createRoot</code> API that allows React to use interruptible rendering when appropriate.</p>
+
+      <h3>createRoot vs Legacy render()</h3>
+      <pre><code class="language-javascript">// Legacy (React 17 and earlier) — synchronous rendering only
+import { render } from 'react-dom';
+render(&lt;App /&gt;, document.getElementById('root'));
+// All updates are synchronous and uninterruptible
+
+// Concurrent (React 18+) — enables concurrent features
+import { createRoot } from 'react-dom/client';
+const root = createRoot(document.getElementById('root'));
+root.render(&lt;App /&gt;);
+// Updates CAN be concurrent (React decides based on context)
+
+// Important: createRoot doesn't mean ALL renders are concurrent.
+// Discrete events (clicks, keydown) still render synchronously.
+// Only "transitions" and deferred updates use concurrent rendering.</code></pre>
+
+      <h3>What Concurrent Features Enable</h3>
+      <ul>
+        <li><strong>startTransition:</strong> Mark state updates as non-urgent, allowing React to interrupt them for user input</li>
+        <li><strong>useDeferredValue:</strong> Show stale UI while fresh data renders in the background</li>
+        <li><strong>Suspense for data fetching:</strong> Show fallback UI while async data loads, without blocking other content</li>
+        <li><strong>Streaming SSR with selective hydration:</strong> Hydrate components as they load, prioritizing user-interacted ones</li>
+        <li><strong>Automatic batching:</strong> All updates (even in setTimeout/promises) are batched automatically</li>
+      </ul>
+
+      <h3>StrictMode Double-Render</h3>
+      <pre><code class="language-javascript">// In development + StrictMode, React intentionally double-invokes:
+// - Function component bodies
+// - State updater functions
+// - useMemo/useCallback callbacks
+
+// This helps catch side effects in render:
+function MyComponent() {
+  // ❌ This would fire twice in StrictMode, revealing the bug:
+  fetch('/api/track-view'); // Side effect in render!
+
+  // ✅ Correct: use useEffect for side effects
+  useEffect(() =&gt; {
+    fetch('/api/track-view');
+  }, []);
+
+  return &lt;div&gt;Content&lt;/div&gt;;
+}</code></pre>
+
+      <div class="callout callout-warning">
+        <p><strong>StrictMode in React 18:</strong> Components mount → unmount → remount in development to test resilience to future features (like offscreen rendering / Activity). If your useEffect cleanup isn't symmetric with its setup, StrictMode will expose that bug.</p>
+      </div>
+    </section>
+
+    <!-- Section 12: Cooperative Scheduling -->
+    <section id="cooperative-scheduling" class="content-section">
+      <h2>Cooperative Scheduling</h2>
+      <p>React implements cooperative scheduling: the renderer voluntarily yields the main thread at regular intervals, cooperating with the browser's event loop rather than monopolizing it.</p>
+
+      <h3>Priority Levels</h3>
+      <pre><code class="language-javascript">// From scheduler/src/SchedulerPriorities.js
+const ImmediatePriority   = 1;  // Synchronous, highest priority
+const UserBlockingPriority = 2;  // User interactions (clicks, input)
+const NormalPriority       = 3;  // Default (e.g., network responses)
+const LowPriority          = 4;  // Data prefetching
+const IdlePriority         = 5;  // Offscreen / background work
+
+// Timeout thresholds (from SchedulerFeatureFlags)
+const IMMEDIATE_PRIORITY_TIMEOUT = -1;    // Immediately expired → sync
+const USER_BLOCKING_PRIORITY_TIMEOUT = 250; // 250ms
+const NORMAL_PRIORITY_TIMEOUT = 5000;       // 5 seconds
+const LOW_PRIORITY_TIMEOUT = 10000;         // 10 seconds
+const IDLE_PRIORITY_TIMEOUT = 1073741823;   // Max int — never expires naturally</code></pre>
+
+      <h3>Task Expiration &amp; Starvation Prevention</h3>
+      <pre><code class="language-javascript">// When a task is scheduled, it gets an expiration time:
+function scheduleCallback(priorityLevel, callback) {
+  const currentTime = getCurrentTime();
+  const startTime = currentTime; // or + delay for delayed tasks
+  
+  let timeout;
+  switch (priorityLevel) {
+    case ImmediatePriority: timeout = -1; break;
+    case UserBlockingPriority: timeout = 250; break;
+    case NormalPriority: timeout = 5000; break;
+    case LowPriority: timeout = 10000; break;
+    case IdlePriority: timeout = 1073741823; break;
+  }
+
+  const expirationTime = startTime + timeout;
+  const newTask = {
+    callback,
+    priorityLevel,
+    startTime,
+    expirationTime,
+    sortIndex: expirationTime // Used by the priority queue
+  };
+
+  push(taskQueue, newTask); // Insert into min-heap
+  requestHostCallback(flushWork);
+  return newTask;
+}
+
+// Starvation prevention:
+// If currentTime &gt;= task.expirationTime, the task is "expired"
+// Expired tasks run synchronously regardless of shouldYield()
+function workLoop(initialTime) {
+  let currentTime = initialTime;
+  currentTask = peek(taskQueue);
+
+  while (currentTask !== null) {
+    if (currentTask.expirationTime &gt; currentTime &amp;&amp; shouldYieldToHost()) {
+      // Task not expired AND we should yield → break
+      break;
+    }
+    // Task expired OR we have time → execute it
+    const callback = currentTask.callback;
+    const continuationCallback = callback(currentTask.expirationTime &lt;= currentTime);
+    // ...
+  }
+}</code></pre>
+
+      <h3>Why Not requestIdleCallback?</h3>
+      <ul>
+        <li><strong>Granularity:</strong> rIC fires at most once per frame, with unpredictable deadlines (20-50ms). React needs sub-5ms scheduling precision.</li>
+        <li><strong>Browser support:</strong> Not available in Safari (iOS) at all, making it unusable for production</li>
+        <li><strong>Priority control:</strong> rIC has no priority system — all callbacks are treated equally</li>
+        <li><strong>Cancellation:</strong> rIC cancellation is coarse-grained and unreliable</li>
+        <li><strong>Background tabs:</strong> rIC behavior varies when tabs are backgrounded</li>
+      </ul>
+      <p>React's custom scheduler via MessageChannel gives consistent, predictable, priority-aware scheduling across all environments.</p>
+    </section>
+
+    <!-- Section 13: Scheduler Package -->
+    <section id="scheduler-package" class="content-section">
+      <h2>React's Internal Scheduler Package</h2>
+      <p>The <code>scheduler</code> package (<code>packages/scheduler</code> in the React repo) is a standalone priority task scheduler. It's designed to be React-agnostic but is currently only used by React.</p>
+
+      <h3>Priority Queue (Min-Heap)</h3>
+      <pre><code class="language-javascript">// From scheduler/src/SchedulerMinHeap.js
+// Tasks are stored in a min-heap sorted by sortIndex (expirationTime)
+// This gives O(1) peek, O(log n) push/pop
+
+function push(heap, node) {
+  const index = heap.length;
+  heap.push(node);
+  siftUp(heap, node, index);
+}
+
+function peek(heap) {
+  return heap.length === 0 ? null : heap[0];
+}
+
+function pop(heap) {
+  if (heap.length === 0) return null;
+  const first = heap[0];
+  const last = heap.pop();
+  if (last !== first) {
+    heap[0] = last;
+    siftDown(heap, last, 0);
+  }
+  return first;
+}
+
+function siftUp(heap, node, i) {
+  let index = i;
+  while (index &gt; 0) {
+    const parentIndex = (index - 1) &gt;&gt;&gt; 1;
+    const parent = heap[parentIndex];
+    if (compare(parent, node) &gt; 0) {
+      // Parent is larger — swap
+      heap[parentIndex] = node;
+      heap[index] = parent;
+      index = parentIndex;
+    } else {
+      return;
+    }
+  }
+}
+
+function compare(a, b) {
+  const diff = a.sortIndex - b.sortIndex;
+  return diff !== 0 ? diff : a.id - b.id; // FIFO for equal priority
+}</code></pre>
+
+      <h3>Relationship to Lanes</h3>
+      <p>Lanes are React's internal priority model (used by the reconciler). The scheduler has its own priority levels. The mapping between them:</p>
+      <pre><code class="language-javascript">// From ReactFiberLane.js — Lanes are bitmasks
+const SyncLane            = 0b0000000000000000000000000000001;
+const InputContinuousLane = 0b0000000000000000000000000000100;
+const DefaultLane         = 0b0000000000000000000000000010000;
+const TransitionLanes     = 0b0000000011111111111111110000000;
+const IdleLane            = 0b0100000000000000000000000000000;
+const OffscreenLane       = 0b1000000000000000000000000000000;
+
+// Lane → Scheduler Priority mapping:
+function lanesToSchedulerPriority(lanes) {
+  const lane = getHighestPriorityLane(lanes);
+  if (lane === SyncLane) return ImmediatePriority;
+  if (lane === InputContinuousLane) return UserBlockingPriority;
+  if (lane === DefaultLane) return NormalPriority;
+  if (lane === IdleLane) return IdlePriority;
+  return NormalPriority;
+}
+
+// Why two priority systems?
+// Lanes: fine-grained, bitmask-based, supports batching multiple priorities
+// Scheduler: coarse-grained, for host-level task ordering
+// A single scheduler task may process multiple lanes in one render.</code></pre>
+
+      <h3>shouldYield Implementation</h3>
+      <pre><code class="language-javascript">// The shouldYield exposed to the reconciler
+function shouldYield() {
+  const currentTime = getCurrentTime();
+  advanceTimers(currentTime); // Move expired delayed tasks to taskQueue
+
+  const firstTask = peek(taskQueue);
+  return (
+    (firstTask !== currentTask &amp;&amp;   // A different task is now highest priority
+     currentTask !== null &amp;&amp;
+     firstTask !== null &amp;&amp;
+     firstTask.expirationTime &lt; currentTask.expirationTime) ||
+    shouldYieldToHost()             // Time slice exceeded
+  );
+}</code></pre>
+
+      <div class="callout callout-info">
+        <p><strong>Host config abstraction:</strong> The scheduler uses a "host config" pattern to abstract away platform-specific APIs. In a browser, it uses <code>MessageChannel</code> and <code>performance.now()</code>. In Node.js (for testing), it uses <code>setTimeout</code> and <code>Date.now()</code>. This allows the same scheduler logic to work in any environment.</p>
+      </div>
+    </section>
+
+    <!-- Section 14: Production Implications -->
+    <section id="production-implications" class="content-section">
+      <h2>Production Implications</h2>
+      <p>Concurrent rendering changes the contract between React and your code. Here's what it means in practice:</p>
+
+      <h3>No Side Effects in Render</h3>
+      <pre><code class="language-javascript">// ❌ Broken under concurrent rendering:
+function UserProfile({ userId }) {
+  // This might fire multiple times if render is interrupted and restarted!
+  analytics.trackView(userId);
+
+  const [user, setUser] = useState(null);
+
+  // ❌ Mutating external state in render
+  window.currentUser = userId;
+
+  // ❌ Subscribing in render body
+  eventBus.on('update', handleUpdate);
+
+  return &lt;div&gt;{user?.name}&lt;/div&gt;;
+}
+
+// ✅ Correct: side effects in useEffect
+function UserProfile({ userId }) {
+  const [user, setUser] = useState(null);
+
+  useEffect(() =&gt; {
+    analytics.trackView(userId);
+    const unsub = eventBus.on('update', handleUpdate);
+    return () =&gt; unsub();
+  }, [userId]);
+
+  return &lt;div&gt;{user?.name}&lt;/div&gt;;
+}</code></pre>
+
+      <h3>useRef for Mutable Values</h3>
+      <pre><code class="language-javascript">// ❌ Module-level mutable state is shared across renders
+let renderCount = 0;
+function MyComponent() {
+  renderCount++; // Incorrect count under concurrent rendering
+  return &lt;span&gt;Rendered {renderCount} times&lt;/span&gt;;
+}
+
+// ✅ useRef persists across renders without triggering re-renders
+function MyComponent() {
+  const renderCount = useRef(0);
+  useEffect(() =&gt; {
+    renderCount.current++;
+  });
+  return &lt;span&gt;Committed {renderCount.current} times&lt;/span&gt;;
+}</code></pre>
+
+      <h3>External Store Synchronization (useSyncExternalStore)</h3>
+      <pre><code class="language-javascript">// Problem: concurrent rendering can read from an external store at
+// two different points in time during a single render, causing "tearing"
+// (parts of the UI reflecting different store versions)
+
+// ❌ Naive subscription — may tear under concurrent rendering:
+function useStore(store) {
+  const [state, setState] = useState(store.getState());
+  useEffect(() =&gt; {
+    return store.subscribe(() =&gt; setState(store.getState()));
+  }, [store]);
+  return state;
+}
+
+// ✅ useSyncExternalStore — handles tearing prevention:
+import { useSyncExternalStore } from 'react';
+
+function useStore(store) {
+  return useSyncExternalStore(
+    store.subscribe,    // Subscribe function
+    store.getState,     // Get current client state
+    store.getState      // Get server snapshot (SSR)
+  );
+}
+
+// How it prevents tearing:
+// 1. During render, reads the store snapshot
+// 2. After render completes (before commit), checks if the store changed
+// 3. If changed during render → forces synchronous re-render
+// 4. This guarantees the committed UI is consistent with one store version</code></pre>
+
+      <h3>Strict Mode Compatibility Checklist</h3>
+      <ul>
+        <li>✅ All component bodies are pure functions of props/state</li>
+        <li>✅ useEffect cleanups properly reverse their setup</li>
+        <li>✅ No reading from mutable globals during render</li>
+        <li>✅ External stores use <code>useSyncExternalStore</code></li>
+        <li>✅ No assumptions about render-to-commit being 1:1</li>
+        <li>✅ Refs are only read/written in effects or event handlers, not during render</li>
+      </ul>
+    </section>
+
+    <!-- Section 15: Architecture Diagrams -->
+    <section id="architecture-diagrams" class="content-section">
+      <h2>Architecture Diagrams</h2>
+
+      <h3>Fiber Tree Structure</h3>
+      <pre class="diagram">
+Component Tree:              Fiber Tree (linked structure):
+
+    &lt;App&gt;                       App
+    ├── &lt;Nav&gt;                    │ child
+    │   ├── &lt;Logo/&gt;              ▼
+    │   └── &lt;Menu/&gt;            Nav ──────sibling────▶ Content
+    └── &lt;Content&gt;               │ child                  │ child
+        ├── &lt;Hero/&gt;             ▼                        ▼
+        └── &lt;Feed/&gt;           Logo ──sibling──▶ Menu   Hero ──sibling──▶ Feed
+
+    Navigation pointers:
+    ─────▶  child (first child only)
+    ──────▶  sibling (next sibling)
+    ◀──────  return (every node → parent, not drawn for clarity)
+      </pre>
+
+      <h3>Work Loop Flow</h3>
+      <pre class="diagram">
+                    ┌─────────────────────┐
+                    │  ensureRootScheduled │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │  Schedule via        │
+                    │  MessageChannel      │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+              ┌────────────────────────────────┐
+              │     performWorkUntilDeadline    │
+              └────────────────┬───────────────┘
+                               │
+                               ▼
+              ┌────────────────────────────────┐
+              │       workLoopConcurrent        │
+              │                                │
+              │  while (wip !== null &amp;&amp;         │
+              │         !shouldYield())         │
+              │  ┌──────────────────────────┐  │
+              │  │   performUnitOfWork(wip)  │  │
+              │  │                          │  │
+              │  │  next = beginWork(wip)   │  │
+              │  │  if (next === null)      │  │
+              │  │    completeUnitOfWork()  │  │
+              │  │  else                   │  │
+              │  │    wip = next           │  │
+              │  └──────────────────────────┘  │
+              └───────────┬────────┬───────────┘
+                          │        │
+              ┌───────────┘        └───────────┐
+              ▼                                ▼
+    ┌──────────────────┐            ┌──────────────────┐
+    │  shouldYield()   │            │  wip === null    │
+    │  → schedule      │            │  → commitRoot()  │
+    │  continuation    │            │  (sync commit)   │
+    └──────────────────┘            └──────────────────┘
+      </pre>
+
+      <h3>Render vs Commit Phases</h3>
+      <pre class="diagram">
+setState() / startTransition()
+    │
+    ▼
+┌───────────────────────────────────────────────────────────────┐
+│                    RENDER PHASE                                │
+│                                                               │
+│  Properties:                                                  │
+│  • Pure (no DOM mutations)                                    │
+│  • Interruptible (can pause/resume/abort)                     │
+│  • May execute multiple times                                 │
+│  • Builds workInProgress tree                                 │
+│                                                               │
+│  Operations:                                                  │
+│  • Call function components / render methods                  │
+│  • Diff old vs new children (reconcileChildFibers)            │
+│  • Compute new state from updates                             │
+│  • Mark fibers with effect flags                              │
+└───────────────────────────────┬───────────────────────────────┘
+                                │
+                                ▼
+┌───────────────────────────────────────────────────────────────┐
+│                    COMMIT PHASE                                │
+│                                                               │
+│  Properties:                                                  │
+│  • Synchronous (cannot be interrupted)                        │
+│  • Runs exactly once per committed render                     │
+│  • Mutates the real DOM                                       │
+│  • Runs all side effects                                      │
+│                                                               │
+│  Sub-phases:                                                  │
+│  1. beforeMutation: getSnapshotBeforeUpdate                   │
+│  2. mutation: DOM insertions/updates/deletions                │
+│     ─── root.current = finishedWork (tree swap) ───           │
+│  3. layout: useLayoutEffect, componentDidMount/Update, refs   │
+│                                                               │
+│  After paint: useEffect (passive effects)                     │
+└───────────────────────────────────────────────────────────────┘
+      </pre>
+
+      <h3>Double Buffering Lifecycle</h3>
+      <pre class="diagram">
+Render 1 (Initial Mount):
+
+  root.current ──▶ [FiberRootNode]
+                         │
+                    HostRoot fiber
+                         │
+                   (empty tree)
+
+  workInProgress tree built during render:
+  HostRoot → App → Nav → Logo, Menu, Content → Hero, Feed
+
+
+Render 1 (After Commit):
+
+  root.current ──▶ HostRoot → App → Nav → ...  (was workInProgress)
+                      │
+                   alternate
+                      │
+                      ▼
+                   HostRoot (empty, ready to be next WIP)
+
+
+Render 2 (State Update):
+
+  root.current (unchanged, reflects DOM)
+       │
+    alternate ──▶ workInProgress tree (being built)
+                  HostRoot → App → Nav (reused) → ...
+                                    ↑
+                            Only changed subtrees rebuilt,
+                            unchanged fibers cloned via alternate
+      </pre>
+    </section>
+
+    <!-- Section 16: Code Examples -->
+    <section id="code-examples" class="content-section">
+      <h2>Code Examples</h2>
+
+      <h3>Simplified Fiber Reconciler</h3>
+      <details>
+        <summary><strong>Minimal Fiber Implementation (~80 lines)</strong></summary>
+        <pre><code class="language-javascript">// A simplified fiber reconciler demonstrating the core concepts
+// (NOT actual React code — educational abstraction)
+
+let wipRoot = null;       // Work-in-progress root
+let currentRoot = null;   // Currently committed root
+let nextUnitOfWork = null;
+let deletions = [];
+
+function createElement(type, props, ...children) {
+  return {
+    type,
+    props: {
+      ...props,
+      children: children.map(child =&gt;
+        typeof child === 'object' ? child : createTextElement(child)
+      )
+    }
+  };
+}
+
+function createFiber(element, parent) {
+  return {
+    type: element.type,
+    props: element.props,
+    parent,
+    dom: null,
+    child: null,
+    sibling: null,
+    alternate: null,  // Link to previous fiber
+    flags: 'PLACEMENT' // PLACEMENT | UPDATE | DELETION
+  };
+}
+
+function render(element, container) {
+  wipRoot = {
+    dom: container,
+    props: { children: [element] },
+    alternate: currentRoot  // Link to previous tree
+  };
+  deletions = [];
+  nextUnitOfWork = wipRoot;
+  requestIdleCallback(workLoop); // ⚠️ Educational only — React uses MessageChannel, not rIC (see "Why Not rIC?" above)
+}
+
+function workLoop(deadline) {
+  let shouldYield = false;
+  while (nextUnitOfWork &amp;&amp; !shouldYield) {
+    nextUnitOfWork = performUnitOfWork(nextUnitOfWork);
+    shouldYield = deadline.timeRemaining() &lt; 1;
+  }
+
+  if (!nextUnitOfWork &amp;&amp; wipRoot) {
+    commitRoot(); // All work done — commit synchronously
+  }
+
+  if (nextUnitOfWork) {
+    requestIdleCallback(workLoop); // Educational only — schedule continuation
+  }
+}
+
+function performUnitOfWork(fiber) {
+  // Create DOM node (but don't attach to live tree yet)
+  if (!fiber.dom) {
+    fiber.dom = createDom(fiber);
+  }
+
+  // Reconcile children
+  const elements = fiber.props.children || [];
+  reconcileChildren(fiber, elements);
+
+  // Return next unit of work (depth-first traversal)
+  if (fiber.child) return fiber.child;
+
+  let nextFiber = fiber;
+  while (nextFiber) {
+    if (nextFiber.sibling) return nextFiber.sibling;
+    nextFiber = nextFiber.parent;
+  }
+  return null;
+}
+
+function reconcileChildren(wipFiber, elements) {
+  let oldFiber = wipFiber.alternate?.child;
+  let prevSibling = null;
+
+  for (let i = 0; i &lt; elements.length || oldFiber; i++) {
+    const element = elements[i];
+    let newFiber = null;
+    const sameType = oldFiber &amp;&amp; element &amp;&amp; element.type === oldFiber.type;
+
+    if (sameType) {
+      // UPDATE: reuse fiber, update props
+      newFiber = { ...oldFiber, props: element.props,
+                   alternate: oldFiber, parent: wipFiber, flags: 'UPDATE' };
+    }
+    if (element &amp;&amp; !sameType) {
+      // PLACEMENT: new fiber
+      newFiber = createFiber(element, wipFiber);
+    }
+    if (oldFiber &amp;&amp; !sameType) {
+      // DELETION: mark old fiber for removal
+      oldFiber.flags = 'DELETION';
+      deletions.push(oldFiber);
+    }
+
+    if (oldFiber) oldFiber = oldFiber.sibling;
+    if (i === 0) wipFiber.child = newFiber;
+    else if (prevSibling) prevSibling.sibling = newFiber;
+    prevSibling = newFiber;
+  }
+}
+
+function commitRoot() {
+  deletions.forEach(commitWork);
+  commitWork(wipRoot.child);
+  currentRoot = wipRoot; // Swap: WIP becomes current
+  wipRoot = null;
+}
+
+function commitWork(fiber) {
+  if (!fiber) return;
+  const parentDom = fiber.parent.dom;
+  if (fiber.flags === 'PLACEMENT' &amp;&amp; fiber.dom) {
+    parentDom.appendChild(fiber.dom);
+  } else if (fiber.flags === 'UPDATE' &amp;&amp; fiber.dom) {
+    updateDom(fiber.dom, fiber.alternate.props, fiber.props);
+  } else if (fiber.flags === 'DELETION') {
+    parentDom.removeChild(fiber.dom);
+    return;
+  }
+  commitWork(fiber.child);
+  commitWork(fiber.sibling);
+}</code></pre>
+      </details>
+
+      <h3>Demonstrating Interruptible Rendering</h3>
+      <pre><code class="language-javascript">// Visualizing how startTransition enables interruptible updates
+import { useState, startTransition, useDeferredValue } from 'react';
+
+function SearchResults() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+
+  function handleInput(e) {
+    const value = e.target.value;
+
+    // This update is URGENT — update the input immediately (sync)
+    setQuery(value);
+
+    // This update is NON-URGENT — can be interrupted
+    startTransition(() =&gt; {
+      const filtered = heavyFilter(allItems, value); // Expensive!
+      setResults(filtered);
+    });
+  }
+
+  return (
+    &lt;div&gt;
+      &lt;input value={query} onChange={handleInput} /&gt;
+      &lt;ResultsList results={results} /&gt;
+    &lt;/div&gt;
+  );
+}
+
+// Under the hood:
+// 1. handleInput fires → two setState calls
+// 2. setQuery gets SyncLane (discrete event context)
+// 3. setResults gets TransitionLane (wrapped in startTransition)
+// 4. React processes SyncLane first (uninterruptible)
+// 5. Then starts TransitionLane render (interruptible)
+// 6. If user types again before transition completes:
+//    - New SyncLane update interrupts the transition render
+//    - Transition render is discarded, restarted with new value</code></pre>
+
+      <h3>Priority-Based Scheduling Visualization</h3>
+      <pre><code class="language-javascript">// Demonstrating how different events get different priorities
+import { useState, useTransition } from 'react';
+
+function PriorityDemo() {
+  const [urgent, setUrgent] = useState('');
+  const [nonUrgent, setNonUrgent] = useState('');
+  const [isPending, startTransition] = useTransition();
+
+  function handleClick() {
+    // Discrete event → SyncLane → ImmediatePriority
+    setUrgent('clicked!');
+  }
+
+  function handleContinuousInput(e) {
+    // Continuous event → InputContinuousLane → UserBlockingPriority
+    setUrgent(e.target.value);
+
+    // Transition → TransitionLane → NormalPriority
+    startTransition(() =&gt; {
+      setNonUrgent(computeExpensive(e.target.value));
+    });
+  }
+
+  return (
+    &lt;div&gt;
+      &lt;button onClick={handleClick}&gt;Click (Immediate)&lt;/button&gt;
+      &lt;input onChange={handleContinuousInput} /&gt;
+      &lt;div&gt;Urgent: {urgent}&lt;/div&gt;
+      &lt;div style={{ opacity: isPending ? 0.7 : 1 }}&gt;
+        Deferred: {nonUrgent}
+      &lt;/div&gt;
+    &lt;/div&gt;
+  );
+
+  // Scheduling order (if all fire simultaneously):
+  // 1. SyncLane (click) → processed synchronously, no yielding
+  // 2. InputContinuousLane (typing) → high priority, short time slice
+  // 3. TransitionLane (deferred) → normal priority, interruptible
+}</code></pre>
+    </section>
+
+    <!-- Section 17: Common Mistakes -->
+    <section id="common-mistakes" class="content-section">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary><strong>Mistake 1: Side Effects in the Render Phase</strong></summary>
+        <pre><code class="language-javascript">// ❌ WRONG: Side effect during render
+function UserList({ users }) {
+  // This runs during render — may fire multiple times!
+  localStorage.setItem('lastViewed', Date.now());
+
+  // This mutates a ref during render — unsafe
+  countRef.current++;
+
+  // This subscribes during render — leaks on every interrupted render
+  window.addEventListener('resize', handleResize);
+
+  return users.map(u =&gt; &lt;User key={u.id} {...u} /&gt;);
+}
+
+// ✅ CORRECT: Side effects in effects
+function UserList({ users }) {
+  useEffect(() =&gt; {
+    localStorage.setItem('lastViewed', Date.now());
+  });
+
+  const commitCountRef = useRef(0);
+  useEffect(() =&gt; {
+    commitCountRef.current++;
+  });
+
+  useEffect(() =&gt; {
+    window.addEventListener('resize', handleResize);
+    return () =&gt; window.removeEventListener('resize', handleResize);
+  }, []);
+
+  return users.map(u =&gt; &lt;User key={u.id} {...u} /&gt;);
+}</code></pre>
+        <p><strong>Why it matters:</strong> Under concurrent rendering, the render phase can be invoked multiple times, paused, and restarted. Side effects will execute unpredictably — potentially multiple times or not at all for an aborted render.</p>
+      </details>
+
+      <details>
+        <summary><strong>Mistake 2: Relying on Render Count</strong></summary>
+        <pre><code class="language-javascript">// ❌ WRONG: Assuming render count == commit count
+let globalRenderCount = 0;
+function Analytics() {
+  globalRenderCount++; // Fires extra times in StrictMode + concurrent
+  // May report 2x, 3x the actual renders
+
+  return &lt;span&gt;Renders: {globalRenderCount}&lt;/span&gt;;
+}
+
+// ✅ CORRECT: Track commits, not renders
+function Analytics() {
+  const commitCount = useRef(0);
+
+  useEffect(() =&gt; {
+    commitCount.current++;
+    reportMetric('component_committed', commitCount.current);
+  });
+
+  return &lt;span&gt;Commits: {commitCount.current}&lt;/span&gt;;
+}</code></pre>
+        <p><strong>Why it matters:</strong> React may call your render function speculatively (for pre-rendering, StrictMode validation, or after interruption). Only committed renders (those that reach the commit phase) represent actual UI updates.</p>
+      </details>
+
+      <details>
+        <summary><strong>Mistake 3: Not Using Key Properly</strong></summary>
+        <pre><code class="language-javascript">// ❌ WRONG: Index as key for dynamic lists
+function TodoList({ todos }) {
+  return todos.map((todo, index) =&gt; (
+    &lt;TodoItem key={index} todo={todo} /&gt;
+    // If items reorder, React matches fibers by index
+    // → wrong state associated with wrong items
+    // → unnecessary DOM mutations (update all items vs move one)
+  ));
+}
+
+// ❌ WRONG: Non-stable keys
+function TodoList({ todos }) {
+  return todos.map(todo =&gt; (
+    &lt;TodoItem key={Math.random()} todo={todo} /&gt;
+    // Every render creates new keys → all fibers unmount/remount
+    // → destroys component state, triggers mount effects
+    // → terrible performance
+  ));
+}
+
+// ✅ CORRECT: Stable, unique identifier
+function TodoList({ todos }) {
+  return todos.map(todo =&gt; (
+    &lt;TodoItem key={todo.id} todo={todo} /&gt;
+    // React can match old fiber to new element by key
+    // → minimal DOM operations (only move/update what changed)
+    // → preserves component state correctly
+  ));
+}</code></pre>
+        <p><strong>Why it matters for Fiber:</strong> Keys are how the reconciler identifies which fiber corresponds to which element across renders. <code>reconcileChildFibers</code> uses keys to determine Placement vs Update vs Deletion flags. Bad keys cause O(n) unnecessary DOM work instead of O(1) moves.</p>
+      </details>
+
+      <details>
+        <summary><strong>Mistake 4: Ignoring Strict Mode Warnings</strong></summary>
+        <pre><code class="language-javascript">// StrictMode double-invokes these in development:
+// - Function component bodies
+// - useState initializer functions
+// - useMemo callbacks
+// - useReducer reducers
+
+// If you see doubled API calls, doubled console logs, or doubled
+// subscriptions in development — that's StrictMode catching bugs:
+
+function Chat({ roomId }) {
+  useEffect(() =&gt; {
+    const connection = createConnection(roomId);
+    connection.connect();
+    // ❌ Missing cleanup → StrictMode reveals the leak:
+    // Mount → Unmount → Mount = 2 connections, 0 disconnections
+  }, [roomId]);
+
+  // ✅ Proper cleanup:
+  useEffect(() =&gt; {
+    const connection = createConnection(roomId);
+    connection.connect();
+    return () =&gt; connection.disconnect(); // Symmetric cleanup
+  }, [roomId]);
+}</code></pre>
+        <p><strong>Why it matters:</strong> StrictMode simulates the lifecycle of future concurrent features (offscreen rendering, fast refresh). Warnings today become bugs tomorrow when React leverages these rendering capabilities more aggressively.</p>
+      </details>
+
+      <details>
+        <summary><strong>Mistake 5: Assuming Synchronous State Updates</strong></summary>
+        <pre><code class="language-javascript">// ❌ WRONG: Reading state immediately after setState
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  function handleClick() {
+    setCount(count + 1);
+    console.log(count); // Still 0! State updates are batched
+    setCount(count + 1); // Both use stale count=0 → result is 1, not 2
+
+    // ❌ Assuming DOM is updated synchronously
+    setCount(5);
+    document.title = `Count: ${count}`; // Still shows old count
+  }
+
+  // ✅ CORRECT: Use updater function for sequential updates
+  function handleClickCorrect() {
+    setCount(c =&gt; c + 1); // Uses latest state
+    setCount(c =&gt; c + 1); // Chains correctly → result is 2
+
+    // For DOM reads after state update, use useEffect or flushSync:
+    flushSync(() =&gt; {
+      setCount(5); // Forces synchronous commit
+    });
+    // DOM is now updated — safe to read
+    console.log(document.title); // Reflects count=5
+  }
+}</code></pre>
+        <p><strong>Why it matters:</strong> In React 18, ALL state updates are batched by default (even in setTimeout, promises, native event handlers). Under concurrent rendering, updates may also be delayed or reordered based on priority. Never assume immediate state reflection.</p>
+      </details>
+    </section>
+
+    <!-- Section 18: Trade-offs -->
+    <section id="trade-offs" class="content-section">
+      <h2>Trade-offs</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Dimension</th>
+            <th>Synchronous Rendering</th>
+            <th>Concurrent Rendering</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Responsiveness</strong></td>
+            <td>Can block main thread for entire tree traversal</td>
+            <td>Yields every 5ms, stays responsive to user input</td>
+          </tr>
+          <tr>
+            <td><strong>Predictability</strong></td>
+            <td>Render → commit is a single synchronous operation</td>
+            <td>Renders may be interrupted, restarted, or discarded</td>
+          </tr>
+          <tr>
+            <td><strong>Memory</strong></td>
+            <td>Single tree in memory during reconciliation</td>
+            <td>Two full fiber trees (current + workInProgress) always in memory</td>
+          </tr>
+          <tr>
+            <td><strong>Complexity</strong></td>
+            <td>Simple mental model: setState → immediate render → DOM update</td>
+            <td>Complex: priorities, lanes, interruption, starvation, tearing</td>
+          </tr>
+          <tr>
+            <td><strong>Consistency</strong></td>
+            <td>UI always reflects one state version (never torn)</td>
+            <td>External stores can tear without useSyncExternalStore</td>
+          </tr>
+          <tr>
+            <td><strong>CPU cost per update</strong></td>
+            <td>Lower overhead (no scheduling, no yielding checks)</td>
+            <td>Higher overhead per fiber (shouldYield check, alternate management)</td>
+          </tr>
+          <tr>
+            <td><strong>Perceived performance</strong></td>
+            <td>Fast for small updates, janky for large ones</td>
+            <td>Consistently smooth — distributes work across frames</td>
+          </tr>
+          <tr>
+            <td><strong>Code constraints</strong></td>
+            <td>Side effects in render are buggy but "work"</td>
+            <td>Side effects in render are actively broken (non-deterministic)</td>
+          </tr>
+          <tr>
+            <td><strong>Debugging</strong></td>
+            <td>Single call stack, predictable profiling</td>
+            <td>Fragmented execution, harder to trace with DevTools</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-tip">
+        <p><strong>When synchronous is still used:</strong> Even with createRoot, React uses synchronous rendering for discrete events (clicks, key presses) where immediate feedback is expected. Concurrent rendering activates for transitions, deferred values, and Suspense boundaries. It's not all-or-nothing.</p>
+      </div>
+
+      <h3>Memory vs Responsiveness Trade-off</h3>
+      <p>The double-buffer approach (two fiber trees) roughly doubles memory usage for fiber metadata. For a tree with 10,000 fibers, this might be ~5-10MB of additional object allocations. React mitigates this through:</p>
+      <ul>
+        <li><strong>Fiber reuse:</strong> Alternates are recycled, not garbage collected and reallocated</li>
+        <li><strong>Lazy creation:</strong> workInProgress fibers are only created for nodes that need work</li>
+        <li><strong>Structural sharing:</strong> Unchanged subtrees share the same child pointers</li>
+      </ul>
+    </section>
+
+    <!-- Section 19: Follow-up Questions -->
+    <section id="follow-up-questions" class="content-section">
+      <h2>Follow-up Questions</h2>
+
+      <details>
+        <summary><strong>1. How does React determine which lane (priority) an update belongs to?</strong></summary>
+        <p>Lane assignment depends on the <em>context</em> in which setState is called:</p>
+        <ul>
+          <li><strong>Inside a click/keydown handler:</strong> SyncLane (highest priority, processed synchronously)</li>
+          <li><strong>Inside mousemove/scroll handler:</strong> InputContinuousLane</li>
+          <li><strong>Inside startTransition:</strong> TransitionLane (one of 16 transition lanes, for parallelism)</li>
+          <li><strong>Default (e.g., in a setTimeout):</strong> DefaultLane</li>
+          <li><strong>Inside useDeferredValue:</strong> TransitionLane (treated as a transition)</li>
+        </ul>
+        <p>React tracks the "current event priority" via a module-level variable (<code>currentUpdatePriority</code>) that's set by the event system before dispatching handlers and reset after.</p>
+      </details>
+
+      <details>
+        <summary><strong>2. What happens if a higher-priority update arrives while React is mid-render on a lower-priority update?</strong></summary>
+        <p>React performs "preemption":</p>
+        <ol>
+          <li>The scheduler detects a higher-priority task exists (via <code>shouldYield()</code> or task queue comparison)</li>
+          <li>The current work loop exits</li>
+          <li><code>ensureRootIsScheduled</code> sees the new higher-priority lanes</li>
+          <li>It calls <code>prepareFreshStack</code> which discards the partially-built workInProgress tree</li>
+          <li>A new render begins at the higher-priority lane, using the committed current tree as the base</li>
+          <li>After the high-priority render commits, the original lower-priority work is rescheduled (it may need to be restarted from scratch if the base state changed)</li>
+        </ol>
+      </details>
+
+      <details>
+        <summary><strong>3. How does Suspense interact with Fiber and concurrent rendering?</strong></summary>
+        <p>When a component inside a Suspense boundary throws a Promise (the "suspend" signal):</p>
+        <ol>
+          <li>React catches the thrown promise during <code>beginWork</code></li>
+          <li>It marks the Suspense boundary fiber with a <code>DidCapture</code> flag</li>
+          <li>React renders the fallback UI instead of the suspended subtree</li>
+          <li>The promise is attached to the fiber; when it resolves, React schedules a "retry" at the same lane</li>
+          <li>With concurrent rendering, React can <em>keep showing the old UI</em> while the new version loads (instead of immediately showing the fallback) — this is the "concurrent Suspense" behavior enabled by transitions</li>
+        </ol>
+      </details>
+
+      <details>
+        <summary><strong>4. Why are there 31 lanes (bits) instead of simple numeric priorities?</strong></summary>
+        <p>Lanes use a 31-bit integer as a bitmask because:</p>
+        <ul>
+          <li><strong>Batching:</strong> Multiple updates at the same priority can be merged into one render by OR-ing their lanes: <code>renderLanes = lane1 | lane2</code></li>
+          <li><strong>Subset checking:</strong> "Does this fiber have work at this priority?" is a single AND: <code>fiber.lanes &amp; renderLanes !== 0</code></li>
+          <li><strong>Parallel transitions:</strong> 16 transition lanes allow multiple in-flight transitions to be tracked independently</li>
+          <li><strong>Entanglement:</strong> Some updates must commit together (e.g., if update B depends on update A's state). Entangled lanes ensure they're processed in the same render.</li>
+          <li><strong>Performance:</strong> Bitmask operations are single CPU instructions — O(1) for union, intersection, subset checks</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary><strong>5. How does React handle errors during concurrent rendering?</strong></summary>
+        <p>Error boundaries work across both phases:</p>
+        <ul>
+          <li><strong>Render phase error:</strong> React catches it, discards the partial workInProgress subtree, walks up to find the nearest error boundary, re-renders that boundary with the fallback UI</li>
+          <li><strong>Commit phase error:</strong> More serious — DOM may be partially mutated. React still catches it and unmounts the errored subtree, showing the boundary's fallback</li>
+          <li><strong>Concurrent specifics:</strong> If an error occurs during an interruptible render and is caused by a race condition (e.g., reading stale data), React may retry the render synchronously before showing the error boundary. This is the "error retry" mechanism.</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary><strong>6. What is "tearing" and how does useSyncExternalStore prevent it?</strong></summary>
+        <p><strong>Tearing:</strong> Different parts of the UI reflecting different versions of the same data source in a single frame. This can't happen with React state (React controls when state is read), but CAN happen with external stores (Redux, Zustand, module-level variables).</p>
+        <p><strong>How it happens:</strong></p>
+        <ol>
+          <li>React starts rendering Component A, reads store version 1</li>
+          <li>React yields (time slicing)</li>
+          <li>External code updates the store to version 2</li>
+          <li>React resumes, renders Component B, reads store version 2</li>
+          <li>Result: A shows v1 data, B shows v2 data — torn UI</li>
+        </ol>
+        <p><strong>Prevention:</strong> <code>useSyncExternalStore</code> takes a snapshot at render start and checks it before commit. If the store changed during render, React forces a synchronous re-render to get a consistent snapshot.</p>
+      </details>
+
+      <details>
+        <summary><strong>7. How does the Offscreen (Activity) API relate to Fiber's architecture?</strong></summary>
+        <p>The Offscreen API (renamed to <code>&lt;Activity&gt;</code>) leverages Fiber's ability to:</p>
+        <div class="callout callout-warning">
+          <p><strong>Status (2024):</strong> <code>&lt;Activity&gt;</code> remains experimental/unstable in React 19. It's not available in the stable API surface. Don't present it as shipped in an interview — say "there's an experimental Activity API that React is exploring."</p>
+        </div>
+        <ul>
+          <li><strong>Render at lowest priority:</strong> Offscreen content uses IdleLane, only processed when nothing else needs the CPU</li>
+          <li><strong>Keep fiber trees alive but hidden:</strong> Components are rendered but their DOM effects are suppressed (visibility: hidden or detached)</li>
+          <li><strong>Pre-render future views:</strong> A tab you haven't clicked yet can be pre-rendered in the background, its fiber tree ready to be committed instantly when activated</li>
+          <li><strong>Retain state during hide/show:</strong> Unlike unmounting, offscreen fibers keep their state and refs — enabling instant tab switching without data refetching</li>
+        </ul>
+        <p>This is fundamentally only possible because Fiber separates the render phase (building the tree) from the commit phase (showing it). You can render without committing, or commit selectively.</p>
+      </details>
+
+      <details>
+        <summary><strong>8. How does React 19's <code>use()</code> hook integrate with Fiber/Suspense?</strong></summary>
+        <p><code>use()</code> is a new hook (React 19) that reads the value of a Promise or Context during render. When it encounters an unresolved Promise, it throws it (like Suspense), causing Fiber to suspend that subtree. Key differences from existing patterns:</p>
+        <ul>
+          <li>Unlike <code>useEffect</code> + state, <code>use()</code> integrates directly with the render phase and Suspense machinery</li>
+          <li>It can be called conditionally (unlike other hooks), because it doesn't maintain hook slot state — it reads an external value</li>
+          <li>The Promise must be created <em>outside</em> the render function (parent component, cache, or module scope) — otherwise a new Promise is created each render, causing infinite Suspense loops</li>
+        </ul>
+      </details>
+    </section>
+
+    <!-- Section 20: Summary -->
+    <section id="summary" class="content-section">
+      <h2>Summary</h2>
+
+      <h3>Mental Models</h3>
+      <ul>
+        <li><strong>Fiber = virtual stack frame:</strong> Each fiber is a unit of work that would have been a frame on the call stack in the old reconciler. By moving to heap-allocated objects, React can pause/resume/reorder work.</li>
+        <li><strong>Double buffer = back buffer in games:</strong> You never see a half-drawn frame because rendering happens off-screen (workInProgress tree), and only the finished result gets "swapped in" (commit).</li>
+        <li><strong>Scheduler = cooperative OS process scheduler:</strong> React's scheduler multiplexes multiple "processes" (renders at different priorities) onto a single thread, using time slicing and priority queues — exactly like a cooperative multitasking OS.</li>
+        <li><strong>Lanes = bitmask priority groups:</strong> Think of lanes as highway lanes — multiple updates can ride in the same lane (batched), and React processes lanes from fastest (SyncLane) to slowest (IdleLane).</li>
+        <li><strong>Render phase = planning, Commit phase = execution:</strong> The render phase figures out what needs to change (pure computation). The commit phase makes it happen (side effects). Only the planning can be interrupted.</li>
+      </ul>
+
+      <h3>What NOT to Say in an Interview</h3>
+      <div class="callout callout-warning">
+        <ul>
+          <li>❌ "Fiber uses requestIdleCallback" — It doesn't. React has its own scheduler using MessageChannel.</li>
+          <li>❌ "Concurrent mode makes everything async" — Discrete events (clicks) are still synchronous. Only transitions and deferred values use concurrent rendering.</li>
+          <li>❌ "Virtual DOM diffing is what makes React fast" — The virtual DOM is about declarative programming, not speed. Fiber's contribution is scheduling and interruptibility, not diffing speed.</li>
+          <li>❌ "Fiber is about rendering components in parallel" — Fiber is single-threaded. Concurrency here means interleaving, not parallelism. React can switch between tasks, but only one runs at a time.</li>
+          <li>❌ "You need to opt into concurrent rendering per component" — Concurrent rendering is enabled at the root level (createRoot). Individual components opt into concurrent features via startTransition, useDeferredValue, etc.</li>
+          <li>❌ "useEffect runs during render" — Effects are scheduled during render but execute during or after commit. This distinction is fundamental to Fiber's architecture.</li>
+        </ul>
+      </div>
+
+      <h3>Key Takeaways for Senior Engineers</h3>
+      <ol>
+        <li>Fiber replaced the call stack with a linked-list tree of work units that can be paused and resumed</li>
+        <li>The work loop processes one fiber at a time, yielding every ~5ms to keep the main thread responsive</li>
+        <li>Double buffering (current + workInProgress trees) prevents visual tearing</li>
+        <li>The render phase is pure and interruptible; the commit phase is synchronous and effectful</li>
+        <li>Lanes provide fine-grained priority scheduling with bitmask efficiency</li>
+        <li>Your code's contract with React: render must be pure, side effects belong in effects</li>
+        <li>External stores must use useSyncExternalStore to prevent tearing under concurrent rendering</li>
+      </ol>
+    </section>
+
+  </main>
+
+  <script src="../assets/js/main.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+</body>
+</html>
