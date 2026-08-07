@@ -1,0 +1,1639 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 16: PostgreSQL Multi-Tenancy & Row-Level Security | Senior Backend Interview Handbook</title>
+  <link rel="stylesheet" href="../assets/css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+  <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
+  <button class="mobile-menu-toggle" aria-label="Toggle navigation">☰</button>
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a href="../index.html" class="sidebar-brand">📘 Handbook</a>
+    </div>
+    <div class="sidebar-chapter">
+      <span class="chapter-num">Ch 16</span>
+      <span class="chapter-title">PostgreSQL Multi-Tenancy &amp; RLS</span>
+    </div>
+    <nav class="sidebar-nav">
+      <ul>
+        <li><a href="#interviewer-intent">Interviewer Intent</a></li>
+        <li><a href="#quick-answer">Quick Answer</a></li>
+        <li><a href="#multi-tenancy-strategies">Multi-Tenancy Strategies</a></li>
+        <li><a href="#row-level-security">Row-Level Security (RLS)</a></li>
+        <li><a href="#rls-policies">Writing RLS Policies</a></li>
+        <li><a href="#rls-spring-boot">RLS with Spring Boot</a></li>
+        <li><a href="#performance">Performance &amp; Indexing</a></li>
+        <li><a href="#production-incident">Production Incident</a></li>
+        <li><a href="#code-examples">Code Examples</a></li>
+        <li><a href="#common-mistakes">Common Mistakes</a></li>
+        <li><a href="#trade-offs">Trade-Offs</a></li>
+        <li><a href="#follow-up-questions">Follow-Up Questions</a></li>
+        <li><a href="#summary">Summary</a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-actions">
+      <button data-action="expand-all" class="btn-sm">Expand All</button>
+      <button data-action="collapse-all" class="btn-sm">Collapse All</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb">
+      <a href="../index.html">Home</a> &rsaquo;
+      <a href="../index.html#part-ii">Part II — Distributed Systems &amp; Infrastructure</a> &rsaquo;
+      <span>Chapter 16</span>
+    </nav>
+    <header class="chapter-header">
+      <div class="chapter-meta">
+        <span class="badge badge-hard">Hard</span>
+        <span class="badge badge-topic">Multi-Tenancy</span>
+        <span class="badge badge-topic">PostgreSQL</span>
+        <span class="badge badge-topic">RLS</span>
+      </div>
+      <h1>How Would You Design Multi-Tenancy in PostgreSQL, and When Would You Use Row-Level Security?</h1>
+      <p class="chapter-takeaway"><strong>Key Takeaway:</strong> Multi-tenancy has three implementation strategies — separate databases, separate schemas, and shared tables with a tenant ID column — each with different isolation, cost, and operational trade-offs. Row-Level Security (RLS) is PostgreSQL's built-in enforcement layer that makes shared-table multi-tenancy safe at the database level, eliminating the risk of tenant data leaks caused by missing application-layer WHERE clauses.</p>
+    </header>
+    <div class="search-container">
+      <input type="search" class="search-input" placeholder="Search..." aria-label="Search chapter content">
+    </div>
+
+    <!-- Section 1: Interviewer Intent -->
+    <section id="interviewer-intent">
+      <h2>Interviewer Intent</h2>
+      <details>
+        <summary>What the interviewer is really evaluating</summary>
+        <div class="callout callout-info">
+          <p>This question tests your ability to design systems that serve multiple customers from shared infrastructure — a core challenge in SaaS products. The interviewer wants to see:</p>
+        </div>
+        <ul>
+          <li><strong>Awareness of isolation models:</strong> You understand the spectrum from hard database-per-tenant isolation to soft shared-table isolation and can articulate the trade-offs.</li>
+          <li><strong>Security depth:</strong> You know that application-level tenant filtering is fragile and that RLS provides a defense-in-depth layer directly in the database.</li>
+          <li><strong>Operational thinking:</strong> You consider how the choice affects schema migrations, connection pooling, backup strategies, and tenant onboarding costs.</li>
+          <li><strong>Performance intuition:</strong> You understand how indexes, partitioning, and connection pool configuration interact with the chosen strategy.</li>
+          <li><strong>Real experience:</strong> You can describe a data-leak incident or near-miss caused by a missing <code>WHERE tenant_id = ?</code> clause and how RLS would have prevented it.</li>
+        </ul>
+        <p>Senior engineers are expected to have opinions here — not just recite options. The interviewer will probe for why you would choose one approach for a startup with 10 tenants versus an enterprise platform with 10,000.</p>
+      </details>
+    </section>
+
+    <!-- Section 2: Quick Answer -->
+    <section id="quick-answer">
+      <h2>Quick Answer</h2>
+      <details>
+        <summary>30-second interview response</summary>
+        <div class="callout callout-tip">
+          <blockquote>
+            <p>"There are three main strategies. <strong>Database-per-tenant</strong> gives the strongest isolation and is ideal for enterprise customers with strict compliance requirements, but it's expensive to operate at scale. <strong>Schema-per-tenant</strong> keeps tenants in the same Postgres instance but in separate namespaces — good for mid-market SaaS. <strong>Shared tables with a tenant_id column</strong> is the most cost-efficient and scales to thousands of tenants, but it requires rigorous application-level filtering, which is error-prone. That's where <strong>Row-Level Security</strong> comes in — I'd always enable RLS on shared tables as a safety net. You define policies that automatically append a <code>WHERE tenant_id = current_setting('app.tenant_id')</code> filter to every query, so even if the application forgets the filter, the database enforces it."</p>
+          </blockquote>
+        </div>
+        <p>This answer shows you know all three strategies, can justify the choice, and understand RLS as a security mechanism rather than just a performance trick. The sections below expand on each with production-grade SQL and Spring Boot integration.</p>
+      </details>
+    </section>
+
+
+    <!-- Section 3: Multi-Tenancy Strategies -->
+    <section id="multi-tenancy-strategies">
+      <h2>Multi-Tenancy Strategies</h2>
+
+      <details>
+        <summary>Strategy 1 — Database-per-Tenant</summary>
+        <div class="callout callout-info">
+          <p><strong>Model:</strong> Each tenant gets a completely separate PostgreSQL database (or even separate server). No shared objects at the database level.</p>
+        </div>
+        <pre class="diagram">
+  Database-per-Tenant Architecture:
+  ══════════════════════════════════════════════════════════════
+
+  App Server
+      │
+      ├── tenant_id=acme    → postgres://acme-db:5432/acme
+      ├── tenant_id=globex  → postgres://globex-db:5432/globex
+      └── tenant_id=initech → postgres://initech-db:5432/initech
+
+  Each database:
+  ┌──────────────────────┐
+  │  users               │
+  │  orders              │  ← identical schema, no tenant_id column needed
+  │  invoices            │
+  └──────────────────────┘
+
+  Connection routing via tenant registry:
+  ┌─────────────────┐      ┌──────────────────────────┐
+  │  Request        │─────▶│  TenantRoutingDataSource  │
+  │  (tenant=acme)  │      │  resolves connection URL  │
+  └─────────────────┘      └──────────────────────────┘
+        </pre>
+
+        <h3>Implementation: Dynamic DataSource Routing in Spring Boot</h3>
+        <pre><code class="language-java">// TenantContext: stores current tenant in a ThreadLocal
+public class TenantContext {
+    private static final ThreadLocal&lt;String&gt; CURRENT_TENANT = new ThreadLocal&lt;&gt;();
+
+    public static void setTenantId(String tenantId) {
+        CURRENT_TENANT.set(tenantId);
+    }
+
+    public static String getTenantId() {
+        return CURRENT_TENANT.get();
+    }
+
+    public static void clear() {
+        CURRENT_TENANT.remove();
+    }
+}
+
+// AbstractRoutingDataSource: routes connections by tenant
+@Component
+public class TenantRoutingDataSource extends AbstractRoutingDataSource {
+
+    @Override
+    protected Object determineCurrentLookupKey() {
+        String tenantId = TenantContext.getTenantId();
+        if (tenantId == null) {
+            throw new IllegalStateException("No tenant set in current thread context");
+        }
+        return tenantId;
+    }
+}
+
+// Configuration: register one DataSource per tenant at startup
+@Configuration
+public class MultiTenantDataSourceConfig {
+
+    @Autowired
+    private TenantRegistry tenantRegistry; // loads tenant DB configs from DB or config service
+
+    @Bean
+    public DataSource dataSource() {
+        Map&lt;Object, Object&gt; dataSources = new HashMap&lt;&gt;();
+
+        for (TenantConfig tenant : tenantRegistry.getAllTenants()) {
+            HikariConfig config = new HikariConfig();
+            config.setJdbcUrl(tenant.getJdbcUrl());
+            config.setUsername(tenant.getDbUsername());
+            config.setPassword(tenant.getDbPassword());
+            config.setMaximumPoolSize(10); // per-tenant pool — monitor total connections!
+            config.setPoolName("pool-" + tenant.getTenantId());
+            dataSources.put(tenant.getTenantId(), new HikariDataSource(config));
+        }
+
+        TenantRoutingDataSource routingDataSource = new TenantRoutingDataSource();
+        routingDataSource.setTargetDataSources(dataSources);
+        routingDataSource.setDefaultTargetDataSource(dataSources.values().iterator().next());
+        return routingDataSource;
+    }
+}
+
+// Filter: extract tenant from JWT and set in context
+@Component
+@Order(1)
+public class TenantResolutionFilter implements Filter {
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+        HttpServletRequest request = (HttpServletRequest) req;
+        try {
+            String tenantId = extractTenantFromJwt(request);
+            TenantContext.setTenantId(tenantId);
+            chain.doFilter(req, res);
+        } finally {
+            TenantContext.clear(); // CRITICAL: always clear to avoid ThreadLocal leaks
+        }
+    }
+
+    private String extractTenantFromJwt(HttpServletRequest request) {
+        String token = request.getHeader("Authorization");
+        // Parse JWT claims — tenant_id is stored as a custom claim
+        return JwtUtils.getClaim(token, "tenant_id");
+    }
+}</code></pre>
+
+        <h3>Trade-offs</h3>
+        <table>
+          <thead><tr><th>Aspect</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr><td>✅ Isolation</td><td>Complete — no SQL bug can cross tenant boundaries</td></tr>
+            <tr><td>✅ Compliance</td><td>Easy to meet GDPR "right to erasure" — just drop the database</td></tr>
+            <tr><td>✅ Performance</td><td>Dedicated resources; one tenant's query load can't starve another</td></tr>
+            <tr><td>❌ Cost</td><td>N databases × overhead — idle connections, storage, backups multiply with tenant count</td></tr>
+            <tr><td>❌ Migrations</td><td>Schema changes must run against every tenant database (Flyway multi-tenant runner needed)</td></tr>
+            <tr><td>❌ Connection pool</td><td>At 1000 tenants × 10 pool size = 10,000 DB connections — PostgreSQL typically maxes out around 500–1000</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout-warning">
+          <p><strong>Connection pool explosion:</strong> Database-per-tenant with a large number of tenants quickly exhausts PostgreSQL's <code>max_connections</code>. Use PgBouncer in transaction-mode pooling in front of each tenant DB to reduce live connections.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Strategy 2 — Schema-per-Tenant</summary>
+        <div class="callout callout-info">
+          <p><strong>Model:</strong> All tenants share one PostgreSQL instance, but each has a private schema (namespace). The application sets <code>search_path</code> to the tenant's schema on each connection.</p>
+        </div>
+        <pre class="diagram">
+  Schema-per-Tenant Architecture:
+  ══════════════════════════════════════════════════════════════
+
+  Single PostgreSQL Instance
+  ┌─────────────────────────────────────────────────────────┐
+  │                                                         │
+  │  schema: acme        schema: globex     schema: public  │
+  │  ┌──────────────┐    ┌──────────────┐   ┌───────────┐  │
+  │  │ users        │    │ users        │   │ shared    │  │
+  │  │ orders       │    │ orders       │   │ config    │  │
+  │  │ invoices     │    │ invoices     │   └───────────┘  │
+  │  └──────────────┘    └──────────────┘                  │
+  └─────────────────────────────────────────────────────────┘
+
+  App sets: SET search_path TO acme, public;
+  Query:    SELECT * FROM users; → resolves to acme.users
+        </pre>
+
+        <h3>Setting search_path per connection in Spring Boot</h3>
+        <pre><code class="language-java">// Hibernate multi-tenant connection provider using schema isolation
+@Component
+public class SchemaPerTenantConnectionProvider
+        implements MultiTenantConnectionProvider {
+
+    @Autowired
+    private DataSource dataSource; // single datasource for the shared PG instance
+
+    @Override
+    public Connection getAnyConnection() throws SQLException {
+        return dataSource.getConnection();
+    }
+
+    @Override
+    public Connection getConnection(String tenantIdentifier) throws SQLException {
+        Connection conn = dataSource.getConnection();
+        // Validate tenant name to prevent SQL injection via search_path
+        if (!tenantIdentifier.matches("^[a-z0-9_]{1,63}$")) {
+            throw new IllegalArgumentException("Invalid tenant identifier: " + tenantIdentifier);
+        }
+        // Switch schema context for this connection
+        conn.createStatement().execute(
+            "SET search_path TO " + tenantIdentifier + ", public"
+        );
+        return conn;
+    }
+
+    @Override
+    public void releaseConnection(String tenantIdentifier, Connection conn)
+            throws SQLException {
+        // Reset to public schema before returning to pool
+        conn.createStatement().execute("SET search_path TO public");
+        conn.close();
+    }
+
+    // ... other required overrides
+}</code></pre>
+
+        <h3>Provisioning a new tenant schema</h3>
+        <pre><code class="language-sql">-- Called during tenant onboarding
+-- Run via a privileged service account, not the app user
+CREATE SCHEMA IF NOT EXISTS acme;
+
+-- Grant the app role access to the new schema
+GRANT USAGE ON SCHEMA acme TO app_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA acme TO app_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA acme
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_role;
+
+-- Run Flyway migrations scoped to this schema
+-- flyway.schemas=acme
+-- flyway.default-schema=acme</code></pre>
+
+        <h3>Trade-offs</h3>
+        <table>
+          <thead><tr><th>Aspect</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr><td>✅ Isolation</td><td>Good — cross-tenant queries require explicit schema prefix</td></tr>
+            <tr><td>✅ Cost</td><td>Single PG instance; schemas are cheap (just namespace metadata)</td></tr>
+            <tr><td>✅ Migrations</td><td>Run Flyway once per schema; tools like Flyway Teams support multi-schema natively</td></tr>
+            <tr><td>❌ Scale ceiling</td><td>Postgres system catalog bloats with thousands of schemas; practical limit ~1000 tenants per instance</td></tr>
+            <tr><td>❌ search_path risk</td><td>Forgetting to set search_path falls back to public, leaking or corrupting shared state</td></tr>
+            <tr><td>❌ Cross-tenant queries</td><td>Reporting across all tenants requires dynamic SQL or a separate aggregation layer</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Strategy 3 — Shared Tables with tenant_id Column</summary>
+        <div class="callout callout-info">
+          <p><strong>Model:</strong> All tenants share the same tables. Every table has a <code>tenant_id</code> column and the application (or RLS policy) filters by it on every query.</p>
+        </div>
+        <pre class="diagram">
+  Shared-Table Architecture:
+  ══════════════════════════════════════════════════════════════
+
+  Single PostgreSQL Instance, Single Schema
+  ┌─────────────────────────────────────────────────────────┐
+  │                                                         │
+  │  Table: orders                                          │
+  │  ┌──────────┬────────────┬────────┬──────────────────┐  │
+  │  │ id       │ tenant_id  │ amount │ status           │  │
+  │  ├──────────┼────────────┼────────┼──────────────────┤  │
+  │  │ 1001     │ acme       │ 250.00 │ paid             │  │
+  │  │ 1002     │ globex     │ 99.00  │ pending          │  │
+  │  │ 1003     │ acme       │ 75.00  │ pending          │  │
+  │  │ 1004     │ initech    │ 500.00 │ paid             │  │
+  │  └──────────┴────────────┴────────┴──────────────────┘  │
+  │                  ↑                                       │
+  │   EVERY query must filter on this column                 │
+  │   (enforced by app layer OR by RLS policy)               │
+  └─────────────────────────────────────────────────────────┘
+        </pre>
+
+        <h3>Base Schema Setup</h3>
+        <pre><code class="language-sql">-- Tenants registry
+CREATE TABLE tenants (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug        VARCHAR(63) UNIQUE NOT NULL,  -- 'acme', 'globex'
+    name        VARCHAR(255) NOT NULL,
+    plan        VARCHAR(50) NOT NULL DEFAULT 'starter',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+-- All data tables include tenant_id
+CREATE TABLE orders (
+    id          BIGSERIAL,
+    tenant_id   UUID NOT NULL REFERENCES tenants(id),
+    customer_id BIGINT NOT NULL,
+    amount      NUMERIC(12, 2) NOT NULL,
+    status      VARCHAR(50) NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Composite primary key keeps tenant_id in every index
+    PRIMARY KEY (tenant_id, id)
+);
+
+-- Composite index: tenant_id first for all queries that filter by tenant
+CREATE INDEX idx_orders_tenant_status
+    ON orders (tenant_id, status, created_at DESC);
+
+CREATE TABLE invoices (
+    id          BIGSERIAL,
+    tenant_id   UUID NOT NULL REFERENCES tenants(id),
+    order_id    BIGINT NOT NULL,
+    total       NUMERIC(12, 2) NOT NULL,
+    due_date    DATE NOT NULL,
+    PRIMARY KEY (tenant_id, id)
+);
+
+CREATE INDEX idx_invoices_tenant_order
+    ON invoices (tenant_id, order_id);</code></pre>
+
+        <h3>Trade-offs</h3>
+        <table>
+          <thead><tr><th>Aspect</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr><td>✅ Cost</td><td>Single database, single connection pool — easily handles 100,000+ tenants</td></tr>
+            <tr><td>✅ Migrations</td><td>One ALTER TABLE statement covers all tenants instantly</td></tr>
+            <tr><td>✅ Cross-tenant queries</td><td>Aggregating across tenants is a simple GROUP BY tenant_id</td></tr>
+            <tr><td>❌ Isolation risk</td><td>One missing WHERE clause exposes all tenant data — requires RLS as backstop</td></tr>
+            <tr><td>❌ Noisy neighbor</td><td>One tenant's heavy queries can degrade performance for others</td></tr>
+            <tr><td>❌ Compliance</td><td>Harder to prove data isolation for audit purposes without RLS enforced at DB level</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Choosing the right strategy</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Criterion</th>
+              <th>Database-per-Tenant</th>
+              <th>Schema-per-Tenant</th>
+              <th>Shared Tables + RLS</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Tenant count</td>
+              <td>&lt; 100</td>
+              <td>100 – 1,000</td>
+              <td>1,000 – unlimited</td>
+            </tr>
+            <tr>
+              <td>Isolation level</td>
+              <td>Strongest</td>
+              <td>Strong</td>
+              <td>Good (with RLS)</td>
+            </tr>
+            <tr>
+              <td>Compliance needs</td>
+              <td>SOC 2 Type II, HIPAA</td>
+              <td>Standard SaaS</td>
+              <td>Standard SaaS + RLS audit trail</td>
+            </tr>
+            <tr>
+              <td>Operational cost</td>
+              <td>High (N databases)</td>
+              <td>Medium</td>
+              <td>Low</td>
+            </tr>
+            <tr>
+              <td>Migration complexity</td>
+              <td>High (run N times)</td>
+              <td>Medium (run per schema)</td>
+              <td>Low (run once)</td>
+            </tr>
+            <tr>
+              <td>Best for</td>
+              <td>Enterprise / white-label</td>
+              <td>Mid-market SaaS</td>
+              <td>High-volume SaaS / PLG</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout-tip">
+          <p><strong>Hybrid approach:</strong> Many mature SaaS platforms use a tiered model — large enterprise tenants get dedicated databases (premium tier), mid-market tenants get schema isolation, and self-serve/free tenants share tables. Tenant tier is stored in the registry and the routing layer dispatches accordingly.</p>
+        </div>
+      </details>
+    </section>
+
+
+    <!-- Section 4: Row-Level Security -->
+    <section id="row-level-security">
+      <h2>Row-Level Security (RLS)</h2>
+
+      <details>
+        <summary>How RLS works inside PostgreSQL</summary>
+        <div class="callout callout-info">
+          <p>RLS is a PostgreSQL feature (introduced in 9.5) that attaches <strong>security policies</strong> to tables. When enabled, the query planner automatically injects the policy's predicate as an additional filter on every SELECT, INSERT, UPDATE, and DELETE — before the query executes. The application cannot bypass this filter without explicitly being granted the <code>BYPASSRLS</code> privilege.</p>
+        </div>
+        <pre class="diagram">
+  Without RLS:
+  ════════════════════════════════════════════════════════════
+
+  App Query:  SELECT * FROM orders WHERE status = 'pending'
+                                         ↓
+  Planner:    SCAN orders WHERE status = 'pending'
+              ↑ returns rows from ALL tenants if app forgot tenant filter!
+
+  With RLS enabled + policy:
+  ════════════════════════════════════════════════════════════
+
+  App Query:  SELECT * FROM orders WHERE status = 'pending'
+                                         ↓
+  Planner:    SCAN orders
+              WHERE status = 'pending'
+              AND tenant_id = current_setting('app.tenant_id')::uuid
+              ↑ policy predicate injected automatically by PostgreSQL
+              ↑ even if app omits it, tenant isolation is enforced
+
+  Execution flow:
+  ┌─────────────┐    ┌─────────────────────┐    ┌──────────────────────┐
+  │ App sends   │───▶│ Postgres checks RLS  │───▶│ Policy predicate     │
+  │ query       │    │ is enabled on table  │    │ merged with WHERE    │
+  └─────────────┘    └─────────────────────┘    └──────────┬───────────┘
+                                                            │
+                                              ┌─────────────▼───────────┐
+                                              │ Filtered result set      │
+                                              │ (only current tenant)    │
+                                              └─────────────────────────┘
+        </pre>
+
+        <h3>Enabling RLS</h3>
+        <pre><code class="language-sql">-- Step 1: Enable RLS on the table
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+-- Step 2: Force RLS even for the table owner
+-- (without this, table owners bypass policies by default)
+ALTER TABLE orders FORCE ROW LEVEL SECURITY;
+
+-- Repeat for every tenant-scoped table
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invoices FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE users FORCE ROW LEVEL SECURITY;</code></pre>
+
+        <h3>The current_setting mechanism</h3>
+        <p>RLS policies need to know which tenant is active. PostgreSQL's <code>current_setting()</code> reads from a session-local variable set by the application at the start of each request.</p>
+        <pre><code class="language-sql">-- Application sets this at connection acquisition time:
+SET LOCAL app.tenant_id = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+
+-- Policy reads it:
+current_setting('app.tenant_id')::uuid
+
+-- 'missing_ok' variant avoids errors when variable is not set
+-- (returns NULL instead of raising exception — useful in migrations)
+current_setting('app.tenant_id', true)::uuid</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 5: Writing RLS Policies -->
+    <section id="rls-policies">
+      <h2>Writing RLS Policies</h2>
+
+      <details>
+        <summary>SELECT, INSERT, UPDATE, DELETE policies</summary>
+        <h3>Basic read/write policy</h3>
+        <pre><code class="language-sql">-- CREATE POLICY syntax:
+-- CREATE POLICY policy_name ON table_name
+--   [AS {PERMISSIVE | RESTRICTIVE}]
+--   [FOR {ALL | SELECT | INSERT | UPDATE | DELETE}]
+--   [TO role_name]
+--   [USING (predicate)]         -- checked on existing rows (SELECT, UPDATE, DELETE)
+--   [WITH CHECK (predicate)];   -- checked on new rows (INSERT, UPDATE)
+
+-- Policy for SELECT: tenant can only read their own rows
+CREATE POLICY tenant_isolation_select ON orders
+    FOR SELECT
+    USING (tenant_id = current_setting('app.tenant_id')::uuid);
+
+-- Policy for INSERT: tenant can only insert rows tagged with their tenant_id
+CREATE POLICY tenant_isolation_insert ON orders
+    FOR INSERT
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
+
+-- Policy for UPDATE: can only update own rows AND can only update to own tenant_id
+CREATE POLICY tenant_isolation_update ON orders
+    FOR UPDATE
+    USING  (tenant_id = current_setting('app.tenant_id')::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
+
+-- Policy for DELETE: can only delete own rows
+CREATE POLICY tenant_isolation_delete ON orders
+    FOR DELETE
+    USING (tenant_id = current_setting('app.tenant_id')::uuid);
+
+-- Alternatively, combine all into one ALL policy:
+CREATE POLICY tenant_isolation ON orders
+    FOR ALL
+    USING  (tenant_id = current_setting('app.tenant_id')::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);</code></pre>
+
+        <h3>Admin bypass policy (for internal tooling)</h3>
+        <pre><code class="language-sql">-- Create a dedicated admin role that can see all tenants
+-- (used for support tooling, cross-tenant reports, migrations)
+CREATE ROLE app_admin;
+CREATE ROLE app_user;
+
+-- Policy: app_user role sees only their tenant; app_admin sees all
+CREATE POLICY tenant_isolation ON orders
+    FOR ALL
+    TO app_user  -- applies only to this role
+    USING  (tenant_id = current_setting('app.tenant_id')::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
+
+-- app_admin has no restricting policy, so it sees all rows
+-- (or grant BYPASSRLS explicitly)
+ALTER ROLE app_admin BYPASSRLS;
+
+-- Verify policies on a table:
+SELECT policyname, cmd, roles, qual, with_check
+FROM pg_policies
+WHERE tablename = 'orders';</code></pre>
+
+        <h3>PERMISSIVE vs RESTRICTIVE policies</h3>
+        <pre><code class="language-sql">-- PERMISSIVE (default): multiple policies are OR-ed together
+-- A row is visible if ANY permissive policy allows it
+CREATE POLICY owner_policy ON documents
+    AS PERMISSIVE
+    FOR SELECT
+    USING (owner_id = current_user_id());
+
+CREATE POLICY shared_policy ON documents
+    AS PERMISSIVE
+    FOR SELECT
+    USING (is_public = TRUE);
+-- Result: user sees their own docs OR any public doc
+
+-- RESTRICTIVE: policies are AND-ed with permissive policies
+-- A row is visible only if ALL restrictive policies AND any permissive policy allows it
+CREATE POLICY tenant_boundary ON documents
+    AS RESTRICTIVE
+    FOR SELECT
+    USING (tenant_id = current_setting('app.tenant_id')::uuid);
+-- Result: user sees (their own docs OR public docs) AND only within their tenant
+-- This is the right pattern for multi-tenancy: RESTRICTIVE for tenant boundary,
+-- PERMISSIVE for ownership/sharing rules within a tenant</code></pre>
+
+        <h3>Row-level security with JOINs</h3>
+        <pre><code class="language-sql">-- RLS is applied per-table. In a JOIN, each table's policy is checked independently.
+-- This query automatically respects RLS on BOTH orders and invoices:
+
+SELECT o.id, o.amount, i.due_date
+FROM   orders o
+JOIN   invoices i ON i.order_id = o.id
+                 AND i.tenant_id = o.tenant_id
+WHERE  o.status = 'paid';
+
+-- PostgreSQL injects:
+--   orders.tenant_id    = current_setting('app.tenant_id')::uuid
+--   invoices.tenant_id  = current_setting('app.tenant_id')::uuid
+-- No cross-tenant data can leak through JOIN even if you forget the explicit filter.</code></pre>
+
+        <h3>Checking the query plan — verify RLS is applied</h3>
+        <pre><code class="language-sql">-- Always verify policies are being used in the plan
+SET app.tenant_id = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE status = 'pending';
+
+-- Look for the RLS filter in the output:
+-- Filter: ((tenant_id = (current_setting('app.tenant_id'))::uuid) AND ((status)::text = 'pending'::text))
+-- If you don't see the tenant_id filter — RLS is NOT active (check ENABLE + FORCE)</code></pre>
+      </details>
+
+      <details>
+        <summary>Advanced: Partial policies and role-specific rules</summary>
+        <pre><code class="language-sql">-- Use case: support staff can read any tenant's data in read-only mode
+-- but cannot modify data outside their own tenant assignment
+
+CREATE ROLE support_staff;
+
+-- Support can SELECT any row (no tenant restriction)
+CREATE POLICY support_read_all ON orders
+    FOR SELECT
+    TO support_staff
+    USING (TRUE);  -- no restriction — sees everything
+
+-- Support cannot INSERT/UPDATE/DELETE
+-- (simply don't create permissive write policies for support_staff)
+-- Without a matching write policy, writes are denied by default
+
+-- Tenant users retain the standard isolation policy
+CREATE POLICY tenant_isolation ON orders
+    FOR ALL
+    TO app_user
+    USING  (tenant_id = current_setting('app.tenant_id')::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);</code></pre>
+
+        <pre><code class="language-sql">-- Use case: within a tenant, users can only see their own orders
+-- unless they have the 'admin' role within that tenant
+
+CREATE POLICY user_order_isolation ON orders
+    AS PERMISSIVE
+    FOR SELECT
+    TO app_user
+    USING (
+        tenant_id = current_setting('app.tenant_id')::uuid
+        AND (
+            -- User sees their own orders always
+            owner_user_id = current_setting('app.user_id')::bigint
+            OR
+            -- Tenant admins see all tenant orders
+            current_setting('app.user_role') = 'admin'
+        )
+    );</code></pre>
+      </details>
+    </section>
+
+
+    <!-- Section 6: RLS with Spring Boot -->
+    <section id="rls-spring-boot">
+      <h2>RLS with Spring Boot</h2>
+
+      <details>
+        <summary>Setting the session variable on every connection</summary>
+        <p>The core challenge: you must execute <code>SET LOCAL app.tenant_id = '...'</code> at the start of every database transaction, before any SQL runs. The right place is a Hibernate interceptor or a JPA <code>EntityManager</code> callback.</p>
+
+        <h3>Approach 1: Hibernate EmptyInterceptor</h3>
+        <pre><code class="language-java">// Interceptor fires before every transaction begins
+@Component
+public class TenantRlsInterceptor extends EmptyInterceptor {
+
+    @Override
+    public void afterTransactionBegin(Transaction tx) {
+        String tenantId = TenantContext.getTenantId();
+        if (tenantId != null) {
+            // Use the underlying JDBC connection to set the session variable
+            // This fires inside the transaction boundary (SET LOCAL — resets on commit/rollback)
+            Session session = (Session) tx; // cast to Hibernate Session
+            session.doWork(connection -> {
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "SELECT set_config('app.tenant_id', ?, true)")) {
+                    ps.setString(1, tenantId);
+                    ps.execute();
+                }
+            });
+        }
+    }
+}
+
+// Register the interceptor
+@Configuration
+public class HibernateConfig {
+
+    @Autowired
+    private TenantRlsInterceptor tenantRlsInterceptor;
+
+    @Bean
+    public HibernatePropertiesCustomizer hibernatePropertiesCustomizer() {
+        return props -> props.put("hibernate.session_factory.interceptor", tenantRlsInterceptor);
+    }
+}</code></pre>
+
+        <h3>Approach 2: Spring's ConnectionPreparer (recommended for JPA/Spring Data)</h3>
+        <pre><code class="language-java">// DataSource wrapper that sets tenant_id on every borrowed connection
+@Component
+public class TenantAwareDataSource extends DelegatingDataSource {
+
+    public TenantAwareDataSource(DataSource delegate) {
+        super(delegate);
+    }
+
+    @Override
+    public Connection getConnection() throws SQLException {
+        Connection conn = super.getConnection();
+        applyTenantContext(conn);
+        return conn;
+    }
+
+    @Override
+    public Connection getConnection(String username, String password) throws SQLException {
+        Connection conn = super.getConnection(username, password);
+        applyTenantContext(conn);
+        return conn;
+    }
+
+    private void applyTenantContext(Connection conn) throws SQLException {
+        String tenantId = TenantContext.getTenantId();
+        if (tenantId != null) {
+            // set_config(key, value, is_local)
+            // is_local=true: variable is reset at end of transaction (safe for pooled connections)
+            // is_local=false: variable persists for entire session (risky with pooling!)
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT set_config('app.tenant_id', ?, true)")) {
+                ps.setString(1, tenantId);
+                ps.execute();
+            }
+        }
+    }
+}
+
+// Configuration
+@Configuration
+public class DataSourceConfig {
+
+    @Bean
+    @Primary
+    public DataSource dataSource(
+            @Qualifier("rawDataSource") DataSource rawDataSource) {
+        return new TenantAwareDataSource(rawDataSource);
+    }
+
+    @Bean("rawDataSource")
+    public DataSource rawDataSource() {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:postgresql://localhost:5432/myapp");
+        config.setUsername("app_user");
+        config.setPassword("secret");
+        config.setMaximumPoolSize(20);
+        // IMPORTANT: reset app.tenant_id when connection returns to pool
+        config.setConnectionInitSql("SELECT 1"); // optional init check
+        return new HikariDataSource(config);
+    }
+}</code></pre>
+
+        <h3>Approach 3: @Transactional with AOP (cleanest for service layer)</h3>
+        <pre><code class="language-java">// Custom annotation to declare tenant-scoped operations
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+@Transactional  // also makes it transactional
+public @interface TenantScoped { }
+
+// AOP aspect: sets tenant context before @TenantScoped methods
+@Aspect
+@Component
+@Order(1) // run before @Transactional opens the connection
+public class TenantContextAspect {
+
+    @Around("@annotation(TenantScoped)")
+    public Object setTenantContext(ProceedingJoinPoint pjp) throws Throwable {
+        String tenantId = TenantContext.getTenantId();
+        if (tenantId == null) {
+            throw new TenantContextMissingException(
+                "No tenant in context for " + pjp.getSignature().toShortString()
+            );
+        }
+        // TenantAwareDataSource will pick up the value from TenantContext
+        return pjp.proceed();
+    }
+}
+
+// Usage in service layer — clean, no boilerplate
+@Service
+@Slf4j
+public class OrderService {
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @TenantScoped
+    public List&lt;Order&gt; getActiveOrders() {
+        // RLS enforced at DB level; no manual tenant filter needed in query
+        return orderRepository.findByStatus(OrderStatus.ACTIVE);
+    }
+
+    @TenantScoped
+    public Order createOrder(CreateOrderRequest request) {
+        Order order = new Order();
+        order.setTenantId(UUID.fromString(TenantContext.getTenantId()));
+        order.setCustomerId(request.getCustomerId());
+        order.setAmount(request.getAmount());
+        order.setStatus(OrderStatus.PENDING);
+        return orderRepository.save(order); // RLS WITH CHECK ensures correct tenant_id
+    }
+}</code></pre>
+
+        <h3>Full request lifecycle with RLS</h3>
+        <pre class="diagram">
+  HTTP Request Lifecycle with RLS:
+  ══════════════════════════════════════════════════════════════
+
+  1. HTTP Request arrives
+     │
+  2. TenantResolutionFilter
+     │  → extracts tenant_id from JWT claim
+     │  → TenantContext.setTenantId("a1b2c3d4-...")
+     │
+  3. Controller → Service (@TenantScoped)
+     │  → AOP verifies TenantContext is set
+     │
+  4. @Transactional opens transaction
+     │  → HikariCP borrows a connection from pool
+     │
+  5. TenantAwareDataSource.getConnection()
+     │  → executes: SELECT set_config('app.tenant_id', 'a1b2c3d4-...', true)
+     │  → variable is LOCAL to this transaction
+     │
+  6. JPA/Hibernate executes query
+     │  → SELECT * FROM orders WHERE status = 'active'
+     │
+  7. PostgreSQL planner merges RLS policy
+     │  → actual scan: orders WHERE status='active'
+     │                        AND tenant_id='a1b2c3d4-...'
+     │
+  8. Result returned to app — contains ONLY this tenant's rows
+     │
+  9. Transaction commits/rolls back
+     │  → SET LOCAL variable automatically cleared
+     │
+  10. Connection returned to HikariCP pool
+      → no tenant state leaks to next borrower
+        </pre>
+
+        <div class="callout callout-danger">
+          <p><strong>Critical: use SET LOCAL, not SET SESSION.</strong> <code>SET LOCAL</code> scopes the variable to the current transaction and automatically resets when the transaction ends. If you use <code>SET SESSION</code> (or <code>set_config(..., false)</code>), the variable persists on the pooled connection and the next request that borrows it will run with the previous tenant's identity — a data leak.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Testing RLS policies in isolation</summary>
+        <pre><code class="language-sql">-- Always test RLS with the correct role — table owner bypasses RLS by default
+SET ROLE app_user;
+
+-- Simulate tenant A
+SET LOCAL app.tenant_id = 'aaaaaaaa-0000-0000-0000-000000000001';
+SELECT count(*) FROM orders; -- should return only tenant A's rows
+
+-- Simulate tenant B
+SET LOCAL app.tenant_id = 'bbbbbbbb-0000-0000-0000-000000000002';
+SELECT count(*) FROM orders; -- should return only tenant B's rows
+
+-- Verify cross-tenant write is blocked
+INSERT INTO orders (tenant_id, customer_id, amount, status)
+VALUES ('aaaaaaaa-0000-0000-0000-000000000001', 1, 100, 'pending');
+-- ERROR: new row violates row-level security policy for table "orders"
+
+RESET ROLE;</code></pre>
+
+        <pre><code class="language-java">// Integration test: verify RLS blocks cross-tenant access
+@SpringBootTest
+@Transactional
+class RlsIntegrationTest {
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @Test
+    void tenantA_cannotSee_tenantB_orders() {
+        UUID tenantA = UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001");
+        UUID tenantB = UUID.fromString("bbbbbbbb-0000-0000-0000-000000000002");
+
+        // Seed an order for tenant B directly (bypassing RLS as a superuser)
+        jdbcTemplate.update(
+            "INSERT INTO orders (tenant_id, customer_id, amount, status) VALUES (?, 1, 100, 'paid')",
+            tenantB
+        );
+
+        // Set context to tenant A
+        TenantContext.setTenantId(tenantA.toString());
+
+        // Tenant A should see 0 orders (tenant B's order is hidden by RLS)
+        List&lt;Order&gt; orders = orderRepository.findAll();
+        assertThat(orders).isEmpty();
+    }
+
+    @Test
+    void tenantA_cannotInsert_order_for_tenantB() {
+        UUID tenantA = UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001");
+        UUID tenantB = UUID.fromString("bbbbbbbb-0000-0000-0000-000000000002");
+
+        TenantContext.setTenantId(tenantA.toString());
+
+        Order order = new Order();
+        order.setTenantId(tenantB); // trying to insert for tenant B
+        order.setCustomerId(42L);
+        order.setAmount(new BigDecimal("99.00"));
+
+        // RLS WITH CHECK should block this
+        assertThatThrownBy(() -> orderRepository.saveAndFlush(order))
+            .hasCauseInstanceOf(org.postgresql.util.PSQLException.class)
+            .hasMessageContaining("row-level security policy");
+    }
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- Section 7: Performance & Indexing -->
+    <section id="performance">
+      <h2>Performance &amp; Indexing</h2>
+
+      <details>
+        <summary>Index design for shared-table multi-tenancy</summary>
+        <div class="callout callout-info">
+          <p>In a shared-table model, <strong>every query filter includes tenant_id</strong>. Your indexes must lead with <code>tenant_id</code> to be useful — otherwise PostgreSQL performs a full table scan and then filters by tenant in memory.</p>
+        </div>
+
+        <h3>Composite indexes: tenant_id first</h3>
+        <pre><code class="language-sql">-- BAD: index on status alone — full table scan + filter by tenant
+CREATE INDEX idx_orders_status ON orders (status);
+-- Query: WHERE tenant_id = ? AND status = 'pending'
+-- Plan: Seq Scan on orders (Filter: tenant_id=... AND status=...)
+--       reads ALL rows across all tenants, then filters
+
+-- GOOD: tenant_id first in the composite index
+CREATE INDEX idx_orders_tenant_status ON orders (tenant_id, status);
+-- Plan: Index Scan using idx_orders_tenant_status
+--       (tenant_id = ?) → narrow index range for that tenant
+--       then filter by status within that range
+
+-- For time-range queries (most SaaS dashboards):
+CREATE INDEX idx_orders_tenant_status_time
+    ON orders (tenant_id, status, created_at DESC);
+
+-- For full-text or pattern searches scoped to a tenant:
+CREATE INDEX idx_orders_tenant_customer
+    ON orders (tenant_id, customer_id)
+    INCLUDE (amount, status); -- covering index avoids heap fetch
+
+-- Partial index: only index active tenants' pending orders
+-- (useful when a large % of data is archived/cancelled)
+CREATE INDEX idx_orders_active_pending
+    ON orders (tenant_id, created_at DESC)
+    WHERE status IN ('pending', 'processing');</code></pre>
+
+        <h3>Table partitioning by tenant_id</h3>
+        <p>For very large tables (billions of rows), consider declarative partitioning by tenant. Postgres can perform <strong>partition pruning</strong> — skipping partitions not belonging to the current tenant entirely.</p>
+        <pre><code class="language-sql">-- Partition orders by tenant_id (hash partitioning for even distribution)
+CREATE TABLE orders (
+    id          BIGSERIAL,
+    tenant_id   UUID NOT NULL,
+    customer_id BIGINT NOT NULL,
+    amount      NUMERIC(12,2) NOT NULL,
+    status      VARCHAR(50) NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, id)
+) PARTITION BY HASH (tenant_id);
+
+-- Create N partitions (start small, increase as data grows)
+CREATE TABLE orders_p0 PARTITION OF orders FOR VALUES WITH (MODULUS 8, REMAINDER 0);
+CREATE TABLE orders_p1 PARTITION OF orders FOR VALUES WITH (MODULUS 8, REMAINDER 1);
+CREATE TABLE orders_p2 PARTITION OF orders FOR VALUES WITH (MODULUS 8, REMAINDER 2);
+CREATE TABLE orders_p3 PARTITION OF orders FOR VALUES WITH (MODULUS 8, REMAINDER 3);
+CREATE TABLE orders_p4 PARTITION OF orders FOR VALUES WITH (MODULUS 8, REMAINDER 4);
+CREATE TABLE orders_p5 PARTITION OF orders FOR VALUES WITH (MODULUS 8, REMAINDER 5);
+CREATE TABLE orders_p6 PARTITION OF orders FOR VALUES WITH (MODULUS 8, REMAINDER 6);
+CREATE TABLE orders_p7 PARTITION OF orders FOR VALUES WITH (MODULUS 8, REMAINDER 7);
+
+-- Indexes on each partition (inherited automatically in PG 11+)
+CREATE INDEX ON orders (tenant_id, status, created_at DESC);
+
+-- Verify partition pruning:
+EXPLAIN SELECT * FROM orders WHERE tenant_id = 'a1b2c3d4-...' AND status = 'paid';
+-- Should show: Append → Seq Scan on orders_p3  (only 1 of 8 partitions scanned)
+-- "Partition Filters" line confirms pruning is active</code></pre>
+
+        <h3>RLS performance: the policy predicate cost</h3>
+        <pre><code class="language-sql">-- RLS policies add a predicate to every query.
+-- Verify the planner uses the index:
+
+SET app.tenant_id = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT id, amount FROM orders WHERE status = 'pending' LIMIT 20;
+
+-- Good plan (index scan, policy predicate pushed down):
+-- Index Scan using idx_orders_tenant_status on orders
+--   Index Cond: ((tenant_id = '...'::uuid) AND (status = 'pending'))
+--   Rows Removed by Index Recheck: 0
+--   Buffers: shared hit=4
+
+-- Bad plan (seq scan — missing tenant_id index):
+-- Seq Scan on orders
+--   Filter: ((tenant_id = '...'::uuid) AND (status = 'pending'))
+--   Rows Removed by Filter: 4580000  ← reading entire table!
+
+-- current_setting() is evaluated once per query, not per row — low overhead
+-- But always verify with EXPLAIN ANALYZE after enabling RLS on a production table</code></pre>
+
+        <h3>PgBouncer and session variables</h3>
+        <div class="callout callout-warning">
+          <p><strong>PgBouncer in transaction mode breaks SET SESSION variables.</strong> In transaction pooling mode, the same server connection is shared across multiple client sessions between transactions. A <code>SET SESSION app.tenant_id</code> on one transaction would persist to the next client's transaction.</p>
+          <p>Always use <code>SET LOCAL</code> (or <code>set_config(..., true)</code>), which scopes the variable to the current transaction and is automatically reset when the transaction ends — safe with both session and transaction pooling.</p>
+        </div>
+        <pre><code class="language-sql">-- SAFE with PgBouncer transaction pooling:
+BEGIN;
+SELECT set_config('app.tenant_id', 'a1b2c3d4-...', true);  -- LOCAL: resets on COMMIT/ROLLBACK
+SELECT * FROM orders; -- RLS uses the locally-scoped variable
+COMMIT; -- variable is cleared; connection returned to pool safely
+
+-- UNSAFE with PgBouncer transaction pooling:
+SET SESSION app.tenant_id = 'a1b2c3d4-...';  -- persists on the server connection!
+-- Next client borrowing this connection inherits the previous tenant's variable</code></pre>
+      </details>
+    </section>
+
+    <!-- Section 8: Production Incident -->
+    <section id="production-incident">
+      <h2>Real Production Incident</h2>
+
+      <details>
+        <summary>The tenant data leak: a missing WHERE clause exposed 3,000 customer records</summary>
+        <div class="callout callout-danger">
+          <p><strong>Severity:</strong> P0 — Cross-tenant data exposure. Customer records from tenant A were visible to tenant B for approximately 20 minutes. GDPR notification required.</p>
+        </div>
+
+        <h4>Context</h4>
+        <p>B2B SaaS platform using shared-table multi-tenancy with application-layer tenant filtering. A new engineer added a "recently active customers" endpoint for the dashboard.</p>
+
+        <h4>The Faulty Code</h4>
+        <pre><code class="language-java">// New endpoint: returns last 10 active customers
+// Engineer forgot to add tenant filter — looked reasonable in isolation
+@GetMapping("/dashboard/recent-customers")
+public List&lt;CustomerDTO&gt; getRecentCustomers() {
+    // BUG: no tenant_id filter — returns customers from ALL tenants!
+    return customerRepository.findTop10ByOrderByLastActiveAtDesc()
+        .stream()
+        .map(customerMapper::toDTO)
+        .collect(toList());
+}
+
+// The JPA repository method generated this SQL:
+// SELECT * FROM customers ORDER BY last_active_at DESC LIMIT 10
+// No WHERE tenant_id = ?  ← data from all 47 tenants returned</code></pre>
+
+        <h4>Timeline</h4>
+        <pre class="diagram">
+  09:15 — New feature deployed to production
+  09:22 — Tenant "Acme Corp" user opens dashboard
+           → sees 10 most recently active customers platform-wide
+           → 7 of the 10 belong to different tenants
+  09:31 — Acme Corp's admin notices unfamiliar customer names, emails support
+  09:35 — Support ticket escalated to on-call engineer
+  09:41 — Engineer identifies the missing WHERE clause
+  09:42 — Hotfix deployed: added .findTop10ByTenantIdOrderByLastActiveAtDesc(tenantId)
+  09:43 — Endpoint returns correct, scoped results
+  09:45 — Incident declared resolved (data exposure window: ~20 min)
+  10:30 — Post-mortem begins; GDPR team notified
+  Next week — RLS enabled on customers table as preventive control
+        </pre>
+
+        <h4>What Should Have Prevented This</h4>
+        <pre><code class="language-sql">-- If RLS had been active, the query would have been safe automatically:
+-- Application query (no WHERE clause):
+--   SELECT * FROM customers ORDER BY last_active_at DESC LIMIT 10
+
+-- PostgreSQL with RLS enabled would execute:
+--   SELECT * FROM customers
+--   WHERE tenant_id = current_setting('app.tenant_id')::uuid  ← injected by policy
+--   ORDER BY last_active_at DESC
+--   LIMIT 10
+
+-- The missing application filter is irrelevant — the DB enforces it regardless.
+
+-- Enable RLS as the fix:
+ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customers FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON customers
+    FOR ALL
+    TO app_user
+    USING  (tenant_id = current_setting('app.tenant_id')::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);</code></pre>
+
+        <h4>Corrected Application Code</h4>
+        <pre><code class="language-java">// After RLS: query is still safe even without explicit tenant filter
+// (but best practice: keep the filter in application code AND rely on RLS)
+@GetMapping("/dashboard/recent-customers")
+public List&lt;CustomerDTO&gt; getRecentCustomers() {
+    String tenantId = TenantContext.getTenantId(); // belt-and-suspenders
+    return customerRepository
+        .findTop10ByTenantIdOrderByLastActiveAtDesc(UUID.fromString(tenantId))
+        .stream()
+        .map(customerMapper::toDTO)
+        .collect(toList());
+}
+// With RLS: even if tenantId filter is forgotten, DB policy catches it.
+// Defence in depth: app layer filters + DB layer enforces.</code></pre>
+
+        <h4>Preventive Measures Added After Incident</h4>
+        <ul>
+          <li><strong>RLS on all tenant-scoped tables</strong> — enabled as a mandatory architectural control, not optional.</li>
+          <li><strong>Integration test suite</strong> — every repository test runs with a different tenant context and asserts cross-tenant data is invisible.</li>
+          <li><strong>Code review checklist</strong> — PR template for new data-access methods requires a checkbox confirming tenant scoping is handled.</li>
+          <li><strong>Static analysis rule</strong> — custom ArchUnit rule flags any JPA repository method that doesn't include <code>TenantId</code> in its name or that queries tables registered as tenant-scoped.</li>
+        </ul>
+      </details>
+    </section>
+
+
+    <!-- Section 9: Code Examples -->
+    <section id="code-examples">
+      <h2>Production-Ready Code Examples</h2>
+
+      <details>
+        <summary>Complete schema setup: shared-table model with RLS</summary>
+        <pre><code class="language-sql">-- ============================================================
+-- Full production schema for shared-table multi-tenancy + RLS
+-- ============================================================
+
+-- 1. Roles
+CREATE ROLE app_user NOLOGIN;
+CREATE ROLE app_admin NOLOGIN BYPASSRLS;
+CREATE ROLE app_readonly NOLOGIN;
+
+-- 2. Tenant registry
+CREATE TABLE tenants (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug       VARCHAR(63) UNIQUE NOT NULL,
+    name       VARCHAR(255) NOT NULL,
+    plan       VARCHAR(50) NOT NULL DEFAULT 'starter',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_active  BOOLEAN NOT NULL DEFAULT TRUE
+);
+-- Tenants table: no RLS needed — app only queries its own tenant row
+GRANT SELECT ON tenants TO app_user, app_readonly;
+
+-- 3. Core data tables
+CREATE TABLE customers (
+    id          BIGSERIAL,
+    tenant_id   UUID NOT NULL REFERENCES tenants(id),
+    email       VARCHAR(255) NOT NULL,
+    name        VARCHAR(255) NOT NULL,
+    last_active_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, id),
+    UNIQUE (tenant_id, email)  -- email unique per tenant, not globally
+);
+
+CREATE TABLE orders (
+    id          BIGSERIAL,
+    tenant_id   UUID NOT NULL REFERENCES tenants(id),
+    customer_id BIGINT NOT NULL,
+    amount      NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+    status      VARCHAR(50) NOT NULL DEFAULT 'pending',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, id),
+    FOREIGN KEY (tenant_id, customer_id) REFERENCES customers(tenant_id, id)
+);
+
+CREATE TABLE invoices (
+    id          BIGSERIAL,
+    tenant_id   UUID NOT NULL REFERENCES tenants(id),
+    order_id    BIGINT NOT NULL,
+    total       NUMERIC(12,2) NOT NULL,
+    pdf_url     VARCHAR(512),
+    due_date    DATE NOT NULL,
+    paid_at     TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, id),
+    FOREIGN KEY (tenant_id, order_id) REFERENCES orders(tenant_id, id)
+);
+
+-- 4. Indexes (tenant_id always first)
+CREATE INDEX idx_customers_tenant_email    ON customers (tenant_id, email);
+CREATE INDEX idx_customers_tenant_active   ON customers (tenant_id, last_active_at DESC);
+CREATE INDEX idx_orders_tenant_status_time ON orders    (tenant_id, status, created_at DESC);
+CREATE INDEX idx_invoices_tenant_due       ON invoices  (tenant_id, due_date)
+    WHERE paid_at IS NULL; -- partial: only unpaid invoices
+
+-- 5. Enable RLS on all tenant-scoped tables
+ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customers FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE orders FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invoices FORCE ROW LEVEL SECURITY;
+
+-- 6. Create policies
+CREATE POLICY tenant_isolation ON customers
+    FOR ALL TO app_user
+    USING  (tenant_id = current_setting('app.tenant_id', true)::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+CREATE POLICY tenant_isolation ON orders
+    FOR ALL TO app_user
+    USING  (tenant_id = current_setting('app.tenant_id', true)::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+CREATE POLICY tenant_isolation ON invoices
+    FOR ALL TO app_user
+    USING  (tenant_id = current_setting('app.tenant_id', true)::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+-- 7. Read-only role: same tenant restriction, SELECT only
+CREATE POLICY tenant_isolation_ro ON customers
+    FOR SELECT TO app_readonly
+    USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+CREATE POLICY tenant_isolation_ro ON orders
+    FOR SELECT TO app_readonly
+    USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+-- 8. Grant table permissions
+GRANT SELECT, INSERT, UPDATE, DELETE ON customers, orders, invoices TO app_user;
+GRANT SELECT ON customers, orders, invoices TO app_readonly;
+GRANT ALL ON customers, orders, invoices TO app_admin;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user;</code></pre>
+      </details>
+
+      <details>
+        <summary>Complete Spring Boot integration: entity, repository, service, filter</summary>
+        <pre><code class="language-java">// ─── Entity ───────────────────────────────────────────────────
+@Entity
+@Table(name = "orders")
+@IdClass(OrderId.class)  // composite PK: (tenant_id, id)
+public class Order {
+
+    @Id
+    @Column(name = "tenant_id", nullable = false)
+    private UUID tenantId;
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE,
+                    generator = "orders_id_seq")
+    @SequenceGenerator(name = "orders_id_seq",
+                       sequenceName = "orders_id_seq",
+                       allocationSize = 50)
+    @Column(name = "id")
+    private Long id;
+
+    @Column(name = "customer_id", nullable = false)
+    private Long customerId;
+
+    @Column(name = "amount", nullable = false)
+    private BigDecimal amount;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "status", nullable = false)
+    private OrderStatus status = OrderStatus.PENDING;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private OffsetDateTime createdAt = OffsetDateTime.now();
+
+    // getters, setters, equals/hashCode omitted for brevity
+}
+
+// ─── Repository ────────────────────────────────────────────────
+public interface OrderRepository extends JpaRepository&lt;Order, OrderId&gt; {
+
+    // RLS ensures these only return current-tenant rows
+    // — but keeping tenantId in the method name clarifies intent for reviewers
+    List&lt;Order&gt; findByTenantIdAndStatus(UUID tenantId, OrderStatus status);
+
+    @Query("SELECT o FROM Order o WHERE o.tenantId = :tenantId " +
+           "AND o.createdAt BETWEEN :from AND :to " +
+           "ORDER BY o.createdAt DESC")
+    Page&lt;Order&gt; findByTenantIdInDateRange(
+        @Param("tenantId") UUID tenantId,
+        @Param("from") OffsetDateTime from,
+        @Param("to") OffsetDateTime to,
+        Pageable pageable
+    );
+
+    // Cross-tenant aggregate (used by admin service with app_admin role — BYPASSRLS)
+    @Query(value = "SELECT tenant_id, COUNT(*) AS order_count, SUM(amount) AS total_revenue " +
+                   "FROM orders WHERE created_at >= :since GROUP BY tenant_id",
+           nativeQuery = true)
+    List&lt;Object[]&gt; getRevenueByTenant(@Param("since") OffsetDateTime since);
+}
+
+// ─── Service ───────────────────────────────────────────────────
+@Service
+@Slf4j
+public class OrderService {
+
+    @Autowired private OrderRepository orderRepo;
+    @Autowired private CustomerRepository customerRepo;
+
+    @TenantScoped
+    public Page&lt;Order&gt; listOrders(OrderFilter filter, Pageable pageable) {
+        UUID tenantId = UUID.fromString(TenantContext.getTenantId());
+        return orderRepo.findByTenantIdInDateRange(
+            tenantId, filter.getFrom(), filter.getTo(), pageable);
+    }
+
+    @TenantScoped
+    @Transactional
+    public Order placeOrder(PlaceOrderRequest request) {
+        UUID tenantId = UUID.fromString(TenantContext.getTenantId());
+
+        // Verify customer belongs to this tenant (RLS also enforces this)
+        Customer customer = customerRepo.findById(new CustomerId(tenantId, request.getCustomerId()))
+            .orElseThrow(() -> new CustomerNotFoundException(request.getCustomerId()));
+
+        Order order = new Order();
+        order.setTenantId(tenantId);
+        order.setCustomerId(customer.getId());
+        order.setAmount(request.getAmount());
+        order.setStatus(OrderStatus.PENDING);
+
+        Order saved = orderRepo.save(order);
+        log.info("Order {} placed for tenant {}", saved.getId(), tenantId);
+        return saved;
+    }
+}</code></pre>
+      </details>
+
+      <details>
+        <summary>Schema migration runner for multiple tenants (database-per-tenant)</summary>
+        <pre><code class="language-java">// Runs Flyway migrations across all tenant databases on startup or via admin endpoint
+@Service
+@Slf4j
+public class MultiTenantMigrationRunner {
+
+    @Autowired
+    private TenantRegistry tenantRegistry;
+
+    @PostConstruct
+    public void migrateAllTenants() {
+        List&lt;TenantConfig&gt; tenants = tenantRegistry.getAllTenants();
+        log.info("Starting migrations for {} tenants", tenants.size());
+
+        List&lt;String&gt; failed = new ArrayList&lt;&gt;();
+
+        for (TenantConfig tenant : tenants) {
+            try {
+                migrateOneTenant(tenant);
+            } catch (Exception e) {
+                log.error("Migration failed for tenant {}: {}", tenant.getTenantId(), e.getMessage());
+                failed.add(tenant.getTenantId());
+                // Don't rethrow — continue with remaining tenants
+            }
+        }
+
+        if (!failed.isEmpty()) {
+            throw new MigrationException("Migrations failed for tenants: " + failed);
+        }
+        log.info("All tenant migrations completed successfully");
+    }
+
+    private void migrateOneTenant(TenantConfig tenant) {
+        Flyway flyway = Flyway.configure()
+            .dataSource(tenant.getJdbcUrl(), tenant.getDbUsername(), tenant.getDbPassword())
+            .schemas(tenant.getSchema()) // for schema-per-tenant; omit for DB-per-tenant
+            .locations("classpath:db/migration")
+            .baselineOnMigrate(true)
+            .outOfOrder(false)
+            .validateOnMigrate(true)
+            .load();
+
+        MigrateResult result = flyway.migrate();
+        log.info("Tenant {}: {} migrations applied (current version: {})",
+            tenant.getTenantId(),
+            result.migrationsExecuted,
+            result.targetSchemaVersion);
+    }
+}</code></pre>
+      </details>
+    </section>
+
+
+    <!-- Section 10: Common Mistakes -->
+    <section id="common-mistakes">
+      <h2>Common Mistakes</h2>
+
+      <details>
+        <summary>The mistakes interviewers are looking for you to know</summary>
+        <table>
+          <thead>
+            <tr><th>#</th><th>Mistake</th><th>Impact</th><th>Fix</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>Using <code>SET SESSION</code> instead of <code>SET LOCAL</code> for tenant variable</td>
+              <td>Previous tenant's ID leaks to next request via pooled connection</td>
+              <td>Always use <code>set_config('app.tenant_id', ?, true)</code> (is_local = true)</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td>Not calling <code>FORCE ROW LEVEL SECURITY</code></td>
+              <td>Table owner (often the migration user) bypasses all policies silently</td>
+              <td>Always pair <code>ENABLE</code> with <code>FORCE ROW LEVEL SECURITY</code></td>
+            </tr>
+            <tr>
+              <td>3</td>
+              <td>Missing <code>tenant_id</code> as the leading column in indexes</td>
+              <td>Seq scans on large shared tables; all-tenant data read then filtered</td>
+              <td>All indexes on tenant-scoped tables start with <code>(tenant_id, ...)</code></td>
+            </tr>
+            <tr>
+              <td>4</td>
+              <td>Not setting <code>app.tenant_id</code> before a query runs (e.g., in background jobs)</td>
+              <td>RLS policy returns NULL from <code>current_setting</code> — all rows filtered out or error thrown</td>
+              <td>Background jobs must set tenant context explicitly before each tenant's work unit</td>
+            </tr>
+            <tr>
+              <td>5</td>
+              <td>Cross-tenant foreign keys in shared-table model</td>
+              <td>FK from <code>orders.customer_id</code> to <code>customers.id</code> (without tenant_id) allows cross-tenant references</td>
+              <td>Use composite FKs: <code>FOREIGN KEY (tenant_id, customer_id) REFERENCES customers(tenant_id, id)</code></td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>Not validating tenant identifier in schema-per-tenant before interpolation</td>
+              <td>SQL injection via malicious tenant slug in <code>SET search_path TO {tenant}</code></td>
+              <td>Validate with strict regex <code>^[a-z0-9_]{1,63}$</code> before use; prefer allowlist from DB</td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td>Applying RLS <em>after</em> data is already in production</td>
+              <td>Rows with NULL <code>tenant_id</code> become invisible to all users — silent data loss</td>
+              <td>Backfill all NULLs, add NOT NULL constraint, then enable RLS; test with all roles first</td>
+            </tr>
+            <tr>
+              <td>8</td>
+              <td>Not testing RLS with the correct application role</td>
+              <td>Tests pass because they run as the table owner (BYPASSRLS) — policies never actually tested</td>
+              <td>Run tests under <code>SET ROLE app_user</code> to simulate actual application permissions</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 11: Trade-offs -->
+    <section id="trade-offs">
+      <h2>Trade-offs</h2>
+
+      <details>
+        <summary>Multi-tenancy strategy comparison</summary>
+        <table>
+          <thead>
+            <tr>
+              <th>Approach</th>
+              <th>Isolation</th>
+              <th>Scale</th>
+              <th>Migration Cost</th>
+              <th>Operational Cost</th>
+              <th>Best For</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>DB-per-tenant</strong></td>
+              <td>⭐⭐⭐ Strongest</td>
+              <td>Up to ~100 tenants</td>
+              <td>High — N runs</td>
+              <td>High — N connection pools, N backups</td>
+              <td>Enterprise, HIPAA, strict compliance</td>
+            </tr>
+            <tr>
+              <td><strong>Schema-per-tenant</strong></td>
+              <td>⭐⭐ Strong</td>
+              <td>Up to ~1,000 tenants</td>
+              <td>Medium — per schema</td>
+              <td>Medium — shared PG, per-schema overhead</td>
+              <td>Mid-market SaaS, regulated industries</td>
+            </tr>
+            <tr>
+              <td><strong>Shared tables + RLS</strong></td>
+              <td>⭐ Good (with RLS)</td>
+              <td>100,000+ tenants</td>
+              <td>Low — one migration</td>
+              <td>Low — single pool, single DB</td>
+              <td>High-volume PLG SaaS, freemium</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>RLS trade-offs</h3>
+        <table>
+          <thead>
+            <tr><th>Aspect</th><th>Pro</th><th>Con</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Security</td>
+              <td>DB-level enforcement — no app bug can bypass it</td>
+              <td>BYPASSRLS privilege must be carefully controlled</td>
+            </tr>
+            <tr>
+              <td>Performance</td>
+              <td>Policy predicate pushed into index scan; near-zero overhead with good indexes</td>
+              <td>Seq scans become full table scans if indexes are missing tenant_id</td>
+            </tr>
+            <tr>
+              <td>Complexity</td>
+              <td>Simplifies application code — no manual WHERE clauses needed</td>
+              <td>Debugging surprises: queries return 0 rows if <code>app.tenant_id</code> is not set</td>
+            </tr>
+            <tr>
+              <td>Migrations</td>
+              <td>Single migration covers all tenants simultaneously</td>
+              <td>Care needed when enabling RLS retroactively on tables with existing nulls</td>
+            </tr>
+            <tr>
+              <td>Background jobs</td>
+              <td>Cross-tenant jobs can use <code>app_admin</code> role with BYPASSRLS</td>
+              <td>Per-tenant background jobs must explicitly set tenant context before each iteration</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
+    <!-- Section 12: Follow-up Questions -->
+    <section id="follow-up-questions">
+      <h2>Follow-up Interview Questions</h2>
+
+      <details>
+        <summary>Questions the interviewer will ask next</summary>
+        <dl>
+          <dt><strong>Q: "How would you handle a tenant that suddenly grows to 10× normal data volume and starts degrading other tenants' performance?"</strong></dt>
+          <dd>This is the "noisy neighbor" problem. Short-term: identify the tenant via <code>pg_stat_activity</code> filtered by <code>app.tenant_id</code> in query text; use <code>pg_cancel_backend</code> to kill runaway queries. Medium-term: add query-level resource limits with statement_timeout and lock_timeout per application role. Long-term: migrate that tenant to a dedicated database (which is why the routing layer should support this without code changes). Also consider table partitioning by tenant_id so heavy tenants don't bloat shared autovacuum jobs.</dd>
+
+          <dt><strong>Q: "How would you implement a feature where tenant admins can grant other users in their tenant elevated access?"</strong></dt>
+          <dd>Extend the session context to include a user role: <code>set_config('app.user_role', 'admin', true)</code>. Modify RLS policies to check both tenant_id and user_role: <code>USING (tenant_id = current_setting('app.tenant_id')::uuid AND (owner_id = ... OR current_setting('app.user_role') = 'admin'))</code>. The JWT claim carries both tenant_id and the user's role within that tenant. Never trust the client to provide these — always derive from the server-side JWT or session.</dd>
+
+          <dt><strong>Q: "How would you support cross-tenant data sharing (e.g., a shared vendor catalog)?"</strong></dt>
+          <dd>Use a separate table without tenant_id for truly global data (e.g., <code>global_products</code>) and don't enable RLS on it. For partial sharing (tenant A shares specific records with tenant B), add a <code>shared_with_tenant_id</code> column or a separate join table, and write a PERMISSIVE policy alongside the tenant isolation RESTRICTIVE policy. The key is to separate "what you own" from "what is shared with you" at the schema level, not just the application level.</dd>
+
+          <dt><strong>Q: "How would you perform a GDPR 'right to erasure' request in a shared-table model?"</strong></dt>
+          <dd>Use the <code>app_admin</code> role (BYPASSRLS) to delete or anonymize all rows where <code>tenant_id = ?</code> across all tables. The challenge is referential integrity — use cascading deletes or process tables in dependency order. For "soft" erasure (pseudonymization), update PII fields to a hashed value rather than deleting rows, which preserves aggregate metrics without personal data. Log the erasure event in an audit table with the timestamp and requestor.</dd>
+
+          <dt><strong>Q: "What happens to RLS when you use read replicas for reporting queries?"</strong></dt>
+          <dd>RLS policies are replicated to standby servers. The policy still executes on the replica when a query runs there. However, the <code>app.tenant_id</code> session variable must be set on the replica's connection just as on the primary. If you route reporting queries to a read replica via a separate DataSource, ensure the same TenantAwareDataSource wrapper applies <code>set_config</code> on replica connections too.</dd>
+
+          <dt><strong>Q: "How would you audit which tenant accessed what data?"</strong></dt>
+          <dd>Use PostgreSQL's <code>pgaudit</code> extension to log all DML statements with session context (which captures the <code>app.tenant_id</code> variable). Alternatively, write a BEFORE trigger on sensitive tables that inserts into an audit log, capturing the current tenant from <code>current_setting</code>, the operation type, row old/new values, and a timestamp. Store audit logs in a separate schema with APPEND-ONLY access to prevent tampering.</dd>
+        </dl>
+      </details>
+    </section>
+
+    <!-- Section 13: Summary -->
+    <section id="summary">
+      <h2>Summary</h2>
+
+      <div class="callout callout-tip">
+        <p><strong>Interview Takeaways:</strong></p>
+        <ol>
+          <li>There are <strong>three multi-tenancy strategies</strong>: database-per-tenant (strongest isolation, highest cost), schema-per-tenant (balanced), and shared tables (cheapest, scales to 100k+ tenants). Choose based on tenant count, compliance, and budget.</li>
+          <li><strong>Shared-table is the most common</strong> in modern SaaS — but it requires rigorous tenant filtering. <em>Every</em> table needs a <code>tenant_id</code> column and <em>every</em> query must filter by it.</li>
+          <li><strong>Row-Level Security is a database-level safety net</strong>, not a replacement for application-layer filtering. Use both: app code for performance clarity, RLS as the enforcement backstop that prevents data leaks from bugs.</li>
+          <li>Always use <strong><code>SET LOCAL</code> / <code>set_config(..., true)</code></strong> to scope the tenant variable to the current transaction — never <code>SET SESSION</code>, which leaks across pooled connections.</li>
+          <li>Call <strong><code>FORCE ROW LEVEL SECURITY</code></strong> — without it, the table owner bypasses all policies silently.</li>
+          <li><strong>Lead all indexes with <code>tenant_id</code></strong>. An index on <code>(status)</code> is useless in a shared-table model; <code>(tenant_id, status)</code> enables efficient per-tenant scans.</li>
+          <li>Use <strong>composite primary keys <code>(tenant_id, id)</code></strong> and <strong>composite foreign keys</strong> to prevent cross-tenant references at the constraint level.</li>
+          <li>Test RLS by setting <code>SET ROLE app_user</code> in test transactions — the table owner bypasses RLS and will give you false confidence that policies work.</li>
+          <li>For large tenants or compliance-heavy customers, build your architecture to support <strong>hybrid tiering</strong>: route enterprise tenants to dedicated databases without application code changes.</li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Chapter Navigation -->
+    <nav class="chapter-nav">
+      <a href="ch15-intermittent-failures-no-logs.html" class="chapter-nav-prev">← Chapter 15: Intermittent Failures No Logs</a>
+      <a href="../index.html" class="chapter-nav-next">Back to Handbook →</a>
+    </nav>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="../assets/js/main.js"></script>
+</body>
+</html>
